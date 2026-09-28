@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>OwnNAS</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <div id="boot" class="boot">Opening OwnNAS…</div>
+
+  <div id="login-view" class="login-view" hidden>
+    <form id="login-form" class="login-card">
+      <div class="mark" aria-hidden="true">
+        <svg viewBox="0 0 48 48" width="48" height="48">
+          <rect x="4" y="10" width="40" height="30" rx="6" fill="none" stroke="currentColor" stroke-width="2.5"/>
+          <path d="M4 18h40" stroke="currentColor" stroke-width="2.5"/>
+          <path d="M14 10v-2a4 4 0 0 1 4-4h12a4 4 0 0 1 4 4v2" fill="none" stroke="currentColor" stroke-width="2.5"/>
+        </svg>
+      </div>
+      <h1>OwnNAS</h1>
+      <p class="lede">Sign in to browse this library.</p>
+      <label>Username
+        <input id="login-user" name="username" autocomplete="username" required>
+      </label>
+      <label>Password
+        <input id="login-pass" name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <p id="login-error" class="form-error" role="alert"></p>
+      <button type="submit">Sign in</button>
+    </form>
+  </div>
+
+  <div id="app-view" class="app" hidden>
+    <header class="top">
+      <div class="brand">
+        <span class="mark sm" aria-hidden="true">
+          <svg viewBox="0 0 48 48" width="22" height="22">
+            <rect x="4" y="10" width="40" height="30" rx="6" fill="none" stroke="currentColor" stroke-width="3"/>
+            <path d="M4 18h40" stroke="currentColor" stroke-width="3"/>
+          </svg>
+        </span>
+        <strong>OwnNAS</strong>
+      </div>
+      <nav id="crumbs" class="crumbs" aria-label="Current folder"></nav>
+      <div class="top-actions">
+        <span id="who" class="who"></span>
+        <button id="password-btn" type="button">Password</button>
+        <button id="logout-btn" type="button">Sign out</button>
+      </div>
+    </header>
+
+    <div class="toolbar">
+      <input id="filter" type="search" placeholder="Filter this folder" aria-label="Filter this folder">
+      <label class="sort-label">Sort
+        <select id="sort">
+          <option value="name">Name</option>
+          <option value="modified">Date</option>
+          <option value="size">Size</option>
+        </select>
+      </label>
+      <button id="sort-dir" type="button">A–Z</button>
+      <button id="view-toggle" type="button">List</button>
+      <label class="check"><input id="hidden-toggle" type="checkbox"> Hidden</label>
+      <span class="spacer"></span>
+      <button id="mkdir-btn" type="button">New folder</button>
+      <button id="upload-btn" type="button">Upload</button>
+      <button id="folder-btn" type="button">Upload folder</button>
+      <input id="upload-input" type="file" multiple hidden>
+      <input id="folder-input" type="file" multiple hidden webkitdirectory directory>
+    </div>
+
+    <p id="banner" class="banner" hidden></p>
+    <div id="files" class="files grid"></div>
+    <p id="empty" class="empty" hidden></p>
+  </div>
+
+  <aside id="preview" class="preview" hidden>
+    <div class="preview-bar">
+      <h2 id="preview-title"></h2>
+      <button id="preview-close" type="button" aria-label="Close preview">Close</button>
+    </div>
+    <p id="preview-meta" class="muted"></p>
+    <div id="preview-body" class="preview-body"></div>
+    <div class="preview-actions">
+      <a id="preview-download" class="button" href="#">Download</a>
+      <button id="preview-rename" type="button">Rename</button>
+      <button id="preview-delete" type="button" class="danger">Delete</button>
+    </div>
+  </aside>
+
+  <div id="drop" class="drop" hidden>Drop to upload into this folder</div>
+  <div id="progress" class="progress" hidden></div>
+  <div id="toast" class="toast" role="status"></div>
+  <div id="menu" class="menu" hidden></div>
+
+  <dialog id="text-dialog">
+    <form method="dialog">
+      <h3 id="text-title"></h3>
+      <label><span id="text-label-copy">Name</span><input id="text-input" required></label>
+      <div class="dialog-actions">
+        <button value="cancel" type="submit" formnovalidate>Cancel</button>
+        <button id="text-ok" value="ok" type="submit">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="confirm-dialog">
+    <form method="dialog">
+      <h3 id="confirm-title">Delete</h3>
+      <p id="confirm-copy"></p>
+      <div class="dialog-actions">
+        <button value="cancel" type="submit" formnovalidate>Cancel</button>
+        <button value="ok" type="submit" class="danger">Delete</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="password-dialog">
+    <form method="dialog" id="password-form">
+      <h3>Change password</h3>
+      <label>Current password
+        <input id="pw-current" type="password" autocomplete="current-password" required>
+      </label>
+      <label>New password
+        <input id="pw-new" type="password" autocomplete="new-password" minlength="8" required>
+      </label>
+      <label>Repeat new password
+        <input id="pw-repeat" type="password" autocomplete="new-password" minlength="8" required>
+      </label>
+      <p id="pw-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button value="cancel" type="submit" formnovalidate>Cancel</button>
+        <button value="ok" type="submit">Update</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>
