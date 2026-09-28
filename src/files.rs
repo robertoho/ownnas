@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 pub const MAX_LIST: usize = 5_000;
 
@@ -15,6 +16,7 @@ pub enum FileError {
     IsADirectory,
     AlreadyExists,
     InvalidName,
+    Rejected(&'static str),
     Io(&'static str),
 }
 
@@ -444,6 +446,296 @@ fn map_io(err: io::Error) -> FileError {
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub name: String,
+    pub path: String,
+    pub dir: bool,
+    pub kind: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Usage {
+    pub bytes: u64,
+    pub files: u64,
+    pub truncated: bool,
+}
+
+pub fn search(root: &Path, rel: &str, query: &str) -> Result<Vec<SearchHit>, FileError> {
+    let query = query.trim().to_lowercase();
+    if query.chars().count() < 2 {
+        return Err(FileError::Rejected("Type at least 2 characters"));
+    }
+    let start = resolve(root, rel)?;
+    if !start.full.is_dir() {
+        return Err(FileError::NotADirectory);
+    }
+    let root = root.canonicalize().map_err(map_io)?;
+    let mut hits = Vec::new();
+    let mut seen = 0usize;
+    walk_search(&root, &start.full, &start.rel, &query, &mut hits, &mut seen);
+    Ok(hits)
+}
+
+fn walk_search(
+    root: &Path,
+    dir: &Path,
+    rel: &str,
+    query: &str,
+    hits: &mut Vec<SearchHit>,
+    seen: &mut usize,
+) {
+    if hits.len() >= 100 || *seen >= 8_000 {
+        return;
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for item in entries {
+        if hits.len() >= 100 || *seen >= 8_000 {
+            return;
+        }
+        let Ok(item) = item else { continue };
+        *seen += 1;
+        let name = item.file_name().to_string_lossy().to_string();
+        let child = item.path();
+        let canon = match child.canonicalize() {
+            Ok(path) if path.starts_with(root) => path,
+            _ => continue,
+        };
+        let child_rel = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
+        let dir = canon.is_dir();
+        if name.to_lowercase().contains(query) {
+            hits.push(SearchHit {
+                kind: if dir {
+                    "folder".to_string()
+                } else {
+                    kind_of(&name).to_string()
+                },
+                name,
+                path: child_rel.clone(),
+                dir,
+            });
+        }
+        if dir {
+            walk_search(root, &canon, &child_rel, query, hits, seen);
+        }
+    }
+}
+
+pub fn usage(root: &Path, rel: &str) -> Result<Usage, FileError> {
+    let start = resolve(root, rel)?;
+    if !start.full.is_dir() {
+        return Err(FileError::NotADirectory);
+    }
+    let root = root.canonicalize().map_err(map_io)?;
+    let mut usage = Usage {
+        bytes: 0,
+        files: 0,
+        truncated: false,
+    };
+    walk_usage(&root, &start.full, &mut usage);
+    Ok(usage)
+}
+
+fn walk_usage(root: &Path, dir: &Path, usage: &mut Usage) {
+    if usage.files >= 20_000 {
+        usage.truncated = true;
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for item in entries {
+        if usage.files >= 20_000 {
+            usage.truncated = true;
+            return;
+        }
+        let Ok(item) = item else { continue };
+        let canon = match item.path().canonicalize() {
+            Ok(path) if path.starts_with(root) => path,
+            _ => continue,
+        };
+        if canon.is_dir() {
+            walk_usage(root, &canon, usage);
+        } else {
+            usage.files += 1;
+            usage.bytes += canon.metadata().map(|meta| meta.len()).unwrap_or(0);
+        }
+    }
+}
+
+pub fn duplicate(root: &Path, rel: &str) -> Result<String, FileError> {
+    let src = resolve(root, rel)?;
+    if src.rel.is_empty() {
+        return Err(FileError::Forbidden);
+    }
+    let parent = src.full.parent().ok_or(FileError::Forbidden)?;
+    let name = src
+        .full
+        .file_name()
+        .ok_or(FileError::InvalidName)?;
+    let dest = unique_path(parent.join(name));
+    let mut copied = 0usize;
+    copy_path(&src.full, &dest, &mut copied)?;
+    let file_name = dest
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .ok_or(FileError::InvalidName)?;
+    Ok(match parent_rel(&src.rel) {
+        Some(parent_rel) if !parent_rel.is_empty() => format!("{parent_rel}/{file_name}"),
+        _ => file_name,
+    })
+}
+
+pub fn move_entry(root: &Path, rel: &str, dest_rel: &str) -> Result<String, FileError> {
+    let src = resolve(root, rel)?;
+    if src.rel.is_empty() {
+        return Err(FileError::Forbidden);
+    }
+    let dest_dir = resolve(root, dest_rel)?;
+    if !dest_dir.full.is_dir() {
+        return Err(FileError::NotADirectory);
+    }
+    if dest_dir.full.starts_with(&src.full) {
+        return Err(FileError::Rejected("A folder cannot be moved inside itself"));
+    }
+    if src.full.parent() == Some(dest_dir.full.as_path()) {
+        return Err(FileError::Rejected("That item is already in this folder"));
+    }
+    let name = src.full.file_name().ok_or(FileError::InvalidName)?;
+    let target = unique_path(dest_dir.full.join(name));
+    if fs::rename(&src.full, &target).is_err() {
+        let mut copied = 0usize;
+        copy_path(&src.full, &target, &mut copied)?;
+        if src.full.is_dir() {
+            fs::remove_dir_all(&src.full).map_err(map_io)?;
+        } else {
+            fs::remove_file(&src.full).map_err(map_io)?;
+        }
+    }
+    let file_name = target
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .ok_or(FileError::InvalidName)?;
+    Ok(if dest_dir.rel.is_empty() {
+        file_name
+    } else {
+        format!("{}/{file_name}", dest_dir.rel)
+    })
+}
+
+pub fn sha256_file(root: &Path, rel: &str) -> Result<String, FileError> {
+    let resolved = resolve(root, rel)?;
+    if resolved.full.is_dir() {
+        return Err(FileError::IsADirectory);
+    }
+    let meta = fs::metadata(&resolved.full).map_err(map_io)?;
+    if meta.len() > 2 * 1024 * 1024 * 1024 {
+        return Err(FileError::Rejected("That file is too large to hash here"));
+    }
+    let mut file = fs::File::open(&resolved.full).map_err(map_io)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = io::Read::read(&mut file, &mut buf).map_err(|_| FileError::Io("Could not read the file"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+pub fn write_zip(root: &Path, rel: &str, output: &Path) -> Result<String, FileError> {
+    let start = resolve(root, rel)?;
+    if !start.full.is_dir() {
+        return Err(FileError::NotADirectory);
+    }
+    let root = root.canonicalize().map_err(map_io)?;
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).map_err(map_io)?;
+    }
+    let file = fs::File::create(output).map_err(map_io)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let mut count = 0usize;
+    zip_tree(&root, &start.full, "", &mut zip, &mut count)?;
+    zip.finish()
+        .map_err(|_| FileError::Io("Could not finish the zip"))?;
+    let label = if start.rel.is_empty() {
+        root_label(&root)
+    } else {
+        start
+            .full
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "folder".to_string())
+    };
+    Ok(format!("{label}.zip"))
+}
+
+fn zip_tree(
+    root: &Path,
+    dir: &Path,
+    prefix: &str,
+    zip: &mut zip::ZipWriter<fs::File>,
+    count: &mut usize,
+) -> Result<(), FileError> {
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for item in fs::read_dir(dir).map_err(map_io)? {
+        let item = item.map_err(map_io)?;
+        if *count >= 2_000 {
+            return Err(FileError::Rejected("That folder is too large to download as one zip"));
+        }
+        let name = item.file_name().to_string_lossy().to_string();
+        let canon = match item.path().canonicalize() {
+            Ok(path) if path.starts_with(root) => path,
+            _ => continue,
+        };
+        let zip_name = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{}", item.file_name().to_string_lossy())
+        };
+        *count += 1;
+        if canon.is_dir() {
+            zip.add_directory(format!("{zip_name}/"), options)
+                .map_err(|_| FileError::Io("Could not build the zip"))?;
+            zip_tree(root, &canon, &zip_name, zip, count)?;
+        } else {
+            zip.start_file(&zip_name, options)
+                .map_err(|_| FileError::Io("Could not build the zip"))?;
+            let mut input = fs::File::open(&canon).map_err(map_io)?;
+            io::copy(&mut input, zip).map_err(|_| FileError::Io("Could not build the zip"))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_path(src: &Path, dest: &Path, copied: &mut usize) -> Result<(), FileError> {
+    if *copied >= 2_000 {
+        return Err(FileError::Rejected("That item is too large to copy in one step"));
+    }
+    if src.is_dir() {
+        fs::create_dir(dest).map_err(map_io)?;
+        for item in fs::read_dir(src).map_err(map_io)? {
+            let item = item.map_err(map_io)?;
+            *copied += 1;
+            copy_path(&item.path(), &dest.join(item.file_name()), copied)?;
+        }
+    } else {
+        *copied += 1;
+        fs::copy(src, dest).map_err(|_| FileError::Io("Could not copy the file"))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +775,21 @@ mod tests {
         assert_eq!(listing.entries[0].name, "sub");
         let nested = list_dir(&root, "sub", false, false).unwrap();
         assert_eq!(nested.entries[0].kind, "text");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn searches_duplicates_and_measures() {
+        let root = scratch();
+        fs::write(root.join("sub").join("Alpha Note.txt"), b"abc").unwrap();
+        let hits = search(&root, "", "alpha").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "Alpha Note.txt");
+        let copy = duplicate(&root, "sub/Alpha Note.txt").unwrap();
+        assert!(copy.contains("Alpha Note"));
+        assert_ne!(copy, "sub/Alpha Note.txt");
+        let usage = usage(&root, "").unwrap();
+        assert!(usage.bytes >= 3);
         let _ = fs::remove_dir_all(&root);
     }
 }

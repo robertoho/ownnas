@@ -30,6 +30,8 @@ On Windows PowerShell:
 
 Then open `http://127.0.0.1:8787`. From another device on the VPN, open `http://<this-computer-vpn-address>:8787`.
 
+The library page can bookmark folders, remember recently opened files, search by name, measure a folder, download the current folder as a zip, and show an activity log. A file preview can move, duplicate, hash, and step through images.
+
 The database and thumbnail cache default to `./ownnas-data/ownnas.db`. That folder must sit outside `--root`.
 
 ```bash
