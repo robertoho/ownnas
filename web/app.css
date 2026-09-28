@@ -184,7 +184,22 @@ input, select {
   overflow: auto;
   box-shadow: var(--shadow);
 }
-.preview-bar, .preview-actions, .dialog-actions { display: flex; gap: 0.5rem; align-items: center; }
+.preview-bar, .preview-actions, .dialog-actions { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+.extra {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem 0;
+}
+.extra h3 {
+  margin: 0 0 0.35rem;
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.chips { display: flex; flex-wrap: wrap; gap: 0.35rem; min-height: 2rem; }
+.chips button { border-radius: 999px; background: transparent; max-width: 16rem; }
 .preview-bar h2 {
   font-size: 1.05rem;
   margin: 0;
@@ -269,6 +284,7 @@ dialog { color: var(--text); }
 @media (max-width: 720px) {
   .spacer { display: none; }
   .files.grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+  .extra { grid-template-columns: 1fr; }
 }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }

@@ -67,11 +67,25 @@
       <button id="mkdir-btn" type="button">New folder</button>
       <button id="upload-btn" type="button">Upload</button>
       <button id="folder-btn" type="button">Upload folder</button>
+      <button id="search-btn" type="button">Search</button>
+      <button id="bookmark-btn" type="button">Bookmark</button>
+      <button id="usage-btn" type="button">Folder size</button>
+      <a id="zip-link" class="button" href="/api/zip">Download zip</a>
+      <button id="activity-btn" type="button">Activity</button>
       <input id="upload-input" type="file" multiple hidden>
       <input id="folder-input" type="file" multiple hidden webkitdirectory directory>
     </div>
 
-    <p id="banner" class="banner" hidden></p>
+    <section class="extra" aria-label="Library">
+      <div>
+        <h3>Bookmarks</h3>
+        <div id="bookmarks" class="chips"></div>
+      </div>
+      <div>
+        <h3>Recent</h3>
+        <div id="recents" class="chips"></div>
+      </div>
+    </section>
     <div id="files" class="files grid"></div>
     <p id="empty" class="empty" hidden></p>
   </div>
@@ -84,7 +98,12 @@
     <p id="preview-meta" class="muted"></p>
     <div id="preview-body" class="preview-body"></div>
     <div class="preview-actions">
+      <button id="preview-prev" type="button" hidden>Previous</button>
+      <button id="preview-next" type="button" hidden>Next</button>
       <a id="preview-download" class="button" href="#">Download</a>
+      <button id="preview-hash" type="button">SHA-256</button>
+      <button id="preview-duplicate" type="button">Duplicate</button>
+      <button id="preview-move" type="button">Move</button>
       <button id="preview-rename" type="button">Rename</button>
       <button id="preview-delete" type="button" class="danger">Delete</button>
     </div>
@@ -137,6 +156,26 @@
     </form>
   </dialog>
 
-  <script src="/assets/app.js"></script>
+  <dialog id="search-dialog">
+    <form id="search-form">
+      <h3>Search from this folder</h3>
+      <label>Name contains
+        <input id="search-input" minlength="2" required>
+      </label>
+      <div id="search-results" class="chips"></div>
+      <div class="dialog-actions">
+        <button type="button" id="search-close">Close</button>
+        <button type="submit">Search</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="activity-dialog">
+    <h3>Activity</h3>
+    <ul id="activity-list" class="archive-list"></ul>
+    <form method="dialog">
+      <button value="cancel" type="submit">Close</button>
+    </form>
+  </dialog>
 </body>
 </html>

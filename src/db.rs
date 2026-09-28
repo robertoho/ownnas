@@ -45,12 +45,34 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             value TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
+        CREATE TABLE IF NOT EXISTS bookmarks (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            path TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (user_id, path)
+        );
+        CREATE TABLE IF NOT EXISTS recents (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            path TEXT NOT NULL,
+            name TEXT NOT NULL,
+            opened_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS recents_user ON recents(user_id, opened_at);
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER,
+            username TEXT,
+            action TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
         ",
     )
     .map_err(|_| "Could not create the database schema".to_string())?;
     conn.execute(
-        "INSERT INTO settings(key, value) VALUES('schema_version', '1')
-         ON CONFLICT(key) DO NOTHING",
+        "INSERT INTO settings(key, value) VALUES('schema_version', '2')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )
     .map_err(|_| "Could not store the schema version".to_string())?;
@@ -196,6 +218,138 @@ pub fn delete_other_sessions(conn: &Connection, user_id: i64, keep_token: &str) 
     )
     .map_err(|_| "Could not update sessions".to_string())?;
     Ok(())
+}
+
+use serde::Serialize;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Recent {
+    pub path: String,
+    pub name: String,
+    pub opened_at: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Event {
+    pub username: String,
+    pub action: String,
+    pub detail: String,
+    pub created_at: i64,
+}
+
+pub fn add_bookmark(conn: &Connection, user_id: i64, path: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO bookmarks(user_id, path, created_at) VALUES(?1, ?2, ?3)
+         ON CONFLICT(user_id, path) DO NOTHING",
+        params![user_id, path, now_secs()],
+    )
+    .map_err(|_| "Could not save the bookmark".to_string())?;
+    Ok(())
+}
+
+pub fn remove_bookmark(conn: &Connection, user_id: i64, path: &str) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM bookmarks WHERE user_id = ?1 AND path = ?2",
+        params![user_id, path],
+    )
+    .map_err(|_| "Could not remove the bookmark".to_string())?;
+    Ok(())
+}
+
+pub fn list_bookmarks(conn: &Connection, user_id: i64) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT path FROM bookmarks WHERE user_id = ?1 ORDER BY created_at DESC")
+        .map_err(|_| "Could not read bookmarks".to_string())?;
+    let rows = stmt
+        .query_map(params![user_id], |row| row.get(0))
+        .map_err(|_| "Could not read bookmarks".to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "Could not read bookmarks".to_string())
+}
+
+pub fn touch_recent(conn: &Connection, user_id: i64, path: &str, name: &str) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM recents WHERE user_id = ?1 AND path = ?2",
+        params![user_id, path],
+    )
+    .map_err(|_| "Could not update recent files".to_string())?;
+    conn.execute(
+        "INSERT INTO recents(user_id, path, name, opened_at) VALUES(?1, ?2, ?3, ?4)",
+        params![user_id, path, name, now_secs()],
+    )
+    .map_err(|_| "Could not update recent files".to_string())?;
+    conn.execute(
+        "DELETE FROM recents WHERE user_id = ?1 AND id NOT IN (
+            SELECT id FROM recents WHERE user_id = ?1 ORDER BY opened_at DESC LIMIT 30
+        )",
+        params![user_id],
+    )
+    .map_err(|_| "Could not update recent files".to_string())?;
+    Ok(())
+}
+
+pub fn list_recent(conn: &Connection, user_id: i64) -> Result<Vec<Recent>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT path, name, opened_at FROM recents
+             WHERE user_id = ?1 ORDER BY opened_at DESC LIMIT 30",
+        )
+        .map_err(|_| "Could not read recent files".to_string())?;
+    let rows = stmt
+        .query_map(params![user_id], |row| {
+            Ok(Recent {
+                path: row.get(0)?,
+                name: row.get(1)?,
+                opened_at: row.get(2)?,
+            })
+        })
+        .map_err(|_| "Could not read recent files".to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "Could not read recent files".to_string())
+}
+
+pub fn log_event(
+    conn: &Connection,
+    user_id: Option<i64>,
+    username: &str,
+    action: &str,
+    detail: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO events(user_id, username, action, detail, created_at)
+         VALUES(?1, ?2, ?3, ?4, ?5)",
+        params![user_id, username, action, detail, now_secs()],
+    )
+    .map_err(|_| "Could not write the activity log".to_string())?;
+    conn.execute(
+        "DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT 300)",
+        [],
+    )
+    .map_err(|_| "Could not trim the activity log".to_string())?;
+    Ok(())
+}
+
+pub fn list_events(conn: &Connection) -> Result<Vec<Event>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT username, action, detail, created_at FROM events
+             ORDER BY id DESC LIMIT 80",
+        )
+        .map_err(|_| "Could not read the activity log".to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(Event {
+                username: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                action: row.get(1)?,
+                detail: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })
+        .map_err(|_| "Could not read the activity log".to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "Could not read the activity log".to_string())
 }
 
 fn purge_expired(conn: &Connection) -> Result<(), String> {

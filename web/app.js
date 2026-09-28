@@ -11,6 +11,7 @@ const state = {
   filter: "",
   current: null,
   menuPath: "",
+  bookmarks: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -81,6 +82,9 @@ function showApp() {
   $("folder-btn").hidden = !write;
   $("preview-rename").hidden = !write;
   $("preview-delete").hidden = !write;
+  $("preview-duplicate").hidden = !write;
+  $("preview-move").hidden = !write;
+  refreshLibrary().catch((err) => toast(err.message, true));
 }
 
 function formatSize(bytes, dir) {
@@ -197,6 +201,9 @@ async function load(path) {
   closePreview();
   renderCrumbs();
   renderFiles();
+  $("zip-link").href = `/api/zip?path=${encodeURIComponent(state.path)}`;
+  const marked = state.bookmarks.includes(state.path);
+  $("bookmark-btn").textContent = marked ? "Bookmarked" : "Bookmark";
 }
 
 async function go(path) {
@@ -222,6 +229,8 @@ function openMenu(path, anchor) {
   const buttons = [`<button type="button" data-menu="open">Open</button>`];
   if (!entry.dir) buttons.push(`<button type="button" data-menu="download">Download</button>`);
   if (write) {
+    buttons.push(`<button type="button" data-menu="duplicate">Duplicate</button>`);
+    buttons.push(`<button type="button" data-menu="move">Move</button>`);
     buttons.push(`<button type="button" data-menu="rename">Rename</button>`);
     buttons.push(`<button type="button" data-menu="delete">Delete</button>`);
   }
@@ -249,7 +258,13 @@ async function openEntry(entry) {
   $("preview").hidden = false;
   $("preview-title").textContent = entry.name;
   $("preview-meta").textContent = `${formatSize(entry.size, false)} · ${formatDate(entry.modified)}`;
+  $("preview-hash").textContent = "SHA-256";
   $("preview-download").href = `/api/raw?download=1&path=${encodeURIComponent(entry.path)}`;
+  const images = sortedEntries().filter((item) => item.kind === "image" || item.kind === "svg");
+  const imageIndex = images.findIndex((item) => item.path === entry.path);
+  $("preview-prev").hidden = imageIndex <= 0;
+  $("preview-next").hidden = imageIndex < 0 || imageIndex >= images.length - 1;
+  api("/api/recent", { method: "POST", json: { path: entry.path } }).then(() => refreshLibrary()).catch(() => {});
   const body = $("preview-body");
   const raw = `/api/raw?path=${encodeURIComponent(entry.path)}`;
   if (entry.kind === "image" || entry.kind === "svg") {
@@ -512,6 +527,8 @@ $("menu").addEventListener("click", (event) => {
   if (action === "download") location.href = `/api/raw?download=1&path=${encodeURIComponent(entry.path)}`;
   if (action === "rename") renameEntry(entry).catch((err) => toast(err.message, true));
   if (action === "delete") deleteEntry(entry).catch((err) => toast(err.message, true));
+  if (action === "duplicate") duplicateEntry(entry).catch((err) => toast(err.message, true));
+  if (action === "move") moveEntry(entry).catch((err) => toast(err.message, true));
 });
 
 document.addEventListener("click", (event) => {
@@ -639,6 +656,149 @@ window.addEventListener("drop", async (event) => {
     await uploadFiles(items.map((item) => item.file), items.map((item) => item.name));
     toast("Upload finished");
     await load(state.path);
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+async function refreshLibrary() {
+  if (!state.me) return;
+  const [bookmarks, recent] = await Promise.all([
+    api("/api/bookmarks"),
+    api("/api/recent"),
+  ]);
+  state.bookmarks = bookmarks.paths || [];
+  $("bookmarks").innerHTML = state.bookmarks.length
+    ? state.bookmarks.map((path) => `<button type="button" data-go="${esc(path)}">${esc(path || (state.me.rootName || "Library"))}</button>`).join("")
+    : `<span class="muted">None yet</span>`;
+  const items = recent.items || [];
+  $("recents").innerHTML = items.length
+    ? items.map((item) => `<button type="button" data-open="${esc(item.path)}">${esc(item.name)}</button>`).join("")
+    : `<span class="muted">Open a file to see it here</span>`;
+  const marked = state.bookmarks.includes(state.path);
+  $("bookmark-btn").textContent = marked ? "Bookmarked" : "Bookmark";
+}
+
+function imageStep(delta) {
+  if (!state.current) return;
+  const images = sortedEntries().filter((item) => item.kind === "image" || item.kind === "svg");
+  const index = images.findIndex((item) => item.path === state.current.path);
+  const next = images[index + delta];
+  if (next) openEntry(next).catch((err) => toast(err.message, true));
+}
+
+async function duplicateEntry(entry) {
+  await api("/api/duplicate", { method: "POST", json: { path: entry.path } });
+  toast("Duplicated");
+  await load(state.path);
+}
+
+async function moveEntry(entry) {
+  const dest = await askText("Move", "Destination folder (empty for the library root)", state.path.includes("/") ? state.path.slice(0, state.path.lastIndexOf("/")) : "", "Move");
+  if (dest === null) return;
+  await api("/api/move", { method: "POST", json: { path: entry.path, dest } });
+  toast("Moved");
+  await load(state.path);
+}
+
+$("bookmark-btn").addEventListener("click", async () => {
+  try {
+    if (state.bookmarks.includes(state.path)) {
+      await api(`/api/bookmarks?path=${encodeURIComponent(state.path)}`, { method: "DELETE" });
+    } else {
+      await api("/api/bookmarks", { method: "POST", json: { path: state.path } });
+    }
+    await refreshLibrary();
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+$("usage-btn").addEventListener("click", async () => {
+  try {
+    const usage = await api(`/api/usage?path=${encodeURIComponent(state.path)}`);
+    const extra = usage.truncated ? " Count stopped early." : "";
+    toast(`${formatSize(usage.bytes, false)} in ${usage.files} files.${extra}`);
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+$("search-btn").addEventListener("click", () => {
+  $("search-results").innerHTML = "";
+  $("search-dialog").showModal();
+  $("search-input").focus();
+});
+$("search-close").addEventListener("click", () => $("search-dialog").close());
+$("search-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    const data = await api(`/api/search?path=${encodeURIComponent(state.path)}&q=${encodeURIComponent($("search-input").value)}`);
+    const hits = data.hits || [];
+    $("search-results").innerHTML = hits.length
+      ? hits.map((hit) => `<button type="button" data-hit="${esc(hit.path)}" data-dir="${hit.dir ? "1" : "0"}">${esc(hit.path)}</button>`).join("")
+      : `<span class="muted">No matches</span>`;
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+$("search-results").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-hit]");
+  if (!button) return;
+  $("search-dialog").close();
+  if (button.dataset.dir === "1") go(button.dataset.hit).catch((err) => toast(err.message, true));
+  else openEntry({ path: button.dataset.hit, name: button.dataset.hit.split("/").pop(), dir: false, size: 0, modified: 0, kind: "file" }).catch((err) => toast(err.message, true));
+});
+
+$("activity-btn").addEventListener("click", async () => {
+  try {
+    const data = await api("/api/activity");
+    const events = data.events || [];
+    $("activity-list").innerHTML = events.length
+      ? events.map((item) => `<li><span>${esc(item.username)} ${esc(item.action)} ${esc(item.detail)}</span><span class="muted">${esc(formatDate(item.createdAt))}</span></li>`).join("")
+      : `<li>No activity yet</li>`;
+    $("activity-dialog").showModal();
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+$("preview-prev").addEventListener("click", () => imageStep(-1));
+$("preview-next").addEventListener("click", () => imageStep(1));
+$("preview-hash").addEventListener("click", async () => {
+  if (!state.current) return;
+  $("preview-hash").textContent = "Hashing…";
+  try {
+    const data = await api(`/api/hash?path=${encodeURIComponent(state.current.path)}`);
+    $("preview-meta").textContent = `${$("preview-meta").textContent} · ${data.sha256}`;
+    $("preview-hash").textContent = "SHA-256";
+  } catch (err) {
+    $("preview-hash").textContent = "SHA-256";
+    toast(err.message, true);
+  }
+});
+$("preview-duplicate").addEventListener("click", () => {
+  if (state.current) duplicateEntry(state.current).catch((err) => toast(err.message, true));
+});
+$("preview-move").addEventListener("click", () => {
+  if (state.current) moveEntry(state.current).catch((err) => toast(err.message, true));
+});
+
+$("bookmarks").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-go]");
+  if (!button) return;
+  go(button.dataset.go).catch((err) => toast(err.message, true));
+});
+$("recents").addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-open]");
+  if (!button) return;
+  const path = button.dataset.open;
+  const parent = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+  try {
+    if (state.path !== parent) await go(parent);
+    const entry = findEntry(path);
+    if (entry) await openEntry(entry);
+    else await openEntry({ path, name: path.split("/").pop(), dir: false, size: 0, modified: 0, kind: "file" });
   } catch (err) {
     toast(err.message, true);
   }
