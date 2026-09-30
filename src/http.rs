@@ -90,7 +90,10 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/mkdir", post(mkdir))
         .route("/api/rename", post(rename))
         .route("/api/upload", post(upload).layer(DefaultBodyLimit::disable()))
+        .route("/api/upload/conflicts", post(upload_conflicts))
         .route("/api/entry", axum::routing::delete(delete_entry))
+        .route("/api/restore", post(restore_item))
+        .route("/api/trash/empty", post(empty_trash))
         .route("/api/bookmarks", get(list_bookmarks).post(add_bookmark).delete(remove_bookmark))
         .route("/api/recent", get(list_recent).post(touch_recent))
         .route("/api/search", get(search))
@@ -98,8 +101,13 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/hash", get(file_hash))
         .route("/api/activity", get(activity))
         .route("/api/zip", get(zip_folder))
+        .route("/api/download", post(download_selection))
         .route("/api/move", post(move_item))
+        .route("/api/copy", post(copy_item))
         .route("/api/duplicate", post(duplicate_item))
+        .route("/api/annotations", get(get_annotations).post(ack_annotations))
+        .route("/api/tags", post(add_tag).delete(remove_tag))
+        .route("/api/comments", post(add_comment).delete(remove_comment))
         .with_state(state)
 }
 
@@ -169,21 +177,34 @@ fn open_url(url: &str) {
 
 struct ApiError {
     status: StatusCode,
-    message: String,
+    body: serde_json::Value,
 }
 
 impl ApiError {
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
-            message: message.into(),
+            body: json!({ "error": message.into() }),
+        }
+    }
+
+    fn conflict(existing: files::ExistingFile) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            body: json!({
+                "error": "An item with that name already exists",
+                "exists": true,
+                "dir": existing.dir,
+                "modified": existing.modified,
+                "size": existing.size,
+            }),
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
+        (self.status, Json(self.body)).into_response()
     }
 }
 
@@ -221,6 +242,19 @@ struct PathQuery {
     path: Option<String>,
     download: Option<String>,
     hidden: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UploadQuery {
+    path: Option<String>,
+    conflict: Option<String>,
+    modified: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct ConflictBody {
+    path: Option<String>,
+    names: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -481,13 +515,34 @@ async fn list(
 ) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     let root = state.root.clone();
+    let migrations = tokio::task::spawn_blocking({
+        let root = root.clone();
+        move || files::migrate_legacy_dirs(&root)
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not prepare special folders"))?
+    .map_err(ApiError::from)?;
+    for (from, to) in migrations {
+        rewrite_meta(&state, &from, &to);
+    }
     let rel = rel_of(&query.path);
     let hidden = flag(&query.hidden);
     let ffmpeg = state.ffmpeg;
-    let listing = tokio::task::spawn_blocking(move || files::list_dir(&root, &rel, hidden, ffmpeg))
+    let mut listing = tokio::task::spawn_blocking(move || files::list_dir(&root, &rel, hidden, ffmpeg))
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not list the folder"))?
         .map_err(ApiError::from)?;
+    let paths: Vec<String> = listing.entries.iter().map(|entry| entry.path.clone()).collect();
+    if !paths.is_empty() {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        if let Ok(map) = db::tags_for_paths(&conn, &paths) {
+            for entry in &mut listing.entries {
+                if let Some(tags) = map.get(&entry.path) {
+                    entry.tags = tags.clone();
+                }
+            }
+        }
+    }
     Ok(Json(listing))
 }
 
@@ -773,13 +828,15 @@ async fn rename(
     let (user, _) = require_user(&state, &headers)?;
     require_write(&state)?;
     let root = state.root.clone();
+    let from = body.path.clone();
     let label = format!("{} → {}", body.path, body.name);
-    tokio::task::spawn_blocking(move || files::rename_entry(&root, &body.path, &body.name))
+    let to = tokio::task::spawn_blocking(move || files::rename_entry(&root, &body.path, &body.name))
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not rename the item"))?
         .map_err(ApiError::from)?;
+    rewrite_meta(&state, &from, &to);
     record(&state, &user, "rename", &label);
-    Ok(Json(json!({ "ok": true })))
+    Ok(Json(json!({ "ok": true, "path": to })))
 }
 
 async fn delete_entry(
@@ -793,25 +850,121 @@ async fn delete_entry(
     let root = state.root.clone();
     let rel = rel_of(&query.path);
     let label = rel.clone();
-    tokio::task::spawn_blocking(move || files::remove_entry(&root, &rel))
+    let (action, new_path) = tokio::task::spawn_blocking(move || files::trash_or_delete(&root, &rel))
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not delete the item"))?
         .map_err(ApiError::from)?;
-    record(&state, &user, "delete", &label);
-    Ok(Json(json!({ "ok": true })))
+    if let Some(to) = new_path {
+        rewrite_meta(&state, &label, &to);
+    } else {
+        delete_meta(&state, &label);
+    }
+    record(&state, &user, action, &label);
+    Ok(Json(json!({ "ok": true, "action": action })))
+}
+
+async fn restore_item(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<PathBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let root = state.root.clone();
+    let from = body.path.clone();
+    let label = body.path.clone();
+    let path = tokio::task::spawn_blocking(move || files::restore_entry(&root, &body.path))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not restore the item"))?
+        .map_err(ApiError::from)?;
+    rewrite_meta(&state, &from, &path);
+    record(&state, &user, "restore", &label);
+    Ok(Json(json!({ "path": path })))
+}
+
+async fn empty_trash(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let root = state.root.clone();
+    let removed = tokio::task::spawn_blocking(move || files::empty_trash(&root))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not empty the Trash"))?
+        .map_err(ApiError::from)?;
+    delete_meta(&state, files::TRASH_DIR);
+    delete_meta(&state, "Trash");
+    record(&state, &user, "empty-trash", &format!("{removed} item(s)"));
+    Ok(Json(json!({ "removed": removed })))
+}
+
+fn upload_choice(query: &UploadQuery) -> Result<Option<files::UploadChoice>, ApiError> {
+    let Some(conflict) = query.conflict.as_deref() else {
+        return Ok(None);
+    };
+    match conflict {
+        "overwrite" => Ok(Some(files::UploadChoice::Overwrite)),
+        "keep" => Ok(Some(files::UploadChoice::KeepBoth)),
+        "archive-existing" => Ok(Some(files::UploadChoice::ArchiveExisting)),
+        "ignore" => Ok(Some(files::UploadChoice::Ignore)),
+        "archive-older" => {
+            let incoming_modified = query.modified.ok_or_else(|| {
+                ApiError::new(StatusCode::BAD_REQUEST, "Archive older needs the file date")
+            })?;
+            Ok(Some(files::UploadChoice::ArchiveOlder { incoming_modified }))
+        }
+        _ => Err(ApiError::new(StatusCode::BAD_REQUEST, "Unknown upload choice")),
+    }
+}
+
+async fn upload_conflicts(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<ConflictBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (_, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    if body.names.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose at least one file"));
+    }
+    if body.names.len() > files::MAX_LIST {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "That upload contains too many files",
+        ));
+    }
+    let root = state.root.clone();
+    let dir = rel_of(&body.path);
+    let names = body.names;
+    let items = tokio::task::spawn_blocking(move || {
+        names
+            .iter()
+            .map(|name| files::upload_status(&root, &dir, name))
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not check the upload"))?
+    .map_err(ApiError::from)?;
+    Ok(Json(json!({ "items": items })))
 }
 
 async fn upload(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<PathQuery>,
+    Query(query): Query<UploadQuery>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, ApiError> {
     check_csrf(&headers)?;
     let (user, _) = require_user(&state, &headers)?;
     require_write(&state)?;
+    let choice = upload_choice(&query)?;
     let dir_rel = rel_of(&query.path);
     let mut saved = 0u32;
+    let mut skipped = 0u32;
     while let Some(field) = multipart
         .next_field()
         .await
@@ -827,10 +980,26 @@ async fn upload(
             .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "The upload is missing a file name"))?;
         let root = state.root.clone();
         let dir = dir_rel.clone();
-        let dest = tokio::task::spawn_blocking(move || files::prepare_upload(&root, &dir, &filename))
+        let prepared = tokio::task::spawn_blocking(move || files::prepare_upload(&root, &dir, &filename, choice))
             .await
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload"))?
             .map_err(ApiError::from)?;
+        let (dest, archived_as) = match prepared {
+            files::PreparedUpload::Skip => {
+                skipped += 1;
+                let mut field = field;
+                while field
+                    .chunk()
+                    .await
+                    .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "The upload was interrupted"))?
+                    .is_some()
+                {}
+                continue;
+            }
+            files::PreparedUpload::Ask(existing) => return Err(ApiError::conflict(existing)),
+            files::PreparedUpload::Write(dest) => (dest, None),
+            files::PreparedUpload::StoreInArchive { path, original_name } => (path, Some(original_name)),
+        };
         let mut out = tokio::fs::File::create(&dest).await.map_err(|_| {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload")
         })?;
@@ -844,18 +1013,44 @@ async fn upload(
                 .await
                 .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload"))?;
         }
+        drop(out);
+        if let Some(original_name) = archived_as {
+            let root = state.root.clone();
+            let saved_path = dest.clone();
+            tokio::task::spawn_blocking(move || files::record_archived_file(&root, &saved_path, &original_name))
+                .await
+                .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not update the archive log"))?
+                .map_err(ApiError::from)?;
+        }
         saved += 1;
     }
-    if saved == 0 {
+    if saved == 0 && skipped == 0 {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose at least one file"));
     }
-    record(&state, &user, "upload", &format!("{saved} file(s)"));
-    Ok(Json(json!({ "saved": saved })))
+    if saved > 0 {
+        record(&state, &user, "upload", &format!("{saved} file(s)"));
+    }
+    Ok(Json(json!({ "saved": saved, "skipped": skipped })))
 }
 
 fn record(state: &AppState, user: &User, action: &str, detail: &str) {
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     let _ = db::log_event(&conn, Some(user.id), &user.username, action, detail);
+}
+
+fn rewrite_meta(state: &AppState, from: &str, to: &str) {
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let _ = db::rewrite_path_meta(&conn, from, to);
+}
+
+fn delete_meta(state: &AppState, path: &str) {
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let _ = db::delete_path_meta(&conn, path);
+}
+
+fn copy_meta(state: &AppState, from: &str, to: &str) {
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let _ = db::copy_path_meta(&conn, from, to);
 }
 
 #[derive(Deserialize)]
@@ -870,9 +1065,37 @@ struct PathBody {
 }
 
 #[derive(Deserialize)]
+struct PathsBody {
+    paths: Vec<String>,
+}
+
+#[derive(Deserialize)]
 struct MoveBody {
     path: String,
     dest: String,
+}
+
+#[derive(Deserialize)]
+struct TagBody {
+    path: String,
+    tag: String,
+}
+
+#[derive(Deserialize)]
+struct TagQuery {
+    path: Option<String>,
+    tag: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CommentBody {
+    path: String,
+    body: String,
+}
+
+#[derive(Deserialize)]
+struct CommentQuery {
+    id: Option<i64>,
 }
 
 struct DeleteOnDrop<T> {
@@ -998,11 +1221,104 @@ async fn search(
     require_user(&state, &headers)?;
     let root = state.root.clone();
     let rel = rel_of(&query.path);
-    let q = query.q.unwrap_or_default();
-    let hits = tokio::task::spawn_blocking(move || files::search(&root, &rel, &q))
+    let raw = query.q.unwrap_or_default();
+    let trimmed = raw.trim();
+    let (tag_only, exact_tag, needle) = if let Some(rest) = trimmed
+        .strip_prefix("tag:")
+        .or_else(|| trimmed.strip_prefix("TAG:"))
+        .or_else(|| trimmed.strip_prefix("Tag:"))
+    {
+        (true, true, rest.trim().to_string())
+    } else {
+        (false, false, trimmed.to_string())
+    };
+    if needle.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Enter a search"));
+    }
+    if !tag_only && needle.chars().count() < 2 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Type at least 2 characters"));
+    }
+
+    let mut hits = if tag_only {
+        Vec::new()
+    } else {
+        let root = root.clone();
+        let rel = rel.clone();
+        let needle = needle.clone();
+        tokio::task::spawn_blocking(move || files::search(&root, &rel, &needle))
+            .await
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Search failed"))?
+            .map_err(ApiError::from)?
+    };
+
+    let tag_matches = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        db::search_tags(&conn, &needle, &rel, exact_tag)
+            .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?
+    };
+
+    if !tag_matches.is_empty() {
+        let root = state.root.clone();
+        let existing: std::collections::HashSet<String> =
+            hits.iter().map(|hit| hit.path.clone()).collect();
+        let extras = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            for (path, tag) in tag_matches {
+                if existing.contains(&path) {
+                    continue;
+                }
+                let Ok(resolved) = files::resolve(&root, &path) else {
+                    continue;
+                };
+                let name = resolved
+                    .full
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.clone());
+                let dir = resolved.full.is_dir();
+                out.push(files::SearchHit {
+                    kind: if dir {
+                        "folder".to_string()
+                    } else {
+                        files::kind_of(&name).to_string()
+                    },
+                    name,
+                    path,
+                    dir,
+                    matched_tag: Some(tag),
+                });
+                if out.len() >= 100 {
+                    break;
+                }
+            }
+            out
+        })
         .await
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Search failed"))?
-        .map_err(ApiError::from)?;
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Search failed"))?;
+
+        // Mark name hits that also have the tag.
+        {
+            let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+            for hit in &mut hits {
+                if hit.matched_tag.is_some() {
+                    continue;
+                }
+                if let Ok(tags) = db::list_tags(&conn, &hit.path) {
+                    if let Some(tag) = tags.into_iter().find(|tag| {
+                        if exact_tag {
+                            tag.eq_ignore_ascii_case(&needle)
+                        } else {
+                            tag.to_lowercase().contains(&needle.to_lowercase())
+                        }
+                    }) {
+                        hit.matched_tag = Some(tag);
+                    }
+                }
+            }
+        }
+        hits.extend(extras);
+    }
+
     Ok(Json(json!({ "hits": hits })))
 }
 
@@ -1056,12 +1372,34 @@ async fn move_item(
     let (user, _) = require_user(&state, &headers)?;
     require_write(&state)?;
     let root = state.root.clone();
+    let from = body.path.clone();
     let label = format!("{} → {}", body.path, body.dest);
     let path = tokio::task::spawn_blocking(move || files::move_entry(&root, &body.path, &body.dest))
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not move the item"))?
         .map_err(ApiError::from)?;
+    rewrite_meta(&state, &from, &path);
     record(&state, &user, "move", &label);
+    Ok(Json(json!({ "path": path })))
+}
+
+async fn copy_item(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<MoveBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let root = state.root.clone();
+    let from = body.path.clone();
+    let label = format!("{} → {}", body.path, body.dest);
+    let path = tokio::task::spawn_blocking(move || files::copy_entry(&root, &body.path, &body.dest))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not copy the item"))?
+        .map_err(ApiError::from)?;
+    copy_meta(&state, &from, &path);
+    record(&state, &user, "copy", &label);
     Ok(Json(json!({ "path": path })))
 }
 
@@ -1074,13 +1412,144 @@ async fn duplicate_item(
     let (user, _) = require_user(&state, &headers)?;
     require_write(&state)?;
     let root = state.root.clone();
+    let from = body.path.clone();
     let label = body.path.clone();
     let path = tokio::task::spawn_blocking(move || files::duplicate(&root, &body.path))
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not duplicate the item"))?
         .map_err(ApiError::from)?;
+    copy_meta(&state, &from, &path);
     record(&state, &user, "duplicate", &label);
     Ok(Json(json!({ "path": path })))
+}
+
+async fn get_annotations(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let path = rel_of(&query.path);
+    if path.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose a file or folder"));
+    }
+    let (size, modified) = files::entry_stats(&state.root, &path).map_err(ApiError::from)?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let notes = db::list_annotations(&conn, &path, size as i64, modified)
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(Json(notes))
+}
+
+async fn ack_annotations(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<PathBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let path = body.path.trim().trim_start_matches('/').to_string();
+    if path.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose a file or folder"));
+    }
+    let (size, modified) = files::entry_stats(&state.root, &path).map_err(ApiError::from)?;
+    let notes = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        db::touch_fingerprint(&conn, &path, size as i64, modified)
+            .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+        db::list_annotations(&conn, &path, size as i64, modified)
+            .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?
+    };
+    record(&state, &user, "ack-notes", &path);
+    Ok(Json(notes))
+}
+
+async fn add_tag(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<TagBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let path = body.path.trim().trim_start_matches('/').to_string();
+    if path.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose a file or folder"));
+    }
+    let (size, modified) = files::entry_stats(&state.root, &path).map_err(ApiError::from)?;
+    let tag = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        let tag = db::add_tag(&conn, &path, &body.tag)
+            .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+        let _ = db::touch_fingerprint(&conn, &path, size as i64, modified);
+        tag
+    };
+    record(&state, &user, "tag", &format!("{path} #{tag}"));
+    Ok(Json(json!({ "tag": tag })))
+}
+
+async fn remove_tag(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<TagQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let path = rel_of(&query.path);
+    let tag = query.tag.unwrap_or_default();
+    if path.is_empty() || tag.trim().is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose a path and tag"));
+    }
+    {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        db::remove_tag(&conn, &path, &tag)
+            .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    }
+    record(&state, &user, "untag", &format!("{path} #{tag}"));
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn add_comment(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<CommentBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let path = body.path.trim().trim_start_matches('/').to_string();
+    if path.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose a file or folder"));
+    }
+    let (size, modified) = files::entry_stats(&state.root, &path).map_err(ApiError::from)?;
+    let comment = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        let comment = db::add_comment(&conn, &path, user.id, &user.username, &body.body)
+            .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+        let _ = db::touch_fingerprint(&conn, &path, size as i64, modified);
+        comment
+    };
+    record(&state, &user, "comment", &path);
+    Ok(Json(comment))
+}
+
+async fn remove_comment(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<CommentQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let id = query.id.ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Choose a comment"))?;
+    {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        db::remove_comment(&conn, id)
+            .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    }
+    record(&state, &user, "uncomment", &id.to_string());
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn zip_folder(
@@ -1112,6 +1581,50 @@ async fn zip_folder(
         }
     };
     record(&state, &user, "zip", &rel);
+    send_temp_zip(tmp, &name).await
+}
+
+async fn download_selection(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<PathsBody>,
+) -> Result<Response, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    if body.paths.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose at least one item"));
+    }
+    let root = state.root.clone();
+    let paths = body.paths;
+    let label = if paths.len() == 1 {
+        paths[0].clone()
+    } else {
+        format!("{} items", paths.len())
+    };
+    let tmp = std::env::temp_dir().join(format!(
+        "ownnas-dl-{}-{}.zip",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let output = tmp.clone();
+    let name = tokio::task::spawn_blocking(move || files::write_zip_selection(&root, &paths, &output))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not build the download"))?;
+    let name = match name {
+        Ok(name) => name,
+        Err(err) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err.into());
+        }
+    };
+    record(&state, &user, "download", &label);
+    send_temp_zip(tmp, &name).await
+}
+
+async fn send_temp_zip(tmp: PathBuf, name: &str) -> Result<Response, ApiError> {
     let file = tokio::fs::File::open(&tmp).await.map_err(|_| {
         let _ = std::fs::remove_file(&tmp);
         ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not open the zip")
@@ -1121,7 +1634,7 @@ async fn zip_folder(
     Response::builder()
         .header(header::CONTENT_TYPE, "application/zip")
         .header(header::CONTENT_LENGTH, len)
-        .header(header::CONTENT_DISPOSITION, files::content_disposition(&name, true))
+        .header(header::CONTENT_DISPOSITION, files::content_disposition(name, true))
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .body(body)
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not send the zip"))

@@ -8,9 +8,9 @@
   <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
-  <div id="boot" class="boot">Opening OwnNAS…</div>
+  <div id="boot" class="boot" hidden>Opening OwnNAS…</div>
 
-  <div id="login-view" class="login-view" hidden>
+  <div id="login-view" class="login-view">
     <form id="login-form" class="login-card">
       <div class="mark" aria-hidden="true">
         <svg viewBox="0 0 48 48" width="48" height="48">
@@ -34,7 +34,7 @@
 
   <div id="app-view" class="app" hidden>
     <header class="top">
-      <div class="brand">
+      <button type="button" id="brand-home" class="brand" title="Go to library root" aria-label="Go to library root">
         <span class="mark sm" aria-hidden="true">
           <svg viewBox="0 0 48 48" width="22" height="22">
             <rect x="4" y="10" width="40" height="30" rx="6" fill="none" stroke="currentColor" stroke-width="3"/>
@@ -42,7 +42,7 @@
           </svg>
         </span>
         <strong>OwnNAS</strong>
-      </div>
+      </button>
       <nav id="crumbs" class="crumbs" aria-label="Current folder"></nav>
       <div class="top-actions">
         <span id="who" class="who"></span>
@@ -52,7 +52,7 @@
     </header>
 
     <div class="toolbar">
-      <input id="filter" type="search" placeholder="Filter this folder" aria-label="Filter this folder">
+      <input id="filter" type="search" placeholder="Filter by name or tag" aria-label="Filter this folder by name or tag">
       <label class="sort-label">Sort
         <select id="sort">
           <option value="name">Name</option>
@@ -61,41 +61,156 @@
         </select>
       </label>
       <button id="sort-dir" type="button">A–Z</button>
-      <button id="view-toggle" type="button">List</button>
+      <div class="view-switch" role="group" aria-label="View">
+        <button id="view-icons" type="button" data-view="icons" title="Icons" aria-label="Icons view">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <rect x="1" y="1" width="6" height="6" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+            <rect x="9" y="1" width="6" height="6" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+            <rect x="1" y="9" width="6" height="6" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+            <rect x="9" y="9" width="6" height="6" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+          </svg>
+        </button>
+        <button id="view-masonry" type="button" data-view="masonry" title="Grid" aria-label="Grid view">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <rect x="1" y="1" width="6" height="6" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+            <rect x="9" y="1" width="6" height="6" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+            <rect x="1" y="9" width="6" height="6" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+            <rect x="9" y="9" width="6" height="6" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+          </svg>
+        </button>
+        <button id="view-list" type="button" data-view="list" title="List" aria-label="List view">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path d="M1 3h14M1 8h14M1 13h14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
       <label class="check"><input id="hidden-toggle" type="checkbox"> Hidden</label>
       <span class="spacer"></span>
-      <button id="mkdir-btn" type="button">New folder</button>
-      <button id="upload-btn" type="button">Upload</button>
-      <button id="folder-btn" type="button">Upload folder</button>
-      <button id="search-btn" type="button">Search</button>
-      <button id="bookmark-btn" type="button">Bookmark</button>
-      <button id="usage-btn" type="button">Folder size</button>
-      <a id="zip-link" class="button" href="/api/zip">Download zip</a>
-      <button id="activity-btn" type="button">Activity</button>
+      <div class="toolbar-actions" role="group" aria-label="Folder actions">
+        <button id="mkdir-btn" class="icon-btn" type="button" title="New folder" aria-label="New folder">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path d="M1.5 4.5h4l1.2 1.5H14.5v7.5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-8a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+            <path d="M8 8v5M5.5 10.5H10.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <button id="upload-btn" class="icon-btn" type="button" title="Upload" aria-label="Upload files">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path d="M8 11.5V3.5M5 6l3-3 3 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M2.5 12.5v1a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-1" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <button id="folder-btn" class="icon-btn" type="button" title="Upload folder" aria-label="Upload folder">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path d="M1.5 4.5h4l1.2 1.5H14.5v7.5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-8a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+            <path d="M8 12V7.5M5.75 9.25 8 7l2.25 2.25" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+        <button id="download-btn" class="icon-btn" type="button" title="Download selection" aria-label="Download selection">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path d="M8 2.5v8M5 8l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M2.5 12.5v1a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-1" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <a id="zip-link" class="button icon-btn" href="/api/zip" title="Download folder zip" aria-label="Download folder zip">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path d="M4 2.5h5.5L13.5 6v7.5a1 1 0 0 1-1 1h-8.5a1 1 0 0 1-1-1v-10a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+            <path d="M9.5 2.5V6H13.5M7 4.5v1M7 6.5v1M7 8.5v1M6 10.5h2v2H6z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </a>
+        <button id="search-btn" class="icon-btn" type="button" title="Search" aria-label="Search">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <circle cx="7" cy="7" r="4.25" fill="none" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M10.5 10.5 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <button id="library-btn" class="icon-btn" type="button" title="Library" aria-label="Library">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path d="M2.5 2.5h3v11h-3zM6.5 2.5h3v11h-3zM10.5 3.5l3 1v9l-3-1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+          </svg>
+        </button>
+        <button id="bookmark-btn" class="icon-btn" type="button" title="Bookmark this folder" aria-label="Bookmark this folder" aria-pressed="false">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path d="M4 2.5h8v11l-4-2.5-4 2.5z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+          </svg>
+        </button>
+        <button id="usage-btn" class="icon-btn" type="button" title="Folder size" aria-label="Folder size">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path d="M2.5 4.5h11v8a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+            <path d="M5 4.5V3.5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M5.5 9h5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <button id="activity-btn" class="icon-btn" type="button" title="Activity" aria-label="Activity">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M8 5v3.25L10.25 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+        <button id="empty-trash-btn" class="icon-btn danger" type="button" title="Empty Trash" aria-label="Empty Trash" hidden>
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path d="M3 5.5h10M6 5.5V3.75a.75.75 0 0 1 .75-.75h2.5a.75.75 0 0 1 .75.75V5.5M4.5 5.5l.7 7.25a1 1 0 0 0 1 .85h3.6a1 1 0 0 0 1-.85l.7-7.25" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
       <input id="upload-input" type="file" multiple hidden>
       <input id="folder-input" type="file" multiple hidden webkitdirectory directory>
     </div>
 
-    <section class="extra" aria-label="Library">
-      <div>
-        <h3>Bookmarks</h3>
-        <div id="bookmarks" class="chips"></div>
-      </div>
-      <div>
-        <h3>Recent</h3>
-        <div id="recents" class="chips"></div>
-      </div>
-    </section>
+    <p id="banner" class="banner" hidden></p>
     <div id="files" class="files grid"></div>
     <p id="empty" class="empty" hidden></p>
   </div>
+
+  <div id="marquee" class="marquee" hidden></div>
+
+  <aside id="library" class="library" hidden>
+    <div class="preview-bar">
+      <h2>Library</h2>
+      <button id="library-close" type="button" aria-label="Close library">Close</button>
+    </div>
+    <div class="library-tabs" role="tablist" aria-label="Library sections">
+      <button id="library-tab-bookmarks" type="button" role="tab" aria-selected="true" data-library-tab="bookmarks">Bookmarks</button>
+      <button id="library-tab-recent" type="button" role="tab" aria-selected="false" data-library-tab="recent">Recent</button>
+    </div>
+    <section id="library-bookmarks" class="library-panel" role="tabpanel" aria-labelledby="library-tab-bookmarks">
+      <p class="muted">Saved folders from this library.</p>
+      <div id="bookmarks" class="library-list"></div>
+    </section>
+    <section id="library-recent" class="library-panel" role="tabpanel" aria-labelledby="library-tab-recent" hidden>
+      <p class="muted">Files you opened recently.</p>
+      <div id="recents" class="library-list"></div>
+    </section>
+  </aside>
 
   <aside id="preview" class="preview" hidden>
     <div class="preview-bar">
       <h2 id="preview-title"></h2>
       <button id="preview-close" type="button" aria-label="Close preview">Close</button>
     </div>
+    <p id="preview-path" class="preview-path muted" hidden></p>
     <p id="preview-meta" class="muted"></p>
+    <section id="preview-notes" class="preview-notes" hidden>
+      <div id="notes-changed" class="notes-changed" hidden>
+        <p>This file changed since its tags/comments were last updated. Notes are still kept.</p>
+        <button id="notes-ack" type="button">Mark as current</button>
+      </div>
+      <div class="notes-block">
+        <h3>Tags</h3>
+        <div id="preview-tags" class="tag-list"></div>
+        <form id="tag-form" class="notes-form">
+          <input id="tag-input" type="text" maxlength="48" placeholder="Add a tag" autocomplete="off">
+          <button type="submit">Add</button>
+        </form>
+      </div>
+      <div class="notes-block">
+        <h3>Comments</h3>
+        <div id="preview-comments" class="comment-list"></div>
+        <form id="comment-form" class="notes-form comment-form">
+          <textarea id="comment-input" rows="2" maxlength="4000" placeholder="Add a comment"></textarea>
+          <button type="submit">Post</button>
+        </form>
+      </div>
+    </section>
     <div id="preview-body" class="preview-body"></div>
     <div class="preview-actions">
       <button id="preview-prev" type="button" hidden>Previous</button>
@@ -109,29 +224,62 @@
     </div>
   </aside>
 
+  <div id="clipboard" class="clipboard" hidden>
+    <strong id="clipboard-title"></strong>
+    <ul id="clipboard-list"></ul>
+    <div class="dialog-actions">
+      <button id="clipboard-paste" type="button">Paste here</button>
+      <button id="clipboard-clear" type="button">Clear</button>
+    </div>
+  </div>
+  <div id="status-panel" class="status-panel" hidden role="status" aria-live="polite">
+    <div class="status-panel-head">
+      <strong id="status-title">Working…</strong>
+      <button id="status-cancel" type="button">Cancel</button>
+    </div>
+    <span id="status-detail" class="muted"></span>
+    <div class="status-track"><div id="status-bar" class="status-bar"></div></div>
+  </div>
   <div id="drop" class="drop" hidden>Drop to upload into this folder</div>
   <div id="progress" class="progress" hidden></div>
   <div id="toast" class="toast" role="status"></div>
   <div id="menu" class="menu" hidden></div>
 
   <dialog id="text-dialog">
-    <form method="dialog">
+    <form method="dialog" id="text-form">
       <h3 id="text-title"></h3>
       <label><span id="text-label-copy">Name</span><input id="text-input" required></label>
       <div class="dialog-actions">
-        <button value="cancel" type="submit" formnovalidate>Cancel</button>
+        <button id="text-cancel" value="cancel" type="submit" formnovalidate>Cancel</button>
         <button id="text-ok" value="ok" type="submit">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="conflict-dialog">
+    <form method="dialog" id="conflict-form">
+      <h3>File already exists</h3>
+      <p id="conflict-copy"></p>
+      <p id="conflict-meta" class="muted"></p>
+      <label class="check" for="conflict-rest"><input id="conflict-rest" type="checkbox"> Use this choice for the remaining files</label>
+      <div class="dialog-actions">
+        <button value="overwrite" type="submit">Overwrite</button>
+        <button value="keep" type="submit">Keep both</button>
+        <button value="archive-older" type="submit">Archive older</button>
+        <button value="archive-existing" type="submit">Archive existing</button>
+        <button value="ignore" type="submit">Ignore</button>
+        <button value="cancel" type="submit">Cancel</button>
       </div>
     </form>
   </dialog>
 
   <dialog id="confirm-dialog">
     <form method="dialog">
-      <h3 id="confirm-title">Delete</h3>
+      <h3 id="confirm-title">Confirm</h3>
       <p id="confirm-copy"></p>
       <div class="dialog-actions">
         <button value="cancel" type="submit" formnovalidate>Cancel</button>
-        <button value="ok" type="submit" class="danger">Delete</button>
+        <button id="confirm-ok" value="ok" type="submit" class="danger">OK</button>
       </div>
     </form>
   </dialog>
@@ -159,9 +307,10 @@
   <dialog id="search-dialog">
     <form id="search-form">
       <h3>Search from this folder</h3>
-      <label>Name contains
-        <input id="search-input" minlength="2" required>
+      <label>Name or tag
+        <input id="search-input" minlength="1" required placeholder="vacation or tag:family">
       </label>
+      <p class="muted search-hint">Matches file names and tags. Use <code>tag:family</code> for an exact tag.</p>
       <div id="search-results" class="chips"></div>
       <div class="dialog-actions">
         <button type="button" id="search-close">Close</button>
@@ -177,5 +326,6 @@
       <button value="cancel" type="submit">Close</button>
     </form>
   </dialog>
+  <script src="/assets/app.js"></script>
 </body>
 </html>
