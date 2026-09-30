@@ -6,6 +6,16 @@ pub struct User {
     pub id: i64,
     pub username: String,
     pub password_hash: String,
+    pub is_admin: bool,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInfo {
+    pub id: i64,
+    pub username: String,
+    pub is_admin: bool,
+    pub created_at: i64,
 }
 
 pub fn open(path: &std::path::Path) -> Result<Connection, String> {
@@ -93,12 +103,48 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         ",
     )
     .map_err(|_| "Could not create the database schema".to_string())?;
+    ensure_admin_column(conn)?;
     conn.execute(
-        "INSERT INTO settings(key, value) VALUES('schema_version', '4')
+        "INSERT INTO settings(key, value) VALUES('schema_version', '5')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )
     .map_err(|_| "Could not store the schema version".to_string())?;
+    Ok(())
+}
+
+fn ensure_admin_column(conn: &Connection) -> Result<(), String> {
+    let has_admin: bool = conn
+        .prepare("PRAGMA table_info(users)")
+        .and_then(|mut stmt| {
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            for name in rows.flatten() {
+                if name == "is_admin" {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .unwrap_or(false);
+    if !has_admin {
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|_| "Could not add the admin column".to_string())?;
+    }
+    let admins: i64 = conn
+        .query_row("SELECT COUNT(*) FROM users WHERE is_admin = 1", [], |row| row.get(0))
+        .unwrap_or(0);
+    if admins == 0 {
+        // Existing installs: promote the oldest account so Settings stays reachable.
+        conn.execute(
+            "UPDATE users SET is_admin = 1
+             WHERE id = (SELECT id FROM users ORDER BY id ASC LIMIT 1)",
+            [],
+        )
+        .map_err(|_| "Could not promote the first administrator".to_string())?;
+    }
     Ok(())
 }
 
@@ -115,24 +161,58 @@ pub fn count_users(conn: &Connection) -> Result<i64, String> {
 }
 
 pub fn list_users(conn: &Connection) -> Result<Vec<String>, String> {
+    Ok(list_user_infos(conn)?
+        .into_iter()
+        .map(|user| user.username)
+        .collect())
+}
+
+pub fn list_user_infos(conn: &Connection) -> Result<Vec<UserInfo>, String> {
     let mut stmt = conn
-        .prepare("SELECT username FROM users ORDER BY username COLLATE NOCASE")
+        .prepare(
+            "SELECT id, username, is_admin, created_at
+             FROM users
+             ORDER BY username COLLATE NOCASE",
+        )
         .map_err(|_| "Could not read users".to_string())?;
     let rows = stmt
-        .query_map([], |row| row.get(0))
+        .query_map([], |row| {
+            Ok(UserInfo {
+                id: row.get(0)?,
+                username: row.get(1)?,
+                is_admin: row.get::<_, i64>(2)? != 0,
+                created_at: row.get(3)?,
+            })
+        })
         .map_err(|_| "Could not read users".to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|_| "Could not read users".to_string())
 }
 
+pub fn count_admins(conn: &Connection) -> Result<i64, String> {
+    conn.query_row("SELECT COUNT(*) FROM users WHERE is_admin = 1", [], |row| row.get(0))
+        .map_err(|_| "Could not read administrators".to_string())
+}
+
 pub fn create_user(conn: &Connection, username: &str, password: &str) -> Result<(), String> {
+    let make_admin = count_users(conn)? == 0;
+    create_user_with_admin(conn, username, password, make_admin)
+}
+
+pub fn create_user_with_admin(
+    conn: &Connection,
+    username: &str,
+    password: &str,
+    is_admin: bool,
+) -> Result<(), String> {
     auth::validate_username(username).map_err(|e| e.to_string())?;
     auth::validate_password(password).map_err(|e| e.to_string())?;
     let hash = auth::hash_password(password)?;
     let now = now_secs();
+    let admin = if count_users(conn)? == 0 { true } else { is_admin };
     conn.execute(
-        "INSERT INTO users(username, password_hash, created_at) VALUES(?1, ?2, ?3)",
-        params![username.trim(), hash, now],
+        "INSERT INTO users(username, password_hash, created_at, is_admin) VALUES(?1, ?2, ?3, ?4)",
+        params![username.trim(), hash, now, if admin { 1 } else { 0 }],
     )
     .map_err(|err| {
         if err.to_string().contains("UNIQUE") {
@@ -146,7 +226,9 @@ pub fn create_user(conn: &Connection, username: &str, password: &str) -> Result<
 
 pub fn find_user(conn: &Connection, username: &str) -> Result<Option<User>, String> {
     let mut stmt = conn
-        .prepare("SELECT id, username, password_hash FROM users WHERE username = ?1")
+        .prepare(
+            "SELECT id, username, password_hash, is_admin FROM users WHERE username = ?1",
+        )
         .map_err(|_| "Could not read users".to_string())?;
     let mut rows = stmt
         .query(params![username.trim()])
@@ -156,6 +238,7 @@ pub fn find_user(conn: &Connection, username: &str) -> Result<Option<User>, Stri
             id: row.get(0).map_err(|_| "Could not read users".to_string())?,
             username: row.get(1).map_err(|_| "Could not read users".to_string())?,
             password_hash: row.get(2).map_err(|_| "Could not read users".to_string())?,
+            is_admin: row.get::<_, i64>(3).map_err(|_| "Could not read users".to_string())? != 0,
         }))
     } else {
         Ok(None)
@@ -177,12 +260,29 @@ pub fn set_password(conn: &Connection, username: &str, password: &str) -> Result
 }
 
 pub fn delete_user(conn: &Connection, username: &str) -> Result<(), String> {
+    let user = find_user(conn, username)?.ok_or_else(|| "That user does not exist".to_string())?;
+    if user.is_admin && count_admins(conn)? <= 1 {
+        return Err("Cannot remove the last administrator".into());
+    }
     let changed = conn
         .execute("DELETE FROM users WHERE username = ?1", params![username.trim()])
         .map_err(|_| "Could not delete the user".to_string())?;
     if changed == 0 {
         return Err("That user does not exist".into());
     }
+    Ok(())
+}
+
+pub fn set_user_admin(conn: &Connection, username: &str, is_admin: bool) -> Result<(), String> {
+    let user = find_user(conn, username)?.ok_or_else(|| "That user does not exist".to_string())?;
+    if user.is_admin && !is_admin && count_admins(conn)? <= 1 {
+        return Err("Cannot remove the last administrator".into());
+    }
+    conn.execute(
+        "UPDATE users SET is_admin = ?1 WHERE id = ?2",
+        params![if is_admin { 1 } else { 0 }, user.id],
+    )
+    .map_err(|_| "Could not update the administrator flag".to_string())?;
     Ok(())
 }
 
@@ -202,7 +302,7 @@ pub fn user_for_token(conn: &Connection, token: &str) -> Result<Option<User>, St
     let now = now_secs();
     let mut stmt = conn
         .prepare(
-            "SELECT u.id, u.username, u.password_hash
+            "SELECT u.id, u.username, u.password_hash, u.is_admin
              FROM sessions s
              JOIN users u ON u.id = s.user_id
              WHERE s.token_hash = ?1 AND s.expires_at > ?2",
@@ -219,6 +319,7 @@ pub fn user_for_token(conn: &Connection, token: &str) -> Result<Option<User>, St
             id: row.get(0).map_err(|_| "Could not read the session".to_string())?,
             username: row.get(1).map_err(|_| "Could not read the session".to_string())?,
             password_hash: row.get(2).map_err(|_| "Could not read the session".to_string())?,
+            is_admin: row.get::<_, i64>(3).map_err(|_| "Could not read the session".to_string())? != 0,
         }))
     } else {
         Ok(None)
