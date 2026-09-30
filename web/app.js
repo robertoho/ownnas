@@ -4,19 +4,53 @@ const state = {
   entries: [],
   truncated: false,
   total: 0,
-  view: localStorage.getItem("ownnas-view") || "grid",
+  view: normalizeView(localStorage.getItem("ownnas-view")),
   sort: localStorage.getItem("ownnas-sort") || "name",
   direction: localStorage.getItem("ownnas-dir") || "asc",
   hidden: localStorage.getItem("ownnas-hidden") === "1",
   filter: "",
   current: null,
-  menuPath: "",
+  selected: new Set(),
+  anchor: "",
+  clipboard: null,
+  menuEntries: [],
+  pasteInto: "",
   bookmarks: [],
 };
+
+function normalizeView(value) {
+  if (value === "grid") return "masonry";
+  if (value === "masonry" || value === "list" || value === "icons") return value;
+  return "icons";
+}
+
+function tagInitials(tag) {
+  const parts = String(tag).trim().split(/[\s_-]+/).filter(Boolean);
+  if (!parts.length) return "?";
+  if (parts.length >= 2) {
+    return `${parts[0][0] || ""}${parts[1][0] || ""}`.toUpperCase();
+  }
+  return parts[0].slice(0, 2).toUpperCase();
+}
+
+function tagColor(tag) {
+  let hash = 2166136261;
+  for (let i = 0; i < tag.length; i += 1) {
+    hash ^= tag.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  const hue = (hash >>> 0) % 360;
+  return `hsl(${hue} 58% 40%)`;
+}
 
 const $ = (id) => document.getElementById(id);
 let loadGen = 0;
 let toastTimer = 0;
+let skipNextClick = false;
+let activeDownload = null;
+let activeUpload = null;
+let uploadAbort = false;
+let marquee = null;
 
 function esc(value) {
   return String(value).replace(/[&<>"']/g, (ch) => ({
@@ -66,6 +100,7 @@ function showLogin(message) {
   $("boot").hidden = true;
   $("app-view").hidden = true;
   $("preview").hidden = true;
+  $("library").hidden = true;
   $("login-view").hidden = false;
   $("login-error").textContent = message || "";
   state.me = null;
@@ -84,6 +119,7 @@ function showApp() {
   $("preview-delete").hidden = !write;
   $("preview-duplicate").hidden = !write;
   $("preview-move").hidden = !write;
+  $("empty-trash-btn").hidden = true;
   refreshLibrary().catch((err) => toast(err.message, true));
 }
 
@@ -120,6 +156,8 @@ function hashToPath() {
 function glyph(kind) {
   return {
     folder: "DIR",
+    "archive-folder": "ARC",
+    "trash-folder": "BIN",
     image: "IMG",
     svg: "SVG",
     video: "VID",
@@ -133,7 +171,11 @@ function glyph(kind) {
 
 function sortedEntries() {
   const query = state.filter.trim().toLowerCase();
-  const items = state.entries.filter((entry) => entry.name.toLowerCase().includes(query));
+  const items = state.entries.filter((entry) => {
+    if (!query) return true;
+    if (entry.name.toLowerCase().includes(query)) return true;
+    return (entry.tags || []).some((tag) => tag.toLowerCase().includes(query));
+  });
   const factor = state.direction === "desc" ? -1 : 1;
   items.sort((a, b) => {
     if (a.dir !== b.dir) return a.dir ? -1 : 1;
@@ -153,9 +195,22 @@ function renderCrumbs() {
   parts.forEach((part, index) => {
     walked = walked ? `${walked}/${part}` : part;
     const current = index === parts.length - 1 ? ' aria-current="page"' : "";
-    html += `<span class="muted">/</span><button type="button" data-go="${esc(walked)}"${current}>${esc(part)}</button>`;
+    html += `<span class="muted">/</span><button type="button" data-go="${esc(walked)}"${current}>${esc(specialFolderLabel(part))}</button>`;
   });
   nav.innerHTML = html;
+}
+
+function specialFolderLabel(name) {
+  if (name === ".ownnas-trash" || name === "Trash") return "Trash";
+  if (name === ".ownnas-archive" || name === "Archive") return "Archive";
+  return name;
+}
+
+function inTrashPath(path) {
+  return path === ".ownnas-trash"
+    || path.startsWith(".ownnas-trash/")
+    || path === "Trash"
+    || path.startsWith("Trash/");
 }
 
 function renderFiles() {
@@ -164,21 +219,49 @@ function renderFiles() {
   const items = sortedEntries();
   $("empty").hidden = items.length !== 0;
   $("empty").textContent = state.entries.length === 0 ? "This folder is empty." : "Nothing matches that filter.";
-  $("banner").hidden = !state.truncated;
-  $("banner").textContent = state.truncated ? `Showing the first ${state.entries.length} of ${state.total} items.` : "";
+  const banner = $("banner");
+  if (banner) {
+    banner.hidden = !state.truncated;
+    banner.textContent = state.truncated ? `Showing the first ${state.entries.length} of ${state.total} items.` : "";
+  }
   host.innerHTML = items.map((entry) => {
     const thumb = entry.thumb
       ? `<img alt="" loading="lazy" src="/api/thumb?path=${encodeURIComponent(entry.path)}&v=${entry.modified}">`
       : entry.kind === "svg"
         ? `<img alt="" loading="lazy" src="/api/raw?path=${encodeURIComponent(entry.path)}">`
         : `<span class="glyph">${glyph(entry.kind)}</span>`;
-    return `<article class="card" data-path="${esc(entry.path)}" data-dir="${entry.dir ? "1" : "0"}">
-      <div class="thumb">${thumb}</div>
-      <div class="card-row">
-        <div class="name" title="${esc(entry.name)}">${esc(entry.name)}</div>
-        <button class="more" type="button" data-menu-for="${esc(entry.path)}" aria-label="Actions for ${esc(entry.name)}">···</button>
+    const selected = state.selected.has(entry.path);
+    const cut = state.clipboard && state.clipboard.mode === "cut" && state.clipboard.items.some((item) => item.path === entry.path);
+    const archiveFolder = entry.kind === "archive-folder";
+    const trashFolder = entry.kind === "trash-folder";
+    const displayName = archiveFolder ? "Archive" : trashFolder ? "Trash" : entry.name;
+    const badge = archiveFolder
+      ? `<span class="badge">Archive</span>`
+      : trashFolder
+        ? `<span class="badge trash">Trash</span>`
+        : "";
+    const sub = trashFolder
+      ? "OwnNAS trash"
+      : archiveFolder
+        ? "OwnNAS archive"
+        : entry.original
+          ? `From ${entry.original}`
+          : esc(formatSize(entry.size, entry.dir));
+    const tags = entry.tags || [];
+    const shownTags = tags.slice(0, 3);
+    const tagStack = shownTags.length
+      ? `<div class="tag-stack">${shownTags.map((tag) => {
+          const color = tagColor(tag);
+          return `<button type="button" class="tag-badge" data-filter-tag="${esc(tag)}" title="${esc(tag)}" style="--tag-bg:${color}">${esc(tagInitials(tag))}</button>`;
+        }).join("")}${tags.length > 3 ? `<span class="tag-badge more-tags" title="${esc(tags.slice(3).join(", "))}">+${tags.length - 3}</span>` : ""}</div>`
+      : "";
+    return `<article class="card${selected ? " selected" : ""}${cut ? " cut" : ""}${archiveFolder ? " archive-folder" : ""}${trashFolder ? " trash-folder" : ""}" data-path="${esc(entry.path)}" data-dir="${entry.dir ? "1" : "0"}" aria-selected="${selected ? "true" : "false"}">
+      <div class="thumb">${thumb}${badge}${tagStack}</div>
+      <div class="card-body">
+        <div class="name" title="${esc(entry.path)}">${esc(displayName)}</div>
+        <div class="sub" title="${entry.original ? esc(entry.original) : ""}">${sub}</div>
       </div>
-      <div class="sub">${esc(formatSize(entry.size, entry.dir))}</div>
+      <button class="more" type="button" data-menu-for="${esc(entry.path)}" aria-label="Actions for ${esc(displayName)}">···</button>
     </article>`;
   }).join("");
   host.querySelectorAll("img").forEach((img) => {
@@ -198,15 +281,27 @@ async function load(path) {
   state.truncated = !!data.truncated;
   state.total = data.total || state.entries.length;
   if (data.rootName) state.me.rootName = data.rootName;
+  state.selected = new Set();
+  state.anchor = "";
   closePreview();
   renderCrumbs();
   renderFiles();
   $("zip-link").href = `/api/zip?path=${encodeURIComponent(state.path)}`;
+  syncBookmarkBtn();
+  $("empty-trash-btn").hidden = !(state.me && !state.me.readonly && inTrashPath(state.path));
+}
+
+function syncBookmarkBtn() {
   const marked = state.bookmarks.includes(state.path);
-  $("bookmark-btn").textContent = marked ? "Bookmarked" : "Bookmark";
+  const btn = $("bookmark-btn");
+  const label = marked ? "Remove bookmark" : "Bookmark this folder";
+  btn.title = label;
+  btn.setAttribute("aria-label", label);
+  btn.setAttribute("aria-pressed", marked ? "true" : "false");
 }
 
 async function go(path) {
+  closeLibrary();
   const next = pathToHash(path);
   if (location.hash !== next) location.hash = next;
   else await load(path);
@@ -218,53 +313,244 @@ function findEntry(path) {
 
 function closeMenu() {
   $("menu").hidden = true;
-  state.menuPath = "";
 }
 
-function openMenu(path, anchor) {
-  const entry = findEntry(path);
+function parentPath(path) {
+  const index = path.lastIndexOf("/");
+  return index === -1 ? "" : path.slice(0, index);
+}
+
+function selectedEntries() {
+  return state.entries.filter((entry) => state.selected.has(entry.path));
+}
+
+function paintSelection() {
+  document.querySelectorAll("#files .card").forEach((card) => {
+    const selected = state.selected.has(card.dataset.path);
+    card.classList.toggle("selected", selected);
+    card.setAttribute("aria-selected", selected ? "true" : "false");
+    const cut = state.clipboard && state.clipboard.mode === "cut" && state.clipboard.items.some((item) => item.path === card.dataset.path);
+    card.classList.toggle("cut", !!cut);
+  });
+}
+
+function selectOnly(path) {
+  state.selected = new Set([path]);
+  state.anchor = path;
+  paintSelection();
+}
+
+function toggleSelected(path) {
+  if (state.selected.has(path)) state.selected.delete(path);
+  else state.selected.add(path);
+  state.anchor = path;
+  paintSelection();
+}
+
+function selectRange(path) {
+  const items = sortedEntries();
+  const from = items.findIndex((entry) => entry.path === (state.anchor || path));
+  const to = items.findIndex((entry) => entry.path === path);
+  if (from < 0 || to < 0) {
+    selectOnly(path);
+    return;
+  }
+  const [start, end] = from < to ? [from, to] : [to, from];
+  state.selected = new Set(items.slice(start, end + 1).map((entry) => entry.path));
+  paintSelection();
+}
+
+function gridColumnCount() {
+  const cards = [...document.querySelectorAll("#files .card")];
+  if (cards.length < 2 || state.view === "list") return 1;
+  const top = cards[0].offsetTop;
+  let cols = 1;
+  for (let i = 1; i < cards.length; i += 1) {
+    if (Math.abs(cards[i].offsetTop - top) > 2) break;
+    cols += 1;
+  }
+  return Math.max(1, cols);
+}
+
+function scrollSelectedIntoView(path) {
+  const card = document.querySelector(`#files .card[data-path="${CSS.escape(path)}"]`);
+  if (card) card.scrollIntoView({ block: "nearest", inline: "nearest" });
+}
+
+function moveSelection(deltaX, deltaY, extend) {
+  const items = sortedEntries();
+  if (!items.length) return;
+  const cols = gridColumnCount();
+  let index = items.findIndex((entry) => entry.path === state.anchor);
+  if (index < 0) {
+    const selected = selectedEntries();
+    index = selected.length
+      ? items.findIndex((entry) => entry.path === selected[selected.length - 1].path)
+      : 0;
+  }
+  if (index < 0) index = 0;
+  let next = index + deltaX + (deltaY * cols);
+  next = Math.max(0, Math.min(items.length - 1, next));
+  const entry = items[next];
   if (!entry) return;
-  state.menuPath = path;
+  if (extend) selectRange(entry.path);
+  else selectOnly(entry.path);
+  scrollSelectedIntoView(entry.path);
+  if (!$("preview").hidden && !entry.dir) {
+    openEntry(entry).catch((err) => toast(err.message, true));
+  }
+}
+
+function renderClipboard() {
+  const box = $("clipboard");
+  const clip = state.clipboard;
+  if (!clip || !clip.items.length) {
+    box.hidden = true;
+    return;
+  }
+  const verb = clip.mode === "cut" ? "Moving" : "Copying";
+  $("clipboard-title").textContent = clip.items.length === 1 ? `${verb} 1 item` : `${verb} ${clip.items.length} items`;
+  $("clipboard-list").innerHTML = clip.items.map((item) => `<li>${esc(item.name)}</li>`).join("");
+  $("clipboard-paste").hidden = !(state.me && !state.me.readonly);
+  box.hidden = false;
+}
+
+function setClipboard(mode, entries) {
+  if (!entries.length) return;
+  state.clipboard = {
+    mode,
+    items: entries.map((entry) => ({ path: entry.path, name: entry.name, dir: !!entry.dir })),
+  };
+  renderClipboard();
+  paintSelection();
+}
+
+function clearClipboard() {
+  state.clipboard = null;
+  renderClipboard();
+  paintSelection();
+}
+
+function openSelectionMenu(x, y, pasteInto) {
+  const entries = selectedEntries();
   const write = state.me && !state.me.readonly;
-  const buttons = [`<button type="button" data-menu="open">Open</button>`];
-  if (!entry.dir) buttons.push(`<button type="button" data-menu="download">Download</button>`);
-  if (write) {
+  const clip = state.clipboard && state.clipboard.items.length;
+  // Empty-space menu: New folder and Paste. Selection menu needs at least one item.
+  if (!entries.length && !write) return;
+  state.menuEntries = entries;
+  state.pasteInto = pasteInto;
+  const one = entries.length === 1 ? entries[0] : null;
+  const allInTrash = entries.length > 0 && entries.every((entry) => inTrashPath(entry.path));
+  const buttons = [];
+  if (entries.length) {
+    buttons.push(`<div class="menu-label">${entries.length === 1 ? esc(entries[0].name) : `${entries.length} items`}</div>`);
+  } else {
+    buttons.push(`<div class="menu-label">${esc(state.path || "Library")}</div>`);
+  }
+  if (!entries.length && write) {
+    buttons.push(`<button type="button" data-menu="mkdir">New folder</button>`);
+  }
+  if (one) buttons.push(`<button type="button" data-menu="open">Open</button>`);
+  if (entries.length) buttons.push(`<button type="button" data-menu="download">Download</button>`);
+  if (write && allInTrash) buttons.push(`<button type="button" data-menu="restore">Restore</button>`);
+  if (entries.length) buttons.push(`<button type="button" data-menu="copy">Copy</button>`);
+  if (write && entries.length && !allInTrash) {
+    buttons.push(`<button type="button" data-menu="cut">Cut</button>`);
+  }
+  if (write && clip) buttons.push(`<button type="button" data-menu="paste">Paste</button>`);
+  if (write && entries.length && !allInTrash) {
     buttons.push(`<button type="button" data-menu="duplicate">Duplicate</button>`);
     buttons.push(`<button type="button" data-menu="move">Move</button>`);
-    buttons.push(`<button type="button" data-menu="rename">Rename</button>`);
-    buttons.push(`<button type="button" data-menu="delete">Delete</button>`);
+  }
+  if (write && entries.length >= 2 && !allInTrash) {
+    buttons.push(`<button type="button" data-menu="folderWith">New folder with selection</button>`);
+  }
+  if (write && one && !allInTrash) buttons.push(`<button type="button" data-menu="rename">Rename</button>`);
+  if (write && entries.length) {
+    buttons.push(`<button type="button" data-menu="delete" class="danger">${allInTrash ? "Delete forever" : "Move to Trash"}</button>`);
   }
   const menu = $("menu");
   menu.innerHTML = buttons.join("");
   menu.hidden = false;
-  const rect = anchor.getBoundingClientRect();
-  menu.style.top = `${Math.min(rect.bottom + 4, window.innerHeight - 160)}px`;
-  menu.style.left = `${Math.min(rect.left, window.innerWidth - 180)}px`;
+  const rect = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - rect.width - 8))}px`;
+  menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - rect.height - 8))}px`;
 }
 
 function closePreview() {
   $("preview").hidden = true;
   state.current = null;
   $("preview-body").innerHTML = "";
+  $("preview-path").hidden = true;
+  $("preview-path").textContent = "";
+  $("preview-notes").hidden = true;
+  $("notes-changed").hidden = true;
+  $("preview-tags").innerHTML = "";
+  $("preview-comments").innerHTML = "";
+  $("tag-input").value = "";
+  $("comment-input").value = "";
+}
+
+function closeLibrary() {
+  $("library").hidden = true;
+}
+
+function setLibraryTab(tab) {
+  const bookmarks = tab === "bookmarks";
+  $("library-tab-bookmarks").setAttribute("aria-selected", bookmarks ? "true" : "false");
+  $("library-tab-recent").setAttribute("aria-selected", bookmarks ? "false" : "true");
+  $("library-bookmarks").hidden = !bookmarks;
+  $("library-recent").hidden = bookmarks;
+}
+
+function openLibrary(tab) {
+  closePreview();
+  if (tab) setLibraryTab(tab);
+  $("library").hidden = false;
+  refreshLibrary().catch((err) => toast(err.message, true));
+}
+
+function libraryLabel(path) {
+  if (!path) return state.me.rootName || "Library";
+  const parts = path.split("/");
+  return parts[parts.length - 1] || path;
+}
+
+function libraryPath(path) {
+  const root = (state.me && state.me.rootName) || "Library";
+  if (!path) return root;
+  return `${root}/${path.split("/").map(specialFolderLabel).join("/")}`;
 }
 
 async function openEntry(entry) {
   if (!entry) return;
   if (entry.dir) {
+    closeLibrary();
     await go(entry.path);
     return;
   }
+  closeLibrary();
   state.current = entry;
   $("preview").hidden = false;
   $("preview-title").textContent = entry.name;
+  $("preview-path").hidden = false;
+  $("preview-path").textContent = libraryPath(entry.path);
+  $("preview-path").title = libraryPath(entry.path);
   $("preview-meta").textContent = `${formatSize(entry.size, false)} · ${formatDate(entry.modified)}`;
   $("preview-hash").textContent = "SHA-256";
   $("preview-download").href = `/api/raw?download=1&path=${encodeURIComponent(entry.path)}`;
+  $("preview-delete").textContent = inTrashPath(entry.path) ? "Delete forever" : "Move to Trash";
+  const write = state.me && !state.me.readonly;
+  $("tag-form").hidden = !write;
+  $("comment-form").hidden = !write;
   const images = sortedEntries().filter((item) => item.kind === "image" || item.kind === "svg");
   const imageIndex = images.findIndex((item) => item.path === entry.path);
   $("preview-prev").hidden = imageIndex <= 0;
   $("preview-next").hidden = imageIndex < 0 || imageIndex >= images.length - 1;
-  api("/api/recent", { method: "POST", json: { path: entry.path } }).then(() => refreshLibrary()).catch(() => {});
+  if (!inTrashPath(entry.path)) {
+    api("/api/recent", { method: "POST", json: { path: entry.path } }).then(() => refreshLibrary()).catch(() => {});
+  }
+  loadAnnotations(entry.path).catch((err) => toast(err.message, true));
   const body = $("preview-body");
   const raw = `/api/raw?path=${encodeURIComponent(entry.path)}`;
   if (entry.kind === "image" || entry.kind === "svg") {
@@ -280,26 +566,50 @@ async function openEntry(entry) {
     body.innerHTML = `<p class="muted">Loading preview…</p>`;
     try {
       const meta = await api(`/api/meta?path=${encodeURIComponent(entry.path)}`);
-      if (state.current !== entry) return;
+      if (!state.current || state.current.path !== entry.path) return;
       renderMeta(body, entry, meta);
     } catch (err) {
-      if (state.current === entry) body.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
+      if (state.current && state.current.path === entry.path) {
+        body.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
+      }
     }
   }
 }
 
+async function loadAnnotations(path) {
+  const notes = $("preview-notes");
+  notes.hidden = false;
+  $("preview-tags").innerHTML = `<span class="notes-empty">Loading…</span>`;
+  $("preview-comments").innerHTML = "";
+  const data = await api(`/api/annotations?path=${encodeURIComponent(path)}`);
+  if (!state.current || state.current.path !== path) return;
+  renderAnnotations(data);
+}
+
+function renderAnnotations(data) {
+  const write = state.me && !state.me.readonly;
+  const tags = data.tags || [];
+  const comments = data.comments || [];
+  const changed = !!data.changed;
+  $("notes-changed").hidden = !changed;
+  $("notes-ack").hidden = !write;
+  $("preview-tags").innerHTML = tags.length
+    ? tags.map((tag) => `<span class="tag-chip"><button type="button" class="tag-link" data-search-tag="${esc(tag)}">${esc(tag)}</button>${write ? `<button type="button" data-remove-tag="${esc(tag)}" aria-label="Remove tag ${esc(tag)}">×</button>` : ""}</span>`).join("")
+    : `<span class="notes-empty">No tags yet</span>`;
+  $("preview-comments").innerHTML = comments.length
+    ? comments.map((item) => `<article class="comment-item" data-comment-id="${item.id}">
+        <div class="comment-head">
+          <span>${esc(item.username)} · ${esc(formatDate(item.createdAt))}</span>
+          ${write ? `<button type="button" data-remove-comment="${item.id}">Remove</button>` : ""}
+        </div>
+        <div class="comment-body">${esc(item.body)}</div>
+      </article>`).join("")
+    : `<span class="notes-empty">No comments yet</span>`;
+}
+
 function renderMeta(body, entry, meta) {
   if (meta.text && !meta.text.binary) {
-    if (entry.name.toLowerCase().endsWith(".csv") || entry.name.toLowerCase().endsWith(".tsv")) {
-      body.innerHTML = renderTable(meta.text.content, entry.name.toLowerCase().endsWith(".tsv") ? "\t" : ",");
-    } else if (entry.name.toLowerCase().endsWith(".json")) {
-      let pretty = meta.text.content;
-      try { pretty = JSON.stringify(JSON.parse(pretty), null, 2); } catch { /* keep source */ }
-      body.innerHTML = `<pre class="text-preview">${esc(pretty)}</pre>`;
-    } else {
-      body.innerHTML = `<pre class="text-preview">${esc(meta.text.content)}</pre>`;
-    }
-    if (meta.text.truncated) body.insertAdjacentHTML("beforeend", `<p class="muted">Preview truncated.</p>`);
+    body.innerHTML = renderTextViewer(entry.name, meta.text.content, meta.text.truncated);
     return;
   }
   if (meta.archive) {
@@ -309,6 +619,175 @@ function renderMeta(body, entry, meta) {
     return;
   }
   body.innerHTML = `<p class="muted">${esc(meta.note || "No inline preview for this file. Download it to open it locally.")}</p>`;
+}
+
+function textFormat(name) {
+  const lower = name.toLowerCase();
+  if (lower.endsWith(".md") || lower.endsWith(".markdown")) return "markdown";
+  if (/\.(ini|conf|cfg|toml|env|properties)$/.test(lower)) return "ini";
+  if (lower.endsWith(".json")) return "json";
+  if (lower.endsWith(".csv") || lower.endsWith(".tsv")) return "table";
+  if (/\.(ya?ml|xml|html?|css|js|mjs|ts|tsx|jsx|py|rs|go|java|c|h|cpp|hpp|cs|sh|bash|zsh|ps1|sql|rb|php|lua|log|txt)$/.test(lower)) {
+    return lower.endsWith(".log") ? "log" : "text";
+  }
+  return "text";
+}
+
+function formatLabel(format) {
+  return {
+    markdown: "Markdown",
+    ini: "INI",
+    json: "JSON",
+    table: "Table",
+    log: "Log",
+    text: "Text",
+  }[format] || "Text";
+}
+
+function renderTextViewer(name, content, truncated) {
+  const format = textFormat(name);
+  let body = "";
+  if (format === "table") {
+    body = renderTable(content, name.toLowerCase().endsWith(".tsv") ? "\t" : ",");
+  } else if (format === "json") {
+    let pretty = content;
+    try { pretty = JSON.stringify(JSON.parse(pretty), null, 2); } catch { /* keep */ }
+    body = `<pre class="text-code">${esc(pretty)}</pre>`;
+  } else if (format === "markdown") {
+    body = `<div class="md-preview">${renderMarkdown(content)}</div>`;
+  } else if (format === "ini") {
+    body = `<pre class="text-code ini-preview">${renderIni(content)}</pre>`;
+  } else {
+    body = renderLinedText(content, format === "log");
+  }
+  const lines = content ? content.split(/\r?\n/).length : 0;
+  return `<div class="text-viewer format-${format}">
+    <div class="text-viewer-bar">
+      <span class="pill">${esc(formatLabel(format))}</span>
+      <span class="muted">${lines} line${lines === 1 ? "" : "s"}</span>
+    </div>
+    ${body}
+    ${truncated ? `<p class="muted text-viewer-note">Preview truncated.</p>` : ""}
+  </div>`;
+}
+
+function renderLinedText(content, soft) {
+  const lines = content.split(/\r?\n/);
+  const rows = lines.map((line, index) => {
+    const text = line.length ? esc(line) : " ";
+    return `<div class="text-line${soft ? " soft" : ""}"><span class="ln">${index + 1}</span><code>${text}</code></div>`;
+  }).join("");
+  return `<div class="text-lines">${rows || `<div class="text-line"><span class="ln">1</span><code> </code></div>`}</div>`;
+}
+
+function renderIni(content) {
+  return content.split(/\r?\n/).map((line) => {
+    if (/^\s*$/.test(line)) return " ";
+    if (/^\s*[#;]/.test(line)) return `<span class="tok-comment">${esc(line)}</span>`;
+    if (/^\s*\[[^\]]*\]\s*$/.test(line)) return `<span class="tok-section">${esc(line)}</span>`;
+    const match = line.match(/^(\s*)([^=]+?)(\s*=\s*)(.*)$/);
+    if (!match) return esc(line);
+    return `${esc(match[1])}<span class="tok-key">${esc(match[2])}</span><span class="tok-eq">${esc(match[3])}</span><span class="tok-value">${esc(match[4])}</span>`;
+  }).join("\n");
+}
+
+function renderMarkdown(source) {
+  const lines = source.replace(/\r\n/g, "\n").split("\n");
+  const out = [];
+  let i = 0;
+  let inCode = false;
+  let code = [];
+  let list = null;
+
+  function closeList() {
+    if (!list) return;
+    out.push(`</${list}>`);
+    list = null;
+  }
+
+  function inlineMd(text) {
+    let html = esc(text);
+    html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+    html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    html = html.replace(/(^|[^*\w])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    return html;
+  }
+
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.startsWith("```")) {
+      if (inCode) {
+        out.push(`<pre class="text-code"><code>${esc(code.join("\n"))}</code></pre>`);
+        code = [];
+        inCode = false;
+      } else {
+        closeList();
+        inCode = true;
+      }
+      i += 1;
+      continue;
+    }
+    if (inCode) {
+      code.push(line);
+      i += 1;
+      continue;
+    }
+    if (/^\s*$/.test(line)) {
+      closeList();
+      i += 1;
+      continue;
+    }
+    const heading = line.match(/^(#{1,3})\s+(.*)$/);
+    if (heading) {
+      closeList();
+      const level = heading[1].length;
+      out.push(`<h${level + 2}>${inlineMd(heading[2])}</h${level + 2}>`);
+      i += 1;
+      continue;
+    }
+    if (/^---+$/.test(line.trim())) {
+      closeList();
+      out.push("<hr>");
+      i += 1;
+      continue;
+    }
+    const quote = line.match(/^>\s?(.*)$/);
+    if (quote) {
+      closeList();
+      out.push(`<blockquote>${inlineMd(quote[1])}</blockquote>`);
+      i += 1;
+      continue;
+    }
+    const unordered = line.match(/^\s*[-*+]\s+(.*)$/);
+    if (unordered) {
+      if (list !== "ul") {
+        closeList();
+        list = "ul";
+        out.push("<ul>");
+      }
+      out.push(`<li>${inlineMd(unordered[1])}</li>`);
+      i += 1;
+      continue;
+    }
+    const ordered = line.match(/^\s*\d+\.\s+(.*)$/);
+    if (ordered) {
+      if (list !== "ol") {
+        closeList();
+        list = "ol";
+        out.push("<ol>");
+      }
+      out.push(`<li>${inlineMd(ordered[1])}</li>`);
+      i += 1;
+      continue;
+    }
+    closeList();
+    out.push(`<p>${inlineMd(line)}</p>`);
+    i += 1;
+  }
+  if (inCode) out.push(`<pre class="text-code"><code>${esc(code.join("\n"))}</code></pre>`);
+  closeList();
+  return out.join("") || "<p class=\"muted\">Empty file</p>";
 }
 
 function renderTable(content, separator) {
@@ -323,17 +802,26 @@ function askText(title, label, value, okLabel) {
   $("text-input").value = value || "";
   $("text-ok").textContent = okLabel || "Save";
   const dialog = $("text-dialog");
+  // Avoid a previous OK/Cancel sticking around when Escape closes the dialog.
+  dialog.returnValue = "";
   dialog.showModal();
   $("text-input").focus();
+  $("text-input").select();
   return new Promise((resolve) => {
+    const onCancel = () => {
+      dialog.returnValue = "cancel";
+    };
+    dialog.addEventListener("cancel", onCancel, { once: true });
     dialog.addEventListener("close", () => {
+      dialog.removeEventListener("cancel", onCancel);
       resolve(dialog.returnValue === "ok" ? $("text-input").value : null);
     }, { once: true });
   });
 }
 
-function askConfirm(message) {
+function askConfirm(message, okLabel) {
   $("confirm-copy").textContent = message;
+  $("confirm-ok").textContent = okLabel || "OK";
   const dialog = $("confirm-dialog");
   dialog.showModal();
   return new Promise((resolve) => {
@@ -350,48 +838,476 @@ async function renameEntry(entry) {
 }
 
 async function deleteEntry(entry) {
-  const message = entry.dir
-    ? `Delete folder “${entry.name}” and everything inside it?`
-    : `Delete “${entry.name}”?`;
-  if (!await askConfirm(message)) return;
-  await api(`/api/entry?path=${encodeURIComponent(entry.path)}`, { method: "DELETE" });
-  toast("Deleted");
+  await deleteEntries([entry]);
+}
+
+async function deleteEntries(entries) {
+  if (!entries.length) return;
+  const forever = entries.every((entry) => inTrashPath(entry.path));
+  const message = forever
+    ? (entries.length === 1
+      ? `Permanently delete “${entries[0].name}”? This cannot be undone.`
+      : `Permanently delete ${entries.length} items? This cannot be undone.`)
+    : (entries.length === 1
+      ? `Move “${entries[0].name}” to the Trash?`
+      : `Move ${entries.length} items to the Trash?`);
+  if (!await askConfirm(message, forever ? "Delete forever" : "Move to Trash")) return;
+  for (const entry of entries) {
+    await api(`/api/entry?path=${encodeURIComponent(entry.path)}`, { method: "DELETE" });
+  }
+  toast(forever
+    ? (entries.length === 1 ? "Deleted forever" : `Deleted ${entries.length} items forever`)
+    : (entries.length === 1 ? "Moved to Trash" : `Moved ${entries.length} items to Trash`));
   await load(state.path);
 }
 
-function uploadFiles(fileList, names) {
-  const files = [...fileList];
-  if (!files.length) return Promise.resolve();
+async function downloadEntries(entries) {
+  if (!entries.length) {
+    toast("Select a file or folder to download", true);
+    return;
+  }
+  if (entries.length === 1 && !entries[0].dir) {
+    location.href = `/api/raw?download=1&path=${encodeURIComponent(entries[0].path)}`;
+    return;
+  }
+  const label = entries.length === 1
+    ? entries[0].name
+    : `${entries.length} items`;
+  const fallbackName = entries.length === 1
+    ? `${entries[0].name}.zip`
+    : `ownnas-${entries.length}-items.zip`;
+  await downloadZipBlob({
+    url: "/api/download",
+    method: "POST",
+    body: JSON.stringify({ paths: entries.map((entry) => entry.path) }),
+    preparing: `Compressing ${label}…`,
+    fallbackName,
+    doneToast: entries.length === 1 ? "Download started" : `Downloading ${entries.length} items`,
+  });
+}
+
+function showStatus(title, detail = "", percent = null) {
+  const panel = $("status-panel");
+  const bar = $("status-bar");
+  $("status-title").textContent = title;
+  $("status-detail").textContent = detail;
+  panel.hidden = false;
+  if (percent == null) {
+    bar.classList.add("indeterminate");
+    bar.style.width = "";
+  } else {
+    bar.classList.remove("indeterminate");
+    bar.style.width = `${Math.max(0, Math.min(100, Math.round(percent)))}%`;
+  }
+}
+
+function hideStatus() {
+  const panel = $("status-panel");
+  const bar = $("status-bar");
+  panel.hidden = true;
+  bar.classList.remove("indeterminate");
+  bar.style.width = "0";
+  $("status-title").textContent = "Working…";
+  $("status-detail").textContent = "";
+}
+
+function cancelActiveDownload() {
+  if (!activeDownload) return;
+  const xhr = activeDownload;
+  activeDownload = null;
+  xhr.abort();
+}
+
+function cancelActiveUpload() {
+  uploadAbort = true;
+  if (!activeUpload) return;
+  const xhr = activeUpload;
+  activeUpload = null;
+  xhr.abort();
+}
+
+function cancelActiveTransfer() {
+  cancelActiveDownload();
+  cancelActiveUpload();
+}
+
+function downloadZipBlob({ url, method = "GET", body = null, preparing, fallbackName, doneToast }) {
   return new Promise((resolve, reject) => {
+    if (activeDownload) cancelActiveDownload();
+    showStatus(preparing || "Preparing archive…", "This can take a moment for large folders");
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", `/api/upload?path=${encodeURIComponent(state.path)}`);
+    activeDownload = xhr;
+    xhr.open(method, url);
+    xhr.responseType = "blob";
+    xhr.withCredentials = true;
+    xhr.setRequestHeader("X-OwnNAS", "1");
+    if (body != null) xhr.setRequestHeader("Content-Type", "application/json");
+    let receiving = false;
+    let cancelled = false;
+    xhr.onprogress = (event) => {
+      if (cancelled) return;
+      if (!event.lengthComputable || !event.total) {
+        if (receiving) showStatus("Downloading…", "Receiving archive");
+        return;
+      }
+      receiving = true;
+      const percent = (event.loaded / event.total) * 100;
+      showStatus("Downloading…", `${Math.round(percent)}% · ${formatSize(event.loaded, false)} of ${formatSize(event.total, false)}`, percent);
+    };
+    xhr.onreadystatechange = () => {
+      if (cancelled) return;
+      if (xhr.readyState === XMLHttpRequest.HEADERS_RECEIVED && xhr.status >= 200 && xhr.status < 300) {
+        receiving = true;
+        showStatus("Downloading…", "Receiving archive");
+      }
+    };
+    xhr.onload = async () => {
+      if (activeDownload === xhr) activeDownload = null;
+      try {
+        if (xhr.status === 401) {
+          showLogin("");
+          throw new Error("Sign in required");
+        }
+        if (xhr.status < 200 || xhr.status >= 300) {
+          let message = "Download failed";
+          try {
+            const text = await (xhr.response instanceof Blob ? xhr.response.text() : Promise.resolve(""));
+            const data = JSON.parse(text || "");
+            message = data.error || message;
+          } catch { /* keep */ }
+          throw new Error(message);
+        }
+        let filename = fallbackName || "download.zip";
+        const disposition = xhr.getResponseHeader("content-disposition") || "";
+        const match = disposition.match(/filename\*=UTF-8''([^;]+)|filename=\"([^\"]+)\"/i);
+        if (match) {
+          filename = decodeURIComponent((match[1] || match[2] || filename).trim());
+        }
+        const objectUrl = URL.createObjectURL(xhr.response);
+        const link = document.createElement("a");
+        link.href = objectUrl;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(objectUrl);
+        if (doneToast) toast(doneToast);
+        resolve();
+      } catch (err) {
+        reject(err);
+      } finally {
+        hideStatus();
+      }
+    };
+    xhr.onerror = () => {
+      if (activeDownload === xhr) activeDownload = null;
+      hideStatus();
+      reject(new Error("Download failed"));
+    };
+    xhr.onabort = () => {
+      cancelled = true;
+      if (activeDownload === xhr) activeDownload = null;
+      hideStatus();
+      const err = new Error("Download cancelled");
+      err.cancel = true;
+      reject(err);
+    };
+    xhr.send(body);
+  });
+}
+
+async function restoreEntries(entries) {
+  if (!entries.length) return;
+  for (const entry of entries) {
+    await api("/api/restore", { method: "POST", json: { path: entry.path } });
+  }
+  toast(entries.length === 1 ? "Restored" : `Restored ${entries.length} items`);
+  await load(state.path);
+}
+
+async function emptyTrash() {
+  if (!await askConfirm("Empty the Trash? Every item in it will be permanently deleted.", "Empty Trash")) return;
+  const result = await api("/api/trash/empty", { method: "POST" });
+  toast(result.removed ? `Emptied ${result.removed} item(s)` : "Trash was already empty");
+  await load(state.path);
+}
+
+async function duplicateEntries(entries) {
+  for (const entry of entries) {
+    await api("/api/duplicate", { method: "POST", json: { path: entry.path } });
+  }
+  toast(entries.length === 1 ? "Duplicated" : `Duplicated ${entries.length} items`);
+  await load(state.path);
+}
+
+async function moveEntries(entries) {
+  if (!entries.length) return;
+  const fallback = state.path.includes("/") ? state.path.slice(0, state.path.lastIndexOf("/")) : "";
+  const dest = await askText("Move", "Destination folder (empty for the library root)", fallback, "Move");
+  if (dest === null) return;
+  for (const entry of entries) {
+    await api("/api/move", { method: "POST", json: { path: entry.path, dest } });
+  }
+  toast(entries.length === 1 ? "Moved" : `Moved ${entries.length} items`);
+  await load(state.path);
+}
+
+function joinRel(parent, name) {
+  return parent ? `${parent}/${name}` : name;
+}
+
+async function createFolder() {
+  const name = (await askText("New folder", "Folder name", "New folder", "Create") || "").trim();
+  if (!name) return;
+  await api("/api/mkdir", { method: "POST", json: { path: state.path, name } });
+  toast("Folder created");
+  await load(state.path);
+}
+
+async function createFolderWithSelection(entries) {
+  const items = (entries || []).filter((entry) => entry && entry.path);
+  if (items.length < 2) return;
+  const name = (await askText("New folder with selection", "Folder name", "New folder", "Create") || "").trim();
+  if (!name) return;
+  // Create the destination first, then move the captured selection into it.
+  await api("/api/mkdir", { method: "POST", json: { path: state.path, name } });
+  const dest = joinRel(state.path, name);
+  let moved = 0;
+  try {
+    for (const entry of items) {
+      if (entry.path === dest || entry.path.startsWith(`${dest}/`)) {
+        throw new Error(`“${entry.name}” cannot be moved inside itself`);
+      }
+      await api("/api/move", { method: "POST", json: { path: entry.path, dest } });
+      moved += 1;
+    }
+  } finally {
+    await load(state.path);
+  }
+  toast(moved === items.length
+    ? `Moved ${moved} items into “${name}”`
+    : `Moved ${moved} of ${items.length} items into “${name}”`);
+}
+
+async function pasteClipboard(dest) {
+  const clip = state.clipboard;
+  if (!clip || !clip.items.length) return;
+  const remaining = [];
+  let done = 0;
+  let error = null;
+  for (let index = 0; index < clip.items.length; index += 1) {
+    const item = clip.items[index];
+    if (clip.mode === "cut" && parentPath(item.path) === dest) continue;
+    if (item.dir && (dest === item.path || dest.startsWith(`${item.path}/`))) {
+      error = new Error(`“${item.name}” cannot be pasted inside itself`);
+      remaining.push(...clip.items.slice(index));
+      break;
+    }
+    try {
+      const url = clip.mode === "cut" ? "/api/move" : "/api/copy";
+      await api(url, { method: "POST", json: { path: item.path, dest } });
+      done += 1;
+    } catch (err) {
+      error = err;
+      remaining.push(...clip.items.slice(index));
+      break;
+    }
+  }
+  if (clip.mode === "cut") {
+    state.clipboard = remaining.length ? { mode: "cut", items: remaining } : null;
+    renderClipboard();
+  }
+  await load(state.path);
+  if (error) toast(error.message, true);
+  else if (done) toast(clip.mode === "cut" ? "Moved" : "Copied");
+  else toast("Already in this folder");
+}
+
+function uploadFiles(fileList, names) {
+  const files = [...fileList].map((file, index) => ({
+    file,
+    name: (names && names[index]) || file.webkitRelativePath || file.name,
+  }));
+  if (!files.length) return Promise.resolve({ saved: 0, skipped: 0 });
+  return sendUploads(files);
+}
+
+function conflictNote(item, info) {
+  if (info.dir) return "A folder with this name is already here. Keep both saves the upload under a new name.";
+  const incomingSecs = Math.floor(item.file.lastModified / 1000);
+  const here = `Already here: ${formatSize(info.size, false)}, ${formatDate(info.modified)}`;
+  const incoming = `This upload: ${formatSize(item.file.size, false)}, ${formatDate(incomingSecs)}`;
+  let which = "Both have the same date.";
+  if (info.modified < incomingSecs) which = "The file already here is older.";
+  else if (info.modified > incomingSecs) which = "This upload is older.";
+  return `${here}. ${incoming}. ${which}`;
+}
+
+function askUploadConflict(item, info) {
+  const label = item.name;
+  $("conflict-copy").textContent = info.dir
+    ? `A folder named “${label}” already exists.`
+    : `“${label}” already exists.`;
+  $("conflict-meta").textContent = conflictNote(item, info);
+  $("conflict-rest").checked = false;
+  for (const value of ["overwrite", "archive-older", "archive-existing"]) {
+    const button = document.querySelector(`#conflict-dialog button[value="${value}"]`);
+    button.hidden = !!info.dir;
+  }
+  const dialog = $("conflict-dialog");
+  dialog.showModal();
+  const first = [...dialog.querySelectorAll("button")].find((button) => !button.hidden && button.value !== "cancel");
+  if (first) first.focus();
+  return new Promise((resolve) => {
+    dialog.addEventListener("close", () => {
+      const choice = dialog.returnValue;
+      if (!choice || choice === "cancel") resolve(null);
+      else resolve({ choice, rest: $("conflict-rest").checked });
+    }, { once: true });
+  });
+}
+
+function choiceFits(choice, info) {
+  if (!info.dir) return true;
+  return choice === "keep" || choice === "ignore";
+}
+
+async function sendUploads(files) {
+  const plan = await api("/api/upload/conflicts", {
+    method: "POST",
+    json: { path: state.path, names: files.map((item) => item.name) },
+  });
+  const byName = new Map((plan.items || []).map((item) => [item.name, item]));
+  let restChoice = null;
+  let saved = 0;
+  let skipped = 0;
+  const totalBytes = files.reduce((sum, item) => sum + item.file.size, 0) || 1;
+  let loadedBefore = 0;
+  uploadAbort = false;
+  const updateProgress = (item, index, loaded) => {
+    const overall = ((loadedBefore + loaded) / totalBytes) * 100;
+    const label = files.length === 1
+      ? item.name
+      : `${index + 1} of ${files.length} · ${item.name}`;
+    showStatus("Uploading…", `${label} · ${Math.round(overall)}%`, overall);
+  };
+  try {
+    for (let index = 0; index < files.length; index += 1) {
+      if (uploadAbort) {
+        const error = new Error("Upload cancelled");
+        error.cancel = true;
+        throw error;
+      }
+      const item = files[index];
+      const info = byName.get(item.name);
+      let choice = null;
+      if (info && info.exists) {
+        if (restChoice && choiceFits(restChoice, info)) choice = restChoice;
+        else {
+          hideStatus();
+          const answer = await askUploadConflict(item, info);
+          if (!answer) {
+            const error = new Error("Upload cancelled");
+            error.cancel = true;
+            throw error;
+          }
+          choice = answer.choice;
+          if (answer.rest) restChoice = choice;
+        }
+      }
+      if (choice === "ignore") {
+        skipped += 1;
+        loadedBefore += item.file.size;
+        continue;
+      }
+      updateProgress(item, index, 0);
+      let posted = await postFile(item, choice, (loaded) => updateProgress(item, index, loaded));
+      if (posted && posted.exists) {
+        hideStatus();
+        const answer = await askUploadConflict(item, posted);
+        if (!answer) {
+          const error = new Error("Upload cancelled");
+          error.cancel = true;
+          throw error;
+        }
+        if (answer.rest) restChoice = answer.choice;
+        if (answer.choice === "ignore") {
+          skipped += 1;
+          loadedBefore += item.file.size;
+          continue;
+        }
+        updateProgress(item, index, 0);
+        posted = await postFile(item, answer.choice, (loaded) => updateProgress(item, index, loaded));
+        if (posted && posted.exists) throw new Error("An item with that name already exists");
+      }
+      loadedBefore += item.file.size;
+      saved += 1;
+    }
+  } finally {
+    activeUpload = null;
+    hideStatus();
+    const thin = $("progress");
+    if (thin) {
+      thin.hidden = true;
+      thin.style.width = "0";
+    }
+  }
+  return { saved, skipped };
+}
+
+function postFile(item, choice, onProgress) {
+  return new Promise((resolve, reject) => {
+    if (uploadAbort) {
+      const error = new Error("Upload cancelled");
+      error.cancel = true;
+      reject(error);
+      return;
+    }
+    const xhr = new XMLHttpRequest();
+    activeUpload = xhr;
+    const params = new URLSearchParams();
+    params.set("path", state.path);
+    if (choice) params.set("conflict", choice);
+    if (choice === "archive-older") params.set("modified", String(Math.floor(item.file.lastModified / 1000)));
+    xhr.open("POST", `/api/upload?${params}`);
     xhr.setRequestHeader("X-OwnNAS", "1");
     xhr.upload.onprogress = (event) => {
-      if (!event.lengthComputable) return;
-      const bar = $("progress");
-      bar.hidden = false;
-      bar.style.width = `${Math.round((event.loaded / event.total) * 100)}%`;
+      if (event.lengthComputable) onProgress(event.loaded);
     };
     xhr.onload = () => {
-      $("progress").hidden = true;
-      $("progress").style.width = "0";
-      if (xhr.status >= 200 && xhr.status < 300) resolve();
-      else {
+      if (activeUpload === xhr) activeUpload = null;
+      if (xhr.status >= 200 && xhr.status < 300) resolve(null);
+      else if (xhr.status === 409) {
+        try { resolve(JSON.parse(xhr.responseText)); }
+        catch { reject(new Error("An item with that name already exists")); }
+      } else {
         let message = "Upload failed";
         try { message = JSON.parse(xhr.responseText).error || message; } catch { /* keep */ }
         reject(new Error(message));
       }
     };
     xhr.onerror = () => {
-      $("progress").hidden = true;
+      if (activeUpload === xhr) activeUpload = null;
       reject(new Error("Upload failed"));
     };
+    xhr.onabort = () => {
+      if (activeUpload === xhr) activeUpload = null;
+      const error = new Error("Upload cancelled");
+      error.cancel = true;
+      reject(error);
+    };
     const body = new FormData();
-    files.forEach((file, index) => {
-      body.append("file", file, (names && names[index]) || file.webkitRelativePath || file.name);
-    });
+    body.append("file", item.file, item.name);
     xhr.send(body);
   });
+}
+
+function uploadSummary(result) {
+  if (!result.saved && result.skipped) {
+    return result.skipped === 1 ? "Ignored 1 file" : `Ignored ${result.skipped} files`;
+  }
+  if (result.skipped) return `Uploaded ${result.saved}, ignored ${result.skipped}`;
+  return "Upload finished";
 }
 
 async function readDrop(dataTransfer) {
@@ -425,7 +1341,9 @@ async function readDrop(dataTransfer) {
 function syncControls() {
   $("sort").value = state.sort;
   $("sort-dir").textContent = state.direction === "desc" ? "Z–A" : "A–Z";
-  $("view-toggle").textContent = state.view === "grid" ? "List" : "Grid";
+  document.querySelectorAll(".view-switch [data-view]").forEach((button) => {
+    button.setAttribute("aria-pressed", button.dataset.view === state.view ? "true" : "false");
+  });
   $("hidden-toggle").checked = state.hidden;
 }
 
@@ -448,6 +1366,8 @@ async function boot() {
     toast(err.message, true);
   }
 }
+
+boot();
 
 $("login-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -504,31 +1424,211 @@ $("crumbs").addEventListener("click", (event) => {
   go(button.dataset.go).catch((err) => toast(err.message, true));
 });
 
+$("brand-home").addEventListener("click", () => {
+  go("").catch((err) => toast(err.message, true));
+});
+
 $("files").addEventListener("click", (event) => {
+  if (skipNextClick) {
+    skipNextClick = false;
+    return;
+  }
+  const tagButton = event.target.closest("[data-filter-tag]");
+  if (tagButton) {
+    event.stopPropagation();
+    state.filter = tagButton.dataset.filterTag;
+    $("filter").value = state.filter;
+    renderFiles();
+    return;
+  }
   const menuButton = event.target.closest("[data-menu-for]");
   if (menuButton) {
     event.stopPropagation();
-    openMenu(menuButton.dataset.menuFor, menuButton);
+    const path = menuButton.dataset.menuFor;
+    if (!state.selected.has(path)) selectOnly(path);
+    const entry = findEntry(path);
+    const rect = menuButton.getBoundingClientRect();
+    const pasteInto = state.selected.size === 1 && entry && entry.dir ? entry.path : state.path;
+    openSelectionMenu(rect.left, rect.bottom + 4, pasteInto);
     return;
   }
   const card = event.target.closest("[data-path]");
-  if (!card) return;
+  if (!card) {
+    if (event.target === $("files") || $("files").contains(event.target)) {
+      // Empty-space click clears unless Ctrl/Cmd keeps the current selection.
+      if (!(event.ctrlKey || event.metaKey)) {
+        state.selected = new Set();
+        state.anchor = "";
+        paintSelection();
+      }
+    }
+    return;
+  }
+  if (event.detail > 1) return;
+  const path = card.dataset.path;
+  // Windows Explorer-style: Ctrl/Cmd toggles, Shift selects a range.
+  if (event.shiftKey) {
+    event.preventDefault();
+    selectRange(path);
+  } else if (event.ctrlKey || event.metaKey) {
+    event.preventDefault();
+    toggleSelected(path);
+  } else {
+    selectOnly(path);
+    if (!$("preview").hidden) {
+      const entry = findEntry(path);
+      if (entry && !entry.dir) {
+        openEntry(entry).catch((err) => toast(err.message, true));
+      }
+    }
+  }
+});
+
+$("files").addEventListener("mousedown", (event) => {
+  if (event.button !== 0) return;
+  if (event.target.closest(".more, button, a, input, [data-filter-tag], [data-menu-for]")) return;
+  // Keep Ctrl/Shift clicks from selecting card text instead of toggling selection.
+  if ((event.ctrlKey || event.metaKey || event.shiftKey) && event.target.closest("[data-path]")) {
+    event.preventDefault();
+  }
+  // Rubber-band selection starts on empty space, not on a file card.
+  if (event.target.closest("[data-path]")) return;
+  beginMarquee(event);
+});
+
+function beginMarquee(event) {
+  event.preventDefault();
+  closeMenu();
+  const additive = event.ctrlKey || event.metaKey;
+  marquee = {
+    x0: event.clientX,
+    y0: event.clientY,
+    additive,
+    origin: additive ? new Set(state.selected) : new Set(),
+    moved: false,
+  };
+  $("files").classList.add("selecting");
+  const box = $("marquee");
+  box.hidden = false;
+  placeMarquee(event.clientX, event.clientY);
+  window.addEventListener("mousemove", onMarqueeMove);
+  window.addEventListener("mouseup", endMarquee);
+}
+
+function placeMarquee(x1, y1) {
+  const box = $("marquee");
+  const left = Math.min(marquee.x0, x1);
+  const top = Math.min(marquee.y0, y1);
+  box.style.left = `${left}px`;
+  box.style.top = `${top}px`;
+  box.style.width = `${Math.abs(x1 - marquee.x0)}px`;
+  box.style.height = `${Math.abs(y1 - marquee.y0)}px`;
+}
+
+function onMarqueeMove(event) {
+  if (!marquee) return;
+  const dist = Math.hypot(event.clientX - marquee.x0, event.clientY - marquee.y0);
+  if (!marquee.moved && dist < 3) return;
+  marquee.moved = true;
+  skipNextClick = true;
+  placeMarquee(event.clientX, event.clientY);
+  applyMarqueeSelection();
+}
+
+function applyMarqueeSelection() {
+  const band = $("marquee").getBoundingClientRect();
+  const next = new Set(marquee.origin);
+  let lastHit = "";
+  document.querySelectorAll("#files .card").forEach((card) => {
+    const box = card.getBoundingClientRect();
+    const hit = !(
+      box.right < band.left
+      || box.left > band.right
+      || box.bottom < band.top
+      || box.top > band.bottom
+    );
+    if (!hit) return;
+    next.add(card.dataset.path);
+    lastHit = card.dataset.path;
+  });
+  state.selected = next;
+  if (lastHit) state.anchor = lastHit;
+  paintSelection();
+}
+
+function endMarquee() {
+  window.removeEventListener("mousemove", onMarqueeMove);
+  window.removeEventListener("mouseup", endMarquee);
+  $("files").classList.remove("selecting");
+  const box = $("marquee");
+  box.hidden = true;
+  box.style.width = "0";
+  box.style.height = "0";
+  if (marquee && marquee.moved) skipNextClick = true;
+  marquee = null;
+}
+
+$("files").addEventListener("dblclick", (event) => {
+  const card = event.target.closest("[data-path]");
+  if (!card || event.target.closest(".more")) return;
   openEntry(findEntry(card.dataset.path)).catch((err) => toast(err.message, true));
+});
+
+$("files").addEventListener("contextmenu", (event) => {
+  if (!state.me) return;
+  // Ctrl+click is multi-select (Explorer style), not a context menu shortcut.
+  if (event.ctrlKey) {
+    event.preventDefault();
+    const card = event.target.closest("[data-path]");
+    if (card) {
+      toggleSelected(card.dataset.path);
+      skipNextClick = true;
+    }
+    return;
+  }
+  event.preventDefault();
+  const card = event.target.closest("[data-path]");
+  if (card) {
+    const path = card.dataset.path;
+    if (!state.selected.has(path)) selectOnly(path);
+    const entry = findEntry(path);
+    const pasteInto = state.selected.size === 1 && entry && entry.dir ? entry.path : state.path;
+    openSelectionMenu(event.clientX, event.clientY, pasteInto);
+    return;
+  }
+  state.selected = new Set();
+  state.anchor = "";
+  paintSelection();
+  openSelectionMenu(event.clientX, event.clientY, state.path);
 });
 
 $("menu").addEventListener("click", (event) => {
   const button = event.target.closest("[data-menu]");
   if (!button) return;
-  const entry = findEntry(state.menuPath);
+  event.preventDefault();
+  event.stopPropagation();
+  const entries = state.menuEntries.slice();
+  const pasteInto = state.pasteInto;
   closeMenu();
-  if (!entry) return;
-  const action = button.dataset.menu;
-  if (action === "open") openEntry(entry).catch((err) => toast(err.message, true));
-  if (action === "download") location.href = `/api/raw?download=1&path=${encodeURIComponent(entry.path)}`;
-  if (action === "rename") renameEntry(entry).catch((err) => toast(err.message, true));
-  if (action === "delete") deleteEntry(entry).catch((err) => toast(err.message, true));
-  if (action === "duplicate") duplicateEntry(entry).catch((err) => toast(err.message, true));
-  if (action === "move") moveEntry(entry).catch((err) => toast(err.message, true));
+  const action = button.getAttribute("data-menu");
+  const one = entries.length === 1 ? entries[0] : null;
+  if (action === "open" && one) openEntry(one).catch((err) => toast(err.message, true));
+  if (action === "download") {
+    downloadEntries(entries).catch((err) => {
+      if (err.cancel) toast("Download cancelled");
+      else toast(err.message, true);
+    });
+  }
+  if (action === "copy") setClipboard("copy", entries);
+  if (action === "cut") setClipboard("cut", entries);
+  if (action === "paste") pasteClipboard(pasteInto).catch((err) => toast(err.message, true));
+  if (action === "mkdir") createFolder().catch((err) => toast(err.message, true));
+  if (action === "folderWith") createFolderWithSelection(entries).catch((err) => toast(err.message, true));
+  if (action === "rename" && one) renameEntry(one).catch((err) => toast(err.message, true));
+  if (action === "restore") restoreEntries(entries).catch((err) => toast(err.message, true));
+  if (action === "delete") deleteEntries(entries).catch((err) => toast(err.message, true));
+  if (action === "duplicate") duplicateEntries(entries).catch((err) => toast(err.message, true));
+  if (action === "move") moveEntries(entries).catch((err) => toast(err.message, true));
 });
 
 document.addEventListener("click", (event) => {
@@ -536,6 +1636,72 @@ document.addEventListener("click", (event) => {
 });
 
 $("preview-close").addEventListener("click", closePreview);
+
+$("notes-ack").addEventListener("click", async () => {
+  if (!state.current) return;
+  try {
+    const data = await api("/api/annotations", { method: "POST", json: { path: state.current.path } });
+    if (!state.current) return;
+    renderAnnotations(data);
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+$("tag-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!state.current) return;
+  const tag = $("tag-input").value.trim();
+  if (!tag) return;
+  try {
+    await api("/api/tags", { method: "POST", json: { path: state.current.path, tag } });
+    $("tag-input").value = "";
+    await loadAnnotations(state.current.path);
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+$("comment-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!state.current) return;
+  const body = $("comment-input").value.trim();
+  if (!body) return;
+  try {
+    await api("/api/comments", { method: "POST", json: { path: state.current.path, body } });
+    $("comment-input").value = "";
+    await loadAnnotations(state.current.path);
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+$("preview-tags").addEventListener("click", async (event) => {
+  const searchTag = event.target.closest("[data-search-tag]");
+  if (searchTag) {
+    openTagSearch(searchTag.dataset.searchTag);
+    return;
+  }
+  const button = event.target.closest("[data-remove-tag]");
+  if (!button || !state.current) return;
+  try {
+    await api(`/api/tags?path=${encodeURIComponent(state.current.path)}&tag=${encodeURIComponent(button.dataset.removeTag)}`, { method: "DELETE" });
+    await loadAnnotations(state.current.path);
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+$("preview-comments").addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-remove-comment]");
+  if (!button || !state.current) return;
+  try {
+    await api(`/api/comments?id=${encodeURIComponent(button.dataset.removeComment)}`, { method: "DELETE" });
+    await loadAnnotations(state.current.path);
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
 $("preview-rename").addEventListener("click", () => {
   if (state.current) renameEntry(state.current).catch((err) => toast(err.message, true));
 });
@@ -561,12 +1727,16 @@ $("sort-dir").addEventListener("click", () => {
   renderFiles();
 });
 
-$("view-toggle").addEventListener("click", () => {
-  state.view = state.view === "grid" ? "list" : "grid";
+$("view-icons").addEventListener("click", () => setView("icons"));
+$("view-masonry").addEventListener("click", () => setView("masonry"));
+$("view-list").addEventListener("click", () => setView("list"));
+
+function setView(view) {
+  state.view = normalizeView(view);
   localStorage.setItem("ownnas-view", state.view);
   syncControls();
   renderFiles();
-});
+}
 
 $("hidden-toggle").addEventListener("change", (event) => {
   state.hidden = event.target.checked;
@@ -574,15 +1744,8 @@ $("hidden-toggle").addEventListener("change", (event) => {
   load(state.path).catch((err) => toast(err.message, true));
 });
 
-$("mkdir-btn").addEventListener("click", async () => {
-  const name = await askText("New folder", "Folder name", "", "Create");
-  if (!name) return;
-  try {
-    await api("/api/mkdir", { method: "POST", json: { path: state.path, name } });
-    await load(state.path);
-  } catch (err) {
-    toast(err.message, true);
-  }
+$("mkdir-btn").addEventListener("click", () => {
+  createFolder().catch((err) => toast(err.message, true));
 });
 
 $("upload-btn").addEventListener("click", () => $("upload-input").click());
@@ -590,13 +1753,13 @@ $("folder-btn").addEventListener("click", () => $("folder-input").click());
 
 async function onPicked(input) {
   try {
-    await uploadFiles(input.files);
-    toast("Upload finished");
-    await load(state.path);
+    const result = await uploadFiles(input.files);
+    toast(uploadSummary(result));
   } catch (err) {
-    toast(err.message, true);
+    toast(err.cancel ? "Upload cancelled" : err.message, !err.cancel);
   }
   input.value = "";
+  if (state.me) load(state.path).catch((err) => toast(err.message, true));
 }
 $("upload-input").addEventListener("change", () => onPicked($("upload-input")));
 $("folder-input").addEventListener("change", () => onPicked($("folder-input")));
@@ -608,10 +1771,158 @@ window.addEventListener("hashchange", () => {
 
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
+    // Let open dialogs handle Escape themselves (and avoid clearing selection mid-prompt).
+    if (document.querySelector("dialog[open]")) return;
     closeMenu();
     closePreview();
+    closeLibrary();
+    if (marquee) endMarquee();
+    if (state.selected.size) {
+      state.selected = new Set();
+      state.anchor = "";
+      paintSelection();
+    }
+    return;
+  }
+  // Enter in the name dialog should confirm, not hit Cancel (first submit button).
+  if (event.key === "Enter" && event.target && event.target.id === "text-input") {
+    event.preventDefault();
+    $("text-ok").click();
+    return;
+  }
+  if (document.querySelector("dialog[open]")) return;
+  const typing = event.target.closest("input, textarea, select");
+  if (typing) return;
+  const key = event.key.toLowerCase();
+  const command = event.metaKey || event.ctrlKey;
+  if (command && key === "a") {
+    event.preventDefault();
+    const items = sortedEntries();
+    state.selected = new Set(items.map((entry) => entry.path));
+    state.anchor = items.length ? items[0].path : "";
+    paintSelection();
+  }
+  if (command && key === "c") {
+    const entries = selectedEntries();
+    if (!entries.length) return;
+    event.preventDefault();
+    setClipboard("copy", entries);
+  }
+  if (command && key === "x" && state.me && !state.me.readonly) {
+    const entries = selectedEntries();
+    if (!entries.length) return;
+    event.preventDefault();
+    setClipboard("cut", entries);
+  }
+  if (event.key === "Delete" && state.me && !state.me.readonly) {
+    const entries = selectedEntries();
+    if (!entries.length) return;
+    event.preventDefault();
+    deleteEntries(entries).catch((err) => toast(err.message, true));
+  }
+  if (event.key === "ArrowUp" || event.key === "ArrowDown" || event.key === "ArrowLeft" || event.key === "ArrowRight") {
+    if (!state.me || $("app-view").hidden) return;
+    event.preventDefault();
+    const extend = event.shiftKey;
+    if (event.key === "ArrowUp") moveSelection(0, -1, extend);
+    if (event.key === "ArrowDown") moveSelection(0, 1, extend);
+    if (event.key === "ArrowLeft") moveSelection(-1, 0, extend);
+    if (event.key === "ArrowRight") moveSelection(1, 0, extend);
+  }
+  if (event.key === "Enter") {
+    const entries = selectedEntries();
+    if (entries.length !== 1) return;
+    event.preventDefault();
+    openEntry(entries[0]).catch((err) => toast(err.message, true));
   }
 });
+
+window.addEventListener("paste", (event) => {
+  if (!state.me || state.me.readonly) return;
+  if ($("login-view") && !$("login-view").hidden) return;
+  if (document.querySelector("dialog[open]")) return;
+
+  const data = event.clipboardData;
+  if (!data) return;
+
+  const editingSensitive = event.target.closest("#login-view, #password-dialog, #text-dialog, #comment-input, #tag-input, #search-input");
+  const hasFiles = clipboardHasFiles(data);
+
+  // File paste should upload even when the folder filter (or similar) is focused.
+  if (hasFiles) {
+    if (editingSensitive) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const pasted = filesFromPaste(data);
+    if (!pasted.length) {
+      toast("Nothing to upload from the clipboard", true);
+      return;
+    }
+    uploadFiles(pasted.map((item) => item.file), pasted.map((item) => item.name))
+      .then(async (result) => {
+        toast(uploadSummary(result));
+        if (state.me) await load(state.path);
+      })
+      .catch((err) => toast(err.cancel ? "Upload cancelled" : err.message, !err.cancel));
+    return;
+  }
+
+  if (event.target.closest("input, textarea, select, [contenteditable]")) return;
+  if (state.clipboard && state.clipboard.items.length) {
+    event.preventDefault();
+    pasteClipboard(state.path).catch((err) => toast(err.message, true));
+  }
+}, true);
+
+function clipboardHasFiles(clipboardData) {
+  if (!clipboardData) return false;
+  if (clipboardData.files && clipboardData.files.length) return true;
+  const types = clipboardData.types ? [...clipboardData.types] : [];
+  if (types.includes("Files") || types.some((type) => type.startsWith("image/"))) return true;
+  for (const item of clipboardData.items || []) {
+    if (item.kind === "file") return true;
+  }
+  return false;
+}
+
+function filesFromPaste(clipboardData) {
+  if (!clipboardData) return [];
+  const out = [];
+  const seen = new Set();
+  const add = (file) => {
+    if (!file) return;
+    const key = `${file.name}|${file.size}|${file.lastModified}|${file.type}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ file, name: pasteFileName(file) });
+  };
+
+  // Prefer DataTransferItemList: screenshots and some OS pastes leave `files` empty.
+  for (const item of clipboardData.items || []) {
+    if (item.kind === "file") add(item.getAsFile());
+  }
+  if (out.length) return out;
+
+  if (clipboardData.files && clipboardData.files.length) {
+    for (const file of clipboardData.files) add(file);
+  }
+  return out;
+}
+
+function pasteFileName(file) {
+  const raw = (file.name || "").trim();
+  if (raw && raw !== "blob") return raw.includes("/") ? raw.split("/").pop() : raw;
+  const type = file.type || "";
+  const ext = type === "image/png" ? "png"
+    : type === "image/jpeg" ? "jpg"
+    : type === "image/webp" ? "webp"
+    : type === "image/gif" ? "gif"
+    : type === "image/svg+xml" ? "svg"
+    : type.startsWith("text/") ? "txt"
+    : "bin";
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  return `paste-${stamp}.${ext}`;
+}
 
 let fileDragDepth = 0;
 
@@ -653,12 +1964,12 @@ window.addEventListener("drop", async (event) => {
   event.preventDefault();
   try {
     const items = await readDrop(event.dataTransfer);
-    await uploadFiles(items.map((item) => item.file), items.map((item) => item.name));
-    toast("Upload finished");
-    await load(state.path);
+    const result = await uploadFiles(items.map((item) => item.file), items.map((item) => item.name));
+    toast(uploadSummary(result));
   } catch (err) {
-    toast(err.message, true);
+    toast(err.cancel ? "Upload cancelled" : err.message, !err.cancel);
   }
+  if (state.me) load(state.path).catch((err) => toast(err.message, true));
 });
 
 async function refreshLibrary() {
@@ -669,14 +1980,20 @@ async function refreshLibrary() {
   ]);
   state.bookmarks = bookmarks.paths || [];
   $("bookmarks").innerHTML = state.bookmarks.length
-    ? state.bookmarks.map((path) => `<button type="button" data-go="${esc(path)}">${esc(path || (state.me.rootName || "Library"))}</button>`).join("")
-    : `<span class="muted">None yet</span>`;
+    ? state.bookmarks.map((path) => {
+      const label = libraryLabel(path);
+      const detail = path || (state.me.rootName || "Library");
+      return `<button type="button" data-go="${esc(path)}"><strong>${esc(label)}</strong><span class="path">${esc(detail)}</span></button>`;
+    }).join("")
+    : `<p class="empty-note">No bookmarks yet. Use Bookmark on a folder to save it here.</p>`;
   const items = recent.items || [];
   $("recents").innerHTML = items.length
-    ? items.map((item) => `<button type="button" data-open="${esc(item.path)}">${esc(item.name)}</button>`).join("")
-    : `<span class="muted">Open a file to see it here</span>`;
-  const marked = state.bookmarks.includes(state.path);
-  $("bookmark-btn").textContent = marked ? "Bookmarked" : "Bookmark";
+    ? items.map((item) => {
+      const parent = item.path.includes("/") ? item.path.slice(0, item.path.lastIndexOf("/")) : (state.me.rootName || "Library");
+      return `<button type="button" data-open="${esc(item.path)}"><strong>${esc(item.name)}</strong><span class="path">${esc(parent || (state.me.rootName || "Library"))}</span></button>`;
+    }).join("")
+    : `<p class="empty-note">Open a file to see it here.</p>`;
+  syncBookmarkBtn();
 }
 
 function imageStep(delta) {
@@ -714,6 +2031,14 @@ $("bookmark-btn").addEventListener("click", async () => {
   }
 });
 
+$("library-btn").addEventListener("click", () => openLibrary());
+$("library-close").addEventListener("click", closeLibrary);
+$("library-tab-bookmarks").addEventListener("click", () => setLibraryTab("bookmarks"));
+$("library-tab-recent").addEventListener("click", () => setLibraryTab("recent"));
+$("empty-trash-btn").addEventListener("click", () => {
+  emptyTrash().catch((err) => toast(err.message, true));
+});
+
 $("usage-btn").addEventListener("click", async () => {
   try {
     const usage = await api(`/api/usage?path=${encodeURIComponent(state.path)}`);
@@ -724,6 +2049,47 @@ $("usage-btn").addEventListener("click", async () => {
   }
 });
 
+$("download-btn").addEventListener("click", () => {
+  downloadEntries(selectedEntries()).catch((err) => {
+    if (err.cancel) toast("Download cancelled");
+    else toast(err.message, true);
+  });
+});
+
+$("zip-link").addEventListener("click", (event) => {
+  event.preventDefault();
+  const name = state.path ? state.path.split("/").pop() : (state.me.rootName || "Library");
+  downloadZipBlob({
+    url: `/api/zip?path=${encodeURIComponent(state.path)}`,
+    preparing: `Compressing ${name}…`,
+    fallbackName: `${name}.zip`,
+    doneToast: "Download started",
+  }).catch((err) => {
+    if (err.cancel) toast("Download cancelled");
+    else toast(err.message, true);
+  });
+});
+
+$("status-cancel").addEventListener("click", () => cancelActiveTransfer());
+
+function openTagSearch(tag) {
+  $("search-results").innerHTML = "";
+  $("search-input").value = `tag:${tag}`;
+  $("search-dialog").showModal();
+  runSearch().catch((err) => toast(err.message, true));
+}
+
+async function runSearch() {
+  const data = await api(`/api/search?path=${encodeURIComponent(state.path)}&q=${encodeURIComponent($("search-input").value)}`);
+  const hits = data.hits || [];
+  $("search-results").innerHTML = hits.length
+    ? hits.map((hit) => {
+      const tag = hit.matchedTag ? ` <span class="tag-chip mini">#${esc(hit.matchedTag)}</span>` : "";
+      return `<button type="button" data-hit="${esc(hit.path)}" data-dir="${hit.dir ? "1" : "0"}">${esc(hit.path)}${tag}</button>`;
+    }).join("")
+    : `<span class="muted">No matches</span>`;
+}
+
 $("search-btn").addEventListener("click", () => {
   $("search-results").innerHTML = "";
   $("search-dialog").showModal();
@@ -733,11 +2099,7 @@ $("search-close").addEventListener("click", () => $("search-dialog").close());
 $("search-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
-    const data = await api(`/api/search?path=${encodeURIComponent(state.path)}&q=${encodeURIComponent($("search-input").value)}`);
-    const hits = data.hits || [];
-    $("search-results").innerHTML = hits.length
-      ? hits.map((hit) => `<button type="button" data-hit="${esc(hit.path)}" data-dir="${hit.dir ? "1" : "0"}">${esc(hit.path)}</button>`).join("")
-      : `<span class="muted">No matches</span>`;
+    await runSearch();
   } catch (err) {
     toast(err.message, true);
   }
@@ -784,9 +2146,15 @@ $("preview-move").addEventListener("click", () => {
   if (state.current) moveEntry(state.current).catch((err) => toast(err.message, true));
 });
 
+$("clipboard-clear").addEventListener("click", clearClipboard);
+$("clipboard-paste").addEventListener("click", () => {
+  pasteClipboard(state.path).catch((err) => toast(err.message, true));
+});
+
 $("bookmarks").addEventListener("click", (event) => {
   const button = event.target.closest("[data-go]");
   if (!button) return;
+  closeLibrary();
   go(button.dataset.go).catch((err) => toast(err.message, true));
 });
 $("recents").addEventListener("click", async (event) => {
@@ -795,6 +2163,7 @@ $("recents").addEventListener("click", async (event) => {
   const path = button.dataset.open;
   const parent = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
   try {
+    closeLibrary();
     if (state.path !== parent) await go(parent);
     const entry = findEntry(path);
     if (entry) await openEntry(entry);
@@ -803,5 +2172,3 @@ $("recents").addEventListener("click", async (event) => {
     toast(err.message, true);
   }
 });
-
-boot();

@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::fs::{self, Metadata};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -7,6 +8,17 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 pub const MAX_LIST: usize = 5_000;
+const ARCHIVE_DIR: &str = ".ownnas-archive";
+const ARCHIVE_MARK: &str = ".ownnas-id";
+const LEGACY_ARCHIVE_DIR: &str = "Archive";
+const LEGACY_ARCHIVE_MARK: &str = ".ownnas-archive";
+const ARCHIVE_LOG: &str = "archive.log";
+pub const TRASH_DIR: &str = ".ownnas-trash";
+const TRASH_MARK: &str = ".ownnas-trash-id";
+const LEGACY_TRASH_DIR: &str = "Trash";
+const LEGACY_TRASH_MARK: &str = ".ownnas-trash";
+const TRASH_META_DIR: &str = ".meta";
+const TRASH_LOG: &str = "trash.log";
 
 #[derive(Debug)]
 pub enum FileError {
@@ -35,6 +47,10 @@ pub struct Entry {
     pub modified: i64,
     pub kind: String,
     pub thumb: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -121,11 +137,24 @@ pub fn list_dir(root: &Path, rel: &str, show_hidden: bool, ffmpeg: bool) -> Resu
             Err(_) => continue,
         };
         let name = item.file_name().to_string_lossy().to_string();
-        if name.is_empty() || name == "." || name == ".." {
+        let child_path = item.path();
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name == ARCHIVE_MARK
+            || name == TRASH_MARK
+            || name == TRASH_META_DIR
+            || name == TRASH_LOG
+            || name == ARCHIVE_LOG
+            || (name == LEGACY_ARCHIVE_MARK && !child_path.is_dir())
+            || (name == LEGACY_TRASH_MARK && !child_path.is_dir())
+        {
             continue;
         }
-        let child_path = item.path();
-        if !show_hidden && entry_hidden(&child_path, &name) {
+        let special = child_path.is_dir()
+            && (is_archive_folder(&child_path) || is_trash_folder(&child_path));
+        // Dotfolders are normally hidden, but OwnNAS Trash/Archive stay visible as special folders.
+        if !show_hidden && !special && entry_hidden(&child_path, &name) {
             continue;
         }
         let meta = match item.metadata() {
@@ -141,18 +170,32 @@ pub fn list_dir(root: &Path, rel: &str, show_hidden: bool, ffmpeg: bool) -> Resu
         } else {
             format!("{}/{}", resolved.rel, name)
         };
-        entries.push(Entry {
-            kind: if dir {
-                "folder".to_string()
+        let kind = if dir {
+            if is_trash_folder(&child_path) {
+                "trash-folder".to_string()
+            } else if is_archive_folder(&child_path) {
+                "archive-folder".to_string()
             } else {
-                kind_of(&name).to_string()
-            },
+                "folder".to_string()
+            }
+        } else {
+            kind_of(&name).to_string()
+        };
+        let original = if is_under_trash(&path) && !is_trash_root(&path) {
+            trash_original(root, &name)
+        } else {
+            None
+        };
+        entries.push(Entry {
+            kind,
             thumb: !dir && can_thumb(&name, ffmpeg),
             name,
             path,
             dir,
             size: if dir { 0 } else { meta.len() },
             modified: modified_secs(&meta),
+            original,
+            tags: Vec::new(),
         });
     }
     entries.sort_by(|a, b| {
@@ -191,7 +234,7 @@ pub fn make_dir(root: &Path, parent_rel: &str, name: &str) -> Result<(), FileErr
     fs::create_dir(&dest).map_err(map_io)
 }
 
-pub fn rename_entry(root: &Path, rel: &str, new_name: &str) -> Result<(), FileError> {
+pub fn rename_entry(root: &Path, rel: &str, new_name: &str) -> Result<String, FileError> {
     if !valid_new_component(new_name) {
         return Err(FileError::InvalidName);
     }
@@ -204,7 +247,11 @@ pub fn rename_entry(root: &Path, rel: &str, new_name: &str) -> Result<(), FileEr
     if dest.exists() {
         return Err(FileError::AlreadyExists);
     }
-    fs::rename(&src.full, &dest).map_err(map_io)
+    fs::rename(&src.full, &dest).map_err(map_io)?;
+    Ok(match parent_rel(&src.rel) {
+        Some(parent) if !parent.is_empty() => format!("{parent}/{new_name}"),
+        _ => new_name.to_string(),
+    })
 }
 
 pub fn remove_entry(root: &Path, rel: &str) -> Result<(), FileError> {
@@ -212,17 +259,293 @@ pub fn remove_entry(root: &Path, rel: &str) -> Result<(), FileError> {
     if target.rel.is_empty() {
         return Err(FileError::Forbidden);
     }
+    if is_trash_root(&target.rel) {
+        return Err(FileError::Rejected(
+            "Empty the Trash instead of deleting the Trash folder",
+        ));
+    }
     if target.full.is_dir() {
         fs::remove_dir_all(&target.full).map_err(map_io)
     } else {
         fs::remove_file(&target.full).map_err(map_io)
+    }?;
+    if is_under_trash(&target.rel) {
+        let _ = remove_trash_meta(root, &target.rel);
+    }
+    Ok(())
+}
+
+/// Moves an item into the shared-folder Trash. Items already in Trash are removed for good.
+/// Returns `(action, new_path)` where `new_path` is set when the item was moved into Trash.
+pub fn trash_or_delete(root: &Path, rel: &str) -> Result<(&'static str, Option<String>), FileError> {
+    if is_under_trash(rel) {
+        remove_entry(root, rel)?;
+        Ok(("deleted", None))
+    } else {
+        let path = trash_entry(root, rel)?;
+        Ok(("trashed", Some(path)))
     }
 }
 
-/// Builds a destination path inside `dir_rel` for an uploaded file.
-/// Intermediate folders in `filename` (from a folder upload) are created.
-/// An existing file gets a numeric suffix so nothing is overwritten.
-pub fn prepare_upload(root: &Path, dir_rel: &str, filename: &str) -> Result<PathBuf, FileError> {
+pub fn trash_entry(root: &Path, rel: &str) -> Result<String, FileError> {
+    let src = resolve(root, rel)?;
+    if src.rel.is_empty() {
+        return Err(FileError::Forbidden);
+    }
+    if is_trash_folder(&src.full) || is_trash_root(&src.rel) {
+        return Err(FileError::Rejected(
+            "The Trash folder cannot be moved into itself",
+        ));
+    }
+    if is_under_trash(&src.rel) {
+        return Err(FileError::Rejected("That item is already in the Trash"));
+    }
+    let trash = ensure_trash_dir(root)?;
+    let name = src
+        .full
+        .file_name()
+        .ok_or(FileError::InvalidName)?
+        .to_string_lossy()
+        .to_string();
+    let dest = unique_path(trash.join(&name));
+    let saved_as = dest
+        .file_name()
+        .map(|item| item.to_string_lossy().to_string())
+        .ok_or(FileError::InvalidName)?;
+    if fs::rename(&src.full, &dest).is_err() {
+        let mut copied = 0usize;
+        copy_path(&src.full, &dest, &mut copied)?;
+        if src.full.is_dir() {
+            fs::remove_dir_all(&src.full).map_err(map_io)?;
+        } else {
+            fs::remove_file(&src.full).map_err(map_io)?;
+        }
+    }
+    write_trash_meta(root, &saved_as, &src.rel, &name)?;
+    append_trash_log(root, &trash, &src.rel, &saved_as)?;
+    Ok(format!("{TRASH_DIR}/{saved_as}"))
+}
+
+pub fn restore_entry(root: &Path, rel: &str) -> Result<String, FileError> {
+    let src = resolve(root, rel)?;
+    if !is_under_trash(&src.rel) || is_trash_root(&src.rel) {
+        return Err(FileError::Rejected("Only items in the Trash can be restored"));
+    }
+    if src.rel.matches('/').count() != 1 {
+        return Err(FileError::Rejected("Restore items from the Trash root"));
+    }
+    let saved_as = src
+        .full
+        .file_name()
+        .ok_or(FileError::InvalidName)?
+        .to_string_lossy()
+        .to_string();
+    let meta = read_trash_meta(root, &saved_as)?
+        .ok_or_else(|| FileError::Rejected("That Trash item has no restore information"))?;
+    let original = clean_parts(&meta.original)?;
+    if original.is_empty() {
+        return Err(FileError::Forbidden);
+    }
+    let root_canon = root.canonicalize().map_err(map_io)?;
+    let mut dest = root_canon.clone();
+    for (index, part) in original.iter().enumerate() {
+        if !valid_new_component(part) {
+            return Err(FileError::InvalidName);
+        }
+        let is_last = index + 1 == original.len();
+        dest.push(part);
+        if is_last {
+            break;
+        }
+        if dest.exists() {
+            if !dest.is_dir() {
+                return Err(FileError::AlreadyExists);
+            }
+        } else {
+            fs::create_dir(&dest).map_err(map_io)?;
+        }
+    }
+    let dest = unique_path(dest);
+    if !dest.starts_with(&root_canon) {
+        return Err(FileError::Forbidden);
+    }
+    if fs::rename(&src.full, &dest).is_err() {
+        let mut copied = 0usize;
+        copy_path(&src.full, &dest, &mut copied)?;
+        if src.full.is_dir() {
+            fs::remove_dir_all(&src.full).map_err(map_io)?;
+        } else {
+            fs::remove_file(&src.full).map_err(map_io)?;
+        }
+    }
+    let _ = remove_trash_meta(root, &src.rel);
+    let file_name = dest
+        .file_name()
+        .map(|item| item.to_string_lossy().to_string())
+        .ok_or(FileError::InvalidName)?;
+    let parent = meta
+        .original
+        .rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
+        .unwrap_or_default();
+    Ok(if parent.is_empty() {
+        file_name
+    } else {
+        format!("{parent}/{file_name}")
+    })
+}
+
+pub fn empty_trash(root: &Path) -> Result<u32, FileError> {
+    let trash = ensure_trash_dir(root)?;
+    let mut removed = 0u32;
+    for item in fs::read_dir(&trash).map_err(map_io)? {
+        let item = item.map_err(map_io)?;
+        let name = item.file_name().to_string_lossy().to_string();
+        if name == TRASH_MARK || name == TRASH_META_DIR || name == TRASH_LOG {
+            continue;
+        }
+        let path = item.path();
+        if path.is_dir() {
+            fs::remove_dir_all(&path).map_err(map_io)?;
+        } else {
+            fs::remove_file(&path).map_err(map_io)?;
+        }
+        removed += 1;
+    }
+    let meta_dir = trash.join(TRASH_META_DIR);
+    if meta_dir.is_dir() {
+        for item in fs::read_dir(&meta_dir).map_err(map_io)? {
+            let item = item.map_err(map_io)?;
+            let _ = fs::remove_file(item.path());
+        }
+    }
+    Ok(removed)
+}
+
+#[derive(Serialize, serde::Deserialize)]
+struct TrashMeta {
+    original: String,
+    name: String,
+    saved_as: String,
+    deleted_at: i64,
+}
+
+#[derive(Clone, Copy)]
+pub enum UploadChoice {
+    Overwrite,
+    KeepBoth,
+    ArchiveOlder { incoming_modified: i64 },
+    ArchiveExisting,
+    Ignore,
+}
+
+#[derive(Clone, Copy)]
+pub struct ExistingFile {
+    pub dir: bool,
+    pub modified: i64,
+    pub size: u64,
+}
+
+pub enum PreparedUpload {
+    Write(PathBuf),
+    /// The upload itself is the older file, so it is stored in `.ownnas-archive`.
+    /// The log line is written after the bytes are saved.
+    StoreInArchive { path: PathBuf, original_name: String },
+    Skip,
+    Ask(ExistingFile),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadStatus {
+    pub name: String,
+    pub exists: bool,
+    pub dir: bool,
+    pub modified: i64,
+    pub size: u64,
+}
+
+struct LocatedUpload {
+    root: PathBuf,
+    full: PathBuf,
+    pending_dirs: Vec<PathBuf>,
+    existing: Option<ExistingFile>,
+}
+
+/// Reports whether an upload name already exists. Does not create folders.
+pub fn upload_status(root: &Path, dir_rel: &str, filename: &str) -> Result<UploadStatus, FileError> {
+    let located = locate_upload(root, dir_rel, filename)?;
+    let existing = located.existing.unwrap_or(ExistingFile {
+        dir: false,
+        modified: 0,
+        size: 0,
+    });
+    Ok(UploadStatus {
+        name: filename.to_string(),
+        exists: located.existing.is_some(),
+        dir: existing.dir,
+        modified: existing.modified,
+        size: existing.size,
+    })
+}
+
+/// Chooses where an uploaded file will be written.
+/// Intermediate folders in `filename` (from a folder upload) are created only when writing.
+/// Without a choice, an existing file is returned as `Ask` so the caller can prompt.
+pub fn prepare_upload(
+    root: &Path,
+    dir_rel: &str,
+    filename: &str,
+    choice: Option<UploadChoice>,
+) -> Result<PreparedUpload, FileError> {
+    let located = locate_upload(root, dir_rel, filename)?;
+    let Some(existing) = located.existing else {
+        create_dirs(&located.pending_dirs)?;
+        return Ok(PreparedUpload::Write(located.full));
+    };
+    let Some(choice) = choice else {
+        return Ok(PreparedUpload::Ask(existing));
+    };
+    if existing.dir && !matches!(choice, UploadChoice::KeepBoth | UploadChoice::Ignore) {
+        return Err(FileError::Rejected(
+            "A folder with that name already exists. Keep both or ignore it.",
+        ));
+    }
+    match choice {
+        UploadChoice::Ignore => Ok(PreparedUpload::Skip),
+        UploadChoice::KeepBoth => {
+            create_dirs(&located.pending_dirs)?;
+            Ok(PreparedUpload::Write(unique_path(located.full)))
+        }
+        UploadChoice::Overwrite => {
+            create_dirs(&located.pending_dirs)?;
+            Ok(PreparedUpload::Write(located.full))
+        }
+        UploadChoice::ArchiveExisting => {
+            move_to_archive(&located.root, &located.full)?;
+            Ok(PreparedUpload::Write(located.full))
+        }
+        UploadChoice::ArchiveOlder { incoming_modified } => {
+            if existing.modified > incoming_modified {
+                let dest = archived_copy_path(&located.root, &located.full)?;
+                let original_name = located
+                    .full
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "file".to_string());
+                Ok(PreparedUpload::StoreInArchive {
+                    path: dest,
+                    original_name,
+                })
+            } else {
+                move_to_archive(&located.root, &located.full)?;
+                Ok(PreparedUpload::Write(located.full))
+            }
+        }
+    }
+}
+
+fn locate_upload(root: &Path, dir_rel: &str, filename: &str) -> Result<LocatedUpload, FileError> {
     let root = root.canonicalize().map_err(map_io)?;
     let dir = resolve(&root, dir_rel)?;
     if !dir.full.is_dir() {
@@ -233,29 +556,404 @@ pub fn prepare_upload(root: &Path, dir_rel: &str, filename: &str) -> Result<Path
         return Err(FileError::InvalidName);
     }
     let mut cursor = dir.full;
+    let mut pending_dirs = Vec::new();
     for (index, part) in extra.iter().enumerate() {
         let is_last = index + 1 == extra.len();
-        cursor.push(part);
-        if cursor.exists() {
-            let canon = cursor.canonicalize().map_err(map_io)?;
+        let next = cursor.join(part);
+        if next.exists() {
+            let canon = next.canonicalize().map_err(map_io)?;
             if !canon.starts_with(&root) {
                 return Err(FileError::Forbidden);
             }
             if is_last {
-                if canon.is_dir() {
-                    return Err(FileError::AlreadyExists);
-                }
-                return Ok(unique_path(canon));
+                let meta = canon.metadata().map_err(map_io)?;
+                let dir = canon.is_dir();
+                return Ok(LocatedUpload {
+                    root,
+                    full: canon,
+                    pending_dirs,
+                    existing: Some(ExistingFile {
+                        dir,
+                        modified: modified_secs(&meta),
+                        size: if dir { 0 } else { meta.len() },
+                    }),
+                });
             }
             if !canon.is_dir() {
                 return Err(FileError::AlreadyExists);
             }
             cursor = canon;
-        } else if !is_last {
-            fs::create_dir(&cursor).map_err(map_io)?;
+            continue;
+        }
+        if is_last {
+            return Ok(LocatedUpload {
+                root,
+                full: next,
+                pending_dirs,
+                existing: None,
+            });
+        }
+        pending_dirs.push(next.clone());
+        cursor = next;
+    }
+    Err(FileError::InvalidName)
+}
+
+fn create_dirs(dirs: &[PathBuf]) -> Result<(), FileError> {
+    for dir in dirs {
+        if dir.exists() {
+            if !dir.is_dir() {
+                return Err(FileError::AlreadyExists);
+            }
+            continue;
+        }
+        fs::create_dir(dir).map_err(map_io)?;
+    }
+    Ok(())
+}
+
+fn ensure_archive_dir(root: &Path, parent: &Path) -> Result<PathBuf, FileError> {
+    let archive = parent.join(ARCHIVE_DIR);
+    let legacy = parent.join(LEGACY_ARCHIVE_DIR);
+    if !archive.exists() && legacy.is_dir() && is_archive_folder(&legacy) {
+        fs::rename(&legacy, &archive).map_err(map_io)?;
+    }
+    if archive.exists() {
+        let canon = archive.canonicalize().map_err(map_io)?;
+        if !canon.starts_with(root) || !canon.is_dir() {
+            return Err(FileError::Rejected("Could not archive into that folder"));
+        }
+        write_archive_mark(&canon)?;
+        return Ok(canon);
+    }
+    fs::create_dir(&archive).map_err(map_io)?;
+    let canon = archive.canonicalize().map_err(map_io)?;
+    if !canon.starts_with(root) {
+        let _ = fs::remove_dir(&archive);
+        return Err(FileError::Forbidden);
+    }
+    if let Err(err) = write_archive_mark(&canon) {
+        let _ = fs::remove_dir_all(&canon);
+        return Err(err);
+    }
+    Ok(canon)
+}
+
+fn write_archive_mark(archive: &Path) -> Result<(), FileError> {
+    let mark = archive.join(ARCHIVE_MARK);
+    if mark.is_file() {
+        return Ok(());
+    }
+    // Older builds used `.ownnas-archive` as the marker file inside `Archive/`.
+    let legacy_mark = archive.join(LEGACY_ARCHIVE_MARK);
+    if legacy_mark.is_file() {
+        return Ok(());
+    }
+    fs::write(
+        &mark,
+        "OwnNAS archive folder\nThis file marks the folder as an OwnNAS Archive.\n",
+    )
+    .map_err(map_io)
+}
+
+fn is_trash_folder(path: &Path) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    let name = path.file_name().and_then(|name| name.to_str());
+    if matches!(name, Some(ARCHIVE_DIR) | Some(LEGACY_ARCHIVE_DIR)) {
+        return false;
+    }
+    if matches!(name, Some(TRASH_DIR) | Some(LEGACY_TRASH_DIR)) {
+        return true;
+    }
+    path.join(TRASH_MARK).is_file() || path.join(LEGACY_TRASH_MARK).is_file()
+}
+
+fn is_archive_folder(path: &Path) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    let name = path.file_name().and_then(|name| name.to_str());
+    if matches!(name, Some(TRASH_DIR) | Some(LEGACY_TRASH_DIR)) {
+        return false;
+    }
+    if matches!(name, Some(ARCHIVE_DIR) | Some(LEGACY_ARCHIVE_DIR)) {
+        return true;
+    }
+    path.join(ARCHIVE_MARK).is_file() || path.join(LEGACY_ARCHIVE_MARK).is_file()
+}
+
+fn ensure_trash_dir(root: &Path) -> Result<PathBuf, FileError> {
+    let root = root.canonicalize().map_err(map_io)?;
+    let trash = root.join(TRASH_DIR);
+    let legacy = root.join(LEGACY_TRASH_DIR);
+    if !trash.exists() && legacy.is_dir() && is_trash_folder(&legacy) {
+        fs::rename(&legacy, &trash).map_err(map_io)?;
+    }
+    if trash.exists() {
+        let canon = trash.canonicalize().map_err(map_io)?;
+        if !canon.starts_with(&root) || !canon.is_dir() {
+            return Err(FileError::Rejected("Could not open the Trash folder"));
+        }
+        write_trash_mark(&canon)?;
+        fs::create_dir_all(canon.join(TRASH_META_DIR)).map_err(map_io)?;
+        return Ok(canon);
+    }
+    fs::create_dir(&trash).map_err(map_io)?;
+    let canon = trash.canonicalize().map_err(map_io)?;
+    if !canon.starts_with(&root) {
+        let _ = fs::remove_dir(&trash);
+        return Err(FileError::Forbidden);
+    }
+    write_trash_mark(&canon)?;
+    fs::create_dir_all(canon.join(TRASH_META_DIR)).map_err(map_io)?;
+    Ok(canon)
+}
+
+fn write_trash_mark(trash: &Path) -> Result<(), FileError> {
+    let mark = trash.join(TRASH_MARK);
+    if mark.is_file() {
+        return Ok(());
+    }
+    // Older builds used `.ownnas-trash` as the marker file inside `Trash/`.
+    let legacy_mark = trash.join(LEGACY_TRASH_MARK);
+    if legacy_mark.is_file() {
+        return Ok(());
+    }
+    fs::write(
+        &mark,
+        "OwnNAS trash folder\nThis file marks the folder as the OwnNAS Trash.\n",
+    )
+    .map_err(map_io)
+}
+
+fn is_trash_root(rel: &str) -> bool {
+    rel == TRASH_DIR || rel == LEGACY_TRASH_DIR
+}
+
+fn is_under_trash(rel: &str) -> bool {
+    is_trash_root(rel)
+        || rel.starts_with(&format!("{TRASH_DIR}/"))
+        || rel.starts_with(&format!("{LEGACY_TRASH_DIR}/"))
+}
+
+/// Renames legacy `Trash` / root `Archive` folders to the dotted OwnNAS names.
+/// Returns `(from, to)` pairs for database path rewrites.
+pub fn migrate_legacy_dirs(root: &Path) -> Result<Vec<(String, String)>, FileError> {
+    let root = root.canonicalize().map_err(map_io)?;
+    let mut moved = Vec::new();
+    let trash = root.join(TRASH_DIR);
+    let legacy_trash = root.join(LEGACY_TRASH_DIR);
+    if !trash.exists() && legacy_trash.is_dir() && is_trash_folder(&legacy_trash) {
+        fs::rename(&legacy_trash, &trash).map_err(map_io)?;
+        moved.push((LEGACY_TRASH_DIR.to_string(), TRASH_DIR.to_string()));
+    }
+    Ok(moved)
+}
+
+fn trash_meta_path(root: &Path, saved_as: &str) -> Result<PathBuf, FileError> {
+    let trash = ensure_trash_dir(root)?;
+    let mut hasher = Sha256::new();
+    hasher.update(saved_as.as_bytes());
+    Ok(trash
+        .join(TRASH_META_DIR)
+        .join(format!("{}.json", hex::encode(hasher.finalize()))))
+}
+
+fn write_trash_meta(root: &Path, saved_as: &str, original: &str, name: &str) -> Result<(), FileError> {
+    let path = trash_meta_path(root, saved_as)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(map_io)?;
+    }
+    let meta = TrashMeta {
+        original: original.to_string(),
+        name: name.to_string(),
+        saved_as: saved_as.to_string(),
+        deleted_at: now_unix(),
+    };
+    let body = serde_json::to_vec_pretty(&meta).map_err(|_| FileError::Io("Could not write trash metadata"))?;
+    fs::write(path, body).map_err(map_io)
+}
+
+fn read_trash_meta(root: &Path, saved_as: &str) -> Result<Option<TrashMeta>, FileError> {
+    let path = trash_meta_path(root, saved_as)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let body = fs::read(path).map_err(map_io)?;
+    let meta = serde_json::from_slice(&body).map_err(|_| FileError::Io("Could not read trash metadata"))?;
+    Ok(Some(meta))
+}
+
+fn remove_trash_meta(root: &Path, rel: &str) -> Result<(), FileError> {
+    let saved_as = rel
+        .rsplit_once('/')
+        .map(|(_, name)| name)
+        .unwrap_or(rel);
+    let path = trash_meta_path(root, saved_as)?;
+    if path.exists() {
+        fs::remove_file(path).map_err(map_io)?;
+    }
+    Ok(())
+}
+
+fn trash_original(root: &Path, saved_as: &str) -> Option<String> {
+    read_trash_meta(root, saved_as)
+        .ok()
+        .flatten()
+        .map(|meta| meta.original)
+}
+
+fn append_trash_log(root: &Path, trash: &Path, original: &str, saved_as: &str) -> Result<(), FileError> {
+    let log_path = trash.join(TRASH_LOG);
+    if log_path.exists() {
+        let canon = log_path.canonicalize().map_err(map_io)?;
+        if !canon.starts_with(root) || canon.is_dir() {
+            return Err(FileError::Rejected("Could not update the trash log"));
         }
     }
-    Ok(cursor)
+    let detail = if original.ends_with(saved_as) && original != saved_as {
+        format!("{original} as {saved_as}")
+    } else if original == saved_as || original.ends_with(&format!("/{saved_as}")) {
+        original.to_string()
+    } else {
+        format!("{original} as {saved_as}")
+    };
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(map_io)?;
+    writeln!(file, "{}  {detail}", utc_stamp())
+        .map_err(|_| FileError::Io("Could not update the trash log"))?;
+    Ok(())
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn move_to_archive(root: &Path, existing: &Path) -> Result<(), FileError> {
+    let parent = existing.parent().ok_or(FileError::Forbidden)?;
+    let archive = ensure_archive_dir(root, parent)?;
+    let name = existing.file_name().ok_or(FileError::InvalidName)?;
+    let original_name = name.to_string_lossy().to_string();
+    let dest = archive_destination(&archive, name);
+    let saved_as = dest
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .ok_or(FileError::InvalidName)?;
+    fs::rename(existing, &dest).map_err(map_io)?;
+    append_archive_log(root, &archive, &original_name, &saved_as)
+}
+
+fn archived_copy_path(root: &Path, existing: &Path) -> Result<PathBuf, FileError> {
+    let parent = existing.parent().ok_or(FileError::Forbidden)?;
+    let archive = ensure_archive_dir(root, parent)?;
+    let name = existing.file_name().ok_or(FileError::InvalidName)?;
+    Ok(archive_destination(&archive, name))
+}
+
+fn archive_destination(archive: &Path, name: &std::ffi::OsStr) -> PathBuf {
+    let path = unique_path(archive.join(name));
+    match path.file_name().and_then(|item| item.to_str()) {
+        Some(ARCHIVE_LOG) => unique_path(archive.join("archive (2).log")),
+        Some(ARCHIVE_MARK) | Some(LEGACY_ARCHIVE_MARK) => {
+            unique_path(archive.join("ownnas-archive-mark (2)"))
+        }
+        _ => path,
+    }
+}
+
+/// Appends one archived file to `.ownnas-archive/archive.log`.
+pub fn record_archived_file(
+    root: &Path,
+    archived_path: &Path,
+    original_name: &str,
+) -> Result<(), FileError> {
+    let root = root.canonicalize().map_err(map_io)?;
+    let archived_path = archived_path.canonicalize().map_err(map_io)?;
+    if !archived_path.starts_with(&root) || archived_path.is_dir() {
+        return Err(FileError::Forbidden);
+    }
+    let archive = archived_path.parent().ok_or(FileError::Forbidden)?;
+    let saved_as = archived_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .ok_or(FileError::InvalidName)?;
+    append_archive_log(&root, archive, original_name, &saved_as)
+}
+
+fn append_archive_log(
+    root: &Path,
+    archive: &Path,
+    original_name: &str,
+    saved_as: &str,
+) -> Result<(), FileError> {
+    let log_path = archive.join(ARCHIVE_LOG);
+    if log_path.exists() {
+        let canon = log_path.canonicalize().map_err(map_io)?;
+        if !canon.starts_with(root) || canon.is_dir() {
+            return Err(FileError::Rejected("Could not update the archive log"));
+        }
+    }
+    let original_name = one_line(original_name);
+    let saved_as = one_line(saved_as);
+    let detail = if original_name == saved_as {
+        original_name
+    } else {
+        format!("{original_name} saved as {saved_as}")
+    };
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(map_io)?;
+    writeln!(file, "{}  {detail}", utc_stamp())
+        .map_err(|_| FileError::Io("Could not update the archive log"))?;
+    Ok(())
+}
+
+fn one_line(name: &str) -> String {
+    name.replace(['\n', '\r'], " ")
+}
+
+fn utc_stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    format_utc(secs)
+}
+
+fn format_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let tod = secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}Z",
+        hour = tod / 3600,
+        minute = (tod % 3600) / 60,
+        second = tod % 60
+    )
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, day)
 }
 
 pub fn kind_of(name: &str) -> &'static str {
@@ -276,9 +974,10 @@ pub fn kind_of(name: &str) -> &'static str {
         "pdf" => "pdf",
         "zip" | "jar" | "cbz" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "rar" => "archive",
         "txt" | "md" | "markdown" | "json" | "csv" | "tsv" | "log" | "xml" | "yaml" | "yml"
-        | "toml" | "ini" | "conf" | "cfg" | "html" | "htm" | "css" | "js" | "mjs" | "ts"
-        | "tsx" | "jsx" | "py" | "rs" | "go" | "java" | "c" | "h" | "cpp" | "hpp" | "cs"
-        | "sh" | "bash" | "zsh" | "ps1" | "sql" | "rb" | "php" | "lua" | "vue" | "svelte" => "text",
+        | "toml" | "ini" | "conf" | "cfg" | "env" | "nfo" | "properties" | "html" | "htm"
+        | "css" | "js" | "mjs" | "ts" | "tsx" | "jsx" | "py" | "rs" | "go" | "java" | "c"
+        | "h" | "cpp" | "hpp" | "cs" | "sh" | "bash" | "zsh" | "ps1" | "sql" | "rb" | "php"
+        | "lua" | "vue" | "svelte" => "text",
         _ => "file",
     }
 }
@@ -420,10 +1119,19 @@ fn modified_secs(meta: &Metadata) -> i64 {
         .unwrap_or(0)
 }
 
+/// Size and modified time for annotation fingerprints.
+pub fn entry_stats(root: &Path, rel: &str) -> Result<(u64, i64), FileError> {
+    let resolved = resolve(root, rel)?;
+    let meta = fs::metadata(&resolved.full).map_err(map_io)?;
+    Ok((meta.len(), modified_secs(&meta)))
+}
+
 fn entry_hidden(path: &Path, name: &str) -> bool {
     if name.starts_with('.') {
         return true;
     }
+    #[cfg(not(windows))]
+    let _ = path;
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -453,6 +1161,8 @@ pub struct SearchHit {
     pub path: String,
     pub dir: bool,
     pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_tag: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -515,13 +1225,20 @@ fn walk_search(
         if name.to_lowercase().contains(query) {
             hits.push(SearchHit {
                 kind: if dir {
-                    "folder".to_string()
+                    if is_trash_folder(&canon) {
+                        "trash-folder".to_string()
+                    } else if is_archive_folder(&canon) {
+                        "archive-folder".to_string()
+                    } else {
+                        "folder".to_string()
+                    }
                 } else {
                     kind_of(&name).to_string()
                 },
                 name,
                 path: child_rel.clone(),
                 dir,
+                matched_tag: None,
             });
         }
         if dir {
@@ -630,6 +1347,33 @@ pub fn move_entry(root: &Path, rel: &str, dest_rel: &str) -> Result<String, File
     })
 }
 
+pub fn copy_entry(root: &Path, rel: &str, dest_rel: &str) -> Result<String, FileError> {
+    let src = resolve(root, rel)?;
+    if src.rel.is_empty() {
+        return Err(FileError::Forbidden);
+    }
+    let dest_dir = resolve(root, dest_rel)?;
+    if !dest_dir.full.is_dir() {
+        return Err(FileError::NotADirectory);
+    }
+    if dest_dir.full.starts_with(&src.full) {
+        return Err(FileError::Rejected("A folder cannot be copied inside itself"));
+    }
+    let name = src.full.file_name().ok_or(FileError::InvalidName)?;
+    let target = unique_path(dest_dir.full.join(name));
+    let mut copied = 0usize;
+    copy_path(&src.full, &target, &mut copied)?;
+    let file_name = target
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .ok_or(FileError::InvalidName)?;
+    Ok(if dest_dir.rel.is_empty() {
+        file_name
+    } else {
+        format!("{}/{file_name}", dest_dir.rel)
+    })
+}
+
 pub fn sha256_file(root: &Path, rel: &str) -> Result<String, FileError> {
     let resolved = resolve(root, rel)?;
     if resolved.full.is_dir() {
@@ -677,6 +1421,95 @@ pub fn write_zip(root: &Path, rel: &str, output: &Path) -> Result<String, FileEr
             .unwrap_or_else(|| "folder".to_string())
     };
     Ok(format!("{label}.zip"))
+}
+
+/// Builds a zip for one or more selected files and folders.
+pub fn write_zip_selection(root: &Path, rels: &[String], output: &Path) -> Result<String, FileError> {
+    if rels.is_empty() {
+        return Err(FileError::Rejected("Choose at least one item to download"));
+    }
+    if rels.len() > 500 {
+        return Err(FileError::Rejected("Too many items selected for one download"));
+    }
+    if rels.len() == 1 {
+        let one = resolve(root, &rels[0])?;
+        if one.rel.is_empty() {
+            return write_zip(root, "", output);
+        }
+        if one.full.is_dir() {
+            return write_zip(root, &rels[0], output);
+        }
+    }
+    let root = root.canonicalize().map_err(map_io)?;
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).map_err(map_io)?;
+    }
+    let file = fs::File::create(output).map_err(map_io)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let mut count = 0usize;
+    let mut used = HashSet::new();
+    let mut first_name = None;
+    for rel in rels {
+        let resolved = resolve(&root, rel)?;
+        if resolved.rel.is_empty() {
+            return Err(FileError::Rejected("Download selected items instead of the whole library root"));
+        }
+        let base = resolved
+            .full
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .ok_or(FileError::InvalidName)?;
+        if first_name.is_none() {
+            first_name = Some(base.clone());
+        }
+        let zip_name = unique_zip_name(&mut used, &base);
+        count += 1;
+        if count > 2_000 {
+            return Err(FileError::Rejected("That selection is too large to download as one zip"));
+        }
+        if resolved.full.is_dir() {
+            zip.add_directory(format!("{zip_name}/"), options)
+                .map_err(|_| FileError::Io("Could not build the zip"))?;
+            zip_tree(&root, &resolved.full, &zip_name, &mut zip, &mut count)?;
+        } else {
+            zip.start_file(&zip_name, options)
+                .map_err(|_| FileError::Io("Could not build the zip"))?;
+            let mut input = fs::File::open(&resolved.full).map_err(map_io)?;
+            io::copy(&mut input, &mut zip).map_err(|_| FileError::Io("Could not build the zip"))?;
+        }
+    }
+    zip.finish()
+        .map_err(|_| FileError::Io("Could not finish the zip"))?;
+    let label = if rels.len() == 1 {
+        first_name.unwrap_or_else(|| "download".to_string())
+    } else {
+        format!("ownnas-{}-items", rels.len())
+    };
+    Ok(format!("{label}.zip"))
+}
+
+fn unique_zip_name(used: &mut HashSet<String>, name: &str) -> String {
+    if used.insert(name.to_string()) {
+        return name.to_string();
+    }
+    let path = Path::new(name);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let ext = path
+        .extension()
+        .map(|ext| format!(".{}", ext.to_string_lossy()))
+        .unwrap_or_default();
+    for index in 2..10_000 {
+        let candidate = format!("{stem} ({index}){ext}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    name.to_string()
 }
 
 fn zip_tree(
@@ -788,8 +1621,155 @@ mod tests {
         let copy = duplicate(&root, "sub/Alpha Note.txt").unwrap();
         assert!(copy.contains("Alpha Note"));
         assert_ne!(copy, "sub/Alpha Note.txt");
+        fs::create_dir(root.join("other")).unwrap();
+        let pasted = copy_entry(&root, "sub/note.txt", "other").unwrap();
+        assert_eq!(pasted, "other/note.txt");
+        assert_eq!(fs::read(root.join("other").join("note.txt")).unwrap(), b"hello");
+        assert_eq!(fs::read(root.join("sub").join("note.txt")).unwrap(), b"hello");
+        let again = copy_entry(&root, "sub/note.txt", "other").unwrap();
+        assert_ne!(again, "other/note.txt");
+        assert!(again.starts_with("other/note"));
         let usage = usage(&root, "").unwrap();
         assert!(usage.bytes >= 3);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn set_mtime(path: &Path, secs: u64) {
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    #[test]
+    fn upload_conflict_choices() {
+        let root = scratch();
+        let note = root.join("sub").join("note.txt");
+        set_mtime(&note, 1_000);
+        assert!(matches!(
+            prepare_upload(&root, "sub", "note.txt", None).unwrap(),
+            PreparedUpload::Ask(_)
+        ));
+
+        let ignored = prepare_upload(&root, "sub", "note.txt", Some(UploadChoice::Ignore)).unwrap();
+        assert!(matches!(ignored, PreparedUpload::Skip));
+        assert_eq!(fs::read(&note).unwrap(), b"hello");
+
+        let kept = prepare_upload(&root, "sub", "note.txt", Some(UploadChoice::KeepBoth)).unwrap();
+        match kept {
+            PreparedUpload::Write(path) => assert!(path.ends_with("note (2).txt")),
+            _ => panic!("keep both should choose a new path"),
+        }
+
+        set_mtime(&note, 1_000);
+        let older = prepare_upload(
+            &root,
+            "sub",
+            "note.txt",
+            Some(UploadChoice::ArchiveOlder { incoming_modified: 2_000 }),
+        )
+        .unwrap();
+        match older {
+            PreparedUpload::Write(path) => assert_eq!(path, note),
+            _ => panic!("newer upload should keep the original name"),
+        }
+        assert!(root.join("sub").join(".ownnas-archive").join("note.txt").is_file());
+        assert!(root.join("sub").join(".ownnas-archive").join(".ownnas-id").is_file());
+        let listing = list_dir(&root, "sub", true, false).unwrap();
+        let archive = listing
+            .entries
+            .iter()
+            .find(|entry| entry.name == ".ownnas-archive")
+            .unwrap();
+        assert_eq!(archive.kind, "archive-folder");
+        // Special folders stay visible even when Hidden is off.
+        let visible = list_dir(&root, "sub", false, false).unwrap();
+        let visible_archive = visible
+            .entries
+            .iter()
+            .find(|entry| entry.name == ".ownnas-archive")
+            .unwrap();
+        assert_eq!(visible_archive.kind, "archive-folder");
+        let hidden_listing = list_dir(&root, "sub/.ownnas-archive", true, false).unwrap();
+        assert!(!hidden_listing.entries.iter().any(|entry| entry.name == ".ownnas-id"));
+        fs::write(&note, b"new").unwrap();
+        set_mtime(&note, 5_000);
+
+        let newer_existing = prepare_upload(
+            &root,
+            "sub",
+            "note.txt",
+            Some(UploadChoice::ArchiveOlder { incoming_modified: 3_000 }),
+        )
+        .unwrap();
+        match &newer_existing {
+            PreparedUpload::StoreInArchive { path, original_name } => {
+                assert!(path.starts_with(root.join("sub").join(".ownnas-archive")));
+                assert_ne!(path, &note);
+                assert_eq!(original_name, "note.txt");
+                fs::write(path, b"old-upload").unwrap();
+                record_archived_file(&root, path, original_name).unwrap();
+            }
+            _ => panic!("older upload should be archived"),
+        }
+        assert_eq!(fs::read(&note).unwrap(), b"new");
+
+        fs::write(&note, b"stay").unwrap();
+        let replaced = prepare_upload(&root, "sub", "note.txt", Some(UploadChoice::ArchiveExisting)).unwrap();
+        match replaced {
+            PreparedUpload::Write(path) => assert_eq!(path, note),
+            _ => panic!("archive existing should free the original name"),
+        }
+        assert!(!note.exists());
+        assert!(root.join("sub").join(".ownnas-archive").join("note (3).txt").is_file());
+        let log = fs::read_to_string(root.join("sub").join(".ownnas-archive").join("archive.log")).unwrap();
+        let lines: Vec<_> = log.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].ends_with("  note.txt"));
+        assert!(lines[1].ends_with("  note.txt saved as note (2).txt"));
+        assert!(lines[2].ends_with("  note.txt saved as note (3).txt"));
+        assert_eq!(format_utc(1_577_836_800), "2020-01-01 00:00:00Z");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn trash_restore_and_empty() {
+        let root = scratch();
+        fs::write(root.join("sub").join("keep.txt"), b"keep").unwrap();
+        let trashed = trash_entry(&root, "sub/keep.txt").unwrap();
+        assert_eq!(trashed, ".ownnas-trash/keep.txt");
+        assert!(!root.join("sub").join("keep.txt").exists());
+        assert!(root.join(".ownnas-trash").join(".ownnas-trash-id").is_file());
+        let root_listing = list_dir(&root, "", false, false).unwrap();
+        let trash_card = root_listing
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "trash-folder")
+            .unwrap();
+        assert_eq!(trash_card.name, ".ownnas-trash");
+        let listing = list_dir(&root, ".ownnas-trash", false, false).unwrap();
+        let item = listing.entries.iter().find(|entry| entry.name == "keep.txt").unwrap();
+        assert_eq!(item.original.as_deref(), Some("sub/keep.txt"));
+        let restored = restore_entry(&root, ".ownnas-trash/keep.txt").unwrap();
+        assert_eq!(restored, "sub/keep.txt");
+        assert_eq!(fs::read(root.join("sub").join("keep.txt")).unwrap(), b"keep");
+        trash_entry(&root, "sub/keep.txt").unwrap();
+        assert_eq!(empty_trash(&root).unwrap(), 1);
+        assert!(list_dir(&root, ".ownnas-trash", true, false).unwrap().entries.is_empty());
+
+        // Legacy `Trash/` is renamed when the dotted trash folder is absent.
+        let _ = fs::remove_dir_all(root.join(".ownnas-trash"));
+        fs::write(root.join("sub").join("old.txt"), b"old").unwrap();
+        fs::create_dir(root.join("Trash")).unwrap();
+        fs::write(
+            root.join("Trash").join(".ownnas-trash"),
+            b"OwnNAS trash folder\n",
+        )
+        .unwrap();
+        fs::rename(root.join("sub").join("old.txt"), root.join("Trash").join("old.txt")).unwrap();
+        let moved = migrate_legacy_dirs(&root).unwrap();
+        assert_eq!(moved, vec![("Trash".to_string(), ".ownnas-trash".to_string())]);
+        assert!(root.join(".ownnas-trash").join("old.txt").is_file());
+        assert!(!root.join("Trash").exists());
         let _ = fs::remove_dir_all(&root);
     }
 }
