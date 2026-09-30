@@ -6,6 +6,13 @@
   <meta name="robots" content="noindex, nofollow">
   <title>OwnNAS</title>
   <link rel="stylesheet" href="/assets/app.css">
+  <script>
+    (() => {
+      const allowed = ["ownnas","tokyo-night","catppuccin","catppuccin-latte","everforest","gruvbox","kanagawa","osaka-jade","matte-black","rose-pine"];
+      const theme = localStorage.getItem("ownnas-theme");
+      document.documentElement.setAttribute("data-theme", allowed.includes(theme) ? theme : "ownnas");
+    })();
+  </script>
 </head>
 <body>
   <div id="boot" class="boot" hidden>Opening OwnNAS…</div>
@@ -46,6 +53,7 @@
       <nav id="crumbs" class="crumbs" aria-label="Current folder"></nav>
       <div class="top-actions">
         <span id="who" class="who"></span>
+        <button id="settings-btn" type="button">Settings</button>
         <button id="password-btn" type="button">Password</button>
         <button id="logout-btn" type="button">Sign out</button>
       </div>
@@ -182,6 +190,35 @@
     </section>
   </aside>
 
+  <aside id="settings" class="settings" hidden>
+    <div class="preview-bar">
+      <h2>Settings</h2>
+      <button id="settings-close" type="button" aria-label="Close settings">Close</button>
+    </div>
+    <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+      <button id="settings-tab-theme" type="button" role="tab" aria-selected="true" data-settings-tab="theme">Appearance</button>
+      <button id="settings-tab-users" type="button" role="tab" aria-selected="false" data-settings-tab="users" hidden>Users</button>
+    </div>
+    <section id="settings-theme" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-theme">
+      <p class="muted">Themes inspired by Omarchy palettes. Choice is saved in this browser.</p>
+      <div id="theme-grid" class="theme-grid"></div>
+    </section>
+    <section id="settings-users" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-users" hidden>
+      <p class="muted">Administrators can add accounts, reset passwords, and grant admin access.</p>
+      <div id="users-list"></div>
+      <form id="user-create-form" class="user-form">
+        <strong>Add user</strong>
+        <div class="row">
+          <label>Username<input id="user-create-name" autocomplete="off" required></label>
+          <label>Password<input id="user-create-pass" type="password" autocomplete="new-password" required minlength="8"></label>
+        </div>
+        <label class="check"><input id="user-create-admin" type="checkbox"> Make administrator</label>
+        <button type="submit">Create account</button>
+        <p id="user-create-error" class="form-error"></p>
+      </form>
+    </section>
+  </aside>
+
   <aside id="preview" class="preview" hidden>
     <div class="preview-bar">
       <h2 id="preview-title"></h2>
@@ -249,6 +286,7 @@
     <form method="dialog" id="text-form">
       <h3 id="text-title"></h3>
       <label><span id="text-label-copy">Name</span><input id="text-input" required></label>
+      <p id="text-warning" class="text-warning" hidden></p>
       <div class="dialog-actions">
         <button id="text-cancel" value="cancel" type="submit" formnovalidate>Cancel</button>
         <button id="text-ok" value="ok" type="submit">Save</button>

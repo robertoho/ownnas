@@ -24,6 +24,47 @@ function normalizeView(value) {
   return "icons";
 }
 
+const THEMES = [
+  { id: "ownnas", name: "OwnNAS", mode: "dark", swatches: ["#12140f", "#1b1e16", "#dff25a", "#f4f2e8"] },
+  { id: "tokyo-night", name: "Tokyo Night", mode: "dark", swatches: ["#1a1b26", "#24283b", "#7aa2f7", "#c0caf5"] },
+  { id: "catppuccin", name: "Catppuccin", mode: "dark", swatches: ["#1e1e2e", "#313244", "#89b4fa", "#cdd6f4"] },
+  { id: "catppuccin-latte", name: "Catppuccin Latte", mode: "light", swatches: ["#eff1f5", "#e6e9ef", "#1e66f5", "#4c4f69"] },
+  { id: "everforest", name: "Everforest", mode: "dark", swatches: ["#2d353b", "#374247", "#7fbbb3", "#d3c6aa"] },
+  { id: "gruvbox", name: "Gruvbox", mode: "dark", swatches: ["#282828", "#3c3836", "#7daea3", "#ebdbb2"] },
+  { id: "kanagawa", name: "Kanagawa", mode: "dark", swatches: ["#1f1f28", "#2a2a37", "#7e9cd8", "#dcd7ba"] },
+  { id: "osaka-jade", name: "Osaka Jade", mode: "dark", swatches: ["#111c18", "#1a2a22", "#509475", "#c1c497"] },
+  { id: "matte-black", name: "Matte Black", mode: "dark", swatches: ["#121212", "#1c1c1c", "#e68e0d", "#eaeaea"] },
+  { id: "rose-pine", name: "Rose Pine", mode: "light", swatches: ["#faf4ed", "#fffaf3", "#56949f", "#575279"] },
+];
+
+function normalizeTheme(value) {
+  return THEMES.some((theme) => theme.id === value) ? value : "ownnas";
+}
+
+function applyTheme(id) {
+  const theme = normalizeTheme(id);
+  document.documentElement.setAttribute("data-theme", theme);
+  localStorage.setItem("ownnas-theme", theme);
+  renderThemeGrid();
+}
+
+function currentTheme() {
+  return normalizeTheme(localStorage.getItem("ownnas-theme") || "ownnas");
+}
+
+function renderThemeGrid() {
+  const host = $("theme-grid");
+  if (!host) return;
+  const active = currentTheme();
+  host.innerHTML = THEMES.map((theme) => `
+    <button type="button" class="theme-card" data-theme-id="${esc(theme.id)}" aria-pressed="${theme.id === active ? "true" : "false"}">
+      <span class="theme-swatch" aria-hidden="true"></span>
+      <strong>${esc(theme.name)}</strong>
+      <span class="muted">${theme.mode}</span>
+    </button>
+  `).join("");
+}
+
 function tagInitials(tag) {
   const parts = String(tag).trim().split(/[\s_-]+/).filter(Boolean);
   if (!parts.length) return "?";
@@ -101,6 +142,7 @@ function showLogin(message) {
   $("app-view").hidden = true;
   $("preview").hidden = true;
   $("library").hidden = true;
+  $("settings").hidden = true;
   $("login-view").hidden = false;
   $("login-error").textContent = message || "";
   state.me = null;
@@ -110,7 +152,7 @@ function showApp() {
   $("boot").hidden = true;
   $("login-view").hidden = true;
   $("app-view").hidden = false;
-  $("who").textContent = state.me.username;
+  $("who").textContent = state.me.admin ? `${state.me.username} · admin` : state.me.username;
   const write = !state.me.readonly;
   $("mkdir-btn").hidden = !write;
   $("upload-btn").hidden = !write;
@@ -302,6 +344,7 @@ function syncBookmarkBtn() {
 
 async function go(path) {
   closeLibrary();
+  closeSettings();
   const next = pathToHash(path);
   if (location.hash !== next) location.hash = next;
   else await load(path);
@@ -495,6 +538,58 @@ function closeLibrary() {
   $("library").hidden = true;
 }
 
+function closeSettings() {
+  $("settings").hidden = true;
+}
+
+function setSettingsTab(tab) {
+  const theme = tab === "theme";
+  $("settings-tab-theme").setAttribute("aria-selected", theme ? "true" : "false");
+  $("settings-tab-users").setAttribute("aria-selected", theme ? "false" : "true");
+  $("settings-theme").hidden = !theme;
+  $("settings-users").hidden = theme;
+}
+
+function openSettings(tab) {
+  closePreview();
+  closeLibrary();
+  const admin = !!(state.me && state.me.admin);
+  $("settings-tab-users").hidden = !admin;
+  if (!admin) tab = "theme";
+  setSettingsTab(tab || "theme");
+  renderThemeGrid();
+  $("settings").hidden = false;
+  if (admin) loadUsers().catch((err) => toast(err.message, true));
+}
+
+async function loadUsers() {
+  const data = await api("/api/users");
+  const users = data.users || [];
+  const host = $("users-list");
+  if (!users.length) {
+    host.innerHTML = `<p class="muted">No accounts yet.</p>`;
+    return;
+  }
+  host.innerHTML = `<table class="users-table">
+    <thead><tr><th>User</th><th>Role</th><th></th></tr></thead>
+    <tbody>
+      ${users.map((user) => `
+        <tr data-username="${esc(user.username)}">
+          <td>${esc(user.username)}</td>
+          <td>${user.isAdmin ? `<span class="pill">Admin</span>` : `<span class="muted">Member</span>`}</td>
+          <td>
+            <div class="user-actions">
+              <button type="button" data-user-password="${esc(user.username)}">Reset password</button>
+              <button type="button" data-user-admin="${esc(user.username)}" data-admin="${user.isAdmin ? "0" : "1"}">${user.isAdmin ? "Revoke admin" : "Make admin"}</button>
+              <button type="button" class="danger" data-user-remove="${esc(user.username)}">Remove</button>
+            </div>
+          </td>
+        </tr>
+      `).join("")}
+    </tbody>
+  </table>`;
+}
+
 function setLibraryTab(tab) {
   const bookmarks = tab === "bookmarks";
   $("library-tab-bookmarks").setAttribute("aria-selected", bookmarks ? "true" : "false");
@@ -505,6 +600,7 @@ function setLibraryTab(tab) {
 
 function openLibrary(tab) {
   closePreview();
+  closeSettings();
   if (tab) setLibraryTab(tab);
   $("library").hidden = false;
   refreshLibrary().catch((err) => toast(err.message, true));
@@ -796,17 +892,50 @@ function renderTable(content, separator) {
   return `<div class="table-wrap"><table>${rows.join("")}</table></div>`;
 }
 
-function askText(title, label, value, okLabel) {
+function fileExtension(name) {
+  const base = String(name || "");
+  const index = base.lastIndexOf(".");
+  // Leading-dot names like ".gitignore" have no extension unless another dot follows.
+  if (index <= 0 || index === base.length - 1) return "";
+  return base.slice(index + 1).toLowerCase();
+}
+
+function extensionLabel(ext) {
+  return ext ? `.${ext}` : "(none)";
+}
+
+function askText(title, label, value, okLabel, options = {}) {
   $("text-title").textContent = title;
   $("text-label-copy").textContent = label;
   $("text-input").value = value || "";
   $("text-ok").textContent = okLabel || "Save";
+  const warning = $("text-warning");
+  const originalName = options.watchExtensionFrom || "";
+  const updateWarning = () => {
+    if (!originalName) {
+      warning.hidden = true;
+      warning.textContent = "";
+      return;
+    }
+    const next = $("text-input").value.trim();
+    const fromExt = fileExtension(originalName);
+    const toExt = fileExtension(next);
+    if (next && fromExt !== toExt) {
+      warning.hidden = false;
+      warning.textContent = `Extension changes from ${extensionLabel(fromExt)} to ${extensionLabel(toExt)}.`;
+    } else {
+      warning.hidden = true;
+      warning.textContent = "";
+    }
+  };
+  updateWarning();
   const dialog = $("text-dialog");
   // Avoid a previous OK/Cancel sticking around when Escape closes the dialog.
   dialog.returnValue = "";
   dialog.showModal();
   $("text-input").focus();
   $("text-input").select();
+  $("text-input").addEventListener("input", updateWarning);
   return new Promise((resolve) => {
     const onCancel = () => {
       dialog.returnValue = "cancel";
@@ -814,6 +943,9 @@ function askText(title, label, value, okLabel) {
     dialog.addEventListener("cancel", onCancel, { once: true });
     dialog.addEventListener("close", () => {
       dialog.removeEventListener("cancel", onCancel);
+      $("text-input").removeEventListener("input", updateWarning);
+      warning.hidden = true;
+      warning.textContent = "";
       resolve(dialog.returnValue === "ok" ? $("text-input").value : null);
     }, { once: true });
   });
@@ -830,9 +962,28 @@ function askConfirm(message, okLabel) {
 }
 
 async function renameEntry(entry) {
-  const name = await askText("Rename", "New name", entry.name, "Rename");
-  if (!name || name === entry.name) return;
-  await api("/api/rename", { method: "POST", json: { path: entry.path, name } });
+  const name = await askText(
+    "Rename",
+    "New name",
+    entry.name,
+    "Rename",
+    entry.dir ? {} : { watchExtensionFrom: entry.name },
+  );
+  if (name === null) return;
+  const next = name.trim();
+  if (!next || next === entry.name) return;
+  if (!entry.dir) {
+    const fromExt = fileExtension(entry.name);
+    const toExt = fileExtension(next);
+    if (fromExt !== toExt) {
+      const confirmed = await askConfirm(
+        `You are changing the file extension from ${extensionLabel(fromExt)} to ${extensionLabel(toExt)}.\n\n“${entry.name}” → “${next}”\n\nPrograms may no longer open this file correctly.`,
+        "Change extension",
+      );
+      if (!confirmed) return;
+    }
+  }
+  await api("/api/rename", { method: "POST", json: { path: entry.path, name: next } });
   toast("Renamed");
   await load(state.path);
 }
@@ -1368,6 +1519,7 @@ async function boot() {
 }
 
 boot();
+applyTheme(currentTheme());
 
 $("login-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -1776,6 +1928,7 @@ window.addEventListener("keydown", (event) => {
     closeMenu();
     closePreview();
     closeLibrary();
+    closeSettings();
     if (marquee) endMarquee();
     if (state.selected.size) {
       state.selected = new Set();
@@ -2033,6 +2186,73 @@ $("bookmark-btn").addEventListener("click", async () => {
 
 $("library-btn").addEventListener("click", () => openLibrary());
 $("library-close").addEventListener("click", closeLibrary);
+$("settings-btn").addEventListener("click", () => openSettings());
+$("settings-close").addEventListener("click", closeSettings);
+$("settings-tab-theme").addEventListener("click", () => setSettingsTab("theme"));
+$("settings-tab-users").addEventListener("click", () => {
+  setSettingsTab("users");
+  loadUsers().catch((err) => toast(err.message, true));
+});
+$("theme-grid").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-theme-id]");
+  if (!button) return;
+  applyTheme(button.dataset.themeId);
+});
+$("user-create-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  $("user-create-error").textContent = "";
+  try {
+    await api("/api/users", {
+      method: "POST",
+      json: {
+        username: $("user-create-name").value.trim(),
+        password: $("user-create-pass").value,
+        admin: $("user-create-admin").checked,
+      },
+    });
+    $("user-create-form").reset();
+    toast("Account created");
+    await loadUsers();
+  } catch (err) {
+    $("user-create-error").textContent = err.message;
+  }
+});
+$("users-list").addEventListener("click", async (event) => {
+  const passwordBtn = event.target.closest("[data-user-password]");
+  const adminBtn = event.target.closest("[data-user-admin]");
+  const removeBtn = event.target.closest("[data-user-remove]");
+  try {
+    if (passwordBtn) {
+      const username = passwordBtn.dataset.userPassword;
+      const password = await askText(`Reset password for ${username}`, "New password", "", "Save");
+      if (password === null) return;
+      if (password.trim().length < 8) {
+        toast("Password must be at least 8 characters", true);
+        return;
+      }
+      await api("/api/users/password", { method: "POST", json: { username, password } });
+      toast("Password updated");
+      return;
+    }
+    if (adminBtn) {
+      const username = adminBtn.dataset.userAdmin;
+      const admin = adminBtn.dataset.admin === "1";
+      await api("/api/users/admin", { method: "POST", json: { username, admin } });
+      toast(admin ? "Administrator granted" : "Administrator revoked");
+      await loadUsers();
+      return;
+    }
+    if (removeBtn) {
+      const username = removeBtn.dataset.userRemove;
+      if (!await askConfirm(`Remove account “${username}”?`, "Remove")) return;
+      await api("/api/users/remove", { method: "POST", json: { username } });
+      toast("Account removed");
+      await loadUsers();
+    }
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
 $("library-tab-bookmarks").addEventListener("click", () => setLibraryTab("bookmarks"));
 $("library-tab-recent").addEventListener("click", () => setLibraryTab("recent"));
 $("empty-trash-btn").addEventListener("click", () => {

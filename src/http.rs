@@ -83,6 +83,10 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
         .route("/api/password", post(change_password))
+        .route("/api/users", get(list_users).post(create_managed_user))
+        .route("/api/users/password", post(admin_set_password))
+        .route("/api/users/admin", post(set_user_admin))
+        .route("/api/users/remove", post(remove_managed_user))
         .route("/api/list", get(list))
         .route("/api/meta", get(meta))
         .route("/api/raw", get(raw))
@@ -320,6 +324,17 @@ fn require_write(state: &AppState) -> Result<(), ApiError> {
     }
 }
 
+fn require_admin(user: &User) -> Result<(), ApiError> {
+    if user.is_admin {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Administrator access required",
+        ))
+    }
+}
+
 fn login_allowed(gate: &mut AttemptGate, username: &str) -> bool {
     let now = Instant::now();
     let window = Duration::from_secs(10 * 60);
@@ -473,11 +488,125 @@ async fn me(
     let (user, _) = require_user(&state, &headers)?;
     Ok(Json(json!({
         "username": user.username,
+        "admin": user.is_admin,
         "readonly": state.readonly,
         "version": env!("CARGO_PKG_VERSION"),
         "rootName": files::root_label(&state.root),
         "ffmpeg": state.ffmpeg,
     })))
+}
+
+async fn list_users(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let users = db::list_user_infos(&conn)
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(Json(json!({ "users": users })))
+}
+
+#[derive(Deserialize)]
+struct ManagedUserBody {
+    username: String,
+    password: String,
+    #[serde(default)]
+    admin: bool,
+}
+
+async fn create_managed_user(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<ManagedUserBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    db::create_user_with_admin(&conn, &body.username, &body.password, body.admin)
+        .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    record(
+        &state,
+        &user,
+        "user-add",
+        &format!("{}{}", body.username.trim(), if body.admin { " (admin)" } else { "" }),
+    );
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct AdminPasswordBody {
+    username: String,
+    password: String,
+}
+
+async fn admin_set_password(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AdminPasswordBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    db::set_password(&conn, &body.username, &body.password)
+        .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    record(&state, &user, "user-password", body.username.trim());
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct AdminFlagBody {
+    username: String,
+    admin: bool,
+}
+
+async fn set_user_admin(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AdminFlagBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    db::set_user_admin(&conn, &body.username, body.admin)
+        .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    record(
+        &state,
+        &user,
+        if body.admin { "user-admin-grant" } else { "user-admin-revoke" },
+        body.username.trim(),
+    );
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct RemoveUserBody {
+    username: String,
+}
+
+async fn remove_managed_user(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<RemoveUserBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    if user.username.eq_ignore_ascii_case(body.username.trim()) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "You cannot remove your own account while signed in",
+        ));
+    }
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    db::delete_user(&conn, &body.username)
+        .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    record(&state, &user, "user-remove", body.username.trim());
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn change_password(

@@ -2,6 +2,8 @@
 
 OwnNAS is a small web server you compile yourself. It shares one folder and its subfolders on your own network or VPN, with a username and password, file previews, and thumbnails. Accounts and sessions live in a SQLite file next to a thumbnail cache. The files themselves stay in the folder you choose.
 
+For a full walkthrough (thumbnails, media playback, tags, Trash, keyboard shortcuts, and more), see [DOCS.md](DOCS.md).
+
 ## Build
 
 Install a C compiler as well as Rust. SQLite is compiled into the binary.
