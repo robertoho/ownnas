@@ -53,9 +53,24 @@
       <nav id="crumbs" class="crumbs" aria-label="Current folder"></nav>
       <div class="top-actions">
         <span id="who" class="who"></span>
-        <button id="settings-btn" type="button">Settings</button>
-        <button id="password-btn" type="button">Password</button>
-        <button id="logout-btn" type="button">Sign out</button>
+        <button id="settings-btn" class="icon-btn" type="button" title="Settings" aria-label="Settings">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path d="M6.4 1.6h3.2l.35 1.55a4.8 4.8 0 0 1 1.15.66l1.55-.45 1.6 2.75-1.2 1.05c.08.35.12.7.12 1.05s-.04.7-.12 1.05l1.2 1.05-1.6 2.75-1.55-.45a4.8 4.8 0 0 1-1.15.66L9.6 14.4H6.4l-.35-1.55a4.8 4.8 0 0 1-1.15-.66l-1.55.45L1.75 9.9l1.2-1.05A4.9 4.9 0 0 1 2.8 7.8c0-.35.04-.7.12-1.05L1.75 5.7l1.6-2.75 1.55.45c.35-.28.73-.5 1.15-.66L6.4 1.6z" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/>
+            <circle cx="8" cy="8" r="2" fill="none" stroke="currentColor" stroke-width="1.35"/>
+          </svg>
+        </button>
+        <button id="password-btn" class="icon-btn" type="button" title="Change password" aria-label="Change password">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <rect x="3" y="7" width="10" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            <circle cx="8" cy="10.5" r="1" fill="currentColor"/>
+          </svg>
+        </button>
+        <button id="logout-btn" class="icon-btn" type="button" title="Sign out" aria-label="Sign out">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path d="M6.5 3H4a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h2.5M10 11.5 13.5 8 10 4.5M13.5 8H6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
       </div>
     </header>
 
@@ -99,6 +114,12 @@
           <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
             <path d="M1.5 4.5h4l1.2 1.5H14.5v7.5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-8a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
             <path d="M8 8v5M5.5 10.5H10.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <button id="newfile-btn" class="icon-btn" type="button" title="New file" aria-label="New file">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path d="M4.5 2.5h5L12.5 5.5V13a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+            <path d="M9.5 2.5V5.5H12.5M8 8v4M6 10h4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
           </svg>
         </button>
         <button id="upload-btn" class="icon-btn" type="button" title="Upload" aria-label="Upload files">
@@ -220,35 +241,65 @@
   </aside>
 
   <aside id="preview" class="preview" hidden>
-    <div class="preview-bar">
-      <h2 id="preview-title"></h2>
-      <button id="preview-close" type="button" aria-label="Close preview">Close</button>
+    <div class="preview-head">
+      <div class="preview-info">
+        <h2 id="preview-title"></h2>
+        <p id="preview-path" class="preview-path muted" hidden></p>
+        <p id="preview-meta" class="preview-meta muted"></p>
+      </div>
+      <div class="preview-bar-actions">
+        <button id="preview-expand" class="icon-btn" type="button" title="Expand preview" aria-label="Expand preview" aria-pressed="false">
+          <svg class="preview-expand-icon" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path d="M2.5 6V2.5H6M10 2.5h3.5V6M13.5 10v3.5H10M6 13.5H2.5V10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <svg class="preview-collapse-icon" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path d="M6 2.5V6H2.5M13.5 6H10V2.5M10 13.5V10h3.5M2.5 10H6v3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+        <button id="preview-close" class="icon-btn" type="button" title="Close preview" aria-label="Close preview">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
     </div>
-    <p id="preview-path" class="preview-path muted" hidden></p>
-    <p id="preview-meta" class="muted"></p>
+    <div id="preview-body" class="preview-body"></div>
     <section id="preview-notes" class="preview-notes" hidden>
-      <div id="notes-changed" class="notes-changed" hidden>
-        <p>This file changed since its tags/comments were last updated. Notes are still kept.</p>
-        <button id="notes-ack" type="button">Mark as current</button>
-      </div>
-      <div class="notes-block">
-        <h3>Tags</h3>
-        <div id="preview-tags" class="tag-list"></div>
-        <form id="tag-form" class="notes-form">
-          <input id="tag-input" type="text" maxlength="48" placeholder="Add a tag" autocomplete="off">
-          <button type="submit">Add</button>
-        </form>
-      </div>
-      <div class="notes-block">
-        <h3>Comments</h3>
-        <div id="preview-comments" class="comment-list"></div>
-        <form id="comment-form" class="notes-form comment-form">
-          <textarea id="comment-input" rows="2" maxlength="4000" placeholder="Add a comment"></textarea>
-          <button type="submit">Post</button>
-        </form>
+      <button type="button" id="notes-toggle" class="notes-summary" aria-expanded="false" aria-controls="notes-details">
+        <span id="notes-summary-tags" class="notes-summary-tags"></span>
+        <span id="notes-summary-comments" class="notes-summary-comments" hidden title="Has comments">
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+            <path d="M3 3.5h10A1.5 1.5 0 0 1 14.5 5v5A1.5 1.5 0 0 1 13 11.5H8.2L5 14v-2.5H3A1.5 1.5 0 0 1 1.5 10V5A1.5 1.5 0 0 1 3 3.5z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+          </svg>
+          <span id="notes-comment-count"></span>
+        </span>
+        <span class="notes-summary-spacer"></span>
+        <span class="notes-toggle-label">Notes</span>
+        <span class="notes-chevron" aria-hidden="true">▸</span>
+      </button>
+      <div id="notes-details" class="notes-details" hidden>
+        <div id="notes-changed" class="notes-changed" hidden>
+          <p>This file changed since its tags/comments were last updated. Notes are still kept.</p>
+          <button id="notes-ack" type="button">Mark as current</button>
+        </div>
+        <div class="notes-block">
+          <h3>Tags</h3>
+          <div id="preview-tags" class="tag-list"></div>
+          <form id="tag-form" class="notes-form">
+            <input id="tag-input" type="text" maxlength="48" placeholder="Add a tag" autocomplete="off">
+            <button type="submit">Add</button>
+          </form>
+        </div>
+        <div class="notes-block">
+          <h3>Comments</h3>
+          <div id="preview-comments" class="comment-list"></div>
+          <form id="comment-form" class="notes-form comment-form">
+            <textarea id="comment-input" rows="2" maxlength="4000" placeholder="Add a comment"></textarea>
+            <button type="submit">Post</button>
+          </form>
+        </div>
       </div>
     </section>
-    <div id="preview-body" class="preview-body"></div>
     <div class="preview-actions">
       <button id="preview-prev" type="button" hidden>Previous</button>
       <button id="preview-next" type="button" hidden>Next</button>
@@ -290,6 +341,25 @@
       <div class="dialog-actions">
         <button id="text-cancel" value="cancel" type="submit" formnovalidate>Cancel</button>
         <button id="text-ok" value="ok" type="submit">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="create-file-dialog">
+    <form method="dialog" id="create-file-form">
+      <h3>New file</h3>
+      <label>Type
+        <select id="create-file-kind">
+          <option value="md">Markdown (.md)</option>
+          <option value="csv">CSV (.csv)</option>
+        </select>
+      </label>
+      <label>Name
+        <input id="create-file-name" required autocomplete="off" maxlength="180">
+      </label>
+      <div class="dialog-actions">
+        <button value="cancel" type="submit" formnovalidate>Cancel</button>
+        <button id="create-file-ok" value="ok" type="submit">Create</button>
       </div>
     </form>
   </dialog>

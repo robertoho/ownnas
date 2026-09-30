@@ -92,6 +92,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/raw", get(raw))
         .route("/api/thumb", get(thumb))
         .route("/api/mkdir", post(mkdir))
+        .route("/api/create", post(create_entry))
         .route("/api/rename", post(rename))
         .route("/api/upload", post(upload).layer(DefaultBodyLimit::disable()))
         .route("/api/upload/conflicts", post(upload_conflicts))
@@ -265,6 +266,13 @@ struct ConflictBody {
 struct NameBody {
     path: Option<String>,
     name: String,
+}
+
+#[derive(Deserialize)]
+struct CreateBody {
+    path: Option<String>,
+    name: String,
+    kind: String,
 }
 
 #[derive(Deserialize)]
@@ -946,6 +954,26 @@ async fn mkdir(
         .map_err(ApiError::from)?;
     record(&state, &user, "create-folder", &label);
     Ok(Json(json!({ "ok": true })))
+}
+
+async fn create_entry(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<CreateBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let root = state.root.clone();
+    let parent = rel_of(&body.path);
+    let name = body.name;
+    let kind = body.kind;
+    let created = tokio::task::spawn_blocking(move || files::create_file(&root, &parent, &name, &kind))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not create the file"))?
+        .map_err(ApiError::from)?;
+    record(&state, &user, "create-file", &created);
+    Ok(Json(json!({ "ok": true, "path": created })))
 }
 
 async fn rename(
