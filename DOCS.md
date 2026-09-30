@@ -77,7 +77,7 @@ After sign-in you get a file manager over `--root`:
 
 ### Context menus
 
-- **Right-click empty space**: New folder, Paste (when clipboard has items).
+- **Right-click empty space**: New folder, New file, Paste (when clipboard has items).
 - **Right-click selection / ··· menu**: Open, Download, Copy/Cut, Paste, Duplicate, Move, Rename, Trash/Delete, Restore (in Trash).
 - **New folder with selection** (2+ items): creates a folder in the current directory and moves the selected items into it.
 
@@ -226,6 +226,7 @@ Uploads show a status panel with progress and cancel.
 | Action | Notes |
 | --- | --- |
 | New folder | Toolbar or empty-space menu. |
+| New file | Toolbar or empty-space menu. Formats: Markdown (`.md`), CSV (`.csv`). Opens in preview after create. |
 | Rename / Move / Copy / Duplicate | Context menu or preview actions. |
 | Cut / Paste | Same-directory cut is a no-op paste (“already here”). |
 | Trash / Restore / Empty Trash | Soft delete into `.ownnas-trash`. |

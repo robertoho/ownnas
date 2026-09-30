@@ -234,6 +234,53 @@ pub fn make_dir(root: &Path, parent_rel: &str, name: &str) -> Result<(), FileErr
     fs::create_dir(&dest).map_err(map_io)
 }
 
+/// Creates a new empty-ish file of a supported kind (`md`, `csv`) in `parent_rel`.
+/// Returns the relative path of the created file.
+pub fn create_file(root: &Path, parent_rel: &str, name: &str, kind: &str) -> Result<String, FileError> {
+    let ext = match kind {
+        "md" | "csv" => kind,
+        _ => return Err(FileError::Rejected("Unsupported file type")),
+    };
+    let name = finalize_new_filename(name, ext)?;
+    if !valid_new_component(&name) {
+        return Err(FileError::InvalidName);
+    }
+    let parent = resolve(root, parent_rel)?;
+    if !parent.full.is_dir() {
+        return Err(FileError::NotADirectory);
+    }
+    let dest = parent.full.join(&name);
+    if dest.exists() {
+        return Err(FileError::AlreadyExists);
+    }
+    let stem = Path::new(&name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Untitled".to_string());
+    let body = match ext {
+        "md" => format!("# {stem}\n\n"),
+        "csv" => String::new(),
+        _ => String::new(),
+    };
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&dest)
+        .map_err(|err| {
+            if err.kind() == io::ErrorKind::AlreadyExists {
+                FileError::AlreadyExists
+            } else {
+                map_io(err)
+            }
+        })?;
+    file.write_all(body.as_bytes()).map_err(map_io)?;
+    Ok(if parent.rel.is_empty() {
+        name
+    } else {
+        format!("{}/{}", parent.rel, name)
+    })
+}
+
 pub fn rename_entry(root: &Path, rel: &str, new_name: &str) -> Result<String, FileError> {
     if !valid_new_component(new_name) {
         return Err(FileError::InvalidName);
@@ -1089,6 +1136,24 @@ fn valid_new_component(name: &str) -> bool {
         && !name.chars().any(|c| c.is_control())
 }
 
+fn finalize_new_filename(name: &str, ext: &str) -> Result<String, FileError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(FileError::InvalidName);
+    }
+    let want = format!(".{ext}");
+    let lower = name.to_lowercase();
+    if lower.ends_with(&want) {
+        return Ok(name.to_string());
+    }
+    if let Some(idx) = name.rfind('.') {
+        if idx > 0 {
+            return Ok(format!("{}{want}", &name[..idx]));
+        }
+    }
+    Ok(format!("{name}{want}"))
+}
+
 fn unique_path(path: PathBuf) -> PathBuf {
     if !path.exists() {
         return path;
@@ -1585,6 +1650,27 @@ mod tests {
         fs::create_dir_all(path.join("sub")).unwrap();
         fs::write(path.join("sub").join("note.txt"), b"hello").unwrap();
         path.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn creates_markdown_and_csv_files() {
+        let root = scratch();
+        let md = create_file(&root, "sub", "Notes", "md").unwrap();
+        assert_eq!(md, "sub/Notes.md");
+        let text = fs::read_to_string(root.join("sub").join("Notes.md")).unwrap();
+        assert!(text.starts_with("# Notes\n"));
+        let csv = create_file(&root, "sub", "data.csv", "csv").unwrap();
+        assert_eq!(csv, "sub/data.csv");
+        assert!(root.join("sub").join("data.csv").exists());
+        assert!(matches!(
+            create_file(&root, "sub", "Notes", "md"),
+            Err(FileError::AlreadyExists)
+        ));
+        assert!(matches!(
+            create_file(&root, "sub", "x", "docx"),
+            Err(FileError::Rejected(_))
+        ));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

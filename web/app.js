@@ -155,6 +155,7 @@ function showApp() {
   $("who").textContent = state.me.admin ? `${state.me.username} · admin` : state.me.username;
   const write = !state.me.readonly;
   $("mkdir-btn").hidden = !write;
+  $("newfile-btn").hidden = !write;
   $("upload-btn").hidden = !write;
   $("folder-btn").hidden = !write;
   $("preview-rename").hidden = !write;
@@ -195,20 +196,22 @@ function hashToPath() {
   return hash.split("/").filter(Boolean).map(decodeURIComponent).join("/");
 }
 
-function glyph(kind) {
-  return {
-    folder: "DIR",
-    "archive-folder": "ARC",
-    "trash-folder": "BIN",
-    image: "IMG",
-    svg: "SVG",
-    video: "VID",
-    audio: "AUD",
-    pdf: "PDF",
-    text: "TXT",
-    archive: "ZIP",
-    file: "FILE",
-  }[kind] || "FILE";
+function typeIcon(kind) {
+  const icons = {
+    folder: `<path d="M2 4.5A1.5 1.5 0 0 1 3.5 3H7l1.2 1.5H12.5A1.5 1.5 0 0 1 14 6v6.5A1.5 1.5 0 0 1 12.5 14h-9A1.5 1.5 0 0 1 2 12.5z" fill="currentColor" opacity="0.22"/><path d="M2 6.5h12v6A1.5 1.5 0 0 1 12.5 14h-9A1.5 1.5 0 0 1 2 12.5z" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3H7l1.5 1.8H12.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>`,
+    "archive-folder": `<path d="M3 3.5h10v2H3zm1 2v7.5A1.5 1.5 0 0 0 5.5 14.5h5A1.5 1.5 0 0 0 12 13V5.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M6.5 8.5h3M6.5 11h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>`,
+    "trash-folder": `<path d="M3.5 5h9M6 5V3.8A.8.8 0 0 1 6.8 3h2.4a.8.8 0 0 1 .8.8V5m-.8 0v7.2a1 1 0 0 1-1 1H7.8a1 1 0 0 1-1-1V5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M7 7.5v4M9 7.5v4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>`,
+    image: `<rect x="2.5" y="3.5" width="11" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="6" cy="7" r="1.1" fill="currentColor"/><path d="M2.8 11.2 6.2 8.4l2.1 1.7 2.2-2.5 2.7 3.6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>`,
+    svg: `<rect x="2.5" y="3.5" width="11" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M5 10.5 8 5.5l3 5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>`,
+    video: `<rect x="2.5" y="3.5" width="11" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M7 6.2v3.6L10.2 8z" fill="currentColor"/>`,
+    audio: `<path d="M5 10.5a1.7 1.7 0 1 0 0 .2V6.2L12 4.8v4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="5" cy="11" r="1.7" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="12" cy="9.5" r="1.7" fill="none" stroke="currentColor" stroke-width="1.5"/>`,
+    pdf: `<path d="M4.5 2.5h5L12.5 5v8.5A1.5 1.5 0 0 1 11 15H5A1.5 1.5 0 0 1 3.5 13.5v-10A1 1 0 0 1 4.5 2.5z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M9.5 2.6V5h2.4M5.5 9h5M5.5 11.5h3.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>`,
+    text: `<path d="M4.5 2.5h5L12.5 5v8.5A1.5 1.5 0 0 1 11 15H5A1.5 1.5 0 0 1 3.5 13.5v-10A1 1 0 0 1 4.5 2.5z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M9.5 2.6V5h2.4M5.8 8.5h4.4M5.8 11h3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>`,
+    archive: `<path d="M3 3.5h10v2.2H3zm1.2 2.2v7.8A1.5 1.5 0 0 0 5.7 15h4.6a1.5 1.5 0 0 0 1.5-1.5V5.7" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 8.2v4.2M6.6 10.3h2.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>`,
+    file: `<path d="M4.5 2.5h5L12.5 5v8.5A1.5 1.5 0 0 1 11 15H5A1.5 1.5 0 0 1 3.5 13.5v-10A1 1 0 0 1 4.5 2.5z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M9.5 2.6V5h2.4" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>`,
+  };
+  const body = icons[kind] || icons.file;
+  return `<svg class="type-icon" viewBox="0 0 16 16" width="28" height="28" aria-hidden="true">${body}</svg>`;
 }
 
 function sortedEntries() {
@@ -271,7 +274,7 @@ function renderFiles() {
       ? `<img alt="" loading="lazy" src="/api/thumb?path=${encodeURIComponent(entry.path)}&v=${entry.modified}">`
       : entry.kind === "svg"
         ? `<img alt="" loading="lazy" src="/api/raw?path=${encodeURIComponent(entry.path)}">`
-        : `<span class="glyph">${glyph(entry.kind)}</span>`;
+        : `<span class="glyph kind-${esc(entry.kind)}" aria-hidden="true">${typeIcon(entry.kind)}</span>`;
     const selected = state.selected.has(entry.path);
     const cut = state.clipboard && state.clipboard.mode === "cut" && state.clipboard.items.some((item) => item.path === entry.path);
     const archiveFolder = entry.kind === "archive-folder";
@@ -308,7 +311,11 @@ function renderFiles() {
   }).join("");
   host.querySelectorAll("img").forEach((img) => {
     img.addEventListener("error", () => {
-      img.replaceWith(Object.assign(document.createElement("span"), { className: "glyph", textContent: "FILE" }));
+      const wrap = document.createElement("span");
+      wrap.className = "glyph kind-file";
+      wrap.setAttribute("aria-hidden", "true");
+      wrap.innerHTML = typeIcon("file");
+      img.replaceWith(wrap);
     });
   });
 }
@@ -492,6 +499,7 @@ function openSelectionMenu(x, y, pasteInto) {
   }
   if (!entries.length && write) {
     buttons.push(`<button type="button" data-menu="mkdir">New folder</button>`);
+    buttons.push(`<button type="button" data-menu="newfile">New file…</button>`);
   }
   if (one) buttons.push(`<button type="button" data-menu="open">Open</button>`);
   if (entries.length) buttons.push(`<button type="button" data-menu="download">Download</button>`);
@@ -521,6 +529,7 @@ function openSelectionMenu(x, y, pasteInto) {
 }
 
 function closePreview() {
+  setPreviewFullscreen(false);
   $("preview").hidden = true;
   state.current = null;
   $("preview-body").innerHTML = "";
@@ -528,10 +537,22 @@ function closePreview() {
   $("preview-path").textContent = "";
   $("preview-notes").hidden = true;
   $("notes-changed").hidden = true;
+  setNotesExpanded(false);
   $("preview-tags").innerHTML = "";
   $("preview-comments").innerHTML = "";
+  $("notes-summary-tags").innerHTML = "";
+  $("notes-summary-comments").hidden = true;
   $("tag-input").value = "";
   $("comment-input").value = "";
+}
+
+function setPreviewFullscreen(on) {
+  const preview = $("preview");
+  const btn = $("preview-expand");
+  preview.classList.toggle("is-fullscreen", !!on);
+  btn.setAttribute("aria-pressed", on ? "true" : "false");
+  btn.title = on ? "Collapse preview" : "Expand preview";
+  btn.setAttribute("aria-label", on ? "Collapse preview" : "Expand preview");
 }
 
 function closeLibrary() {
@@ -675,11 +696,23 @@ async function openEntry(entry) {
 async function loadAnnotations(path) {
   const notes = $("preview-notes");
   notes.hidden = false;
+  setNotesExpanded(false);
   $("preview-tags").innerHTML = `<span class="notes-empty">Loading…</span>`;
   $("preview-comments").innerHTML = "";
+  $("notes-summary-tags").innerHTML = `<span class="notes-empty-inline">Loading…</span>`;
+  $("notes-summary-comments").hidden = true;
   const data = await api(`/api/annotations?path=${encodeURIComponent(path)}`);
   if (!state.current || state.current.path !== path) return;
   renderAnnotations(data);
+}
+
+function setNotesExpanded(expanded) {
+  const notes = $("preview-notes");
+  const details = $("notes-details");
+  const toggle = $("notes-toggle");
+  notes.dataset.expanded = expanded ? "true" : "false";
+  details.hidden = !expanded;
+  toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
 }
 
 function renderAnnotations(data) {
@@ -689,6 +722,20 @@ function renderAnnotations(data) {
   const changed = !!data.changed;
   $("notes-changed").hidden = !changed;
   $("notes-ack").hidden = !write;
+  $("tag-form").hidden = !write;
+  $("comment-form").hidden = !write;
+
+  $("notes-summary-tags").innerHTML = tags.length
+    ? tags.slice(0, 6).map((tag) => {
+        const color = tagColor(tag);
+        return `<span class="tag-badge" title="${esc(tag)}" style="--tag-bg:${color}">${esc(tagInitials(tag))}</span>`;
+      }).join("") + (tags.length > 6 ? `<span class="notes-empty-inline">+${tags.length - 6}</span>` : "")
+    : `<span class="notes-empty-inline">No tags</span>`;
+
+  const hasComments = comments.length > 0;
+  $("notes-summary-comments").hidden = !hasComments;
+  $("notes-comment-count").textContent = hasComments ? String(comments.length) : "";
+
   $("preview-tags").innerHTML = tags.length
     ? tags.map((tag) => `<span class="tag-chip"><button type="button" class="tag-link" data-search-tag="${esc(tag)}">${esc(tag)}</button>${write ? `<button type="button" data-remove-tag="${esc(tag)}" aria-label="Remove tag ${esc(tag)}">×</button>` : ""}</span>`).join("")
     : `<span class="notes-empty">No tags yet</span>`;
@@ -1213,6 +1260,69 @@ async function createFolder() {
   await api("/api/mkdir", { method: "POST", json: { path: state.path, name } });
   toast("Folder created");
   await load(state.path);
+}
+
+const NEW_FILE_KINDS = {
+  md: { label: "Markdown", ext: "md", defaultName: "Untitled" },
+  csv: { label: "CSV", ext: "csv", defaultName: "Untitled" },
+};
+
+function syncCreateFileName(kind, forceDefault) {
+  const meta = NEW_FILE_KINDS[kind] || NEW_FILE_KINDS.md;
+  const input = $("create-file-name");
+  const current = input.value.trim();
+  const stem = (() => {
+    if (!current || forceDefault) return meta.defaultName;
+    const dot = current.lastIndexOf(".");
+    if (dot > 0) return current.slice(0, dot);
+    return current;
+  })();
+  input.value = `${stem}.${meta.ext}`;
+}
+
+function askCreateFile(preferredKind) {
+  const dialog = $("create-file-dialog");
+  const kindSelect = $("create-file-kind");
+  const kinds = Object.keys(NEW_FILE_KINDS);
+  kindSelect.value = kinds.includes(preferredKind) ? preferredKind : "md";
+  syncCreateFileName(kindSelect.value, true);
+  dialog.returnValue = "";
+  dialog.showModal();
+  $("create-file-name").focus();
+  $("create-file-name").select();
+  return new Promise((resolve) => {
+    const onCancel = () => {
+      dialog.returnValue = "cancel";
+    };
+    const onKind = () => syncCreateFileName(kindSelect.value, false);
+    kindSelect.addEventListener("change", onKind);
+    dialog.addEventListener("cancel", onCancel, { once: true });
+    dialog.addEventListener("close", () => {
+      dialog.removeEventListener("cancel", onCancel);
+      kindSelect.removeEventListener("change", onKind);
+      if (dialog.returnValue !== "ok") {
+        resolve(null);
+        return;
+      }
+      resolve({
+        kind: kindSelect.value,
+        name: $("create-file-name").value.trim(),
+      });
+    }, { once: true });
+  });
+}
+
+async function createFile(preferredKind) {
+  const choice = await askCreateFile(preferredKind);
+  if (!choice || !choice.name) return;
+  const data = await api("/api/create", {
+    method: "POST",
+    json: { path: state.path, name: choice.name, kind: choice.kind },
+  });
+  toast("File created");
+  await load(state.path);
+  const created = state.entries.find((entry) => entry.path === data.path);
+  if (created) openEntry(created).catch((err) => toast(err.message, true));
 }
 
 async function createFolderWithSelection(entries) {
@@ -1775,6 +1885,7 @@ $("menu").addEventListener("click", (event) => {
   if (action === "cut") setClipboard("cut", entries);
   if (action === "paste") pasteClipboard(pasteInto).catch((err) => toast(err.message, true));
   if (action === "mkdir") createFolder().catch((err) => toast(err.message, true));
+  if (action === "newfile") createFile().catch((err) => toast(err.message, true));
   if (action === "folderWith") createFolderWithSelection(entries).catch((err) => toast(err.message, true));
   if (action === "rename" && one) renameEntry(one).catch((err) => toast(err.message, true));
   if (action === "restore") restoreEntries(entries).catch((err) => toast(err.message, true));
@@ -1789,6 +1900,10 @@ document.addEventListener("click", (event) => {
 
 $("preview-close").addEventListener("click", closePreview);
 
+$("preview-expand").addEventListener("click", () => {
+  setPreviewFullscreen(!$("preview").classList.contains("is-fullscreen"));
+});
+
 $("notes-ack").addEventListener("click", async () => {
   if (!state.current) return;
   try {
@@ -1798,6 +1913,11 @@ $("notes-ack").addEventListener("click", async () => {
   } catch (err) {
     toast(err.message, true);
   }
+});
+
+$("notes-toggle").addEventListener("click", () => {
+  const expanded = $("preview-notes").dataset.expanded === "true";
+  setNotesExpanded(!expanded);
 });
 
 $("tag-form").addEventListener("submit", async (event) => {
@@ -1900,6 +2020,10 @@ $("mkdir-btn").addEventListener("click", () => {
   createFolder().catch((err) => toast(err.message, true));
 });
 
+$("newfile-btn").addEventListener("click", () => {
+  createFile().catch((err) => toast(err.message, true));
+});
+
 $("upload-btn").addEventListener("click", () => $("upload-input").click());
 $("folder-btn").addEventListener("click", () => $("folder-input").click());
 
@@ -1926,6 +2050,10 @@ window.addEventListener("keydown", (event) => {
     // Let open dialogs handle Escape themselves (and avoid clearing selection mid-prompt).
     if (document.querySelector("dialog[open]")) return;
     closeMenu();
+    if ($("preview").classList.contains("is-fullscreen")) {
+      setPreviewFullscreen(false);
+      return;
+    }
     closePreview();
     closeLibrary();
     closeSettings();
@@ -1938,9 +2066,10 @@ window.addEventListener("keydown", (event) => {
     return;
   }
   // Enter in the name dialog should confirm, not hit Cancel (first submit button).
-  if (event.key === "Enter" && event.target && event.target.id === "text-input") {
+  if (event.key === "Enter" && event.target && (event.target.id === "text-input" || event.target.id === "create-file-name")) {
     event.preventDefault();
-    $("text-ok").click();
+    if (event.target.id === "create-file-name") $("create-file-ok").click();
+    else $("text-ok").click();
     return;
   }
   if (document.querySelector("dialog[open]")) return;
@@ -1998,7 +2127,7 @@ window.addEventListener("paste", (event) => {
   const data = event.clipboardData;
   if (!data) return;
 
-  const editingSensitive = event.target.closest("#login-view, #password-dialog, #text-dialog, #comment-input, #tag-input, #search-input");
+  const editingSensitive = event.target.closest("#login-view, #password-dialog, #text-dialog, #create-file-dialog, #comment-input, #tag-input, #search-input");
   const hasFiles = clipboardHasFiles(data);
 
   // File paste should upload even when the folder filter (or similar) is focused.
