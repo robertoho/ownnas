@@ -93,6 +93,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/thumb", get(thumb))
         .route("/api/mkdir", post(mkdir))
         .route("/api/create", post(create_entry))
+        .route("/api/write", post(write_entry))
         .route("/api/rename", post(rename))
         .route("/api/upload", post(upload).layer(DefaultBodyLimit::disable()))
         .route("/api/upload/conflicts", post(upload_conflicts))
@@ -247,6 +248,7 @@ struct PathQuery {
     path: Option<String>,
     download: Option<String>,
     hidden: Option<String>,
+    slow: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -273,6 +275,12 @@ struct CreateBody {
     path: Option<String>,
     name: String,
     kind: String,
+}
+
+#[derive(Deserialize)]
+struct WriteBody {
+    path: String,
+    content: String,
 }
 
 #[derive(Deserialize)]
@@ -679,6 +687,20 @@ async fn list(
                 }
             }
         }
+        for entry in &mut listing.entries {
+            if !entry.dir {
+                continue;
+            }
+            let Ok(stamp) = files::folder_stamp(&state.root, &entry.path) else {
+                continue;
+            };
+            if let Ok(Some(row)) = db::get_folder_size(&conn, &entry.path) {
+                if row.fingerprint == stamp {
+                    entry.measured_size = Some(row.bytes);
+                    entry.measured_truncated = Some(row.truncated);
+                }
+            }
+        }
     }
     Ok(Json(listing))
 }
@@ -952,6 +974,7 @@ async fn mkdir(
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not create the folder"))?
         .map_err(ApiError::from)?;
+    invalidate_sizes(&state, &rel_of(&body.path));
     record(&state, &user, "create-folder", &label);
     Ok(Json(json!({ "ok": true })))
 }
@@ -972,8 +995,29 @@ async fn create_entry(
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not create the file"))?
         .map_err(ApiError::from)?;
+    invalidate_sizes(&state, &parent_rel_path(&created));
     record(&state, &user, "create-file", &created);
     Ok(Json(json!({ "ok": true, "path": created })))
+}
+
+async fn write_entry(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<WriteBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let root = state.root.clone();
+    let path = body.path.clone();
+    let content = body.content;
+    tokio::task::spawn_blocking(move || files::write_text_file(&root, &path, &content))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not save the file"))?
+        .map_err(ApiError::from)?;
+    invalidate_sizes(&state, &parent_rel_path(&body.path));
+    record(&state, &user, "edit-file", &body.path);
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn rename(
@@ -1185,6 +1229,7 @@ async fn upload(
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose at least one file"));
     }
     if saved > 0 {
+        invalidate_sizes(&state, &dir_rel);
         record(&state, &user, "upload", &format!("{saved} file(s)"));
     }
     Ok(Json(json!({ "saved": saved, "skipped": skipped })))
@@ -1203,6 +1248,18 @@ fn rewrite_meta(state: &AppState, from: &str, to: &str) {
 fn delete_meta(state: &AppState, path: &str) {
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     let _ = db::delete_path_meta(&conn, path);
+}
+
+fn invalidate_sizes(state: &AppState, path: &str) {
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let _ = db::invalidate_folder_sizes(&conn, path);
+}
+
+fn parent_rel_path(path: &str) -> String {
+    match path.rfind('/') {
+        Some(idx) => path[..idx].to_string(),
+        None => String::new(),
+    }
 }
 
 fn copy_meta(state: &AppState, from: &str, to: &str) {
@@ -1487,10 +1544,57 @@ async fn folder_usage(
     require_user(&state, &headers)?;
     let root = state.root.clone();
     let rel = rel_of(&query.path);
-    let usage = tokio::task::spawn_blocking(move || files::usage(&root, &rel))
-        .await
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not measure the folder"))?
-        .map_err(ApiError::from)?;
+    let slow = flag(&query.slow);
+    let stamp = tokio::task::spawn_blocking({
+        let root = root.clone();
+        let rel = rel.clone();
+        move || files::folder_stamp(&root, &rel)
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the folder"))?
+    .map_err(ApiError::from)?;
+    {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        if let Ok(Some(row)) = db::get_folder_size(&conn, &rel) {
+            if row.fingerprint == stamp {
+                return Ok(Json(files::Usage {
+                    bytes: row.bytes,
+                    files: row.files,
+                    truncated: row.truncated,
+                    cached: true,
+                    fingerprint: row.fingerprint,
+                    max_mtime: row.max_mtime,
+                }));
+            }
+        }
+    }
+    let usage = tokio::task::spawn_blocking({
+        let root = root.clone();
+        let rel = rel.clone();
+        move || {
+            if slow {
+                files::usage_paced(&root, &rel, true)
+            } else {
+                files::usage(&root, &rel)
+            }
+        }
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not measure the folder"))?
+    .map_err(ApiError::from)?;
+    {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        let _ = db::invalidate_folder_size_ancestors(&conn, &rel);
+        let _ = db::upsert_folder_size(
+            &conn,
+            &rel,
+            usage.bytes,
+            usage.files,
+            usage.truncated,
+            usage.max_mtime,
+            &usage.fingerprint,
+        );
+    }
     Ok(Json(usage))
 }
 
@@ -1556,6 +1660,7 @@ async fn copy_item(
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not copy the item"))?
         .map_err(ApiError::from)?;
     copy_meta(&state, &from, &path);
+    invalidate_sizes(&state, &parent_rel_path(&path));
     record(&state, &user, "copy", &label);
     Ok(Json(json!({ "path": path })))
 }
@@ -1576,6 +1681,7 @@ async fn duplicate_item(
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not duplicate the item"))?
         .map_err(ApiError::from)?;
     copy_meta(&state, &from, &path);
+    invalidate_sizes(&state, &parent_rel_path(&path));
     record(&state, &user, "duplicate", &label);
     Ok(Json(json!({ "path": path })))
 }

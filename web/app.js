@@ -10,6 +10,9 @@ const state = {
   hidden: localStorage.getItem("ownnas-hidden") === "1",
   filter: "",
   current: null,
+  editor: null,
+  folderSizeGen: 0,
+  folderSizes: new Map(),
   selected: new Set(),
   anchor: "",
   clipboard: null,
@@ -138,6 +141,7 @@ async function api(url, options = {}) {
 }
 
 function showLogin(message) {
+  clearEditor();
   $("boot").hidden = true;
   $("app-view").hidden = true;
   $("preview").hidden = true;
@@ -179,9 +183,34 @@ function formatSize(bytes, dir) {
   return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unit]}`;
 }
 
+function formatFolderSize(info) {
+  if (!info) return "Folder";
+  const label = formatSize(info.bytes || 0, false);
+  return info.truncated ? `${label}+` : label;
+}
+
+function invalidateFolderSizes() {
+  state.folderSizes.clear();
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function formatDate(seconds) {
   if (!seconds) return "";
   return new Date(seconds * 1000).toLocaleString();
+}
+
+function formatDateShort(seconds) {
+  if (!seconds) return "";
+  return new Date(seconds * 1000).toLocaleString(undefined, {
+    year: "2-digit",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function pathToHash(path) {
@@ -279,19 +308,36 @@ function renderFiles() {
     const cut = state.clipboard && state.clipboard.mode === "cut" && state.clipboard.items.some((item) => item.path === entry.path);
     const archiveFolder = entry.kind === "archive-folder";
     const trashFolder = entry.kind === "trash-folder";
+    const mediaCard = entry.kind === "image" || entry.kind === "svg" || entry.kind === "video";
     const displayName = archiveFolder ? "Archive" : trashFolder ? "Trash" : entry.name;
     const badge = archiveFolder
       ? `<span class="badge">Archive</span>`
       : trashFolder
         ? `<span class="badge trash">Trash</span>`
         : "";
+    const cachedSize = entry.dir
+      ? (state.folderSizes.get(entry.path)
+        || (entry.measuredSize != null
+          ? { bytes: entry.measuredSize, truncated: !!entry.measuredTruncated }
+          : null))
+      : null;
     const sub = trashFolder
       ? "OwnNAS trash"
       : archiveFolder
         ? "OwnNAS archive"
         : entry.original
           ? `From ${entry.original}`
-          : esc(formatSize(entry.size, entry.dir));
+          : entry.dir
+            ? esc(formatFolderSize(cachedSize))
+            : esc(formatSize(entry.size, false));
+    const createdLabel = formatDateShort(entry.created || entry.modified);
+    const modifiedLabel = formatDateShort(entry.modified);
+    const dates = (!trashFolder && !archiveFolder && (createdLabel || modifiedLabel))
+      ? `<div class="meta-dates">
+          ${createdLabel ? `<span title="Created ${esc(formatDate(entry.created || entry.modified))}">Created ${esc(createdLabel)}</span>` : ""}
+          ${modifiedLabel ? `<span title="Modified ${esc(formatDate(entry.modified))}">Modified ${esc(modifiedLabel)}</span>` : ""}
+        </div>`
+      : "";
     const tags = entry.tags || [];
     const shownTags = tags.slice(0, 3);
     const tagStack = shownTags.length
@@ -300,11 +346,12 @@ function renderFiles() {
           return `<button type="button" class="tag-badge" data-filter-tag="${esc(tag)}" title="${esc(tag)}" style="--tag-bg:${color}">${esc(tagInitials(tag))}</button>`;
         }).join("")}${tags.length > 3 ? `<span class="tag-badge more-tags" title="${esc(tags.slice(3).join(", "))}">+${tags.length - 3}</span>` : ""}</div>`
       : "";
-    return `<article class="card${selected ? " selected" : ""}${cut ? " cut" : ""}${archiveFolder ? " archive-folder" : ""}${trashFolder ? " trash-folder" : ""}" data-path="${esc(entry.path)}" data-dir="${entry.dir ? "1" : "0"}" aria-selected="${selected ? "true" : "false"}">
+    return `<article class="card${selected ? " selected" : ""}${cut ? " cut" : ""}${archiveFolder ? " archive-folder" : ""}${trashFolder ? " trash-folder" : ""}${mediaCard ? " media-card" : ""}" data-path="${esc(entry.path)}" data-dir="${entry.dir ? "1" : "0"}" aria-selected="${selected ? "true" : "false"}">
       <div class="thumb">${thumb}${badge}${tagStack}</div>
       <div class="card-body">
         <div class="name" title="${esc(entry.path)}">${esc(displayName)}</div>
         <div class="sub" title="${entry.original ? esc(entry.original) : ""}">${sub}</div>
+        ${dates}
       </div>
       <button class="more" type="button" data-menu-for="${esc(entry.path)}" aria-label="Actions for ${esc(displayName)}">···</button>
     </article>`;
@@ -318,9 +365,14 @@ function renderFiles() {
       img.replaceWith(wrap);
     });
   });
+  updateSelectionSummary();
 }
 
-async function load(path) {
+async function load(path, options = {}) {
+  if (!options.keepPreview && state.editor && state.editor.dirty) {
+    if (!window.confirm("You have unsaved edits. Discard them?")) return;
+    state.editor.dirty = false;
+  }
   const gen = ++loadGen;
   const hidden = state.hidden ? "&hidden=1" : "";
   const data = await api(`/api/list?path=${encodeURIComponent(path)}${hidden}`);
@@ -332,12 +384,76 @@ async function load(path) {
   if (data.rootName) state.me.rootName = data.rootName;
   state.selected = new Set();
   state.anchor = "";
-  closePreview();
+  if (!options.keepPreview) closePreview(true);
   renderCrumbs();
   renderFiles();
   $("zip-link").href = `/api/zip?path=${encodeURIComponent(state.path)}`;
   syncBookmarkBtn();
   $("empty-trash-btn").hidden = !(state.me && !state.me.readonly && inTrashPath(state.path));
+  scheduleFolderSizes();
+}
+
+function applyFolderSize(path, info) {
+  const card = [...$("files").querySelectorAll('.card[data-dir="1"]')]
+    .find((el) => el.dataset.path === path);
+  if (!card) return;
+  const sub = card.querySelector(".sub");
+  if (!sub) return;
+  const text = sub.textContent || "";
+  if (text === "OwnNAS trash" || text === "OwnNAS archive" || text.startsWith("From ")) return;
+  sub.textContent = formatFolderSize(info);
+  sub.title = info.truncated ? "Count stopped early" : "";
+  const entry = state.entries.find((item) => item.path === path);
+  if (entry) {
+    entry.size = info.bytes || 0;
+    entry.measuredSize = info.bytes || 0;
+    entry.measuredTruncated = !!info.truncated;
+  }
+  if (state.selected.has(path)) updateSelectionSummary();
+}
+
+function scheduleFolderSizes() {
+  const gen = ++state.folderSizeGen;
+  const folders = state.entries.filter((entry) => {
+    if (!entry.dir) return false;
+    if (entry.kind === "archive-folder" || entry.kind === "trash-folder") return false;
+    return true;
+  });
+  (async () => {
+    for (const entry of folders) {
+      if (gen !== state.folderSizeGen) return;
+      if (entry.measuredSize != null) {
+        const info = {
+          bytes: entry.measuredSize,
+          truncated: !!entry.measuredTruncated,
+          files: 0,
+        };
+        state.folderSizes.set(entry.path, info);
+        applyFolderSize(entry.path, info);
+        continue;
+      }
+      // Stamp mismatch or never measured — drop any stale memory cache and scan.
+      state.folderSizes.delete(entry.path);
+      applyFolderSize(entry.path, null);
+      try {
+        const usage = await api(`/api/usage?path=${encodeURIComponent(entry.path)}&slow=1`);
+        if (gen !== state.folderSizeGen) return;
+        const info = {
+          bytes: usage.bytes || 0,
+          truncated: !!usage.truncated,
+          files: usage.files || 0,
+        };
+        state.folderSizes.set(entry.path, info);
+        entry.measuredSize = info.bytes;
+        entry.measuredTruncated = info.truncated;
+        applyFolderSize(entry.path, info);
+        if (!usage.cached) await sleep(150);
+      } catch {
+        // Leave the placeholder; another pass can retry later.
+      }
+      if (gen !== state.folderSizeGen) return;
+    }
+  })();
 }
 
 function syncBookmarkBtn() {
@@ -374,6 +490,41 @@ function selectedEntries() {
   return state.entries.filter((entry) => state.selected.has(entry.path));
 }
 
+function entryKnownBytes(entry) {
+  if (!entry) return null;
+  if (!entry.dir) return entry.size || 0;
+  if (entry.kind === "archive-folder" || entry.kind === "trash-folder") return null;
+  const cached = state.folderSizes.get(entry.path);
+  if (cached) return cached.bytes || 0;
+  if (entry.measuredSize != null) return entry.measuredSize;
+  return null;
+}
+
+function updateSelectionSummary() {
+  const el = $("selection-summary");
+  if (!el) return;
+  const entries = selectedEntries();
+  if (!entries.length) {
+    el.hidden = true;
+    el.textContent = "";
+    return;
+  }
+  let total = 0;
+  let unknown = 0;
+  for (const entry of entries) {
+    const bytes = entryKnownBytes(entry);
+    if (bytes == null) unknown += 1;
+    else total += bytes;
+  }
+  const count = entries.length === 1 ? "1 selected" : `${entries.length} selected`;
+  let text = `${count} · ${formatSize(total, false)}`;
+  if (unknown) {
+    text += unknown === entries.length ? " · sizing…" : " · partial";
+  }
+  el.hidden = false;
+  el.textContent = text;
+}
+
 function paintSelection() {
   document.querySelectorAll("#files .card").forEach((card) => {
     const selected = state.selected.has(card.dataset.path);
@@ -382,6 +533,7 @@ function paintSelection() {
     const cut = state.clipboard && state.clipboard.mode === "cut" && state.clipboard.items.some((item) => item.path === card.dataset.path);
     card.classList.toggle("cut", !!cut);
   });
+  updateSelectionSummary();
 }
 
 function selectOnly(path) {
@@ -528,7 +680,11 @@ function openSelectionMenu(x, y, pasteInto) {
   menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - rect.height - 8))}px`;
 }
 
-function closePreview() {
+function closePreview(force = false) {
+  if (!force && state.editor && state.editor.dirty) {
+    if (!window.confirm("You have unsaved edits. Discard them?")) return false;
+  }
+  clearEditor();
   setPreviewFullscreen(false);
   $("preview").hidden = true;
   state.current = null;
@@ -544,6 +700,11 @@ function closePreview() {
   $("notes-summary-comments").hidden = true;
   $("tag-input").value = "";
   $("comment-input").value = "";
+  return true;
+}
+
+function clearEditor() {
+  state.editor = null;
 }
 
 function setPreviewFullscreen(on) {
@@ -572,7 +733,7 @@ function setSettingsTab(tab) {
 }
 
 function openSettings(tab) {
-  closePreview();
+  if (!closePreview()) return;
   closeLibrary();
   const admin = !!(state.me && state.me.admin);
   $("settings-tab-users").hidden = !admin;
@@ -620,7 +781,7 @@ function setLibraryTab(tab) {
 }
 
 function openLibrary(tab) {
-  closePreview();
+  if (!closePreview()) return;
   closeSettings();
   if (tab) setLibraryTab(tab);
   $("library").hidden = false;
@@ -646,6 +807,11 @@ async function openEntry(entry) {
     await go(entry.path);
     return;
   }
+  if (state.editor && state.editor.dirty && state.current && state.current.path !== entry.path) {
+    if (!window.confirm("You have unsaved edits. Discard them?")) return;
+    state.editor.dirty = false;
+  }
+  clearEditor();
   closeLibrary();
   state.current = entry;
   $("preview").hidden = false;
@@ -752,7 +918,7 @@ function renderAnnotations(data) {
 
 function renderMeta(body, entry, meta) {
   if (meta.text && !meta.text.binary) {
-    body.innerHTML = renderTextViewer(entry.name, meta.text.content, meta.text.truncated);
+    mountTextEditor(body, entry, meta.text);
     return;
   }
   if (meta.archive) {
@@ -787,31 +953,262 @@ function formatLabel(format) {
   }[format] || "Text";
 }
 
-function renderTextViewer(name, content, truncated) {
-  const format = textFormat(name);
-  let body = "";
-  if (format === "table") {
-    body = renderTable(content, name.toLowerCase().endsWith(".tsv") ? "\t" : ",");
-  } else if (format === "json") {
-    let pretty = content;
-    try { pretty = JSON.stringify(JSON.parse(pretty), null, 2); } catch { /* keep */ }
-    body = `<pre class="text-code">${esc(pretty)}</pre>`;
-  } else if (format === "markdown") {
-    body = `<div class="md-preview">${renderMarkdown(content)}</div>`;
-  } else if (format === "ini") {
-    body = `<pre class="text-code ini-preview">${renderIni(content)}</pre>`;
-  } else {
-    body = renderLinedText(content, format === "log");
+function tableSeparator(name) {
+  return String(name || "").toLowerCase().endsWith(".tsv") ? "\t" : ",";
+}
+
+function isEditableFormat(format) {
+  return format === "markdown" || format === "table" || format === "text" || format === "json" || format === "ini" || format === "log";
+}
+
+function mountTextEditor(body, entry, text) {
+  const format = textFormat(entry.name);
+  state.editor = {
+    path: entry.path,
+    name: entry.name,
+    format,
+    original: text.content,
+    content: text.content,
+    truncated: !!text.truncated,
+    mode: "view",
+    dirty: false,
+    sep: tableSeparator(entry.name),
+    saving: false,
+  };
+  paintTextEditor(body);
+}
+
+function paintTextEditor(body = $("preview-body")) {
+  const ed = state.editor;
+  if (!ed || !body) return;
+  const write = state.me && !state.me.readonly && !ed.truncated && isEditableFormat(ed.format);
+  const editing = write && ed.mode === "edit";
+  const actions = [];
+  if (write) {
+    if (ed.format === "markdown") {
+      actions.push(`<button type="button" data-editor="mode" data-mode="view" class="${ed.mode === "view" ? "is-active" : ""}">Preview</button>`);
+      actions.push(`<button type="button" data-editor="mode" data-mode="edit" class="${ed.mode === "edit" ? "is-active" : ""}">Edit</button>`);
+    } else if (!editing) {
+      actions.push(`<button type="button" data-editor="mode" data-mode="edit">Edit</button>`);
+    } else {
+      actions.push(`<button type="button" data-editor="mode" data-mode="view">Done</button>`);
+    }
+    if (ed.format === "table" && editing) {
+      actions.push(`<button type="button" data-editor="add-row">Add row</button>`);
+      actions.push(`<button type="button" data-editor="add-col">Add column</button>`);
+      actions.push(`<button type="button" data-editor="del-row">Remove row</button>`);
+      actions.push(`<button type="button" data-editor="del-col">Remove column</button>`);
+    }
+    actions.push(`<button type="button" data-editor="save" ${ed.dirty && !ed.saving ? "" : "disabled"}>Save</button>`);
   }
-  const lines = content ? content.split(/\r?\n/).length : 0;
-  return `<div class="text-viewer format-${format}">
+  let main = "";
+  if (editing && ed.format === "table") {
+    main = renderCsvEditor(ed.content, ed.sep);
+  } else if (editing) {
+    main = `<textarea class="text-editor-area" data-editor-input spellcheck="true">${esc(ed.content)}</textarea>`;
+  } else if (ed.format === "table") {
+    main = renderTable(ed.content, ed.sep);
+  } else if (ed.format === "json") {
+    let pretty = ed.content;
+    try { pretty = JSON.stringify(JSON.parse(pretty), null, 2); } catch { /* keep */ }
+    main = `<pre class="text-code">${esc(pretty)}</pre>`;
+  } else if (ed.format === "markdown") {
+    main = `<div class="md-preview">${renderMarkdown(ed.content)}</div>`;
+  } else if (ed.format === "ini") {
+    main = `<pre class="text-code ini-preview">${renderIni(ed.content)}</pre>`;
+  } else {
+    main = renderLinedText(ed.content, ed.format === "log");
+  }
+  const lines = ed.content ? ed.content.split(/\r?\n/).length : 0;
+  body.innerHTML = `<div class="text-viewer format-${ed.format}${editing ? " is-editing" : ""}">
     <div class="text-viewer-bar">
-      <span class="pill">${esc(formatLabel(format))}</span>
-      <span class="muted">${lines} line${lines === 1 ? "" : "s"}</span>
+      <div class="text-viewer-meta">
+        <span class="pill">${esc(formatLabel(ed.format))}</span>
+        <span class="muted">${lines} line${lines === 1 ? "" : "s"}</span>
+        ${ed.dirty ? `<span class="editor-dirty">Unsaved</span>` : ""}
+      </div>
+      <div class="text-viewer-actions">${actions.join("")}</div>
     </div>
-    ${body}
-    ${truncated ? `<p class="muted text-viewer-note">Preview truncated.</p>` : ""}
+    ${main}
+    ${ed.truncated ? `<p class="muted text-viewer-note">Preview truncated — editing is disabled for this file.</p>` : ""}
   </div>`;
+}
+
+function syncEditorFromDom() {
+  const ed = state.editor;
+  if (!ed || ed.mode !== "edit") return;
+  if (ed.format === "table") {
+    const wrap = $("preview-body").querySelector("[data-csv-editor]");
+    if (!wrap) return;
+    ed.content = serializeCsv(readCsvGrid(wrap), ed.sep);
+  } else {
+    const area = $("preview-body").querySelector("[data-editor-input]");
+    if (!area) return;
+    ed.content = area.value;
+  }
+  ed.dirty = ed.content !== ed.original;
+}
+
+function markEditorDirty() {
+  const ed = state.editor;
+  if (!ed) return;
+  syncEditorFromDom();
+  const dirty = ed.dirty;
+  const saveBtn = $("preview-body").querySelector("[data-editor='save']");
+  if (saveBtn) saveBtn.disabled = !dirty || ed.saving;
+  const flag = $("preview-body").querySelector(".editor-dirty");
+  if (dirty && !flag) {
+    const meta = $("preview-body").querySelector(".text-viewer-meta");
+    if (meta) meta.insertAdjacentHTML("beforeend", `<span class="editor-dirty">Unsaved</span>`);
+  } else if (!dirty && flag) {
+    flag.remove();
+  }
+}
+
+async function saveEditor() {
+  const ed = state.editor;
+  if (!ed || ed.saving) return;
+  syncEditorFromDom();
+  if (!ed.dirty) return;
+  if (ed.content.length > 1024 * 1024) {
+    toast("This file is too large to save in the editor (1 MB max)", true);
+    return;
+  }
+  ed.saving = true;
+  paintTextEditor();
+  try {
+    await api("/api/write", { method: "POST", json: { path: ed.path, content: ed.content } });
+    ed.original = ed.content;
+    ed.dirty = false;
+    ed.saving = false;
+    toast("Saved");
+    const path = ed.path;
+    await load(state.path, { keepPreview: true });
+    if (state.current && state.current.path === path) {
+      const entry = state.entries.find((item) => item.path === path) || state.current;
+      state.current = entry;
+      $("preview-meta").textContent = `${formatSize(entry.size, false)} · ${formatDate(entry.modified)}`;
+      paintTextEditor();
+      loadAnnotations(path).catch(() => {});
+    }
+  } catch (err) {
+    ed.saving = false;
+    paintTextEditor();
+    toast(err.message, true);
+  }
+}
+
+function parseCsv(text, sep) {
+  const rows = [];
+  let row = [];
+  let cell = "";
+  let i = 0;
+  let inQuotes = false;
+  const input = String(text || "").replace(/^\uFEFF/, "");
+  while (i < input.length) {
+    const ch = input[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (input[i + 1] === '"') {
+          cell += '"';
+          i += 2;
+          continue;
+        }
+        inQuotes = false;
+        i += 1;
+        continue;
+      }
+      cell += ch;
+      i += 1;
+      continue;
+    }
+    if (ch === '"') {
+      inQuotes = true;
+      i += 1;
+      continue;
+    }
+    if (ch === sep) {
+      row.push(cell);
+      cell = "";
+      i += 1;
+      continue;
+    }
+    if (ch === "\n") {
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = "";
+      i += 1;
+      continue;
+    }
+    if (ch === "\r") {
+      i += 1;
+      continue;
+    }
+    cell += ch;
+    i += 1;
+  }
+  if (cell.length || row.length) {
+    row.push(cell);
+    rows.push(row);
+  }
+  if (!rows.length) rows.push([""]);
+  const width = Math.max(1, ...rows.map((r) => r.length));
+  return rows.map((r) => {
+    const next = r.slice();
+    while (next.length < width) next.push("");
+    return next;
+  });
+}
+
+function serializeCsv(rows, sep) {
+  return rows.map((row) => row.map((value) => {
+    const cell = String(value ?? "");
+    if (/["\r\n]/.test(cell) || cell.includes(sep)) {
+      return `"${cell.replace(/"/g, '""')}"`;
+    }
+    return cell;
+  }).join(sep)).join("\n");
+}
+
+function readCsvGrid(wrap) {
+  return [...wrap.querySelectorAll("tr")].map((tr) =>
+    [...tr.querySelectorAll("input")].map((input) => input.value)
+  );
+}
+
+function renderCsvEditor(content, sep) {
+  const rows = parseCsv(content, sep);
+  const body = rows.map((row, r) =>
+    `<tr>${row.map((cell, c) =>
+      `<td><input type="text" data-r="${r}" data-c="${c}" value="${escAttr(cell)}" spellcheck="false"></td>`
+    ).join("")}</tr>`
+  ).join("");
+  return `<div class="table-wrap csv-editor" data-csv-editor><table><tbody>${body}</tbody></table></div>`;
+}
+
+function escAttr(value) {
+  return esc(value).replace(/`/g, "&#96;");
+}
+
+function mutateCsvGrid(action) {
+  const ed = state.editor;
+  if (!ed || ed.format !== "table") return;
+  syncEditorFromDom();
+  let rows = parseCsv(ed.content, ed.sep);
+  const width = rows[0] ? rows[0].length : 1;
+  if (action === "add-row") {
+    rows.push(Array.from({ length: width }, () => ""));
+  } else if (action === "add-col") {
+    rows = rows.map((row) => row.concat([""]));
+  } else if (action === "del-row") {
+    if (rows.length > 1) rows.pop();
+  } else if (action === "del-col") {
+    if (width > 1) rows = rows.map((row) => row.slice(0, -1));
+  }
+  ed.content = serializeCsv(rows, ed.sep);
+  ed.dirty = ed.content !== ed.original;
+  paintTextEditor();
 }
 
 function renderLinedText(content, soft) {
@@ -934,9 +1331,9 @@ function renderMarkdown(source) {
 }
 
 function renderTable(content, separator) {
-  const lines = content.split(/\r?\n/).filter((line) => line.length).slice(0, 200);
-  const rows = lines.map((line) => `<tr>${line.split(separator).map((cell) => `<td>${esc(cell)}</td>`).join("")}</tr>`);
-  return `<div class="table-wrap"><table>${rows.join("")}</table></div>`;
+  const rows = parseCsv(content, separator).slice(0, 200);
+  const html = rows.map((row) => `<tr>${row.map((cell) => `<td>${esc(cell)}</td>`).join("")}</tr>`);
+  return `<div class="table-wrap"><table>${html.join("")}</table></div>`;
 }
 
 function fileExtension(name) {
@@ -1032,6 +1429,7 @@ async function renameEntry(entry) {
   }
   await api("/api/rename", { method: "POST", json: { path: entry.path, name: next } });
   toast("Renamed");
+  invalidateFolderSizes();
   await load(state.path);
 }
 
@@ -1056,6 +1454,7 @@ async function deleteEntries(entries) {
   toast(forever
     ? (entries.length === 1 ? "Deleted forever" : `Deleted ${entries.length} items forever`)
     : (entries.length === 1 ? "Moved to Trash" : `Moved ${entries.length} items to Trash`));
+  invalidateFolderSizes();
   await load(state.path);
 }
 
@@ -1220,6 +1619,7 @@ async function restoreEntries(entries) {
     await api("/api/restore", { method: "POST", json: { path: entry.path } });
   }
   toast(entries.length === 1 ? "Restored" : `Restored ${entries.length} items`);
+  invalidateFolderSizes();
   await load(state.path);
 }
 
@@ -1227,6 +1627,7 @@ async function emptyTrash() {
   if (!await askConfirm("Empty the Trash? Every item in it will be permanently deleted.", "Empty Trash")) return;
   const result = await api("/api/trash/empty", { method: "POST" });
   toast(result.removed ? `Emptied ${result.removed} item(s)` : "Trash was already empty");
+  invalidateFolderSizes();
   await load(state.path);
 }
 
@@ -1235,6 +1636,7 @@ async function duplicateEntries(entries) {
     await api("/api/duplicate", { method: "POST", json: { path: entry.path } });
   }
   toast(entries.length === 1 ? "Duplicated" : `Duplicated ${entries.length} items`);
+  invalidateFolderSizes();
   await load(state.path);
 }
 
@@ -1247,6 +1649,7 @@ async function moveEntries(entries) {
     await api("/api/move", { method: "POST", json: { path: entry.path, dest } });
   }
   toast(entries.length === 1 ? "Moved" : `Moved ${entries.length} items`);
+  invalidateFolderSizes();
   await load(state.path);
 }
 
@@ -1259,6 +1662,7 @@ async function createFolder() {
   if (!name) return;
   await api("/api/mkdir", { method: "POST", json: { path: state.path, name } });
   toast("Folder created");
+  invalidateFolderSizes();
   await load(state.path);
 }
 
@@ -1320,6 +1724,7 @@ async function createFile(preferredKind) {
     json: { path: state.path, name: choice.name, kind: choice.kind },
   });
   toast("File created");
+  invalidateFolderSizes();
   await load(state.path);
   const created = state.entries.find((entry) => entry.path === data.path);
   if (created) openEntry(created).catch((err) => toast(err.message, true));
@@ -1343,6 +1748,7 @@ async function createFolderWithSelection(entries) {
       moved += 1;
     }
   } finally {
+    invalidateFolderSizes();
     await load(state.path);
   }
   toast(moved === items.length
@@ -1378,6 +1784,7 @@ async function pasteClipboard(dest) {
     state.clipboard = remaining.length ? { mode: "cut", items: remaining } : null;
     renderClipboard();
   }
+  invalidateFolderSizes();
   await load(state.path);
   if (error) toast(error.message, true);
   else if (done) toast(clip.mode === "cut" ? "Moved" : "Copied");
@@ -1898,10 +2305,39 @@ document.addEventListener("click", (event) => {
   if (!event.target.closest("#menu") && !event.target.closest(".more")) closeMenu();
 });
 
-$("preview-close").addEventListener("click", closePreview);
+$("preview-close").addEventListener("click", () => {
+  closePreview();
+});
 
 $("preview-expand").addEventListener("click", () => {
   setPreviewFullscreen(!$("preview").classList.contains("is-fullscreen"));
+});
+
+$("preview-body").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-editor]");
+  if (!button || !state.editor) return;
+  const action = button.getAttribute("data-editor");
+  if (action === "mode") {
+    syncEditorFromDom();
+    state.editor.mode = button.getAttribute("data-mode") || "view";
+    paintTextEditor();
+    const focus = $("preview-body").querySelector("[data-editor-input], [data-csv-editor] input");
+    if (focus) focus.focus();
+    return;
+  }
+  if (action === "save") {
+    saveEditor().catch((err) => toast(err.message, true));
+    return;
+  }
+  if (action === "add-row" || action === "add-col" || action === "del-row" || action === "del-col") {
+    mutateCsvGrid(action);
+  }
+});
+
+$("preview-body").addEventListener("input", (event) => {
+  if (!state.editor || state.editor.mode !== "edit") return;
+  if (!event.target.closest("[data-editor-input], [data-csv-editor]")) return;
+  markEditorDirty();
 });
 
 $("notes-ack").addEventListener("click", async () => {
@@ -2035,7 +2471,10 @@ async function onPicked(input) {
     toast(err.cancel ? "Upload cancelled" : err.message, !err.cancel);
   }
   input.value = "";
-  if (state.me) load(state.path).catch((err) => toast(err.message, true));
+  if (state.me) {
+    invalidateFolderSizes();
+    load(state.path).catch((err) => toast(err.message, true));
+  }
 }
 $("upload-input").addEventListener("change", () => onPicked($("upload-input")));
 $("folder-input").addEventListener("change", () => onPicked($("folder-input")));
@@ -2046,6 +2485,13 @@ window.addEventListener("hashchange", () => {
 });
 
 window.addEventListener("keydown", (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+    if (state.editor && state.me && !state.me.readonly && !$("preview").hidden) {
+      event.preventDefault();
+      saveEditor().catch((err) => toast(err.message, true));
+      return;
+    }
+  }
   if (event.key === "Escape") {
     // Let open dialogs handle Escape themselves (and avoid clearing selection mid-prompt).
     if (document.querySelector("dialog[open]")) return;
@@ -2054,7 +2500,8 @@ window.addEventListener("keydown", (event) => {
       setPreviewFullscreen(false);
       return;
     }
-    closePreview();
+    if (!$("preview").hidden && !closePreview()) return;
+    if (!$("preview").hidden) return;
     closeLibrary();
     closeSettings();
     if (marquee) endMarquee();
@@ -2127,7 +2574,7 @@ window.addEventListener("paste", (event) => {
   const data = event.clipboardData;
   if (!data) return;
 
-  const editingSensitive = event.target.closest("#login-view, #password-dialog, #text-dialog, #create-file-dialog, #comment-input, #tag-input, #search-input");
+  const editingSensitive = event.target.closest("#login-view, #password-dialog, #text-dialog, #create-file-dialog, #comment-input, #tag-input, #search-input, [data-editor-input], [data-csv-editor]");
   const hasFiles = clipboardHasFiles(data);
 
   // File paste should upload even when the folder filter (or similar) is focused.

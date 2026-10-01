@@ -100,12 +100,21 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             modified INTEGER NOT NULL,
             noted_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS folder_sizes (
+            path TEXT PRIMARY KEY,
+            bytes INTEGER NOT NULL,
+            files INTEGER NOT NULL,
+            truncated INTEGER NOT NULL,
+            max_mtime INTEGER NOT NULL,
+            fingerprint TEXT NOT NULL,
+            scanned_at INTEGER NOT NULL
+        );
         ",
     )
     .map_err(|_| "Could not create the database schema".to_string())?;
     ensure_admin_column(conn)?;
     conn.execute(
-        "INSERT INTO settings(key, value) VALUES('schema_version', '5')
+        "INSERT INTO settings(key, value) VALUES('schema_version', '6')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )
@@ -847,6 +856,8 @@ pub fn rewrite_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), 
             params![to, to],
         );
     }
+    invalidate_folder_sizes(conn, from)?;
+    invalidate_folder_sizes(conn, to)?;
     Ok(())
 }
 
@@ -928,6 +939,123 @@ pub fn delete_path_meta(conn: &Connection, path: &str) -> Result<(), String> {
         params![path, like],
     )
     .map_err(|_| "Could not remove recent files".to_string())?;
+    invalidate_folder_sizes(conn, path)?;
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+pub struct FolderSizeRow {
+    pub bytes: u64,
+    pub files: u64,
+    pub truncated: bool,
+    pub max_mtime: i64,
+    pub fingerprint: String,
+}
+
+pub fn get_folder_size(conn: &Connection, path: &str) -> Result<Option<FolderSizeRow>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT path, bytes, files, truncated, max_mtime, fingerprint, scanned_at
+             FROM folder_sizes WHERE path = ?1",
+        )
+        .map_err(|_| "Could not read folder sizes".to_string())?;
+    let mut rows = stmt
+        .query(params![path])
+        .map_err(|_| "Could not read folder sizes".to_string())?;
+    let Some(row) = rows.next().map_err(|_| "Could not read folder sizes".to_string())? else {
+        return Ok(None);
+    };
+    Ok(Some(FolderSizeRow {
+        bytes: row.get::<_, i64>(1).map_err(|_| "Could not read folder sizes".to_string())? as u64,
+        files: row.get::<_, i64>(2).map_err(|_| "Could not read folder sizes".to_string())? as u64,
+        truncated: row.get::<_, i64>(3).map_err(|_| "Could not read folder sizes".to_string())? != 0,
+        max_mtime: row.get(4).map_err(|_| "Could not read folder sizes".to_string())?,
+        fingerprint: row.get(5).map_err(|_| "Could not read folder sizes".to_string())?,
+    }))
+}
+
+pub fn upsert_folder_size(
+    conn: &Connection,
+    path: &str,
+    bytes: u64,
+    files: u64,
+    truncated: bool,
+    max_mtime: i64,
+    fingerprint: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO folder_sizes(path, bytes, files, truncated, max_mtime, fingerprint, scanned_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(path) DO UPDATE SET
+            bytes = excluded.bytes,
+            files = excluded.files,
+            truncated = excluded.truncated,
+            max_mtime = excluded.max_mtime,
+            fingerprint = excluded.fingerprint,
+            scanned_at = excluded.scanned_at",
+        params![
+            path,
+            bytes as i64,
+            files as i64,
+            if truncated { 1 } else { 0 },
+            max_mtime,
+            fingerprint,
+            now_secs()
+        ],
+    )
+    .map_err(|_| "Could not save folder size".to_string())?;
+    Ok(())
+}
+
+fn folder_parent(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    match path.rfind('/') {
+        Some(idx) => Some(path[..idx].to_string()),
+        None => Some(String::new()),
+    }
+}
+
+/// Drop cached sizes for this path, its descendants, and its ancestors.
+/// Call after OwnNAS changes files, or when a folder stamp no longer matches.
+pub fn invalidate_folder_sizes(conn: &Connection, path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        conn.execute("DELETE FROM folder_sizes", [])
+            .map_err(|_| "Could not clear folder sizes".to_string())?;
+        return Ok(());
+    }
+    let like = path_like(path);
+    conn.execute(
+        "DELETE FROM folder_sizes WHERE path = ?1 OR path LIKE ?2",
+        params![path, like],
+    )
+    .map_err(|_| "Could not clear folder sizes".to_string())?;
+    let mut cursor = folder_parent(path);
+    while let Some(parent) = cursor {
+        conn.execute("DELETE FROM folder_sizes WHERE path = ?1", params![parent])
+            .map_err(|_| "Could not clear folder sizes".to_string())?;
+        cursor = if parent.is_empty() {
+            None
+        } else {
+            folder_parent(&parent)
+        };
+    }
+    Ok(())
+}
+
+/// Drop only ancestor caches (keep this path), e.g. before writing a fresh measurement.
+pub fn invalidate_folder_size_ancestors(conn: &Connection, path: &str) -> Result<(), String> {
+    let mut cursor = folder_parent(path);
+    while let Some(parent) = cursor {
+        conn.execute("DELETE FROM folder_sizes WHERE path = ?1", params![parent])
+            .map_err(|_| "Could not clear folder sizes".to_string())?;
+        cursor = if parent.is_empty() {
+            None
+        } else {
+            folder_parent(&parent)
+        };
+    }
     Ok(())
 }
 
