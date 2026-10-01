@@ -143,7 +143,7 @@ Opening a file opens the preview panel. Content streams from `/api/raw?path=…`
 | **Video** | HTML5 `<video controls playsinline>` with optional poster from `/api/thumb`. |
 | **Audio** | HTML5 `<audio controls>`. |
 | **PDF** | Inline iframe. |
-| **Text / code / CSV / JSON / Markdown** | Fetched via `/api/meta` and rendered (tables, markdown, highlighted text as appropriate). |
+| **Text / code / CSV / JSON / Markdown** | Fetched via `/api/meta` and rendered (tables, markdown, highlighted text as appropriate). When not readonly, **Edit** opens an in-browser editor (Markdown preview/edit, CSV grid, plain text). Save with the button or Ctrl/Cmd+S (1 MB max). |
 | **Archives (zip/tar/…)** | Listing / meta preview when supported. |
 | **Other** | Meta panel + download. |
 
@@ -215,7 +215,7 @@ Uploads show a status panel with progress and cancel.
 | **Bookmarks** | Pin folders; toggle from the toolbar. |
 | **Recent** | Files you opened (not from Trash). |
 | **Search** | Name (and tag) search under the current path. |
-| **Folder size** | Recursive usage for the current folder. |
+| **Folder size** | Toolbar measures the current folder. Child folder sizes are cached in SQLite and reused across restarts; OwnNAS invalidates them when it changes files, and a cheap folder fingerprint triggers a paced rescan if the folder was changed outside OwnNAS. |
 | **Activity** | Recent server-side actions (login, mkdir, move, upload, …). |
 | **SHA-256** | Hash the current preview file (size-capped). |
 
@@ -227,6 +227,7 @@ Uploads show a status panel with progress and cancel.
 | --- | --- |
 | New folder | Toolbar or empty-space menu. |
 | New file | Toolbar or empty-space menu. Formats: Markdown (`.md`), CSV (`.csv`). Opens in preview after create. |
+| Edit text / Markdown / CSV | Preview panel Edit → Save (or Ctrl/Cmd+S). Disabled for truncated/binary files and in `--readonly`. |
 | Rename / Move / Copy / Duplicate | Context menu or preview actions. |
 | Cut / Paste | Same-directory cut is a no-op paste (“already here”). |
 | Trash / Restore / Empty Trash | Soft delete into `.ownnas-trash`. |

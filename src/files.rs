@@ -45,12 +45,18 @@ pub struct Entry {
     pub dir: bool,
     pub size: u64,
     pub modified: i64,
+    pub created: i64,
     pub kind: String,
     pub thumb: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub original: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Cached recursive folder size when still valid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured_size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured_truncated: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -194,8 +200,11 @@ pub fn list_dir(root: &Path, rel: &str, show_hidden: bool, ffmpeg: bool) -> Resu
             dir,
             size: if dir { 0 } else { meta.len() },
             modified: modified_secs(&meta),
+            created: created_secs(&meta),
             original,
             tags: Vec::new(),
+            measured_size: None,
+            measured_truncated: None,
         });
     }
     entries.sort_by(|a, b| {
@@ -279,6 +288,52 @@ pub fn create_file(root: &Path, parent_rel: &str, name: &str, kind: &str) -> Res
     } else {
         format!("{}/{}", parent.rel, name)
     })
+}
+
+/// Overwrites a text file with UTF-8 content (Markdown, CSV, source, etc.).
+pub fn write_text_file(root: &Path, rel: &str, content: &str) -> Result<(), FileError> {
+    const MAX_BYTES: usize = 1024 * 1024;
+    if content.len() > MAX_BYTES {
+        return Err(FileError::Rejected(
+            "This file is too large to save in the editor (1 MB max)",
+        ));
+    }
+    if content.contains('\0') {
+        return Err(FileError::Rejected("Binary content cannot be saved here"));
+    }
+    let target = resolve(root, rel)?;
+    if target.rel.is_empty() {
+        return Err(FileError::Forbidden);
+    }
+    if target.full.is_dir() {
+        return Err(FileError::IsADirectory);
+    }
+    let name = target
+        .full
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if kind_of(&name) != "text" {
+        return Err(FileError::Rejected("Only text files can be edited"));
+    }
+    let parent = target.full.parent().ok_or(FileError::Forbidden)?;
+    let tmp = parent.join(format!(
+        ".ownnas-write-{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::write(&tmp, content.as_bytes()).map_err(map_io)?;
+    if target.full.exists() {
+        fs::remove_file(&target.full).map_err(map_io)?;
+    }
+    if let Err(err) = fs::rename(&tmp, &target.full) {
+        let _ = fs::remove_file(&tmp);
+        return Err(map_io(err));
+    }
+    Ok(())
 }
 
 pub fn rename_entry(root: &Path, rel: &str, new_name: &str) -> Result<String, FileError> {
@@ -1184,6 +1239,14 @@ fn modified_secs(meta: &Metadata) -> i64 {
         .unwrap_or(0)
 }
 
+fn created_secs(meta: &Metadata) -> i64 {
+    meta.created()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_else(|| modified_secs(meta))
+}
+
 /// Size and modified time for annotation fingerprints.
 pub fn entry_stats(root: &Path, rel: &str) -> Result<(u64, i64), FileError> {
     let resolved = resolve(root, rel)?;
@@ -1236,6 +1299,9 @@ pub struct Usage {
     pub bytes: u64,
     pub files: u64,
     pub truncated: bool,
+    pub cached: bool,
+    pub fingerprint: String,
+    pub max_mtime: i64,
 }
 
 pub fn search(root: &Path, rel: &str, query: &str) -> Result<Vec<SearchHit>, FileError> {
@@ -1312,22 +1378,74 @@ fn walk_search(
     }
 }
 
-pub fn usage(root: &Path, rel: &str) -> Result<Usage, FileError> {
+/// Cheap stamp of a folder's immediate children (name/size/mtime) + directory mtime.
+/// External adds/removes/renames, or edits of direct children, change this.
+pub fn folder_stamp(root: &Path, rel: &str) -> Result<String, FileError> {
     let start = resolve(root, rel)?;
     if !start.full.is_dir() {
         return Err(FileError::NotADirectory);
     }
+    let mut hasher = Sha256::new();
+    let dir_meta = fs::metadata(&start.full).map_err(map_io)?;
+    hasher.update(modified_secs(&dir_meta).to_le_bytes());
+    hasher.update(created_secs(&dir_meta).to_le_bytes());
+    let mut children = Vec::new();
+    if let Ok(entries) = fs::read_dir(&start.full) {
+        for item in entries.flatten() {
+            let name = item.file_name().to_string_lossy().to_string();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let meta = match item.metadata() {
+                Ok(meta) => meta,
+                Err(_) => continue,
+            };
+            children.push((
+                name,
+                meta.is_dir(),
+                if meta.is_dir() { 0 } else { meta.len() },
+                modified_secs(&meta),
+            ));
+        }
+    }
+    children.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    hasher.update((children.len() as u64).to_le_bytes());
+    for (name, is_dir, size, modified) in children {
+        hasher.update(name.as_bytes());
+        hasher.update([u8::from(is_dir)]);
+        hasher.update(size.to_le_bytes());
+        hasher.update(modified.to_le_bytes());
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Recursively measures a folder. When `slow` is set, the walk yields briefly
+/// so background listing updates do not pin a CPU core.
+pub fn usage(root: &Path, rel: &str) -> Result<Usage, FileError> {
+    usage_paced(root, rel, false)
+}
+
+pub fn usage_paced(root: &Path, rel: &str, slow: bool) -> Result<Usage, FileError> {
+    let start = resolve(root, rel)?;
+    if !start.full.is_dir() {
+        return Err(FileError::NotADirectory);
+    }
+    let fingerprint = folder_stamp(root, rel)?;
     let root = root.canonicalize().map_err(map_io)?;
     let mut usage = Usage {
         bytes: 0,
         files: 0,
         truncated: false,
+        cached: false,
+        fingerprint,
+        max_mtime: 0,
     };
-    walk_usage(&root, &start.full, &mut usage);
+    let mut since_yield = 0u32;
+    walk_usage(&root, &start.full, &mut usage, slow, &mut since_yield);
     Ok(usage)
 }
 
-fn walk_usage(root: &Path, dir: &Path, usage: &mut Usage) {
+fn walk_usage(root: &Path, dir: &Path, usage: &mut Usage, slow: bool, since_yield: &mut u32) {
     if usage.files >= 20_000 {
         usage.truncated = true;
         return;
@@ -1344,10 +1462,24 @@ fn walk_usage(root: &Path, dir: &Path, usage: &mut Usage) {
             _ => continue,
         };
         if canon.is_dir() {
-            walk_usage(root, &canon, usage);
+            walk_usage(root, &canon, usage, slow, since_yield);
         } else {
             usage.files += 1;
-            usage.bytes += canon.metadata().map(|meta| meta.len()).unwrap_or(0);
+            let meta = canon.metadata().ok();
+            usage.bytes += meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            if let Some(meta) = meta.as_ref() {
+                usage.max_mtime = usage.max_mtime.max(modified_secs(meta));
+            }
+            if slow {
+                *since_yield += 1;
+                if *since_yield >= 48 {
+                    *since_yield = 0;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+        if usage.truncated {
+            return;
         }
     }
 }
@@ -1668,6 +1800,15 @@ mod tests {
         ));
         assert!(matches!(
             create_file(&root, "sub", "x", "docx"),
+            Err(FileError::Rejected(_))
+        ));
+        write_text_file(&root, "sub/Notes.md", "# Updated\n\nbody\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("sub").join("Notes.md")).unwrap(),
+            "# Updated\n\nbody\n"
+        );
+        assert!(matches!(
+            write_text_file(&root, "sub/Notes.md", &"x".repeat(1024 * 1024 + 1)),
             Err(FileError::Rejected(_))
         ));
         let _ = fs::remove_dir_all(&root);
