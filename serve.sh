@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-root="${HOME}/fotos"
+root="${HOME}/Pictures"
 
 if [[ ! -x target/release/ownnas ]]; then
     echo "target/release/ownnas was not found. Run ./build.sh first."

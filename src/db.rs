@@ -100,6 +100,11 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             modified INTEGER NOT NULL,
             noted_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS folder_appearance (
+            path TEXT PRIMARY KEY,
+            color TEXT NOT NULL DEFAULT '',
+            icon TEXT NOT NULL DEFAULT 'folder'
+        );
         CREATE TABLE IF NOT EXISTS folder_sizes (
             path TEXT PRIMARY KEY,
             bytes INTEGER NOT NULL,
@@ -114,7 +119,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     .map_err(|_| "Could not create the database schema".to_string())?;
     ensure_admin_column(conn)?;
     conn.execute(
-        "INSERT INTO settings(key, value) VALUES('schema_version', '6')
+        "INSERT INTO settings(key, value) VALUES('schema_version', '7')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )
@@ -798,6 +803,11 @@ pub fn rewrite_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), 
         return Ok(());
     }
     delete_path_meta(conn, to)?;
+    conn.execute(
+        "UPDATE folder_appearance SET path = CASE WHEN path = ?1 THEN ?2 ELSE ?2 || substr(path, length(?1) + 1) END
+         WHERE path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/'",
+        params![from, to],
+    ).map_err(|_| "Could not move folder appearance".to_string())?;
     let like = path_like(from);
     let start = (from.len() + 1) as i64;
     conn.execute(
@@ -866,6 +876,13 @@ pub fn copy_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), Str
     if from.is_empty() || from == to {
         return Ok(());
     }
+    conn.execute(
+        "INSERT INTO folder_appearance(path, color, icon)
+         SELECT CASE WHEN path = ?1 THEN ?2 ELSE ?2 || substr(path, length(?1) + 1) END, color, icon
+         FROM folder_appearance WHERE path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/'
+         ON CONFLICT(path) DO UPDATE SET color = excluded.color, icon = excluded.icon",
+        params![from, to],
+    ).map_err(|_| "Could not copy folder appearance".to_string())?;
     let like = path_like(from);
     let start = (from.len() + 1) as i64;
     conn.execute(
@@ -913,6 +930,10 @@ pub fn delete_path_meta(conn: &Connection, path: &str) -> Result<(), String> {
     if path.is_empty() {
         return Ok(());
     }
+    conn.execute(
+        "DELETE FROM folder_appearance WHERE path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/'",
+        params![path],
+    ).map_err(|_| "Could not remove folder appearance".to_string())?;
     let like = path_like(path);
     conn.execute(
         "DELETE FROM file_tags WHERE path = ?1 OR path LIKE ?2",
@@ -1117,5 +1138,68 @@ mod tests {
         assert!(list_annotations(&conn, "archive/a.jpg", 12, 100).unwrap().noted_size.is_none());
 
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct FolderAppearance {
+    pub color: String,
+    pub icon: String,
+}
+
+pub fn folder_appearance_for_paths(conn: &Connection, paths: &[String]) -> Result<std::collections::HashMap<String, FolderAppearance>, String> {
+    let mut result = std::collections::HashMap::new();
+    for chunk in paths.chunks(200) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare(&format!("SELECT path, color, icon FROM folder_appearance WHERE path IN ({placeholders})"))
+            .map_err(|_| "Could not read folder appearance".to_string())?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, FolderAppearance { color: row.get(1)?, icon: row.get(2)? }))
+        }).map_err(|_| "Could not read folder appearance".to_string())?;
+        for row in rows { let (path, appearance) = row.map_err(|_| "Could not read folder appearance".to_string())?; result.insert(path, appearance); }
+    }
+    Ok(result)
+}
+
+pub fn set_folder_appearance(conn: &Connection, paths: &[String], color: &str, icon: &str) -> Result<(), String> {
+    if !(color.is_empty() || (color.len() == 7 && color.starts_with('#') && color[1..].bytes().all(|c| c.is_ascii_hexdigit()))) {
+        return Err("Choose a valid folder color".into());
+    }
+    if !["folder", "documents", "photos", "music", "video", "code", "work", "star", "heart", "archive", "cloud"].contains(&icon) {
+        return Err("Choose a supported folder icon".into());
+    }
+    let tx = conn.unchecked_transaction().map_err(|_| "Could not save folder appearance".to_string())?;
+    for path in paths {
+        if color.is_empty() && icon == "folder" {
+            tx.execute("DELETE FROM folder_appearance WHERE path = ?1", params![path])
+        } else {
+            tx.execute("INSERT INTO folder_appearance(path,color,icon) VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET color=excluded.color, icon=excluded.icon", params![path, color.to_ascii_lowercase(), icon])
+        }.map_err(|_| "Could not save folder appearance".to_string())?;
+    }
+    tx.commit().map_err(|_| "Could not save folder appearance".to_string())
+}
+
+#[cfg(test)]
+mod appearance_tests {
+    use super::*;
+    #[test]
+    fn appearance_follows_folder_trees_and_validates_values() {
+        let conn = Connection::open_in_memory().unwrap(); migrate(&conn).unwrap();
+        let paths = vec!["żółć_100%".to_string(), "żółć_100%/child".to_string()];
+        set_folder_appearance(&conn, &paths, "#AB12EF", "photos").unwrap();
+        set_folder_appearance(&conn, &["żółćX100Y/child".into()], "#123456", "work").unwrap();
+        assert!(set_folder_appearance(&conn, &paths, "red;", "folder").is_err());
+        assert!(set_folder_appearance(&conn, &paths, "", "<script>").is_err());
+        copy_path_meta(&conn, &paths[0], "copy").unwrap();
+        rewrite_path_meta(&conn, &paths[0], ".ownnas-trash/item").unwrap();
+        let moved = folder_appearance_for_paths(&conn, &[".ownnas-trash/item/child".into(), "copy/child".into(), "żółćX100Y/child".into()]).unwrap();
+        assert_eq!(moved.len(), 3);
+        assert_eq!(moved["copy/child"].color, "#ab12ef");
+        rewrite_path_meta(&conn, ".ownnas-trash/item", "restored").unwrap();
+        delete_path_meta(&conn, "copy").unwrap();
+        assert!(folder_appearance_for_paths(&conn, &["copy/child".into()]).unwrap().is_empty());
+        assert!(folder_appearance_for_paths(&conn, &["restored/child".into()]).unwrap().contains_key("restored/child"));
+        set_folder_appearance(&conn, &["restored/child".into()], "", "folder").unwrap();
+        assert!(folder_appearance_for_paths(&conn, &["restored/child".into()]).unwrap().is_empty());
     }
 }

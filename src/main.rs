@@ -1,9 +1,13 @@
 mod auth;
+mod content_index;
 mod db;
 mod files;
 mod http;
+mod pdf_ops;
 mod preview;
 mod thumbs;
+mod tls;
+mod update;
 
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -28,10 +32,20 @@ enum Command {
     /// Start the web server and share one folder
     #[command(after_help = SERVE_AFTER_HELP)]
     Serve(ServeArgs),
+    /// Generate a private HTTPS CA and server certificate
+    Tls {
+        #[command(subcommand)]
+        command: TlsCommand,
+    },
     /// Manage accounts stored in the SQLite database
     User {
         #[command(subcommand)]
         command: UserCommand,
+    },
+    /// Generate keys / sign release manifests for the static update host
+    Update {
+        #[command(subcommand)]
+        command: UpdateCommand,
     },
 }
 
@@ -77,6 +91,18 @@ Background / daemon:
   the command line. Full plist and unit samples are in README.md.
 ";
 
+#[derive(Subcommand)]
+enum TlsCommand {
+    /// Generate certificates in a new directory; distribute only ca.crt to users
+    Generate {
+        #[arg(long, default_value = "ownnas-tls")]
+        out: PathBuf,
+        /// DNS name or IP used to reach this server (repeat for multiple names)
+        #[arg(long, required = true)]
+        host: Vec<String>,
+    },
+}
+
 #[derive(Parser)]
 struct ServeArgs {
     /// Folder to share, including its subfolders. Asked on the first start when omitted.
@@ -88,6 +114,12 @@ struct ServeArgs {
     /// Folder for ownnas.db and the thumbnail cache. Must sit outside --root.
     #[arg(long, env = "OWNNAS_DATA", default_value = "ownnas-data", value_name = "DIR")]
     data: PathBuf,
+    /// PEM server certificate chain; enables native HTTPS
+    #[arg(long, env = "OWNNAS_TLS_CERT", requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+    /// PEM private key for the HTTPS server
+    #[arg(long, env = "OWNNAS_TLS_KEY", requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
     /// Create this account when the database has no users yet. Ignored later.
     #[arg(long, env = "OWNNAS_USER", value_name = "NAME")]
     username: Option<String>,
@@ -103,6 +135,28 @@ struct ServeArgs {
     /// Open a browser window on this computer after the server starts
     #[arg(long, action = clap::ArgAction::SetTrue)]
     open: bool,
+    /// HTTPS URL to latest.json on your update host (OWNNAS_UPDATE_URL)
+    #[arg(long, env = "OWNNAS_UPDATE_URL", value_name = "URL")]
+    update_url: Option<String>,
+    /// Hex ed25519 public key for latest.json.sig (OWNNAS_UPDATE_PUBKEY)
+    #[arg(long, env = "OWNNAS_UPDATE_PUBKEY", value_name = "HEX")]
+    update_pubkey: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum UpdateCommand {
+    /// Create update.sk / update.pk for signing manifests
+    Keygen {
+        #[arg(long, default_value = "releases/keys", value_name = "DIR")]
+        out: PathBuf,
+    },
+    /// Sign latest.json → latest.json.sig with update.sk
+    Sign {
+        #[arg(long, value_name = "PATH")]
+        key: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        manifest: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -152,6 +206,13 @@ fn main() {
 fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Serve(args) => serve(args),
+        Command::Tls { command } => match command {
+            TlsCommand::Generate { out, host } => tls::generate(&out, host),
+        },
+        Command::Update { command } => match command {
+            UpdateCommand::Keygen { out } => update::keygen(&out),
+            UpdateCommand::Sign { key, manifest } => update::sign_manifest(&key, &manifest),
+        },
         Command::User { command } => match command {
             UserCommand::Add(args) => {
                 let conn = open_data(&args.data.data)?;
@@ -199,12 +260,26 @@ fn serve(args: ServeArgs) -> Result<(), String> {
         None => first_run_root(&args.data, &mut announced)?,
     };
     let (root, data) = files::prepare_paths(&root, &args.data)?;
+    let pubkey = match args.update_pubkey.as_deref() {
+        Some(value) if !value.trim().is_empty() => Some(update::parse_pubkey_hex(value)?),
+        _ => None,
+    };
+    let update = update::UpdateConfig {
+        url: args
+            .update_url
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty()),
+        pubkey,
+    };
+    let saved_root = root.clone();
     let state = Arc::new(http::new_state(
         root,
         data,
         args.readonly,
-        args.secure_cookie,
+        args.secure_cookie || args.tls_cert.is_some(),
         thumbs::ffmpeg_available(),
+        content_index::tesseract_available(),
+        update,
     )?);
     {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
@@ -218,11 +293,20 @@ fn serve(args: ServeArgs) -> Result<(), String> {
             println!("An account already exists, so --username was left unused.");
         }
     }
+    {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        save_shared_root(&conn, &saved_root)?;
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|_| "Could not start the async runtime".to_string())?;
-    runtime.block_on(http::serve(state, &args.addr, args.open))
+    runtime.block_on(async {
+        match (args.tls_cert, args.tls_key) {
+            (Some(cert), Some(key)) => http::serve_https(state, &args.addr, args.open, &cert, &key).await,
+            _ => http::serve(state, &args.addr, args.open).await,
+        }
+    })
 }
 
 fn interactive() -> bool {
@@ -238,12 +322,33 @@ fn announce(announced: &mut bool) {
     *announced = true;
 }
 
+fn load_shared_root(conn: &rusqlite::Connection) -> Result<Option<PathBuf>, String> {
+    use rusqlite::OptionalExtension;
+    let value: Option<String> = conn.query_row(
+        "SELECT value FROM settings WHERE key = 'shared_root'", [], |row| row.get(0),
+    ).optional().map_err(|err| format!("Could not read the saved shared folder: {err}"))?;
+    value.map(|value| serde_json::from_str(&value)
+        .map_err(|err| format!("Could not read the saved shared folder; pass --root to replace it: {err}")))
+        .transpose()
+}
+
+fn save_shared_root(conn: &rusqlite::Connection, root: &Path) -> Result<(), String> {
+    let value = serde_json::to_string(root).map_err(|err| err.to_string())?;
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES('shared_root', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [value],
+    ).map_err(|err| format!("Could not save the shared folder: {err}"))?;
+    Ok(())
+}
+
 fn first_run_root(data: &Path, announced: &mut bool) -> Result<PathBuf, String> {
     let conn = open_data(data)?;
-    let fresh = db::count_users(&conn)? == 0;
+    if let Some(root) = load_shared_root(&conn)? {
+        return Ok(root);
+    }
     drop(conn);
-    if !fresh || !interactive() {
-        return Err("Pass --root with the folder to share.".into());
+    if !interactive() {
+        return Err("No shared folder is saved yet. Pass --root with the folder to share.".into());
     }
     announce(announced);
     loop {

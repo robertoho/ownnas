@@ -1,0 +1,28 @@
+# Example: serve OwnNAS updates from /var/www/ownnas-updates
+# Put TLS in front (certbot, Caddy, Cloudflare, etc.).
+
+server {
+    listen 80;
+    server_name updates.example.com;
+    root /var/www/ownnas-updates;
+    autoindex off;
+
+    location = /latest.json {
+        default_type application/json;
+        add_header Cache-Control "no-cache";
+    }
+
+    location = /latest.json.sig {
+        default_type text/plain;
+        add_header Cache-Control "no-cache";
+    }
+
+    location ~ ^/v[0-9] {
+        add_header Cache-Control "public, max-age=86400";
+        try_files $uri =404;
+    }
+
+    location / {
+        return 404;
+    }
+}

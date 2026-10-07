@@ -1,0 +1,81 @@
+apply plugin: "com.android.application"
+
+def repoDir = rootProject.projectDir.parentFile
+def rustTargets = [
+    "armeabi-v7a": [target: "armv7-linux-androideabi", linker: "armv7a-linux-androideabi26-clang.cmd", compiler: "armv7a-linux-androideabi26-clang.cmd"],
+    "arm64-v8a":  [target: "aarch64-linux-android", linker: "aarch64-linux-android26-clang.cmd", compiler: "aarch64-linux-android26-clang.cmd"],
+    "x86_64":     [target: "x86_64-linux-android", linker: "x86_64-linux-android26-clang.cmd", compiler: "x86_64-linux-android26-clang.cmd"]
+]
+
+android {
+    namespace "com.ownnas"
+    compileSdk 35
+    ndkVersion "28.2.13676358"
+
+    defaultConfig {
+        applicationId "com.ownnas"
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName "0.1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            shrinkResources false
+        }
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging true
+        }
+    }
+}
+
+def rustupExecutable = System.getProperty("os.name").toLowerCase().contains("windows") ? "rustup.exe" : "rustup"
+def cargoExecutable = System.getProperty("os.name").toLowerCase().contains("windows") ? "cargo.exe" : "cargo"
+def targetNames = rustTargets.values().collect { it.target }
+
+tasks.register("installRustAndroidTargets", Exec) {
+    commandLine rustupExecutable, "target", "add"
+    args targetNames
+}
+
+def rustTasks = []
+rustTargets.each { abi, config ->
+    def taskName = "buildRust${abi.replace('-', '_')}"
+    def target = config.target
+    def targetEnv = target.toUpperCase().replace('-', '_')
+    def ndkBin = file("${android.sdkDirectory}/ndk/${android.ndkVersion}/toolchains/llvm/prebuilt/windows-x86_64/bin")
+    def linker = new File(ndkBin, config.linker).absolutePath
+    def compiler = new File(ndkBin, config.compiler).absolutePath
+    def llvmAr = new File(ndkBin, "llvm-ar.exe").absolutePath
+    def outputDir = file("${repoDir}/target/${target}/release")
+    def jniDir = file("${projectDir}/src/main/jniLibs/${abi}")
+
+    def rustTask = tasks.register(taskName, Exec) {
+        dependsOn "installRustAndroidTargets"
+        workingDir repoDir
+        commandLine cargoExecutable, "build", "--lib", "--release", "--target", target
+        environment "CARGO_TARGET_${targetEnv}_LINKER", linker
+        environment "AR_${targetEnv}", llvmAr
+        environment "CC_${targetEnv}", compiler
+        environment "CXX_${targetEnv}", compiler.replace("clang.cmd", "clang++.cmd")
+        doFirst {
+            jniDir.mkdirs()
+        }
+        doLast {
+            copy {
+                from new File(outputDir, "libownnas.so")
+                into jniDir
+            }
+        }
+    }
+    rustTasks << rustTask
+}
+
+tasks.named("preBuild").configure {
+    dependsOn rustTasks
+}

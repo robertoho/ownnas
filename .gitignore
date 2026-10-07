@@ -5,3 +5,20 @@
 *.db-shm
 .DS_Store
 Thumbs.db
+releases/keys/update.sk
+releases/keys/*.sk
+
+# Android/Gradle build outputs and generated native libraries
+/android/.gradle
+/android/build
+/android/app/build
+/android/app/src/main/jniLibs
+/android/local.properties
+
+# Locally generated HTTPS certificates and private keys
+/ownnas-tls
+
+# Generated release packages and Python bytecode
+/dist/
+__pycache__/
+*.py[cod]

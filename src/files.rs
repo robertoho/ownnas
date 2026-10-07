@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 use std::fs::{self, Metadata};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
@@ -28,8 +30,35 @@ pub enum FileError {
     IsADirectory,
     AlreadyExists,
     InvalidName,
+    Cancelled,
     Rejected(&'static str),
     Io(&'static str),
+}
+
+/// Cooperative cancel flag for long walks (compress, usage, duplicates, zip).
+#[derive(Clone, Default)]
+pub struct CancelFlag(Arc<AtomicBool>);
+
+impl CancelFlag {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn check(&self) -> Result<(), FileError> {
+        if self.is_cancelled() {
+            Err(FileError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 pub struct Resolved {
@@ -243,11 +272,11 @@ pub fn make_dir(root: &Path, parent_rel: &str, name: &str) -> Result<(), FileErr
     fs::create_dir(&dest).map_err(map_io)
 }
 
-/// Creates a new empty-ish file of a supported kind (`md`, `csv`) in `parent_rel`.
+/// Creates a new empty-ish file of a supported kind in `parent_rel`.
 /// Returns the relative path of the created file.
 pub fn create_file(root: &Path, parent_rel: &str, name: &str, kind: &str) -> Result<String, FileError> {
     let ext = match kind {
-        "md" | "csv" => kind,
+        "md" | "csv" | "txt" | "json" | "html" | "docx" => kind,
         _ => return Err(FileError::Rejected("Unsupported file type")),
     };
     let name = finalize_new_filename(name, ext)?;
@@ -269,6 +298,11 @@ pub fn create_file(root: &Path, parent_rel: &str, name: &str, kind: &str) -> Res
     let body = match ext {
         "md" => format!("# {stem}\n\n"),
         "csv" => String::new(),
+        "txt" => String::new(),
+        "json" => "{\n  \n}\n".to_string(),
+        "html" => format!(
+            "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <title>{stem}</title>\n</head>\n<body>\n  <h1>{stem}</h1>\n</body>\n</html>\n"
+        ),
         _ => String::new(),
     };
     let mut file = fs::OpenOptions::new()
@@ -282,7 +316,8 @@ pub fn create_file(root: &Path, parent_rel: &str, name: &str, kind: &str) -> Res
                 map_io(err)
             }
         })?;
-    file.write_all(body.as_bytes()).map_err(map_io)?;
+    if ext == "docx" { file.write_all(&blank_docx()?).map_err(map_io)?; }
+    else { file.write_all(body.as_bytes()).map_err(map_io)?; }
     Ok(if parent.rel.is_empty() {
         name
     } else {
@@ -1080,6 +1115,9 @@ pub fn kind_of(name: &str) -> &'static str {
         | "css" | "js" | "mjs" | "ts" | "tsx" | "jsx" | "py" | "rs" | "go" | "java" | "c"
         | "h" | "cpp" | "hpp" | "cs" | "sh" | "bash" | "zsh" | "ps1" | "sql" | "rb" | "php"
         | "lua" | "vue" | "svelte" => "text",
+        "obj" | "stl" | "gltf" | "glb" | "ply" | "3mf" | "stp" | "step" | "iges" | "igs" => {
+            "model3d"
+        }
         _ => "file",
     }
 }
@@ -1180,7 +1218,7 @@ fn clean_parts(rel: &str) -> Result<Vec<String>, FileError> {
     Ok(parts)
 }
 
-fn valid_new_component(name: &str) -> bool {
+pub(crate) fn valid_new_component(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."
@@ -1209,7 +1247,7 @@ fn finalize_new_filename(name: &str, ext: &str) -> Result<String, FileError> {
     Ok(format!("{name}{want}"))
 }
 
-fn unique_path(path: PathBuf) -> PathBuf {
+pub(crate) fn unique_path(path: PathBuf) -> PathBuf {
     if !path.exists() {
         return path;
     }
@@ -1273,7 +1311,7 @@ fn entry_hidden(path: &Path, name: &str) -> bool {
     false
 }
 
-fn map_io(err: io::Error) -> FileError {
+pub(crate) fn map_io(err: io::Error) -> FileError {
     match err.kind() {
         io::ErrorKind::NotFound => FileError::NotFound,
         io::ErrorKind::PermissionDenied => FileError::Io("Permission denied"),
@@ -1288,9 +1326,13 @@ pub struct SearchHit {
     pub name: String,
     pub path: String,
     pub dir: bool,
+    pub size: u64,
+    pub modified: i64,
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_content: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1304,10 +1346,28 @@ pub struct Usage {
     pub max_mtime: i64,
 }
 
-pub fn search(root: &Path, rel: &str, query: &str) -> Result<Vec<SearchHit>, FileError> {
+pub struct SearchOptions {
+    pub ocr: bool,
+    pub cache_dir: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum SearchPhase {
+    /// Names + text files + PDFs (cached). No image OCR.
+    Fast,
+    /// Image OCR only (uses cache when available).
+    Ocr,
+}
+
+pub fn search(
+    root: &Path,
+    rel: &str,
+    query: &str,
+    options: &SearchOptions,
+) -> Result<Vec<SearchHit>, FileError> {
     let query = query.trim().to_lowercase();
-    if query.chars().count() < 2 {
-        return Err(FileError::Rejected("Type at least 2 characters"));
+    if query.is_empty() {
+        return Err(FileError::Rejected("Enter a search"));
     }
     let start = resolve(root, rel)?;
     if !start.full.is_dir() {
@@ -1316,8 +1376,137 @@ pub fn search(root: &Path, rel: &str, query: &str) -> Result<Vec<SearchHit>, Fil
     let root = root.canonicalize().map_err(map_io)?;
     let mut hits = Vec::new();
     let mut seen = 0usize;
-    walk_search(&root, &start.full, &start.rel, &query, &mut hits, &mut seen);
+    // Phase 1: cheap content (text + PDF cache). This is what makes a single-PDF library feel snappy.
+    walk_search(
+        &root,
+        &start.full,
+        &start.rel,
+        &query,
+        &mut hits,
+        &mut seen,
+        options,
+        SearchPhase::Fast,
+        &mut 0,
+    );
+    // Phase 2: OCR images only if enabled and we still have room for more hits.
+    // First OCR runs are slow; results are cached under ownnas-data/text-cache/.
+    if options.ocr && query.chars().count() >= 2 && hits.len() < 100 {
+        let mut ocr_budget = 12usize;
+        let mut ocr_seen = 0usize;
+        walk_search(
+            &root,
+            &start.full,
+            &start.rel,
+            &query,
+            &mut hits,
+            &mut ocr_seen,
+            options,
+            SearchPhase::Ocr,
+            &mut ocr_budget,
+        );
+    }
     Ok(hits)
+}
+
+fn content_snippet(haystack: &str, needle: &str) -> Option<String> {
+    if !crate::content_index::text_matches(haystack, needle) {
+        return None;
+    }
+    let lower = haystack.to_lowercase();
+    let needle_l = needle.to_lowercase();
+    let idx = lower.find(&needle_l).unwrap_or_else(|| {
+        let compact_hay: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+        let compact_needle: String = needle_l.chars().filter(|c| !c.is_whitespace()).collect();
+        let Some(compact_idx) = compact_hay.find(&compact_needle) else {
+            return 0;
+        };
+        let target_chars = compact_hay[..compact_idx].chars().count();
+        let mut kept_chars = 0usize;
+        for (byte_idx, ch) in haystack.char_indices() {
+            if ch.is_whitespace() {
+                continue;
+            }
+            if kept_chars == target_chars {
+                return byte_idx;
+            }
+            kept_chars += 1;
+        }
+        0
+    });
+    let start = haystack[..idx]
+        .char_indices()
+        .rev()
+        .nth(40)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let end = haystack[idx..]
+        .char_indices()
+        .nth(80)
+        .map(|(i, _)| idx + i)
+        .unwrap_or(haystack.len());
+    let mut snippet = haystack[start..end].replace('\n', " ").replace('\r', " ");
+    while snippet.contains("  ") {
+        snippet = snippet.replace("  ", " ");
+    }
+    let mut out = snippet.trim().to_string();
+    if start > 0 {
+        out.insert_str(0, "…");
+    }
+    if end < haystack.len() {
+        out.push('…');
+    }
+    Some(out)
+}
+
+fn text_file_contains(path: &Path, query: &str) -> Option<String> {
+    const MAX: u64 = 256 * 1024;
+    let meta = fs::metadata(path).ok()?;
+    if meta.len() == 0 || meta.len() > MAX {
+        return None;
+    }
+    let mut file = fs::File::open(path).ok()?;
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    std::io::Read::take(&mut file, MAX)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.contains(&0) {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    if !crate::content_index::text_matches(&text, query) {
+        return None;
+    }
+    content_snippet(&text, query)
+}
+
+fn indexed_contains(
+    path: &Path,
+    kind: &str,
+    query: &str,
+    options: &SearchOptions,
+    ocr_budget: &mut usize,
+) -> Option<String> {
+    if kind == "image" && !options.ocr {
+        return None;
+    }
+    let text = if kind == "image" && *ocr_budget == 0 {
+        crate::content_index::cached_text(path, kind, &options.cache_dir, options.ocr)?
+    } else {
+        let (text, did_work) = crate::content_index::extract_for_search(
+            path,
+            kind,
+            &options.cache_dir,
+            options.ocr,
+        )?;
+        if kind == "image" && did_work {
+            *ocr_budget = ocr_budget.saturating_sub(1);
+        }
+        text
+    };
+    if text.is_empty() || !crate::content_index::text_matches(&text, query) {
+        return None;
+    }
+    content_snippet(&text, query)
 }
 
 fn walk_search(
@@ -1327,8 +1516,14 @@ fn walk_search(
     query: &str,
     hits: &mut Vec<SearchHit>,
     seen: &mut usize,
+    options: &SearchOptions,
+    phase: SearchPhase,
+    ocr_budget: &mut usize,
 ) {
     if hits.len() >= 100 || *seen >= 8_000 {
+        return;
+    }
+    if matches!(phase, SearchPhase::Ocr) && *ocr_budget == 0 {
         return;
     }
     let entries = match fs::read_dir(dir) {
@@ -1337,6 +1532,9 @@ fn walk_search(
     };
     for item in entries {
         if hits.len() >= 100 || *seen >= 8_000 {
+            return;
+        }
+        if matches!(phase, SearchPhase::Ocr) && *ocr_budget == 0 {
             return;
         }
         let Ok(item) = item else { continue };
@@ -1353,27 +1551,60 @@ fn walk_search(
             format!("{rel}/{name}")
         };
         let dir = canon.is_dir();
-        if name.to_lowercase().contains(query) {
-            hits.push(SearchHit {
-                kind: if dir {
-                    if is_trash_folder(&canon) {
-                        "trash-folder".to_string()
-                    } else if is_archive_folder(&canon) {
-                        "archive-folder".to_string()
-                    } else {
-                        "folder".to_string()
-                    }
-                } else {
-                    kind_of(&name).to_string()
-                },
-                name,
-                path: child_rel.clone(),
-                dir,
-                matched_tag: None,
-            });
+        let kind = if dir {
+            if is_trash_folder(&canon) {
+                "trash-folder".to_string()
+            } else if is_archive_folder(&canon) {
+                "archive-folder".to_string()
+            } else {
+                "folder".to_string()
+            }
+        } else {
+            kind_of(&name).to_string()
+        };
+        let name_hit = matches!(phase, SearchPhase::Fast) && name.to_lowercase().contains(query);
+        let content_hit = if !dir && !name_hit && query.chars().count() >= 2 {
+            match (phase, kind.as_str()) {
+                (SearchPhase::Fast, "text") => text_file_contains(&canon, query),
+                (SearchPhase::Fast, "pdf") => {
+                    indexed_contains(&canon, "pdf", query, options, ocr_budget)
+                }
+                (SearchPhase::Ocr, "image") => {
+                    indexed_contains(&canon, "image", query, options, ocr_budget)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if name_hit || content_hit.is_some() {
+            // Avoid duplicate paths if OCR phase somehow overlaps (should not).
+            if !hits.iter().any(|hit| hit.path == child_rel) {
+                let Ok(meta) = canon.metadata() else { continue };
+                hits.push(SearchHit {
+                    kind,
+                    name,
+                    path: child_rel.clone(),
+                    dir,
+                    size: if dir { 0 } else { meta.len() },
+                    modified: modified_secs(&meta),
+                    matched_tag: None,
+                    matched_content: content_hit,
+                });
+            }
         }
         if dir {
-            walk_search(root, &canon, &child_rel, query, hits, seen);
+            walk_search(
+                root,
+                &canon,
+                &child_rel,
+                query,
+                hits,
+                seen,
+                options,
+                phase,
+                ocr_budget,
+            );
         }
     }
 }
@@ -1422,10 +1653,15 @@ pub fn folder_stamp(root: &Path, rel: &str) -> Result<String, FileError> {
 /// Recursively measures a folder. When `slow` is set, the walk yields briefly
 /// so background listing updates do not pin a CPU core.
 pub fn usage(root: &Path, rel: &str) -> Result<Usage, FileError> {
-    usage_paced(root, rel, false)
+    usage_paced(root, rel, false, &CancelFlag::new())
 }
 
-pub fn usage_paced(root: &Path, rel: &str, slow: bool) -> Result<Usage, FileError> {
+pub fn usage_paced(
+    root: &Path,
+    rel: &str,
+    slow: bool,
+    cancel: &CancelFlag,
+) -> Result<Usage, FileError> {
     let start = resolve(root, rel)?;
     if !start.full.is_dir() {
         return Err(FileError::NotADirectory);
@@ -1441,20 +1677,31 @@ pub fn usage_paced(root: &Path, rel: &str, slow: bool) -> Result<Usage, FileErro
         max_mtime: 0,
     };
     let mut since_yield = 0u32;
-    walk_usage(&root, &start.full, &mut usage, slow, &mut since_yield);
+    walk_usage(&root, &start.full, &mut usage, slow, &mut since_yield, cancel)?;
     Ok(usage)
 }
 
-fn walk_usage(root: &Path, dir: &Path, usage: &mut Usage, slow: bool, since_yield: &mut u32) {
+fn walk_usage(
+    root: &Path,
+    dir: &Path,
+    usage: &mut Usage,
+    slow: bool,
+    since_yield: &mut u32,
+    cancel: &CancelFlag,
+) -> Result<(), FileError> {
+    cancel.check()?;
     if usage.files >= 20_000 {
         usage.truncated = true;
-        return;
+        return Ok(());
     }
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
+    };
     for item in entries {
+        cancel.check()?;
         if usage.files >= 20_000 {
             usage.truncated = true;
-            return;
+            return Ok(());
         }
         let Ok(item) = item else { continue };
         let canon = match item.path().canonicalize() {
@@ -1462,7 +1709,7 @@ fn walk_usage(root: &Path, dir: &Path, usage: &mut Usage, slow: bool, since_yiel
             _ => continue,
         };
         if canon.is_dir() {
-            walk_usage(root, &canon, usage, slow, since_yield);
+            walk_usage(root, &canon, usage, slow, since_yield, cancel)?;
         } else {
             usage.files += 1;
             let meta = canon.metadata().ok();
@@ -1479,9 +1726,10 @@ fn walk_usage(root: &Path, dir: &Path, usage: &mut Usage, slow: bool, since_yiel
             }
         }
         if usage.truncated {
-            return;
+            return Ok(());
         }
     }
+    Ok(())
 }
 
 pub fn duplicate(root: &Path, rel: &str) -> Result<String, FileError> {
@@ -1505,6 +1753,21 @@ pub fn duplicate(root: &Path, rel: &str) -> Result<String, FileError> {
         Some(parent_rel) if !parent_rel.is_empty() => format!("{parent_rel}/{file_name}"),
         _ => file_name,
     })
+}
+
+pub fn move_exact(root: &Path, rel: &str, dest_rel: &str) -> Result<String, FileError> {
+    let src = resolve(root, rel)?;
+    if src.rel.is_empty() { return Err(FileError::Forbidden); }
+    let parts = clean_parts(dest_rel)?;
+    let name = parts.last().ok_or(FileError::InvalidName)?;
+    if !valid_new_component(name) { return Err(FileError::InvalidName); }
+    let parent = resolve(root, &parts[..parts.len()-1].join("/"))?;
+    if !parent.full.is_dir() { return Err(FileError::NotADirectory); }
+    if parent.full.starts_with(&src.full) { return Err(FileError::Rejected("A folder cannot be moved inside itself")); }
+    let target = parent.full.join(name);
+    if target.exists() { return Err(FileError::Rejected("The original location is occupied. Undo would overwrite an item.")); }
+    fs::rename(&src.full, &target).map_err(map_io)?;
+    Ok(parts.join("/"))
 }
 
 pub fn move_entry(root: &Path, rel: &str, dest_rel: &str) -> Result<String, FileError> {
@@ -1593,7 +1856,303 @@ pub fn sha256_file(root: &Path, rel: &str) -> Result<String, FileError> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-pub fn write_zip(root: &Path, rel: &str, output: &Path) -> Result<String, FileError> {
+/// Overwrites an image file with raw bytes (used by the preview crop/rotate editor).
+pub fn write_image_bytes(root: &Path, rel: &str, bytes: &[u8]) -> Result<(), FileError> {
+    const MAX_BYTES: usize = 25 * 1024 * 1024;
+    if bytes.is_empty() {
+        return Err(FileError::Rejected("Empty image data"));
+    }
+    if bytes.len() > MAX_BYTES {
+        return Err(FileError::Rejected("Edited image is too large to save (25 MB max)"));
+    }
+    let target = resolve(root, rel)?;
+    if target.rel.is_empty() {
+        return Err(FileError::Forbidden);
+    }
+    if target.full.is_dir() {
+        return Err(FileError::IsADirectory);
+    }
+    let name = target
+        .full
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if kind_of(&name) != "image" {
+        return Err(FileError::Rejected("Only raster images can be saved from the editor"));
+    }
+    let parent = target.full.parent().ok_or(FileError::Forbidden)?;
+    let tmp = parent.join(format!(
+        ".ownnas-img-{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::write(&tmp, bytes).map_err(map_io)?;
+    fs::rename(&tmp, &target.full).map_err(|err| {
+        let _ = fs::remove_file(&tmp);
+        map_io(err)
+    })?;
+    Ok(())
+}
+
+/// Converts a raster image to another format, writing a sibling file (keeps the original).
+pub fn convert_image(root: &Path, rel: &str, format: &str) -> Result<String, FileError> {
+    let (ext, image_format) = match format.trim().to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => ("jpg", image::ImageFormat::Jpeg),
+        "png" => ("png", image::ImageFormat::Png),
+        "webp" => ("webp", image::ImageFormat::WebP),
+        "gif" => ("gif", image::ImageFormat::Gif),
+        "bmp" => ("bmp", image::ImageFormat::Bmp),
+        "tif" | "tiff" => ("tiff", image::ImageFormat::Tiff),
+        _ => return Err(FileError::Rejected("Unsupported image format")),
+    };
+    let target = resolve(root, rel)?;
+    if target.rel.is_empty() {
+        return Err(FileError::Forbidden);
+    }
+    if target.full.is_dir() {
+        return Err(FileError::IsADirectory);
+    }
+    let name = target
+        .full
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if kind_of(&name) != "image" {
+        return Err(FileError::Rejected("Only raster images can be converted"));
+    }
+    let current_ext = extension(&name.to_ascii_lowercase());
+    if current_ext == ext || (current_ext == "jpeg" && ext == "jpg") || (current_ext == "tif" && ext == "tiff") {
+        return Err(FileError::Rejected("That file is already in this format"));
+    }
+    let meta = fs::metadata(&target.full).map_err(map_io)?;
+    if meta.len() > 40 * 1024 * 1024 {
+        return Err(FileError::Rejected("Image is too large to convert (40 MB max)"));
+    }
+    let orientation = read_image_orientation(&target.full);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(25_000);
+    limits.max_image_height = Some(25_000);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    let mut reader = image::ImageReader::open(&target.full)
+        .map_err(|_| FileError::Io("Could not open the image"))?
+        .with_guessed_format()
+        .map_err(|_| FileError::Rejected("Could not recognize the image format"))?;
+    reader.limits(limits);
+    let decoded = reader
+        .decode()
+        .map_err(|_| FileError::Rejected("Could not decode the image"))?;
+    if decoded.width() == 0 || decoded.height() == 0 {
+        return Err(FileError::Rejected("The image is empty"));
+    }
+    let oriented = apply_image_orientation(decoded, orientation);
+    let stem = Path::new(&name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "image".to_string());
+    let parent = target.full.parent().ok_or(FileError::Forbidden)?;
+    let dest = unique_path(parent.join(format!("{stem}.{ext}")));
+    let dest_name = dest
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("{stem}.{ext}"));
+    let tmp = parent.join(format!(
+        ".ownnas-convert-{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    oriented
+        .save_with_format(&tmp, image_format)
+        .map_err(|_| FileError::Rejected("Could not encode the converted image"))?;
+    fs::rename(&tmp, &dest).map_err(|err| {
+        let _ = fs::remove_file(&tmp);
+        map_io(err)
+    })?;
+    Ok(if target.rel.contains('/') {
+        let parent_rel = target.rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        if parent_rel.is_empty() {
+            dest_name
+        } else {
+            format!("{parent_rel}/{dest_name}")
+        }
+    } else {
+        dest_name
+    })
+}
+
+fn read_image_orientation(path: &Path) -> u32 {
+    let Ok(file) = fs::File::open(path) else {
+        return 1;
+    };
+    let mut reader = io::BufReader::new(file);
+    let Ok(exif) = exif::Reader::new().read_from_container(&mut reader) else {
+        return 1;
+    };
+    exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+        .and_then(|field| field.value.get_uint(0))
+        .unwrap_or(1)
+}
+
+fn apply_image_orientation(img: image::DynamicImage, orientation: u32) -> image::DynamicImage {
+    match orientation {
+        2 => img.fliph(),
+        3 => img.rotate180(),
+        4 => img.flipv(),
+        5 => img.rotate90().fliph(),
+        6 => img.rotate90(),
+        7 => img.rotate270().fliph(),
+        8 => img.rotate270(),
+        _ => img,
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateGroup {
+    pub size: u64,
+    pub sha256: String,
+    pub paths: Vec<String>,
+}
+
+/// Finds likely duplicates under `rel` by size then SHA-256.
+pub fn find_duplicates(
+    root: &Path,
+    rel: &str,
+    cancel: &CancelFlag,
+) -> Result<Vec<DuplicateGroup>, FileError> {
+    let start = resolve(root, rel)?;
+    if !start.full.is_dir() {
+        return Err(FileError::NotADirectory);
+    }
+    let root_canon = root.canonicalize().map_err(map_io)?;
+    let mut by_size: std::collections::HashMap<u64, Vec<(String, PathBuf)>> =
+        std::collections::HashMap::new();
+    let mut seen = 0usize;
+    collect_files_for_dupes(
+        &root_canon,
+        &start.full,
+        &start.rel,
+        &mut by_size,
+        &mut seen,
+        cancel,
+    )?;
+    let mut groups = Vec::new();
+    for (size, entries) in by_size {
+        cancel.check()?;
+        if size == 0 || entries.len() < 2 {
+            continue;
+        }
+        let mut by_hash: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (path, full) in entries {
+            cancel.check()?;
+            if groups.len() >= 40 {
+                break;
+            }
+            let Ok(meta) = fs::metadata(&full) else { continue };
+            if meta.len() > 200 * 1024 * 1024 {
+                continue;
+            }
+            let Ok(mut file) = fs::File::open(&full) else { continue };
+            let mut hasher = Sha256::new();
+            let mut buf = [0u8; 64 * 1024];
+            let mut ok = true;
+            loop {
+                cancel.check()?;
+                match file.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => hasher.update(&buf[..n]),
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let digest = hex::encode(hasher.finalize());
+            by_hash.entry(digest).or_default().push(path);
+        }
+        for (sha256, paths) in by_hash {
+            if paths.len() >= 2 {
+                groups.push(DuplicateGroup { size, sha256, paths });
+            }
+            if groups.len() >= 40 {
+                break;
+            }
+        }
+        if groups.len() >= 40 {
+            break;
+        }
+    }
+    groups.sort_by(|a, b| b.size.cmp(&a.size).then(b.paths.len().cmp(&a.paths.len())));
+    Ok(groups)
+}
+
+fn collect_files_for_dupes(
+    root: &Path,
+    dir: &Path,
+    rel: &str,
+    by_size: &mut std::collections::HashMap<u64, Vec<(String, PathBuf)>>,
+    seen: &mut usize,
+    cancel: &CancelFlag,
+) -> Result<(), FileError> {
+    cancel.check()?;
+    if *seen >= 6_000 {
+        return Ok(());
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for item in entries {
+        cancel.check()?;
+        if *seen >= 6_000 {
+            return Ok(());
+        }
+        let Ok(item) = item else { continue };
+        *seen += 1;
+        let name = item.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let child = item.path();
+        let Ok(canon) = child.canonicalize() else { continue };
+        if !canon.starts_with(root) {
+            continue;
+        }
+        let child_rel = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
+        if canon.is_dir() {
+            if is_trash_folder(&canon) || is_archive_folder(&canon) {
+                continue;
+            }
+            collect_files_for_dupes(root, &canon, &child_rel, by_size, seen, cancel)?;
+            continue;
+        }
+        let Ok(meta) = fs::metadata(&canon) else { continue };
+        by_size
+            .entry(meta.len())
+            .or_default()
+            .push((child_rel, canon));
+    }
+    Ok(())
+}
+
+pub fn write_zip(
+    root: &Path,
+    rel: &str,
+    output: &Path,
+    cancel: &CancelFlag,
+) -> Result<String, FileError> {
     let start = resolve(root, rel)?;
     if !start.full.is_dir() {
         return Err(FileError::NotADirectory);
@@ -1605,7 +2164,7 @@ pub fn write_zip(root: &Path, rel: &str, output: &Path) -> Result<String, FileEr
     let file = fs::File::create(output).map_err(map_io)?;
     let mut zip = zip::ZipWriter::new(file);
     let mut count = 0usize;
-    zip_tree(&root, &start.full, "", &mut zip, &mut count)?;
+    zip_tree(&root, &start.full, "", &mut zip, &mut count, cancel)?;
     zip.finish()
         .map_err(|_| FileError::Io("Could not finish the zip"))?;
     let label = if start.rel.is_empty() {
@@ -1621,7 +2180,12 @@ pub fn write_zip(root: &Path, rel: &str, output: &Path) -> Result<String, FileEr
 }
 
 /// Builds a zip for one or more selected files and folders.
-pub fn write_zip_selection(root: &Path, rels: &[String], output: &Path) -> Result<String, FileError> {
+pub fn write_zip_selection(
+    root: &Path,
+    rels: &[String],
+    output: &Path,
+    cancel: &CancelFlag,
+) -> Result<String, FileError> {
     if rels.is_empty() {
         return Err(FileError::Rejected("Choose at least one item to download"));
     }
@@ -1631,10 +2195,10 @@ pub fn write_zip_selection(root: &Path, rels: &[String], output: &Path) -> Resul
     if rels.len() == 1 {
         let one = resolve(root, &rels[0])?;
         if one.rel.is_empty() {
-            return write_zip(root, "", output);
+            return write_zip(root, "", output, cancel);
         }
         if one.full.is_dir() {
-            return write_zip(root, &rels[0], output);
+            return write_zip(root, &rels[0], output, cancel);
         }
     }
     let root = root.canonicalize().map_err(map_io)?;
@@ -1649,6 +2213,7 @@ pub fn write_zip_selection(root: &Path, rels: &[String], output: &Path) -> Resul
     let mut used = HashSet::new();
     let mut first_name = None;
     for rel in rels {
+        cancel.check()?;
         let resolved = resolve(&root, rel)?;
         if resolved.rel.is_empty() {
             return Err(FileError::Rejected("Download selected items instead of the whole library root"));
@@ -1669,7 +2234,7 @@ pub fn write_zip_selection(root: &Path, rels: &[String], output: &Path) -> Resul
         if resolved.full.is_dir() {
             zip.add_directory(format!("{zip_name}/"), options)
                 .map_err(|_| FileError::Io("Could not build the zip"))?;
-            zip_tree(&root, &resolved.full, &zip_name, &mut zip, &mut count)?;
+            zip_tree(&root, &resolved.full, &zip_name, &mut zip, &mut count, cancel)?;
         } else {
             zip.start_file(&zip_name, options)
                 .map_err(|_| FileError::Io("Could not build the zip"))?;
@@ -1715,10 +2280,13 @@ fn zip_tree(
     prefix: &str,
     zip: &mut zip::ZipWriter<fs::File>,
     count: &mut usize,
+    cancel: &CancelFlag,
 ) -> Result<(), FileError> {
+    cancel.check()?;
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
     for item in fs::read_dir(dir).map_err(map_io)? {
+        cancel.check()?;
         let item = item.map_err(map_io)?;
         if *count >= 2_000 {
             return Err(FileError::Rejected("That folder is too large to download as one zip"));
@@ -1737,12 +2305,286 @@ fn zip_tree(
         if canon.is_dir() {
             zip.add_directory(format!("{zip_name}/"), options)
                 .map_err(|_| FileError::Io("Could not build the zip"))?;
-            zip_tree(root, &canon, &zip_name, zip, count)?;
+            zip_tree(root, &canon, &zip_name, zip, count, cancel)?;
         } else {
             zip.start_file(&zip_name, options)
                 .map_err(|_| FileError::Io("Could not build the zip"))?;
             let mut input = fs::File::open(&canon).map_err(map_io)?;
             io::copy(&mut input, zip).map_err(|_| FileError::Io("Could not build the zip"))?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ArchiveFormat {
+    Zip,
+    Tar,
+    TarGz,
+    TarXz,
+}
+
+impl ArchiveFormat {
+    fn parse(value: &str) -> Result<Self, FileError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "zip" => Ok(Self::Zip),
+            "tar" => Ok(Self::Tar),
+            "tar.gz" | "tgz" => Ok(Self::TarGz),
+            "tar.xz" | "txz" => Ok(Self::TarXz),
+            "rar" | "7z" | "zipx" => Err(FileError::Rejected(
+                "That archive format cannot be created here (use ZIP or TAR.GZ)",
+            )),
+            _ => Err(FileError::Rejected("Unsupported archive format")),
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Zip => "zip",
+            Self::Tar => "tar",
+            Self::TarGz => "tar.gz",
+            Self::TarXz => "tar.xz",
+        }
+    }
+}
+
+/// Compresses selected files/folders into a new archive beside them in the library.
+pub fn compress_selection(
+    root: &Path,
+    rels: &[String],
+    format: &str,
+    cancel: &CancelFlag,
+) -> Result<String, FileError> {
+    let format = ArchiveFormat::parse(format)?;
+    if rels.is_empty() {
+        return Err(FileError::Rejected("Choose at least one item to compress"));
+    }
+    if rels.len() > 500 {
+        return Err(FileError::Rejected("Too many items selected for one archive"));
+    }
+    cancel.check()?;
+    let parent_rel = shared_parent_rel(rels)?;
+    let parent = resolve(root, &parent_rel)?;
+    if !parent.full.is_dir() {
+        return Err(FileError::NotADirectory);
+    }
+    let label = archive_label(root, rels)?;
+    let archive_name = format!("{label}.{}", format.extension());
+    if !valid_new_component(&archive_name) {
+        return Err(FileError::InvalidName);
+    }
+    let dest = unique_path(parent.full.join(&archive_name));
+    let dest_name = dest
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or(archive_name);
+    let tmp = parent.full.join(format!(
+        ".ownnas-compress-{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let built = match format {
+        ArchiveFormat::Zip => write_zip_selection(root, rels, &tmp, cancel).map(|_| ()),
+        ArchiveFormat::Tar | ArchiveFormat::TarGz | ArchiveFormat::TarXz => {
+            write_tar_selection(root, rels, &tmp, format, cancel)
+        }
+    };
+    if let Err(err) = built {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if cancel.is_cancelled() {
+        let _ = fs::remove_file(&tmp);
+        return Err(FileError::Cancelled);
+    }
+    fs::rename(&tmp, &dest).map_err(|err| {
+        let _ = fs::remove_file(&tmp);
+        map_io(err)
+    })?;
+    Ok(if parent_rel.is_empty() {
+        dest_name
+    } else {
+        format!("{parent_rel}/{dest_name}")
+    })
+}
+
+fn shared_parent_rel(rels: &[String]) -> Result<String, FileError> {
+    let mut parent: Option<String> = None;
+    for rel in rels {
+        let trimmed = rel.trim().trim_start_matches('/').to_string();
+        if trimmed.is_empty() {
+            return Err(FileError::Rejected("Compress items inside a folder, not the library root"));
+        }
+        if trimmed.contains("..") {
+            return Err(FileError::Forbidden);
+        }
+        let this_parent = trimmed
+            .rsplit_once('/')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_default();
+        match &parent {
+            None => parent = Some(this_parent),
+            Some(existing) if existing == &this_parent => {}
+            Some(_) => {
+                return Err(FileError::Rejected(
+                    "Select items from the same folder to compress together",
+                ))
+            }
+        }
+    }
+    Ok(parent.unwrap_or_default())
+}
+
+fn archive_label(root: &Path, rels: &[String]) -> Result<String, FileError> {
+    if rels.len() == 1 {
+        let resolved = resolve(root, &rels[0])?;
+        let name = resolved
+            .full
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Archive".to_string());
+        // Avoid "photo.jpg.zip" feeling odd for files — use stem for files, full name for dirs.
+        if resolved.full.is_dir() {
+            Ok(name)
+        } else {
+            let stem = Path::new(&name)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or(name);
+            Ok(if stem.is_empty() { "Archive".into() } else { stem })
+        }
+    } else {
+        Ok(format!("Archive ({} items)", rels.len()))
+    }
+}
+
+fn write_tar_selection(
+    root: &Path,
+    rels: &[String],
+    output: &Path,
+    format: ArchiveFormat,
+    cancel: &CancelFlag,
+) -> Result<(), FileError> {
+    let root = root.canonicalize().map_err(map_io)?;
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).map_err(map_io)?;
+    }
+    let file = fs::File::create(output).map_err(map_io)?;
+    let mut count = 0usize;
+    let mut used = HashSet::new();
+    match format {
+        ArchiveFormat::Tar => {
+            let mut builder = tar::Builder::new(file);
+            append_selection_to_tar(&root, rels, &mut builder, &mut used, &mut count, cancel)?;
+            builder
+                .finish()
+                .map_err(|_| FileError::Io("Could not finish the archive"))?;
+        }
+        ArchiveFormat::TarGz => {
+            let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            let mut builder = tar::Builder::new(encoder);
+            append_selection_to_tar(&root, rels, &mut builder, &mut used, &mut count, cancel)?;
+            let encoder = builder
+                .into_inner()
+                .map_err(|_| FileError::Io("Could not finish the archive"))?;
+            encoder
+                .finish()
+                .map_err(|_| FileError::Io("Could not finish the archive"))?;
+        }
+        ArchiveFormat::TarXz => {
+            let encoder = xz2::write::XzEncoder::new(file, 6);
+            let mut builder = tar::Builder::new(encoder);
+            append_selection_to_tar(&root, rels, &mut builder, &mut used, &mut count, cancel)?;
+            let encoder = builder
+                .into_inner()
+                .map_err(|_| FileError::Io("Could not finish the archive"))?;
+            encoder
+                .finish()
+                .map_err(|_| FileError::Io("Could not finish the archive"))?;
+        }
+        ArchiveFormat::Zip => unreachable!(),
+    }
+    Ok(())
+}
+
+fn append_selection_to_tar<W: Write>(
+    root: &Path,
+    rels: &[String],
+    builder: &mut tar::Builder<W>,
+    used: &mut HashSet<String>,
+    count: &mut usize,
+    cancel: &CancelFlag,
+) -> Result<(), FileError> {
+    for rel in rels {
+        cancel.check()?;
+        let resolved = resolve(root, rel)?;
+        if resolved.rel.is_empty() {
+            return Err(FileError::Rejected(
+                "Compress items inside a folder, not the library root",
+            ));
+        }
+        let base = resolved
+            .full
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .ok_or(FileError::InvalidName)?;
+        let archive_name = unique_zip_name(used, &base);
+        *count += 1;
+        if *count > 2_000 {
+            return Err(FileError::Rejected("That selection is too large to compress"));
+        }
+        if resolved.full.is_dir() {
+            tar_append_tree(root, &resolved.full, &archive_name, builder, count, cancel)?;
+        } else {
+            builder
+                .append_path_with_name(&resolved.full, &archive_name)
+                .map_err(|_| FileError::Io("Could not build the archive"))?;
+        }
+    }
+    Ok(())
+}
+
+fn tar_append_tree<W: Write>(
+    root: &Path,
+    dir: &Path,
+    prefix: &str,
+    builder: &mut tar::Builder<W>,
+    count: &mut usize,
+    cancel: &CancelFlag,
+) -> Result<(), FileError> {
+    cancel.check()?;
+    // Include the directory node itself when prefix is non-empty.
+    if !prefix.is_empty() {
+        builder
+            .append_dir(prefix, dir)
+            .map_err(|_| FileError::Io("Could not build the archive"))?;
+    }
+    for item in fs::read_dir(dir).map_err(map_io)? {
+        cancel.check()?;
+        let item = item.map_err(map_io)?;
+        if *count >= 2_000 {
+            return Err(FileError::Rejected("That selection is too large to compress"));
+        }
+        let name = item.file_name().to_string_lossy().to_string();
+        let canon = match item.path().canonicalize() {
+            Ok(path) if path.starts_with(root) => path,
+            _ => continue,
+        };
+        let entry_name = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{}", item.file_name().to_string_lossy())
+        };
+        *count += 1;
+        if canon.is_dir() {
+            tar_append_tree(root, &canon, &entry_name, builder, count, cancel)?;
+        } else {
+            builder
+                .append_path_with_name(&canon, &entry_name)
+                .map_err(|_| FileError::Io("Could not build the archive"))?;
         }
     }
     Ok(())
@@ -1799,7 +2641,7 @@ mod tests {
             Err(FileError::AlreadyExists)
         ));
         assert!(matches!(
-            create_file(&root, "sub", "x", "docx"),
+            create_file(&root, "sub", "x", "unsupported"),
             Err(FileError::Rejected(_))
         ));
         write_text_file(&root, "sub/Notes.md", "# Updated\n\nbody\n").unwrap();
@@ -1828,6 +2670,24 @@ mod tests {
     }
 
     #[test]
+    fn undo_moves_preserves_conflicts_and_restores_trash() {
+        let root = scratch();
+        let moved = move_entry(&root, "sub/note.txt", "").unwrap();
+        fs::write(root.join("sub/note.txt"), b"new item").unwrap();
+        assert!(move_exact(&root, &moved, "sub/note.txt").is_err());
+        assert_eq!(fs::read(root.join("sub/note.txt")).unwrap(), b"new item");
+        assert_eq!(fs::read(root.join(&moved)).unwrap(), b"hello");
+        fs::remove_file(root.join("sub/note.txt")).unwrap();
+        assert_eq!(move_exact(&root, &moved, "sub/note.txt").unwrap(), "sub/note.txt");
+        let trashed = trash_entry(&root, "sub/note.txt").unwrap();
+        move_exact(&root, &trashed, "sub/note.txt").unwrap();
+        assert_eq!(fs::read(root.join("sub/note.txt")).unwrap(), b"hello");
+        assert!(move_exact(&root, "sub/note.txt", "../escape.txt").is_err());
+        assert!(move_exact(&root, "sub", "sub/inside").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn lists_children() {
         let root = scratch();
         let listing = list_dir(&root, "", false, false).unwrap();
@@ -1839,10 +2699,38 @@ mod tests {
     }
 
     #[test]
+    fn search_matches_partial_file_and_folder_names() {
+        let root = scratch();
+        fs::create_dir(root.join("MyProjectsArchive")).unwrap();
+        fs::write(root.join("MyProjectsArchive/AnnualReport.DOCX"), b"binary fixture").unwrap();
+        fs::write(root.join("content.txt"), b"single character Z in content").unwrap();
+        let options = SearchOptions { ocr: false, cache_dir: root.join(".text-cache") };
+        let folders = search(&root, "", "PROJECTS", &options).unwrap();
+        assert!(folders.iter().any(|hit| hit.dir && hit.name == "MyProjectsArchive"));
+        let files = search(&root, "", "ualrep", &options).unwrap();
+        assert!(files.iter().any(|hit| !hit.dir && hit.name == "AnnualReport.DOCX"));
+        let one_character = search(&root, "", "R", &options).unwrap();
+        assert!(one_character.iter().any(|hit| hit.dir && hit.name == "MyProjectsArchive"));
+        assert!(one_character.iter().any(|hit| hit.name == "AnnualReport.DOCX"));
+        assert!(search(&root, "", "Z", &options).unwrap().is_empty(), "single character searches only match names");
+        assert!(search(&root, "", " ", &options).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn searches_duplicates_and_measures() {
         let root = scratch();
         fs::write(root.join("sub").join("Alpha Note.txt"), b"abc").unwrap();
-        let hits = search(&root, "", "alpha").unwrap();
+        let hits = search(
+            &root,
+            "",
+            "alpha",
+            &SearchOptions {
+                ocr: false,
+                cache_dir: root.join(".text-cache"),
+            },
+        )
+        .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "Alpha Note.txt");
         let copy = duplicate(&root, "sub/Alpha Note.txt").unwrap();
@@ -1998,5 +2886,82 @@ mod tests {
         assert!(root.join(".ownnas-trash").join("old.txt").is_file());
         assert!(!root.join("Trash").exists());
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+/// Save an existing DOCX package using a temporary file.
+/// The hash guards against overwriting edits made since the document was opened.
+pub fn write_docx_bytes(root: &Path, rel: &str, bytes: &[u8], expected_hash: &str) -> Result<String, FileError> {
+    static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = SAVE_LOCK.lock().map_err(|_| FileError::Io("Document save lock failed"))?;
+    if bytes.is_empty() || bytes.len() > 25 * 1024 * 1024 {
+        return Err(FileError::Rejected("Document must be between 1 byte and 25 MB"));
+    }
+    let target = resolve(root, rel)?;
+    if !target.full.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("docx")) || is_under_trash(&target.rel) {
+        return Err(FileError::Rejected("Only DOCX files outside Trash can be edited"));
+    }
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|_| FileError::Rejected("Invalid DOCX package"))?;
+    if archive.len() > 4096 { return Err(FileError::Rejected("Too many document parts")); }
+    let mut total = 0u64;
+    for i in 0..archive.len() {
+        let part = archive.by_index(i).map_err(|_| FileError::Rejected("Invalid document part"))?;
+        total = total.saturating_add(part.size());
+        if total > 100 * 1024 * 1024 { return Err(FileError::Rejected("Document expands beyond 100 MB")); }
+    }
+    for name in ["[Content_Types].xml", "word/document.xml"] {
+        let mut part = archive.by_name(name).map_err(|_| FileError::Rejected("Missing DOCX document part"))?;
+        let mut data = String::new();
+        part.read_to_string(&mut data).map_err(|_| FileError::Rejected("Invalid document XML"))?;
+        if !data.contains('<') { return Err(FileError::Rejected("Invalid document XML")); }
+    }
+    let old = fs::read(&target.full).map_err(map_io)?;
+    if hex::encode(Sha256::digest(&old)) != expected_hash {
+        return Err(FileError::Rejected("Document changed on the server. Reopen it before saving."));
+    }
+    let parent = target.full.parent().ok_or(FileError::Forbidden)?;
+    let tmp = parent.join(format!(".ownnas-docx-{}-{}.tmp", std::process::id(), rand::random::<u64>()));
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(map_io)?;
+    let result = (|| {
+        file.write_all(bytes).map_err(map_io)?;
+        file.sync_all().map_err(map_io)?;
+        drop(file);
+        fs::rename(&tmp, &target.full).map_err(map_io)?;
+        Ok(hex::encode(Sha256::digest(bytes)))
+    })();
+    if result.is_err() { let _ = fs::remove_file(&tmp); }
+    result
+}
+
+fn blank_docx() -> Result<Vec<u8>, FileError> {
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for (name, data) in [
+        ("[Content_Types].xml", r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#),
+        ("_rels/.rels", r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#),
+        ("word/document.xml", r#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve"></w:t></w:r></w:p><w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr></w:body></w:document>"#),
+    ] {
+        zip.start_file(name, zip::write::SimpleFileOptions::default()).map_err(|_| FileError::Io("Could not create document"))?;
+        zip.write_all(data.as_bytes()).map_err(map_io)?;
+    }
+    Ok(zip.finish().map_err(|_| FileError::Io("Could not create document"))?.into_inner())
+}
+
+#[cfg(test)]
+mod docx_tests {
+    use super::*;
+    #[test]
+    fn saves_docx_and_rejects_stale_or_invalid_updates() {
+        let root = std::env::temp_dir().join(format!("ownnas-docx-{}", rand::random::<u64>()));
+        fs::create_dir(&root).unwrap();
+        let rel = create_file(&root, "", "Document", "docx").unwrap();
+        let original = fs::read(root.join(&rel)).unwrap();
+        let hash = hex::encode(Sha256::digest(&original));
+        assert!(write_docx_bytes(&root, &rel, b"bad zip", &hash).is_err());
+        assert_eq!(fs::read(root.join(&rel)).unwrap(), original);
+        assert!(write_docx_bytes(&root, &rel, &original, "stale").is_err());
+        assert_eq!(write_docx_bytes(&root, &rel, &original, &hash).unwrap(), hash);
+        assert!(write_docx_bytes(&root, "../escape.docx", &original, &hash).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 }

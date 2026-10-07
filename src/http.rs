@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::Mutex;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use std::future::Future;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Multipart, Query, State};
@@ -20,20 +21,40 @@ use tokio_util::io::ReaderStream;
 use crate::auth::{self, COOKIE_NAME};
 use crate::db::{self, User};
 use crate::files::{self, FileError};
+use crate::pdf_ops;
 use crate::preview;
 use crate::thumbs;
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_CSS: &str = include_str!("../web/app.css");
+const DOCX_EDITOR_CSS: &str = include_str!("../web/docx-editor.css");
+const DOCX_EDITOR_JS: &str = include_str!("../web/docx-editor.js");
 const APP_JS: &str = include_str!("../web/app.js");
+const MODEL_VIEWER_JS: &str = include_str!("../web/model-viewer.js");
+const THREE_MODULE_JS: &str = include_str!("../web/vendor/three/three.module.min.js");
+const THREE_ORBIT_CONTROLS_JS: &str = include_str!("../web/vendor/three/addons/controls/OrbitControls.js");
+const THREE_OBJ_LOADER_JS: &str = include_str!("../web/vendor/three/addons/loaders/OBJLoader.js");
+const THREE_STL_LOADER_JS: &str = include_str!("../web/vendor/three/addons/loaders/STLLoader.js");
+const THREE_GLTF_LOADER_JS: &str = include_str!("../web/vendor/three/addons/loaders/GLTFLoader.js");
+const THREE_PLY_LOADER_JS: &str = include_str!("../web/vendor/three/addons/loaders/PLYLoader.js");
+const THREE_3MF_LOADER_JS: &str = include_str!("../web/vendor/three/addons/loaders/3MFLoader.js");
+const THREE_FFLATE_JS: &str = include_str!("../web/vendor/three/addons/libs/fflate.module.js");
+const THREE_BUFFER_GEOMETRY_UTILS_JS: &str =
+    include_str!("../web/vendor/three/addons/utils/BufferGeometryUtils.js");
+const OCCT_IMPORT_JS: &str = include_str!("../web/vendor/occt/occt-import-js.js");
+const OCCT_WORKER_JS: &str = include_str!("../web/vendor/occt/ownnas-occt-worker.js");
+const OCCT_WASM: &[u8] = include_bytes!("../web/vendor/occt/occt-import-js.wasm");
 
 pub struct AppState {
     pub db: Mutex<rusqlite::Connection>,
     pub root: PathBuf,
     pub thumbs: PathBuf,
+    pub text_cache: PathBuf,
     pub readonly: bool,
     pub secure_cookie: bool,
     pub ffmpeg: bool,
+    pub ocr: bool,
+    pub update: crate::update::UpdateConfig,
     pub attempts: Mutex<AttemptGate>,
 }
 
@@ -57,18 +78,24 @@ pub fn new_state(
     readonly: bool,
     secure_cookie: bool,
     ffmpeg: bool,
+    ocr: bool,
+    update: crate::update::UpdateConfig,
 ) -> Result<AppState, String> {
     let db_path = data_dir.join("ownnas.db");
     let conn = db::open(&db_path)?;
     let thumbs = data_dir.join("thumbs");
     std::fs::create_dir_all(&thumbs).map_err(|_| "Could not create the thumbnail cache".to_string())?;
+    let text_cache = crate::content_index::ensure_cache_dir(&data_dir)?;
     Ok(AppState {
         db: Mutex::new(conn),
         root,
         thumbs,
+        text_cache,
         readonly,
         secure_cookie,
         ffmpeg,
+        ocr,
+        update,
         attempts: Mutex::new(AttemptGate::new()),
     })
 }
@@ -78,10 +105,57 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/", get(index))
         .route("/assets/app.css", get(css))
         .route("/assets/app.js", get(javascript))
+        .route("/assets/docx-editor.js", get(docx_editor_javascript))
+        .route("/assets/docx-editor.css", get(docx_editor_css))
+        .route("/assets/model-viewer.js", get(model_viewer_javascript))
+        .route("/assets/vendor/three/three.module.min.js", get(three_module))
+        .route(
+            "/assets/vendor/three/addons/controls/OrbitControls.js",
+            get(three_orbit_controls),
+        )
+        .route(
+            "/assets/vendor/three/addons/loaders/OBJLoader.js",
+            get(three_obj_loader),
+        )
+        .route(
+            "/assets/vendor/three/addons/loaders/STLLoader.js",
+            get(three_stl_loader),
+        )
+        .route(
+            "/assets/vendor/three/addons/loaders/GLTFLoader.js",
+            get(three_gltf_loader),
+        )
+        .route(
+            "/assets/vendor/three/addons/loaders/PLYLoader.js",
+            get(three_ply_loader),
+        )
+        .route(
+            "/assets/vendor/three/addons/loaders/3MFLoader.js",
+            get(three_3mf_loader),
+        )
+        .route(
+            "/assets/vendor/three/addons/libs/fflate.module.js",
+            get(three_fflate),
+        )
+        .route(
+            "/assets/vendor/three/addons/utils/BufferGeometryUtils.js",
+            get(three_buffer_geometry_utils),
+        )
+        .route(
+            "/assets/vendor/occt/occt-import-js.js",
+            get(occt_import_javascript),
+        )
+        .route(
+            "/assets/vendor/occt/ownnas-occt-worker.js",
+            get(occt_worker_javascript),
+        )
+        .route("/assets/vendor/occt/occt-import-js.wasm", get(occt_wasm))
         .route("/api/health", get(health))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
+        .route("/api/update/check", get(update_check))
+        .route("/api/update/apply", post(update_apply))
         .route("/api/password", post(change_password))
         .route("/api/users", get(list_users).post(create_managed_user))
         .route("/api/users/password", post(admin_set_password))
@@ -90,10 +164,19 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/list", get(list))
         .route("/api/meta", get(meta))
         .route("/api/raw", get(raw))
+        .route("/api/docx", get(read_docx))
         .route("/api/thumb", get(thumb))
         .route("/api/mkdir", post(mkdir))
         .route("/api/create", post(create_entry))
         .route("/api/write", post(write_entry))
+        .route("/api/write-docx", post(write_docx_entry).layer(DefaultBodyLimit::max(36 * 1024 * 1024)))
+        .route("/api/write-image", post(write_image_entry))
+        .route("/api/convert-image", post(convert_image_entry))
+        .route("/api/pdf/info", get(pdf_info))
+        .route("/api/pdf/extract", post(pdf_extract))
+        .route("/api/pdf/split", post(pdf_split))
+        .route("/api/pdf/merge", post(pdf_merge))
+        .route("/api/pdf/rotate", post(pdf_rotate))
         .route("/api/rename", post(rename))
         .route("/api/upload", post(upload).layer(DefaultBodyLimit::disable()))
         .route("/api/upload/conflicts", post(upload_conflicts))
@@ -105,43 +188,119 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/search", get(search))
         .route("/api/usage", get(folder_usage))
         .route("/api/hash", get(file_hash))
+        .route("/api/duplicates", get(find_duplicates))
         .route("/api/activity", get(activity))
         .route("/api/zip", get(zip_folder))
         .route("/api/download", post(download_selection))
+        .route("/api/compress", post(compress_entries))
         .route("/api/move", post(move_item))
+        .route("/api/undo-move", post(undo_move_item))
         .route("/api/copy", post(copy_item))
         .route("/api/duplicate", post(duplicate_item))
+        .route("/api/folder-appearance", get(get_folder_appearance).post(set_folder_appearance))
         .route("/api/annotations", get(get_annotations).post(ack_annotations))
         .route("/api/tags", post(add_tag).delete(remove_tag))
+        .route("/api/tags/bulk", post(bulk_tags))
         .route("/api/comments", post(add_comment).delete(remove_comment))
         .with_state(state)
 }
 
 pub async fn serve(state: std::sync::Arc<AppState>, addr: &str, open_browser: bool) -> Result<(), String> {
+    serve_with_shutdown(state, addr, open_browser, None, std::future::pending()).await
+}
+
+/// Serve HTTPS directly using a supplied PEM certificate chain and private key.
+pub async fn serve_https(
+    state: std::sync::Arc<AppState>,
+    addr: &str,
+    open_browser: bool,
+    cert: &std::path::Path,
+    key: &std::path::Path,
+) -> Result<(), String> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+        .await
+        .map_err(|err| format!("Could not load HTTPS certificate/key: {err}"))?;
+    let listener = std::net::TcpListener::bind(addr)
+        .map_err(|err| format!("Could not listen on {addr}: {err}"))?;
+    listener.set_nonblocking(true).map_err(|err| err.to_string())?;
+    let bound = listener.local_addr().map_err(|err| err.to_string())?;
+    print_banner(&state, bound, "https");
+    if open_browser {
+        open_url(&format!("https://127.0.0.1:{}", bound.port()));
+    }
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
+    let shutdown = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+        }
+    });
+    let result = axum_server::from_tcp_rustls(listener, config)
+        .map_err(|err| err.to_string())?
+        .handle(handle)
+        .serve(router(state).into_make_service())
+        .await
+        .map_err(|err| format!("HTTPS server stopped: {err}"));
+    shutdown.abort();
+    result
+}
+
+/// Start the HTTP server and optionally report the bound address before serving.
+///
+/// The Android bridge uses this variant so Java can wait until the loopback
+/// listener is ready before loading the WebView. Desktop callers should use
+/// `serve`, which keeps the original Ctrl+C-driven lifecycle.
+pub async fn serve_with_shutdown<F>(
+    state: std::sync::Arc<AppState>,
+    addr: &str,
+    open_browser: bool,
+    ready: Option<std::sync::mpsc::Sender<Result<SocketAddr, String>>>,
+    shutdown: F,
+) -> Result<(), String>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .map_err(|_| format!("Could not listen on {addr}. The port may already be in use."))?;
+        .map_err(|_| {
+            let error = format!("Could not listen on {addr}. The port may already be in use.");
+            if let Some(sender) = &ready {
+                let _ = sender.send(Err(error.clone()));
+            }
+            error
+        })?;
     let bound = listener
         .local_addr()
-        .map_err(|_| "Could not read the listen address".to_string())?;
-    print_banner(&state, bound);
+        .map_err(|_| {
+            let error = "Could not read the listen address".to_string();
+            if let Some(sender) = &ready {
+                let _ = sender.send(Err(error.clone()));
+            }
+            error
+        })?;
+    if let Some(sender) = ready {
+        let _ = sender.send(Ok(bound));
+    }
+    print_banner(&state, bound, "http");
     if open_browser {
         let url = format!("http://127.0.0.1:{}", bound.port());
         open_url(&url);
     }
     let app = router(state);
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
         .await
         .map_err(|_| "The server stopped because of a network error".to_string())
 }
 
-fn print_banner(state: &AppState, bound: SocketAddr) {
+fn print_banner(state: &AppState, bound: SocketAddr, scheme: &str) {
     let local = match bound.ip() {
-        std::net::IpAddr::V4(ip) if ip.is_unspecified() => format!("http://127.0.0.1:{}", bound.port()),
-        std::net::IpAddr::V6(ip) if ip.is_unspecified() => format!("http://[::1]:{}", bound.port()),
-        _ => format!("http://{bound}"),
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() => format!("{scheme}://127.0.0.1:{}", bound.port()),
+        std::net::IpAddr::V6(ip) if ip.is_unspecified() => format!("{scheme}://[::1]:{}", bound.port()),
+        _ => format!("{scheme}://{bound}"),
     };
-    println!("OwnNAS is listening on http://{bound}");
+    println!("OwnNAS is listening on {scheme}://{bound}");
     println!("On this machine: {local}");
     println!("Sharing: {}", state.root.display());
     println!(
@@ -155,6 +314,16 @@ fn print_banner(state: &AppState, bound: SocketAddr) {
         println!("Video thumbnails: ffmpeg");
     } else {
         println!("Video thumbnails: install ffmpeg and restart OwnNAS to enable them");
+    }
+    if state.ocr {
+        println!("Image OCR search: tesseract");
+    } else {
+        println!("Image OCR search: install tesseract and restart OwnNAS to enable it");
+    }
+    if crate::content_index::pdftotext_available() {
+        println!("PDF text search: pdftotext");
+    } else {
+        println!("PDF text search: built-in extractor (install poppler/pdftotext for better PDF search)");
     }
     println!("Use the VPN address of this computer from other devices. Press Ctrl+C to stop.");
 }
@@ -225,9 +394,19 @@ impl From<FileError> for ApiError {
                 ApiError::new(StatusCode::CONFLICT, "An item with that name already exists")
             }
             FileError::InvalidName => ApiError::new(StatusCode::BAD_REQUEST, "That name is not allowed"),
+            FileError::Cancelled => ApiError::new(StatusCode::BAD_REQUEST, "Cancelled"),
             FileError::Rejected(message) => ApiError::new(StatusCode::BAD_REQUEST, message),
             FileError::Io(message) => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, message),
         }
+    }
+}
+
+/// Sets a cancel flag when the HTTP handler is dropped (client abort / disconnect).
+struct CancelOnDrop(files::CancelFlag);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -284,9 +463,59 @@ struct WriteBody {
 }
 
 #[derive(Deserialize)]
+struct WriteImageBody {
+    path: String,
+    /// Base64-encoded image bytes (optionally data-URL prefixed).
+    data: String,
+}
+
+#[derive(Deserialize)]
+struct ConvertImageBody {
+    path: String,
+    /// Target format: jpeg, png, webp, gif, bmp, tiff
+    format: String,
+}
+
+#[derive(Deserialize)]
+struct PdfExtractBody {
+    path: String,
+    /// Page list like "1,3,5-8"
+    pages: String,
+    /// "combined" (one PDF) or "separate" (one file per page)
+    mode: String,
+}
+
+#[derive(Deserialize)]
+struct PdfPathBody {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct PdfMergeBody {
+    paths: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct PdfRotateBody {
+    path: String,
+    /// Empty = all pages. Otherwise "1,3,5-8".
+    pages: Option<String>,
+    /// 90, 180, or 270 (clockwise).
+    degrees: i64,
+}
+
+#[derive(Deserialize)]
 struct RenameBody {
     path: String,
     name: String,
+}
+
+#[derive(Deserialize)]
+struct BulkTagsBody {
+    paths: Vec<String>,
+    tag: String,
+    /// "add" (default) or "remove"
+    action: Option<String>,
 }
 
 fn flag(value: &Option<String>) -> bool {
@@ -392,7 +621,7 @@ async fn index() -> impl IntoResponse {
             (header::X_FRAME_OPTIONS, "SAMEORIGIN"),
             (
                 header::CONTENT_SECURITY_POLICY,
-                "default-src 'self'; img-src 'self'; media-src 'self'; frame-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'self'",
+                "default-src 'self'; img-src 'self'; media-src 'self'; frame-src 'self'; style-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; base-uri 'none'; form-action 'self'",
             ),
             (header::REFERRER_POLICY, "no-referrer"),
         ],
@@ -417,6 +646,80 @@ async fn javascript() -> impl IntoResponse {
             (header::CACHE_CONTROL, "no-cache"),
         ],
         APP_JS,
+    )
+}
+
+fn module_javascript(body: &'static str) -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        body,
+    )
+}
+
+fn app_module_javascript(body: &'static str) -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+}
+
+async fn docx_editor_css() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/css; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], DOCX_EDITOR_CSS)
+}
+
+async fn docx_editor_javascript() -> impl IntoResponse {
+    app_module_javascript(DOCX_EDITOR_JS)
+}
+
+async fn model_viewer_javascript() -> impl IntoResponse {
+    app_module_javascript(MODEL_VIEWER_JS)
+}
+async fn three_module() -> impl IntoResponse {
+    module_javascript(THREE_MODULE_JS)
+}
+async fn three_orbit_controls() -> impl IntoResponse {
+    module_javascript(THREE_ORBIT_CONTROLS_JS)
+}
+async fn three_obj_loader() -> impl IntoResponse {
+    module_javascript(THREE_OBJ_LOADER_JS)
+}
+async fn three_stl_loader() -> impl IntoResponse {
+    module_javascript(THREE_STL_LOADER_JS)
+}
+async fn three_gltf_loader() -> impl IntoResponse {
+    module_javascript(THREE_GLTF_LOADER_JS)
+}
+async fn three_ply_loader() -> impl IntoResponse {
+    module_javascript(THREE_PLY_LOADER_JS)
+}
+async fn three_3mf_loader() -> impl IntoResponse {
+    module_javascript(THREE_3MF_LOADER_JS)
+}
+async fn three_fflate() -> impl IntoResponse {
+    module_javascript(THREE_FFLATE_JS)
+}
+async fn three_buffer_geometry_utils() -> impl IntoResponse {
+    module_javascript(THREE_BUFFER_GEOMETRY_UTILS_JS)
+}
+async fn occt_import_javascript() -> impl IntoResponse {
+    module_javascript(OCCT_IMPORT_JS)
+}
+async fn occt_worker_javascript() -> impl IntoResponse {
+    app_module_javascript(OCCT_WORKER_JS)
+}
+async fn occt_wasm() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "application/wasm"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        OCCT_WASM,
     )
 }
 
@@ -502,13 +805,89 @@ async fn me(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     let (user, _) = require_user(&state, &headers)?;
+    use sha2::Digest;
+    let library_id = hex::encode(sha2::Sha256::digest(state.root.to_string_lossy().as_bytes()));
     Ok(Json(json!({
+        "libraryId": library_id,
         "username": user.username,
         "admin": user.is_admin,
         "readonly": state.readonly,
         "version": env!("CARGO_PKG_VERSION"),
         "rootName": files::root_label(&state.root),
         "ffmpeg": state.ffmpeg,
+        "ocr": state.ocr,
+        "updatesConfigured": state.update.url.is_some(),
+        "updatesSigned": state.update.pubkey.is_some(),
+        "updateTarget": crate::update::current_target(),
+    })))
+}
+
+async fn update_check(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    if state.update.url.is_none() {
+        return Ok(Json(json!({
+            "current": env!("CARGO_PKG_VERSION"),
+            "latest": env!("CARGO_PKG_VERSION"),
+            "notes": "",
+            "available": false,
+            "target": crate::update::current_target(),
+            "artifactUrl": null,
+            "signed": false,
+            "updateUrl": null,
+            "configured": false,
+        })));
+    }
+    let config = state.update.clone();
+    let result = tokio::task::spawn_blocking(move || crate::update::check(&config))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Update check failed"))?
+        .map_err(|err| ApiError::new(StatusCode::BAD_GATEWAY, err))?;
+    Ok(Json(json!({
+        "current": result.current,
+        "latest": result.latest,
+        "notes": result.notes,
+        "available": result.available,
+        "target": result.target,
+        "artifactUrl": result.artifact_url,
+        "signed": result.signed,
+        "updateUrl": result.update_url,
+        "configured": true,
+    })))
+}
+
+async fn update_apply(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    if state.update.url.is_none() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Updates are not configured. Pass --update-url when starting OwnNAS.",
+        ));
+    }
+    let config = state.update.clone();
+    let version = tokio::task::spawn_blocking(move || crate::update::download_and_replace(&config))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Update failed"))?
+        .map_err(|err| ApiError::new(StatusCode::BAD_GATEWAY, err))?;
+    record(&state, &user, "update", &format!("installed {version}"));
+    crate::update::spawn_replaced_binary()
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        std::process::exit(0);
+    });
+    Ok(Json(json!({
+        "ok": true,
+        "version": version,
+        "restarting": true,
     })))
 }
 
@@ -702,7 +1081,9 @@ async fn list(
             }
         }
     }
-    Ok(Json(listing))
+    let mut payload = serde_json::to_value(listing).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not list folder"))?;
+    decorate_folder_appearance(&state, &mut payload["entries"])?;
+    Ok(Json(payload))
 }
 
 async fn meta(
@@ -741,6 +1122,28 @@ async fn meta(
     .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the file"))?
     .map_err(ApiError::from)?;
     Ok(Json(payload))
+}
+
+async fn read_docx(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<Response, ApiError> {
+    use sha2::Digest;
+    require_user(&state, &headers)?;
+    let target = files::resolve(&state.root, &rel_of(&query.path))?;
+    if !target.full.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("docx")) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Expected a DOCX file"));
+    }
+    let mut file = tokio::fs::File::open(target.full).await.map_err(|_| ApiError::from(FileError::NotFound))?;
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    (&mut file).take(25 * 1024 * 1024 + 1).read_to_end(&mut bytes).await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read document"))?;
+    if bytes.len() > 25 * 1024 * 1024 { return Err(ApiError::new(StatusCode::BAD_REQUEST, "Documents up to 25 MB are supported")); }
+    let hash = hex::encode(sha2::Sha256::digest(&bytes));
+    Ok(([(header::CONTENT_TYPE.as_str(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        ("x-docx-hash", hash.as_str()), ("cache-control", "no-store")], bytes).into_response())
 }
 
 async fn raw(
@@ -832,6 +1235,17 @@ fn raw_media_type(path: &std::path::Path, name: &str) -> String {
     }
     if kind == "svg" {
         return "image/svg+xml".to_string();
+    }
+    if kind == "model3d" {
+        return match extension_of(name).as_str() {
+            "obj" => "model/obj".to_string(),
+            "stl" => "model/stl".to_string(),
+            "gltf" => "model/gltf+json".to_string(),
+            "glb" => "model/gltf-binary".to_string(),
+            "ply" => "model/ply".to_string(),
+            "3mf" => "model/3mf".to_string(),
+            _ => "application/octet-stream".to_string(),
+        };
     }
     mime_guess::from_path(path)
         .first_raw()
@@ -1020,6 +1434,252 @@ async fn write_entry(
     Ok(Json(json!({ "ok": true })))
 }
 
+#[derive(Deserialize)]
+struct WriteDocxBody {
+    path: String,
+    data: String,
+    expected_hash: String,
+}
+
+async fn write_docx_entry(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<WriteDocxBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let bytes = base64_decode(&body.data)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Invalid document data"))?;
+    let root = state.root.clone();
+    let path = body.path.clone();
+    let hash = tokio::task::spawn_blocking(move || files::write_docx_bytes(&root, &path, &bytes, &body.expected_hash))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not save document"))?
+        .map_err(ApiError::from)?;
+    invalidate_sizes(&state, &parent_rel_path(&body.path));
+    record(&state, &user, "edit-document", &body.path);
+    Ok(Json(json!({ "ok": true, "hash": hash })))
+}
+
+async fn write_image_entry(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<WriteImageBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let raw = body.data.trim();
+    let b64 = raw
+        .rsplit_once(',')
+        .map(|(_, data)| data)
+        .unwrap_or(raw);
+    let bytes = base64_decode(b64)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Image data is not valid base64"))?;
+    let root = state.root.clone();
+    let path = body.path.clone();
+    tokio::task::spawn_blocking(move || files::write_image_bytes(&root, &path, &bytes))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not save the image"))?
+        .map_err(ApiError::from)?;
+    invalidate_sizes(&state, &parent_rel_path(&body.path));
+    record(&state, &user, "edit-image", &body.path);
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn convert_image_entry(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<ConvertImageBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let root = state.root.clone();
+    let path = body.path.clone();
+    let format = body.format.clone();
+    let created = tokio::task::spawn_blocking(move || files::convert_image(&root, &path, &format))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not convert the image"))?
+        .map_err(ApiError::from)?;
+    invalidate_sizes(&state, &parent_rel_path(&created));
+    record(
+        &state,
+        &user,
+        "convert-image",
+        &format!("{} → {created}", body.path),
+    );
+    Ok(Json(json!({ "ok": true, "path": created })))
+}
+
+async fn pdf_info(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (_user, _) = require_user(&state, &headers)?;
+    let root = state.root.clone();
+    let path = rel_of(&query.path);
+    let info = tokio::task::spawn_blocking(move || pdf_ops::pdf_info(&root, &path))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the PDF"))?
+        .map_err(ApiError::from)?;
+    Ok(Json(info))
+}
+
+async fn pdf_extract(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<PdfExtractBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let root = state.root.clone();
+    let path = body.path.clone();
+    let pages = body.pages.clone();
+    let mode = body.mode.clone();
+    let created = tokio::task::spawn_blocking(move || pdf_ops::pdf_extract(&root, &path, &pages, &mode))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not extract PDF pages"))?
+        .map_err(ApiError::from)?;
+    if let Some(first) = created.first() {
+        invalidate_sizes(&state, &parent_rel_path(first));
+    }
+    record(
+        &state,
+        &user,
+        "pdf-extract",
+        &format!("{} → {} file(s)", body.path, created.len()),
+    );
+    Ok(Json(json!({ "ok": true, "paths": created })))
+}
+
+async fn pdf_split(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<PdfPathBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let root = state.root.clone();
+    let path = body.path.clone();
+    let created = tokio::task::spawn_blocking(move || pdf_ops::pdf_split_all(&root, &path))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not split the PDF"))?
+        .map_err(ApiError::from)?;
+    if let Some(first) = created.first() {
+        invalidate_sizes(&state, &parent_rel_path(first));
+    }
+    record(
+        &state,
+        &user,
+        "pdf-split",
+        &format!("{} → {} page(s)", body.path, created.len()),
+    );
+    Ok(Json(json!({ "ok": true, "paths": created })))
+}
+
+async fn pdf_merge(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<PdfMergeBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    if body.paths.len() < 2 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Select at least two PDFs"));
+    }
+    let root = state.root.clone();
+    let paths = body.paths.clone();
+    let created = tokio::task::spawn_blocking(move || pdf_ops::pdf_merge(&root, &paths))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not join the PDFs"))?
+        .map_err(ApiError::from)?;
+    invalidate_sizes(&state, &parent_rel_path(&created));
+    record(
+        &state,
+        &user,
+        "pdf-merge",
+        &format!("{} PDFs → {created}", body.paths.len()),
+    );
+    Ok(Json(json!({ "ok": true, "path": created })))
+}
+
+async fn pdf_rotate(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<PdfRotateBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let root = state.root.clone();
+    let path = body.path.clone();
+    let pages = body.pages.clone().unwrap_or_default();
+    let degrees = body.degrees;
+    let created = tokio::task::spawn_blocking(move || pdf_ops::pdf_rotate(&root, &path, &pages, degrees))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not rotate the PDF"))?
+        .map_err(ApiError::from)?;
+    invalidate_sizes(&state, &parent_rel_path(&created));
+    record(
+        &state,
+        &user,
+        "pdf-rotate",
+        &format!("{} → {created}", body.path),
+    );
+    Ok(Json(json!({ "ok": true, "path": created })))
+}
+
+fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let clean: Vec<u8> = input
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    if clean.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity(clean.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for &c in &clean {
+        if c == b'=' {
+            break;
+        }
+        let val = TABLE.iter().position(|&x| x == c).ok_or(())? as u32;
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Ok(out)
+}
+
+async fn find_duplicates(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (_user, _) = require_user(&state, &headers)?;
+    let root = state.root.clone();
+    let path = rel_of(&query.path);
+    let cancel = files::CancelFlag::new();
+    let _guard = CancelOnDrop(cancel.clone());
+    let groups = tokio::task::spawn_blocking(move || files::find_duplicates(&root, &path, &cancel))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not scan for duplicates"))?
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "groups": groups })))
+}
+
 async fn rename(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
@@ -1055,13 +1715,13 @@ async fn delete_entry(
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not delete the item"))?
         .map_err(ApiError::from)?;
-    if let Some(to) = new_path {
+    if let Some(ref to) = new_path {
         rewrite_meta(&state, &label, &to);
     } else {
         delete_meta(&state, &label);
     }
     record(&state, &user, action, &label);
-    Ok(Json(json!({ "ok": true, "action": action })))
+    Ok(Json(json!({ "ok": true, "action": action, "path": new_path })))
 }
 
 async fn restore_item(
@@ -1284,6 +1944,12 @@ struct PathsBody {
 }
 
 #[derive(Deserialize)]
+struct CompressBody {
+    paths: Vec<String>,
+    format: String,
+}
+
+#[derive(Deserialize)]
 struct MoveBody {
     path: String,
     dest: String,
@@ -1449,9 +2115,6 @@ async fn search(
     if needle.is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "Enter a search"));
     }
-    if !tag_only && needle.chars().count() < 2 {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Type at least 2 characters"));
-    }
 
     let mut hits = if tag_only {
         Vec::new()
@@ -1459,7 +2122,16 @@ async fn search(
         let root = root.clone();
         let rel = rel.clone();
         let needle = needle.clone();
-        tokio::task::spawn_blocking(move || files::search(&root, &rel, &needle))
+        let ocr = state.ocr;
+        let cache_dir = state.text_cache.clone();
+        tokio::task::spawn_blocking(move || {
+            files::search(
+                &root,
+                &rel,
+                &needle,
+                &files::SearchOptions { ocr, cache_dir },
+            )
+        })
             .await
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Search failed"))?
             .map_err(ApiError::from)?
@@ -1490,6 +2162,7 @@ async fn search(
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| path.clone());
                 let dir = resolved.full.is_dir();
+                let Ok(meta) = resolved.full.metadata() else { continue };
                 out.push(files::SearchHit {
                     kind: if dir {
                         "folder".to_string()
@@ -1499,7 +2172,10 @@ async fn search(
                     name,
                     path,
                     dir,
+                    size: if dir { 0 } else { meta.len() },
+                    modified: meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(0),
                     matched_tag: Some(tag),
+                    matched_content: None,
                 });
                 if out.len() >= 100 {
                     break;
@@ -1533,7 +2209,9 @@ async fn search(
         hits.extend(extras);
     }
 
-    Ok(Json(json!({ "hits": hits })))
+    let mut payload = json!({ "hits": hits });
+    decorate_folder_appearance(&state, &mut payload["hits"])?;
+    Ok(Json(payload))
 }
 
 async fn folder_usage(
@@ -1568,14 +2246,16 @@ async fn folder_usage(
             }
         }
     }
+    let cancel = files::CancelFlag::new();
+    let _guard = CancelOnDrop(cancel.clone());
     let usage = tokio::task::spawn_blocking({
         let root = root.clone();
         let rel = rel.clone();
         move || {
             if slow {
-                files::usage_paced(&root, &rel, true)
+                files::usage_paced(&root, &rel, true, &cancel)
             } else {
-                files::usage(&root, &rel)
+                files::usage_paced(&root, &rel, false, &cancel)
             }
         }
     })
@@ -1622,6 +2302,24 @@ async fn activity(
     let events = db::list_events(&conn)
         .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     Ok(Json(json!({ "events": events })))
+}
+
+async fn undo_move_item(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<MoveBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let root = state.root.clone();
+    let from = body.path.clone();
+    let to = tokio::task::spawn_blocking(move || files::move_exact(&root, &body.path, &body.dest))
+        .await.map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not undo the move"))?
+        .map_err(ApiError::from)?;
+    rewrite_meta(&state, &from, &to);
+    record(&state, &user, "undo", &from);
+    Ok(Json(json!({"path": to})))
 }
 
 async fn move_item(
@@ -1684,6 +2382,62 @@ async fn duplicate_item(
     invalidate_sizes(&state, &parent_rel_path(&path));
     record(&state, &user, "duplicate", &label);
     Ok(Json(json!({ "path": path })))
+}
+
+fn decorate_folder_appearance(state: &AppState, entries: &mut serde_json::Value) -> Result<(), ApiError> {
+    let Some(entries) = entries.as_array_mut() else { return Ok(()); };
+    let paths: Vec<String> = entries.iter().filter(|entry| entry["dir"] == true).filter_map(|entry| entry["path"].as_str().map(String::from)).collect();
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let appearances = db::folder_appearance_for_paths(&conn, &paths).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    for entry in entries {
+        if let Some(appearance) = entry["path"].as_str().and_then(|path| appearances.get(path)) {
+            entry["folderAppearance"] = json!(appearance);
+        }
+    }
+    Ok(())
+}
+
+async fn get_folder_appearance(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let folder = files::resolve(&state.root, &rel_of(&query.path))?;
+    if !folder.full.is_dir() { return Err(FileError::NotADirectory.into()); }
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let appearance = db::folder_appearance_for_paths(&conn, &[folder.rel.clone()])
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(Json(json!(appearance.get(&folder.rel))))
+}
+
+#[derive(Deserialize)]
+struct FolderAppearanceBody { paths: Vec<String>, color: String, icon: String }
+
+async fn set_folder_appearance(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<FolderAppearanceBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    if body.paths.is_empty() || body.paths.len() > 200 { return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose between 1 and 200 folders")); }
+    let mut paths = Vec::new();
+    for path in &body.paths {
+        let folder = files::resolve(&state.root, &path)?;
+        if folder.rel.is_empty() || folder.rel == files::TRASH_DIR || folder.rel.starts_with(&format!("{}/", files::TRASH_DIR)) || folder.rel == "Trash" || folder.rel.starts_with("Trash/") || folder.rel == ".ownnas-archive" || folder.rel == "Archive" {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose an ordinary folder outside Trash"));
+        }
+        if !folder.full.is_dir() { return Err(FileError::NotADirectory.into()); }
+        paths.push(folder.rel);
+    }
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    db::set_folder_appearance(&conn, &paths, &body.color, &body.icon)
+        .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    drop(conn);
+    record(&state, &user, "folder-appearance", &paths.join(", "));
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn get_annotations(
@@ -1749,6 +2503,53 @@ async fn add_tag(
     };
     record(&state, &user, "tag", &format!("{path} #{tag}"));
     Ok(Json(json!({ "tag": tag })))
+}
+
+async fn bulk_tags(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<BulkTagsBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let tag = body.tag.trim();
+    if tag.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Enter a tag"));
+    }
+    if body.paths.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Select at least one item"));
+    }
+    let remove = matches!(body.action.as_deref(), Some("remove"));
+    let mut applied = 0usize;
+    {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        for raw in &body.paths {
+            let path = raw.trim().trim_start_matches('/').to_string();
+            if path.is_empty() {
+                continue;
+            }
+            if remove {
+                db::remove_tag(&conn, &path, tag)
+                    .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+            } else {
+                let _ = db::add_tag(&conn, &path, tag)
+                    .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+                if let Ok((size, modified)) = files::entry_stats(&state.root, &path) {
+                    let _ = db::touch_fingerprint(&conn, &path, size as i64, modified);
+                }
+            }
+            applied += 1;
+        }
+    }
+    let action = if remove { "untag-bulk" } else { "tag-bulk" };
+    record(
+        &state,
+        &user,
+        action,
+        &format!("{applied} items #{tag}"),
+    );
+    Ok(Json(json!({ "ok": true, "count": applied })))
 }
 
 async fn remove_tag(
@@ -1833,7 +2634,9 @@ async fn zip_folder(
     ));
     let output = tmp.clone();
     let packed = rel.clone();
-    let name = tokio::task::spawn_blocking(move || files::write_zip(&root, &packed, &output))
+    let cancel = files::CancelFlag::new();
+    let _guard = CancelOnDrop(cancel.clone());
+    let name = tokio::task::spawn_blocking(move || files::write_zip(&root, &packed, &output, &cancel))
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not build the zip"))?;
     let name = match name {
@@ -1873,7 +2676,9 @@ async fn download_selection(
             .unwrap_or(0)
     ));
     let output = tmp.clone();
-    let name = tokio::task::spawn_blocking(move || files::write_zip_selection(&root, &paths, &output))
+    let cancel = files::CancelFlag::new();
+    let _guard = CancelOnDrop(cancel.clone());
+    let name = tokio::task::spawn_blocking(move || files::write_zip_selection(&root, &paths, &output, &cancel))
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not build the download"))?;
     let name = match name {
@@ -1885,6 +2690,38 @@ async fn download_selection(
     };
     record(&state, &user, "download", &label);
     send_temp_zip(tmp, &name).await
+}
+
+async fn compress_entries(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<CompressBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    if body.paths.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose at least one item"));
+    }
+    let root = state.root.clone();
+    let paths = body.paths.clone();
+    let format = body.format.clone();
+    let cancel = files::CancelFlag::new();
+    let _guard = CancelOnDrop(cancel.clone());
+    let created = tokio::task::spawn_blocking(move || {
+        files::compress_selection(&root, &paths, &format, &cancel)
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not create the archive"))?
+    .map_err(ApiError::from)?;
+    invalidate_sizes(&state, &parent_rel_path(&created));
+    record(
+        &state,
+        &user,
+        "compress",
+        &format!("{} → {created}", body.format),
+    );
+    Ok(Json(json!({ "ok": true, "path": created })))
 }
 
 async fn send_temp_zip(tmp: PathBuf, name: &str) -> Result<Response, ApiError> {
@@ -1930,7 +2767,15 @@ mod tests {
 
     async fn app() -> (Router, PathBuf) {
         let (root, data) = scratch();
-        let state = Arc::new(new_state(root.clone(), data, false, false, false).unwrap());
+        let state = Arc::new(new_state(
+            root.clone(),
+            data,
+            false,
+            false,
+            false,
+            false,
+            crate::update::UpdateConfig::default(),
+        ).unwrap());
         {
             let conn = state.db.lock().unwrap();
             db::create_user(&conn, "ada", "longenough").unwrap();
@@ -1977,6 +2822,85 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let text = String::from_utf8(body_bytes(response).await).unwrap();
         assert!(text.contains("hello.txt"));
+
+        files::make_dir(&root, "", "Projects").unwrap();
+        let appearance = json!({"paths":["Projects"], "color":"#ABCDEF", "icon":"work"}).to_string();
+        let response = app.clone().oneshot(Request::builder().method("POST")
+            .uri("/api/folder-appearance").header("cookie", &cookie).header("content-type", "application/json")
+            .body(Body::from(appearance.clone())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = app.clone().oneshot(Request::builder().method("POST")
+            .uri("/api/folder-appearance").header("cookie", &cookie).header("x-ownnas", "1")
+            .header("content-type", "application/json").body(Body::from(appearance)).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app.clone().oneshot(Request::builder().uri("/api/list").header("cookie", &cookie)
+            .body(Body::empty()).unwrap()).await.unwrap();
+        let listing: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        let folder = listing["entries"].as_array().unwrap().iter().find(|entry| entry["name"] == "Projects").unwrap();
+        assert_eq!(folder["folderAppearance"]["color"], "#abcdef");
+        assert_eq!(folder["folderAppearance"]["icon"], "work");
+        for (paths, color, icon, status) in [
+            (vec!["Projects"], "invalid", "work", StatusCode::BAD_REQUEST),
+            (vec!["Projects"], "", "<script>", StatusCode::BAD_REQUEST),
+            (vec!["hello.txt"], "", "folder", StatusCode::BAD_REQUEST),
+            (vec!["../outside"], "", "folder", StatusCode::FORBIDDEN),
+            (vec![""], "", "folder", StatusCode::BAD_REQUEST),
+            (vec!["Projects", "missing"], "#123456", "folder", StatusCode::NOT_FOUND),
+        ] {
+            let response = app.clone().oneshot(Request::builder().method("POST")
+                .uri("/api/folder-appearance").header("cookie", &cookie).header("x-ownnas", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"paths":paths,"color":color,"icon":icon}).to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(), status);
+        }
+        let response = app.clone().oneshot(Request::builder().uri("/api/folder-appearance?path=Projects")
+            .header("cookie", &cookie).body(Body::empty()).unwrap()).await.unwrap();
+        let appearance: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(appearance["color"], "#abcdef", "invalid batch must leave all folders untouched");
+
+        let response = app.clone().oneshot(Request::builder().uri("/api/search?q=Projects")
+            .header("cookie", &cookie).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let search: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(search["hits"][0]["folderAppearance"]["icon"], "work");
+
+        let readonly_app = router(Arc::new(new_state(root.clone(), root.parent().unwrap().join("data"), true, false, false, false, crate::update::UpdateConfig::default()).unwrap()));
+        let response = readonly_app.oneshot(Request::builder().method("POST")
+            .uri("/api/folder-appearance").header("cookie", &cookie).header("x-ownnas", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"paths":["Projects"],"color":"","icon":"folder"}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        files::create_file(&root, "", "Document", "docx").unwrap();
+        let response = app.clone().oneshot(Request::builder()
+            .uri("/api/docx?path=Document.docx").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = app.clone().oneshot(Request::builder()
+            .uri("/api/docx?path=Document.docx").header("cookie", &cookie)
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let hash = response.headers().get("x-docx-hash").unwrap().to_str().unwrap().to_string();
+        let bytes = body_bytes(response).await;
+        // Blank document compressed bytes remain unchanged when saved back.
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut encoded = String::new();
+        for chunk in bytes.chunks(3) {
+            let value = ((chunk[0] as u32) << 16) | ((chunk.get(1).copied().unwrap_or(0) as u32) << 8) | chunk.get(2).copied().unwrap_or(0) as u32;
+            encoded.push(alphabet[((value >> 18) & 63) as usize] as char);
+            encoded.push(alphabet[((value >> 12) & 63) as usize] as char);
+            encoded.push(if chunk.len() > 1 { alphabet[((value >> 6) & 63) as usize] as char } else { '=' });
+            encoded.push(if chunk.len() > 2 { alphabet[(value & 63) as usize] as char } else { '=' });
+        }
+        let payload = json!({"path": "Document.docx", "data": encoded, "expected_hash": hash}).to_string();
+        let response = app.clone().oneshot(Request::builder().method("POST")
+            .uri("/api/write-docx").header("cookie", &cookie).header("content-type", "application/json")
+            .body(Body::from(payload.clone())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = app.clone().oneshot(Request::builder().method("POST")
+            .uri("/api/write-docx").header("cookie", &cookie).header("x-ownnas", "1")
+            .header("content-type", "application/json").body(Body::from(payload)).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(std::fs::read(root.join("Document.docx")).unwrap(), bytes);
 
         let escaped = Request::builder()
             .uri("/api/raw?path=../ownnas.db")
