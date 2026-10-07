@@ -5,10 +5,16 @@ const state = {
   truncated: false,
   total: 0,
   view: normalizeView(localStorage.getItem("ownnas-view")),
+  groupBy: normalizeGroup(localStorage.getItem("ownnas-group")),
+  collapsedGroups: new Set(),
+  detailWidths: readDetailWidths(),
+  tileSize: normalizeTileSize(localStorage.getItem("ownnas-tile-size")),
   sort: localStorage.getItem("ownnas-sort") || "name",
   direction: localStorage.getItem("ownnas-dir") || "asc",
   hidden: localStorage.getItem("ownnas-hidden") === "1",
   filter: "",
+  searchController: null,
+  searchHits: [],
   current: null,
   editor: null,
   folderSizeGen: 0,
@@ -21,10 +27,37 @@ const state = {
   bookmarks: [],
 };
 
+function normalizeGroup(value) {
+  return ["type", "date", "tag"].includes(value) ? value : "none";
+}
+
+function readDetailWidths() {
+  const fallback = [280, 112, 128, 176, 176];
+  try {
+    const saved = JSON.parse(localStorage.getItem("ownnas-detail-widths"));
+    return fallback.map((width, i) => Number.isFinite(saved?.[i]) ? Math.max(i === 0 ? 180 : 72, Math.min(800, saved[i])) : width);
+  } catch { return fallback; }
+}
+
 function normalizeView(value) {
   if (value === "grid") return "masonry";
-  if (value === "masonry" || value === "list" || value === "icons") return value;
+  if (value === "masonry" || value === "list" || value === "icons" || value === "columns") return value;
   return "icons";
+}
+
+function normalizeTileSize(value) {
+  const size = Number(value);
+  if (!Number.isFinite(size) || size <= 0) return 180;
+  return Math.max(96, Math.min(360, Math.round(size / 12) * 12));
+}
+
+function syncTileSize() {
+  $("files").style.setProperty("--tile-size", `${state.tileSize}px`);
+  $("search-results").style.setProperty("--tile-size", `${state.tileSize}px`);
+  $("tile-size").value = state.tileSize;
+  $("tile-size").setAttribute("aria-valuetext", `${state.tileSize} pixels`);
+  $("tile-size").title = `Tile size: ${state.tileSize} px`;
+  $("tile-size-control").hidden = state.view === "list" || state.view === "columns";
 }
 
 const THEMES = [
@@ -115,6 +148,48 @@ function toast(message, bad = false) {
   toastTimer = setTimeout(() => el.classList.remove("show"), 3200);
 }
 
+const undoHistory = [];
+let undoBusy = false;
+let columnGeneration = 0;
+let columnEntries = new Map();
+function syncUndo() {
+  const button = $("undo-btn");
+  if (!button) return;
+  button.disabled = undoBusy || !undoHistory.length || !state.me || state.me.readonly;
+  button.title = undoHistory.length ? `Undo ${undoHistory.at(-1).label} (Ctrl/Cmd+Z)` : "Nothing to undo";
+}
+async function undoFileOperation() {
+  if (undoBusy || !undoHistory.length || !state.me || state.me.readonly) return;
+  undoBusy = true; syncUndo();
+  const operation = undoHistory.at(-1);
+  try {
+    await api("/api/undo-move", { method: "POST", json: { path: operation.path, dest: operation.dest } });
+    undoHistory.pop();
+    invalidateFolderSizes();
+    await load(state.path);
+    toast(`Undid ${operation.label}`);
+  } catch (err) { toast(err.message, true); }
+  finally { undoBusy = false; syncUndo(); }
+}
+async function renderColumns() {
+  const generation = ++columnGeneration;
+  const path = state.path;
+  const paths = [""];
+  for (const part of path.split("/").filter(Boolean)) paths.push(paths.at(-1) ? `${paths.at(-1)}/${part}` : part);
+  try {
+    const listings = await Promise.all(paths.map(p => p === path ? Promise.resolve({entries: state.entries}) : api(`/api/list?path=${encodeURIComponent(p)}${state.hidden ? "&hidden=1" : ""}`)));
+    if (generation !== columnGeneration || state.view !== "columns" || state.path !== path) return;
+    columnEntries = new Map();
+    $("files").innerHTML = paths.map((p, index) => {
+      const entries = index === paths.length - 1 ? sortedEntries() : listings[index].entries;
+      return `<section class="finder-column" data-column-path="${esc(p)}" aria-label="${esc(p || state.me.rootName || 'Library')}"><div class="finder-column-title">${esc(p.split('/').pop() || state.me.rootName || 'Library')}</div>${entries.map(entry => {
+        columnEntries.set(entry.path, entry);
+        return `<button type="button" class="column-entry ${paths[index+1] === entry.path ? 'active' : ''}" draggable="${!state.me.readonly}" data-column-entry="${esc(entry.path)}" data-dir="${entry.dir ? 1 : 0}"><span class="column-glyph">${entryIcon(entry)}</span><span>${esc(entry.name)}</span>${entry.dir ? '<span>›</span>' : ''}</button>`;
+      }).join('')}</section>`;
+    }).join('');
+    $("files").lastElementChild?.scrollIntoView({block: "nearest", inline: "nearest"});
+  } catch (err) { if (generation === columnGeneration) toast(err.message, true); }
+}
 async function api(url, options = {}) {
   const headers = new Headers(options.headers || {});
   const method = options.method || "GET";
@@ -124,7 +199,24 @@ async function api(url, options = {}) {
     headers.set("Content-Type", "application/json");
     body = JSON.stringify(options.json);
   }
-  const response = await fetch(url, { method, headers, body, credentials: "same-origin" });
+  let response;
+  try {
+    response = await fetch(url, {
+      method,
+      headers,
+      body,
+      credentials: "same-origin",
+      signal: options.signal,
+    });
+  } catch (err) {
+    if (err && (err.name === "AbortError" || options.signal?.aborted)) {
+      const abortErr = new Error("Cancelled");
+      abortErr.name = "AbortError";
+      abortErr.cancel = true;
+      throw abortErr;
+    }
+    throw err;
+  }
   const text = await response.text();
   let data = null;
   if (text) {
@@ -135,12 +227,34 @@ async function api(url, options = {}) {
     throw new Error("Sign in required");
   }
   if (!response.ok) {
-    throw new Error((data && data.error) || "Request failed");
+    const message = (data && data.error) || "Request failed";
+    if (message === "Cancelled" || options.signal?.aborted) {
+      const abortErr = new Error("Cancelled");
+      abortErr.name = "AbortError";
+      abortErr.cancel = true;
+      throw abortErr;
+    }
+    throw new Error(message);
+  }
+  if (!undoBusy && state.me) {
+    if (method === "DELETE" && url.startsWith("/api/entry?") && data.action === "deleted" || url === "/api/trash/empty") { undoHistory.length = 0; syncUndo(); }
+    const request = options.json || (["/api/rename", "/api/move"].includes(url) && typeof options.body === "string" ? JSON.parse(options.body) : {});
+    let operation;
+    if (["/api/rename", "/api/move"].includes(url) && method === "POST") operation = { path: data.path, dest: request.path, label: url.endsWith("rename") ? "rename" : "move" };
+    if (method === "DELETE" && url.startsWith("/api/entry?") && data.action === "trashed") operation = { path: data.path, dest: new URL(url, location.href).searchParams.get("path"), label: "move to Trash" };
+    if (operation?.path) { undoHistory.push(operation); if (undoHistory.length > 100) undoHistory.shift(); syncUndo(); }
+    if (url === "/api/logout") { undoHistory.length = 0; syncUndo(); }
   }
   return data;
 }
 
+function isCancelError(err) {
+  return !!(err && (err.cancel || err.name === "AbortError" || err.message === "Cancelled"));
+}
+
 function showLogin(message) {
+  undoHistory.length = 0;
+  syncUndo();
   clearEditor();
   $("boot").hidden = true;
   $("app-view").hidden = true;
@@ -156,7 +270,11 @@ function showApp() {
   $("boot").hidden = true;
   $("login-view").hidden = true;
   $("app-view").hidden = false;
-  $("who").textContent = state.me.admin ? `${state.me.username} · admin` : state.me.username;
+  const whoLabel = state.me.admin ? `${state.me.username} · admin` : state.me.username;
+  $("who").textContent = whoLabel;
+  const settingsBtn = $("settings-btn");
+  settingsBtn.title = `Settings (${whoLabel})`;
+  settingsBtn.setAttribute("aria-label", `Settings (${whoLabel})`);
   const write = !state.me.readonly;
   $("mkdir-btn").hidden = !write;
   $("newfile-btn").hidden = !write;
@@ -228,36 +346,190 @@ function hashToPath() {
 function typeIcon(kind) {
   const icons = {
     folder: `<path d="M2 4.5A1.5 1.5 0 0 1 3.5 3H7l1.2 1.5H12.5A1.5 1.5 0 0 1 14 6v6.5A1.5 1.5 0 0 1 12.5 14h-9A1.5 1.5 0 0 1 2 12.5z" fill="currentColor" opacity="0.22"/><path d="M2 6.5h12v6A1.5 1.5 0 0 1 12.5 14h-9A1.5 1.5 0 0 1 2 12.5z" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3H7l1.5 1.8H12.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>`,
-    "archive-folder": `<path d="M3 3.5h10v2H3zm1 2v7.5A1.5 1.5 0 0 0 5.5 14.5h5A1.5 1.5 0 0 0 12 13V5.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M6.5 8.5h3M6.5 11h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>`,
-    "trash-folder": `<path d="M3.5 5h9M6 5V3.8A.8.8 0 0 1 6.8 3h2.4a.8.8 0 0 1 .8.8V5m-.8 0v7.2a1 1 0 0 1-1 1H7.8a1 1 0 0 1-1-1V5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M7 7.5v4M9 7.5v4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>`,
+    "archive-folder": `
+      <path d="M2.2 4.1h11.6v2.35H2.2z" fill="currentColor" opacity="0.28"/>
+      <path d="M3.15 6.45h9.7v6.2a1.35 1.35 0 0 1-1.35 1.35h-7a1.35 1.35 0 0 1-1.35-1.35z" fill="currentColor" opacity="0.16"/>
+      <path d="M2.2 4.1h11.6v2.35H2.2z" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/>
+      <path d="M3.15 6.45h9.7v6.2a1.35 1.35 0 0 1-1.35 1.35h-7a1.35 1.35 0 0 1-1.35-1.35z" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/>
+      <path d="M2.55 3.15h10.9l.55.95H2z" fill="currentColor" opacity="0.2"/>
+      <path d="M2.55 3.15h10.9l.55.95H2z" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/>
+      <rect x="6.85" y="7.55" width="2.3" height="3.55" rx="0.55" fill="currentColor" opacity="0.22"/>
+      <rect x="6.85" y="7.55" width="2.3" height="3.55" rx="0.55" fill="none" stroke="currentColor" stroke-width="1.2"/>
+      <path d="M7.35 9.05h1.3M7.35 10.35h1.3" stroke="currentColor" stroke-width="1.15" stroke-linecap="round"/>
+      <path d="M4.4 12.15h7.2" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" opacity="0.7"/>
+    `,
+    "trash-folder": `
+      <path d="M4.05 5.85h7.9l-.55 7.05a1.4 1.4 0 0 1-1.4 1.3H6a1.4 1.4 0 0 1-1.4-1.3z" fill="currentColor" opacity="0.18"/>
+      <path d="M4.05 5.85h7.9l-.55 7.05a1.4 1.4 0 0 1-1.4 1.3H6a1.4 1.4 0 0 1-1.4-1.3z" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/>
+      <path d="M2.65 5.85h10.7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+      <path d="M5.55 5.85V4.05A1.15 1.15 0 0 1 6.7 2.9h2.6a1.15 1.15 0 0 1 1.15 1.15v1.8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M6.7 2.9h2.6" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/>
+      <path d="M6.35 7.7v4.15M8 7.7v4.15M9.65 7.7v4.15" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" opacity="0.9"/>
+      <path d="M4.7 5.85l.2-1.05h6.2l.2 1.05" fill="currentColor" opacity="0.22"/>
+    `,
     image: `<rect x="2.5" y="3.5" width="11" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="6" cy="7" r="1.1" fill="currentColor"/><path d="M2.8 11.2 6.2 8.4l2.1 1.7 2.2-2.5 2.7 3.6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>`,
     svg: `<rect x="2.5" y="3.5" width="11" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M5 10.5 8 5.5l3 5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>`,
     video: `<rect x="2.5" y="3.5" width="11" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M7 6.2v3.6L10.2 8z" fill="currentColor"/>`,
     audio: `<path d="M5 10.5a1.7 1.7 0 1 0 0 .2V6.2L12 4.8v4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="5" cy="11" r="1.7" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="12" cy="9.5" r="1.7" fill="none" stroke="currentColor" stroke-width="1.5"/>`,
     pdf: `<path d="M4.5 2.5h5L12.5 5v8.5A1.5 1.5 0 0 1 11 15H5A1.5 1.5 0 0 1 3.5 13.5v-10A1 1 0 0 1 4.5 2.5z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M9.5 2.6V5h2.4M5.5 9h5M5.5 11.5h3.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>`,
+    model3d: `<path d="M8 2.2 13.2 5v6L8 13.8 2.8 11V5z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M8 2.2V8m0 0 5.2 3M8 8 2.8 11" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>`,
     text: `<path d="M4.5 2.5h5L12.5 5v8.5A1.5 1.5 0 0 1 11 15H5A1.5 1.5 0 0 1 3.5 13.5v-10A1 1 0 0 1 4.5 2.5z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M9.5 2.6V5h2.4M5.8 8.5h4.4M5.8 11h3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>`,
-    archive: `<path d="M3 3.5h10v2.2H3zm1.2 2.2v7.8A1.5 1.5 0 0 0 5.7 15h4.6a1.5 1.5 0 0 0 1.5-1.5V5.7" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 8.2v4.2M6.6 10.3h2.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>`,
+    archive: `<path d="M2.4 3.4h11.2v2.2H2.4z" fill="currentColor" opacity="0.2"/><path d="M2.4 3.4h11.2v2.2H2.4z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M3.4 5.6h9.2v7.1A1.3 1.3 0 0 1 11.3 14H4.7A1.3 1.3 0 0 1 3.4 12.7z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M7.15 7.5h1.7v3.2H7.15z" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M7.4 8.9h1.2" stroke="currentColor" stroke-width="1.15" stroke-linecap="round"/>`,
     file: `<path d="M4.5 2.5h5L12.5 5v8.5A1.5 1.5 0 0 1 11 15H5A1.5 1.5 0 0 1 3.5 13.5v-10A1 1 0 0 1 4.5 2.5z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M9.5 2.6V5h2.4" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>`,
   };
   const body = icons[kind] || icons.file;
-  return `<svg class="type-icon" viewBox="0 0 16 16" width="28" height="28" aria-hidden="true">${body}</svg>`;
+  const special = kind === "archive-folder" || kind === "trash-folder";
+  return `<svg class="type-icon${special ? " type-icon-special" : ""}" viewBox="0 0 16 16" width="28" height="28" aria-hidden="true">${body}</svg>`;
+}
+
+const FOLDER_ICONS = {
+  folder: { label: 'Folder', kind: 'folder' },
+  documents: { label: 'Documents', kind: 'text' },
+  photos: { label: 'Photos', kind: 'image' },
+  music: { label: 'Music', kind: 'audio' },
+  video: { label: 'Video', kind: 'video' },
+  code: { label: 'Code', body: '<path d="m6 4-4 4 4 4m4-8 4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5"/>' },
+  work: { label: 'Work', body: '<rect x="2" y="5" width="12" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M5 5V2h6v3M2 9h12M7 8v3h2V8" fill="none" stroke="currentColor" stroke-width="1.5"/>' },
+  star: { label: 'Star', body: '<path d="m8 1.5 2 4 4.5.7-3.3 3.2.8 4.5-4-2.1-4 2.1.8-4.5L1.5 6.2 6 5.5z" fill="currentColor"/>' },
+  heart: { label: 'Heart', body: '<path d="M8 14S1.5 10 1.5 5.5C1.5 1.5 6 1 8 4c2-3 6.5-2.5 6.5 1.5C14.5 10 8 14 8 14z" fill="currentColor"/>' },
+  archive: { label: 'Archive', kind: 'archive' },
+  cloud: { label: 'Cloud', body: '<path d="M4 12h8a3 3 0 0 0 .5-6A4.5 4.5 0 0 0 4 5a3.5 3.5 0 0 0 0 7z" fill="none" stroke="currentColor" stroke-width="1.5"/>' },
+};
+function folderIcon(icon) {
+  const definition = Object.hasOwn(FOLDER_ICONS, icon) ? FOLDER_ICONS[icon] : FOLDER_ICONS.folder;
+  return definition.kind ? typeIcon(definition.kind) : `<svg class="type-icon" viewBox="0 0 16 16" width="28" height="28" aria-hidden="true">${definition.body}</svg>`;
+}
+function entryIcon(entry) {
+  if (!entry.dir || !entry.folderAppearance || ['archive-folder', 'trash-folder'].includes(entry.kind)) return typeIcon(entry.kind);
+  const { color, icon } = entry.folderAppearance;
+  const style = /^#[0-9a-f]{6}$/i.test(color || '') ? ` style="color:${color}"` : '';
+  return `<span class="folder-custom-icon"${style}>${folderIcon(icon)}</span>`;
+}
+function customizableFolder(entry) {
+  return entry.dir && !!entry.path && !inTrashPath(entry.path) && !['archive-folder', 'trash-folder'].includes(entry.kind) && !['.ownnas-archive', 'Archive'].includes(entry.path);
+}
+async function customizeFolders(entries) {
+  const folders = entries.length ? entries : [{ path: state.path, name: state.path.split('/').pop(), dir: true, kind: 'folder' }];
+  if (!folders.every(customizableFolder)) return;
+  const appearance = await api(`/api/folder-appearance?path=${encodeURIComponent(folders[0].path)}`);
+  const dialog = $('folder-appearance-dialog');
+  let color = appearance?.color || '', icon = appearance?.icon || 'folder';
+  $('folder-appearance-title').textContent = folders.length === 1 ? `Customize ${folders[0].name}` : `Customize ${folders.length} folders`;
+  $('folder-appearance-icons').innerHTML = Object.entries(FOLDER_ICONS).map(([id, definition]) => `<button type="button" data-folder-icon="${id}" aria-label="${definition.label}" title="${definition.label}">${folderIcon(id)}<span>${definition.label}</span></button>`).join('');
+  const colors = ['', '#eab308', '#f97316', '#ef4444', '#ec4899', '#a855f7', '#3b82f6', '#06b6d4', '#22c55e', '#94a3b8'];
+  $('folder-appearance-colors').innerHTML = colors.map(value => `<button type="button" data-folder-color="${value}" aria-label="${value || 'Default color'}" title="${value || 'Default color'}"${value ? ` style="background:${value}"` : ''}>${value ? '' : '↺'}</button>`).join('');
+  const paint = () => {
+    $('folder-appearance-preview').innerHTML = `<span class="folder-custom-icon"${color ? ` style="color:${color}"` : ''}>${folderIcon(icon)}</span><span>${esc(folders.length === 1 ? folders[0].name : `${folders.length} folders`)}</span>`;
+    $('folder-appearance-color').value = color || '#3b82f6';
+    dialog.querySelectorAll('[data-folder-icon]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.folderIcon === icon)));
+    dialog.querySelectorAll('[data-folder-color]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.folderColor === color)));
+  };
+  paint(); dialog.returnValue = ''; dialog.showModal();
+  const choice = await new Promise(resolve => {
+    const click = event => {
+      const iconButton = event.target.closest('[data-folder-icon]');
+      const colorButton = event.target.closest('[data-folder-color]');
+      if (iconButton) icon = iconButton.dataset.folderIcon;
+      if (colorButton) color = colorButton.dataset.folderColor;
+      if (event.target.id === 'folder-appearance-reset') { icon = 'folder'; color = ''; }
+      paint();
+    };
+    const input = () => { color = $('folder-appearance-color').value; paint(); };
+    dialog.addEventListener('click', click); $('folder-appearance-color').addEventListener('input', input);
+    dialog.addEventListener('close', () => {
+      dialog.removeEventListener('click', click); $('folder-appearance-color').removeEventListener('input', input);
+      resolve(dialog.returnValue === 'save' ? { color, icon } : null);
+    }, { once: true });
+  });
+  if (!choice) return;
+  await api('/api/folder-appearance', { method: 'POST', json: { paths: folders.map(folder => folder.path), ...choice } });
+  await load(state.path, { keepPreview: true });
+  toast('Folder appearance saved');
 }
 
 function sortedEntries() {
-  const query = state.filter.trim().toLowerCase();
+  const raw = state.filter.trim();
+  const lower = raw.toLowerCase();
+  const tagQuery = lower.startsWith("tag:") ? lower.slice(4).trim() : "";
   const items = state.entries.filter((entry) => {
-    if (!query) return true;
-    if (entry.name.toLowerCase().includes(query)) return true;
-    return (entry.tags || []).some((tag) => tag.toLowerCase().includes(query));
+    if (!raw) return true;
+    if (tagQuery) {
+      return (entry.tags || []).some((tag) => tag.toLowerCase() === tagQuery || tag.toLowerCase().includes(tagQuery));
+    }
+    if (entry.name.toLowerCase().includes(lower)) return true;
+    return (entry.tags || []).some((tag) => tag.toLowerCase().includes(lower));
   });
   const factor = state.direction === "desc" ? -1 : 1;
   items.sort((a, b) => {
     if (a.dir !== b.dir) return a.dir ? -1 : 1;
     if (state.sort === "size") return (a.size - b.size) * factor;
     if (state.sort === "modified") return (a.modified - b.modified) * factor;
+    if (state.sort === "created") return ((a.created || 0) - (b.created || 0)) * factor;
+    if (state.sort === "type") return fileTypeLabel(a).localeCompare(fileTypeLabel(b), undefined, { numeric: true }) * factor || a.name.localeCompare(b.name);
     return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }) * factor;
   });
   return items;
+}
+
+function fileTypeLabel(entry) {
+  if (entry.dir) return "Folder";
+  const labels = { image: "image", video: "video", audio: "audio", model3d: "3D model", pdf: "document", text: "document", archive: "archive", svg: "image" };
+  const ext = entry.name.includes(".") ? entry.name.split(".").pop().toUpperCase() : "";
+  return ext ? `${ext} ${labels[entry.kind] || "file"}` : "File";
+}
+
+function dateGroup(entry, now = new Date()) {
+  if (!entry.modified) return "Unknown date";
+  const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const date = new Date(entry.modified * 1000);
+  const day = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const days = Math.round((midnight - day) / 86400000);
+  if (days <= 0) return "Today";
+  if (days === 1) return "Yesterday";
+  if (days < 7) return "Previous 7 days";
+  if (days < 30) return "Previous 30 days";
+  return "Older";
+}
+
+function groupEntries(items) {
+  if (state.groupBy === "none") return [{ label: "", items }];
+  const groups = new Map();
+  for (const entry of items) {
+    const labels = state.groupBy === "type" ? [fileTypeLabel(entry)]
+      : state.groupBy === "date" ? [dateGroup(entry)]
+      : entry.tags?.length ? [...new Set(entry.tags)] : ["Untagged"];
+    for (const label of labels) {
+      if (!groups.has(label)) groups.set(label, []);
+      groups.get(label).push(entry);
+    }
+  }
+  const dates = ["Today", "Yesterday", "Previous 7 days", "Previous 30 days", "Older", "Unknown date"];
+  return [...groups].sort(([a], [b]) => state.groupBy === "date" ? dates.indexOf(a) - dates.indexOf(b) : a.localeCompare(b, undefined, { numeric: true }))
+    .map(([label, items]) => ({ label, items }));
+}
+
+function displayedEntries() {
+  const seen = new Set();
+  return groupEntries(sortedEntries()).flatMap((group) => state.collapsedGroups.has(`${state.groupBy}:${group.label}`) ? [] : group.items)
+    .filter((entry) => !seen.has(entry.path) && seen.add(entry.path));
+}
+
+const DETAIL_COLUMNS = [["name", "Name"], ["size", "Size"], ["type", "Type"], ["modified", "Modified"], ["created", "Created"]];
+
+function applyDetailWidths() {
+  const [name, ...rest] = state.detailWidths;
+  $("files").style.setProperty("--detail-columns", `minmax(${name}px, 1fr) ${rest.map((width) => `${width}px`).join(" ")} 40px`);
+  $("files").style.setProperty("--detail-min-width", `${state.detailWidths.reduce((a, b) => a + b, 0) + 40}px`);
+}
+
+function detailHeader() {
+  return `<div class="details-header" role="row">${DETAIL_COLUMNS.map(([key, label], i) => {
+    const sort = state.sort === key ? (state.direction === "asc" ? "ascending" : "descending") : "none";
+    return `<div class="detail-heading" role="columnheader" aria-sort="${sort}">
+      <button type="button" data-detail-sort="${key}">${label}${sort === "none" ? "" : sort === "ascending" ? " ↑" : " ↓"}</button>
+      <span class="detail-resize" data-detail-resize="${i}" role="separator" tabindex="0" aria-label="Resize ${label} column" aria-orientation="vertical" aria-valuemin="${i === 0 ? 180 : 72}" aria-valuemax="800" aria-valuenow="${state.detailWidths[i]}"></span>
+    </div>`;
+  }).join("")}<span role="columnheader" aria-label="Actions"></span></div>`;
 }
 
 function renderCrumbs() {
@@ -289,26 +561,38 @@ function inTrashPath(path) {
 
 function renderFiles() {
   const host = $("files");
-  host.className = `files ${state.view}`;
+  host.className = `files ${state.view}${state.groupBy !== "none" ? " grouped" : ""}`;
+  host.setAttribute("role", state.view === "list" ? "table" : "region");
+  if (state.view === "columns") {
+    $("empty").hidden = true;
+    renderColumns();
+    updateSelectionSummary();
+    return;
+  }
+  ++columnGeneration;
+  applyDetailWidths();
   const items = sortedEntries();
   $("empty").hidden = items.length !== 0;
-  $("empty").textContent = state.entries.length === 0 ? "This folder is empty." : "Nothing matches that filter.";
+  $("empty").textContent = state.entries.length === 0 ? "This folder is empty." : "Nothing matches in this folder.";
   const banner = $("banner");
   if (banner) {
     banner.hidden = !state.truncated;
     banner.textContent = state.truncated ? `Showing the first ${state.entries.length} of ${state.total} items.` : "";
   }
-  host.innerHTML = items.map((entry) => {
-    const thumb = entry.thumb
+  const renderCard = (entry) => {
+    const modelThumb = entry.kind === "model3d"
+      ? `<span class="model-thumbnail" data-model-path="${esc(entry.path)}" data-model-name="${esc(entry.name)}" data-model-modified="${entry.modified}" data-model-size="${entry.size}"><span class="glyph kind-model3d" aria-hidden="true">${typeIcon("model3d")}</span></span>`
+      : null;
+    const thumb = modelThumb || (entry.thumb
       ? `<img alt="" loading="lazy" src="/api/thumb?path=${encodeURIComponent(entry.path)}&v=${entry.modified}">`
       : entry.kind === "svg"
         ? `<img alt="" loading="lazy" src="/api/raw?path=${encodeURIComponent(entry.path)}">`
-        : `<span class="glyph kind-${esc(entry.kind)}" aria-hidden="true">${typeIcon(entry.kind)}</span>`;
+        : `<span class="glyph kind-${esc(entry.kind)}" aria-hidden="true">${entryIcon(entry)}</span>`);
     const selected = state.selected.has(entry.path);
     const cut = state.clipboard && state.clipboard.mode === "cut" && state.clipboard.items.some((item) => item.path === entry.path);
     const archiveFolder = entry.kind === "archive-folder";
     const trashFolder = entry.kind === "trash-folder";
-    const mediaCard = entry.kind === "image" || entry.kind === "svg" || entry.kind === "video";
+    const mediaCard = ["image", "svg", "video", "model3d"].includes(entry.kind);
     const displayName = archiveFolder ? "Archive" : trashFolder ? "Trash" : entry.name;
     const badge = archiveFolder
       ? `<span class="badge">Archive</span>`
@@ -326,7 +610,7 @@ function renderFiles() {
       : archiveFolder
         ? "OwnNAS archive"
         : entry.original
-          ? `From ${entry.original}`
+          ? `From ${esc(entry.original)}`
           : entry.dir
             ? esc(formatFolderSize(cachedSize))
             : esc(formatSize(entry.size, false));
@@ -346,6 +630,16 @@ function renderFiles() {
           return `<button type="button" class="tag-badge" data-filter-tag="${esc(tag)}" title="${esc(tag)}" style="--tag-bg:${color}">${esc(tagInitials(tag))}</button>`;
         }).join("")}${tags.length > 3 ? `<span class="tag-badge more-tags" title="${esc(tags.slice(3).join(", "))}">+${tags.length - 3}</span>` : ""}</div>`
       : "";
+    if (state.view === "list") {
+      return `<article class="card details-row${selected ? " selected" : ""}${cut ? " cut" : ""}" role="row" data-path="${esc(entry.path)}" data-dir="${entry.dir ? "1" : "0"}" aria-selected="${selected ? "true" : "false"}">
+        <div class="detail-name" role="cell"><div class="thumb">${thumb}</div><span class="name" title="${esc(entry.path)}">${esc(displayName)}</span></div>
+        <div class="sub detail-size" role="cell">${sub}</div>
+        <div class="detail-cell" role="cell">${esc(fileTypeLabel(entry))}</div>
+        <div class="detail-cell" role="cell" title="${esc(formatDate(entry.modified))}">${esc(modifiedLabel || "—")}</div>
+        <div class="detail-cell" role="cell" title="${entry.created ? esc(formatDate(entry.created)) : ""}">${esc(entry.created ? formatDateShort(entry.created) : "—")}</div>
+        <div role="cell"><button class="more" type="button" data-menu-for="${esc(entry.path)}" aria-label="Actions for ${esc(displayName)}">···</button></div>
+      </article>`;
+    }
     return `<article class="card${selected ? " selected" : ""}${cut ? " cut" : ""}${archiveFolder ? " archive-folder" : ""}${trashFolder ? " trash-folder" : ""}${mediaCard ? " media-card" : ""}" data-path="${esc(entry.path)}" data-dir="${entry.dir ? "1" : "0"}" aria-selected="${selected ? "true" : "false"}">
       <div class="thumb">${thumb}${badge}${tagStack}</div>
       <div class="card-body">
@@ -355,6 +649,15 @@ function renderFiles() {
       </div>
       <button class="more" type="button" data-menu-for="${esc(entry.path)}" aria-label="Actions for ${esc(displayName)}">···</button>
     </article>`;
+  };
+  host.innerHTML = (state.view === "list" ? detailHeader() : "") + groupEntries(items).map((group) => {
+    if (!group.label) return group.items.map(renderCard).join("");
+    const key = `${state.groupBy}:${group.label}`;
+    const collapsed = state.collapsedGroups.has(key);
+    return `<section class="file-group" ${state.view === "list" ? 'role="rowgroup"' : ""}>
+      <button class="file-group-heading" type="button" data-file-group="${esc(key)}" aria-expanded="${!collapsed}"><span aria-hidden="true">${collapsed ? "▸" : "▾"}</span> ${esc(group.label)} <span class="muted">${group.items.length}</span></button>
+      <div class="file-group-items" ${collapsed ? "hidden" : ""}>${collapsed ? "" : group.items.map(renderCard).join("")}</div>
+    </section>`;
   }).join("");
   host.querySelectorAll("img").forEach((img) => {
     img.addEventListener("error", () => {
@@ -365,6 +668,8 @@ function renderFiles() {
       img.replaceWith(wrap);
     });
   });
+  host.querySelectorAll(".card").forEach(card => { card.draggable = !!state.me && !state.me.readonly; });
+  observeModelThumbnails(host);
   updateSelectionSummary();
 }
 
@@ -377,6 +682,8 @@ async function load(path, options = {}) {
   const hidden = state.hidden ? "&hidden=1" : "";
   const data = await api(`/api/list?path=${encodeURIComponent(path)}${hidden}`);
   if (gen !== loadGen) return;
+  const changedFolder = state.path !== (data.path || "");
+  if (changedFolder || options.resetSearch) resetSearch();
   state.path = data.path || "";
   state.entries = data.entries || [];
   state.truncated = !!data.truncated;
@@ -386,7 +693,9 @@ async function load(path, options = {}) {
   state.anchor = "";
   if (!options.keepPreview) closePreview(true);
   renderCrumbs();
+  syncUndo();
   renderFiles();
+  if (changedFolder) document.querySelector(".explorer-content").scrollTop = 0;
   $("zip-link").href = `/api/zip?path=${encodeURIComponent(state.path)}`;
   syncBookmarkBtn();
   $("empty-trash-btn").hidden = !(state.me && !state.me.readonly && inTrashPath(state.path));
@@ -470,15 +779,83 @@ async function go(path) {
   closeSettings();
   const next = pathToHash(path);
   if (location.hash !== next) location.hash = next;
-  else await load(path);
+  else await load(path, { resetSearch: true });
 }
 
 function findEntry(path) {
-  return state.entries.find((entry) => entry.path === path);
+  return state.entries.find((entry) => entry.path === path) || columnEntries.get(path);
+}
+
+const IMAGE_CONVERT_FORMATS = [
+  ["jpeg", "JPEG"],
+  ["png", "PNG"],
+  ["webp", "WebP"],
+  ["gif", "GIF"],
+  ["bmp", "BMP"],
+  ["tiff", "TIFF"],
+];
+const COMPRESS_FORMATS = [
+  ["zip", "ZIP"],
+  ["tar", "TAR"],
+  ["tar.gz", "TAR.GZ"],
+  ["tar.xz", "TAR.XZ"],
+];
+
+function closeMenuSub() {
+  const sub = $("menu-sub");
+  if (sub) sub.hidden = true;
+  state.menuSub = "";
 }
 
 function closeMenu() {
+  closeMenuSub();
   $("menu").hidden = true;
+}
+
+function positionMenuSub(anchorButton) {
+  const menu = $("menu");
+  const sub = $("menu-sub");
+  sub.style.left = "0";
+  sub.style.top = "0";
+  sub.hidden = false;
+  const menuRect = menu.getBoundingClientRect();
+  const anchorRect = anchorButton.getBoundingClientRect();
+  const subRect = sub.getBoundingClientRect();
+  let left = menuRect.right + 6;
+  let top = anchorRect.top;
+  if (left + subRect.width > window.innerWidth - 8) {
+    left = menuRect.left - subRect.width - 6;
+  }
+  if (top + subRect.height > window.innerHeight - 8) {
+    top = Math.max(8, window.innerHeight - subRect.height - 8);
+  }
+  sub.style.left = `${Math.max(8, left)}px`;
+  sub.style.top = `${Math.max(8, top)}px`;
+}
+
+function openMenuSub(kind, anchorButton) {
+  let buttons = [];
+  if (kind === "pdf") {
+    buttons = [
+      `<div class="menu-label">PDF</div>`,
+      `<button type="button" data-menu="pdfExtract">Extract pages…</button>`,
+      `<button type="button" data-menu="pdfSplit">Split into pages</button>`,
+      `<button type="button" data-menu="pdfRotate">Rotate…</button>`,
+    ];
+  } else {
+    const title = kind === "convert" ? "Convert to" : "Compress to";
+    const formats = kind === "convert" ? IMAGE_CONVERT_FORMATS : COMPRESS_FORMATS;
+    const action = kind === "convert" ? "convert" : "compress";
+    buttons = [`<div class="menu-label">${title}</div>`];
+    for (const [format, label] of formats) {
+      buttons.push(
+        `<button type="button" data-menu="${action}" data-format="${esc(format)}">${esc(label)}</button>`,
+      );
+    }
+  }
+  $("menu-sub").innerHTML = buttons.join("");
+  state.menuSub = kind;
+  positionMenuSub(anchorButton);
 }
 
 function parentPath(path) {
@@ -487,7 +864,7 @@ function parentPath(path) {
 }
 
 function selectedEntries() {
-  return state.entries.filter((entry) => state.selected.has(entry.path));
+  return [...state.selected].map(findEntry).filter(Boolean);
 }
 
 function entryKnownBytes(entry) {
@@ -501,6 +878,10 @@ function entryKnownBytes(entry) {
 }
 
 function updateSelectionSummary() {
+  const visible = sortedEntries().length;
+  const itemCount = `${visible} ${visible === 1 ? "item" : "items"}`;
+  const folderTotal = state.truncated ? state.total : state.entries.length;
+  $("folder-summary").textContent = visible === folderTotal ? itemCount : `${itemCount} of ${folderTotal}`;
   const el = $("selection-summary");
   if (!el) return;
   const entries = selectedEntries();
@@ -526,8 +907,8 @@ function updateSelectionSummary() {
 }
 
 function paintSelection() {
-  document.querySelectorAll("#files .card").forEach((card) => {
-    const selected = state.selected.has(card.dataset.path);
+  document.querySelectorAll("#files .card, #files [data-column-entry]").forEach((card) => {
+    const selected = state.selected.has(card.dataset.path || card.dataset.columnEntry);
     card.classList.toggle("selected", selected);
     card.setAttribute("aria-selected", selected ? "true" : "false");
     const cut = state.clipboard && state.clipboard.mode === "cut" && state.clipboard.items.some((item) => item.path === card.dataset.path);
@@ -550,7 +931,7 @@ function toggleSelected(path) {
 }
 
 function selectRange(path) {
-  const items = sortedEntries();
+  const items = displayedEntries();
   const from = items.findIndex((entry) => entry.path === (state.anchor || path));
   const to = items.findIndex((entry) => entry.path === path);
   if (from < 0 || to < 0) {
@@ -565,10 +946,10 @@ function selectRange(path) {
 function gridColumnCount() {
   const cards = [...document.querySelectorAll("#files .card")];
   if (cards.length < 2 || state.view === "list") return 1;
-  const top = cards[0].offsetTop;
+  const top = cards[0].getBoundingClientRect().top;
   let cols = 1;
   for (let i = 1; i < cards.length; i += 1) {
-    if (Math.abs(cards[i].offsetTop - top) > 2) break;
+    if (Math.abs(cards[i].getBoundingClientRect().top - top) > 2) break;
     cols += 1;
   }
   return Math.max(1, cols);
@@ -580,27 +961,42 @@ function scrollSelectedIntoView(path) {
 }
 
 function moveSelection(deltaX, deltaY, extend) {
-  const items = sortedEntries();
+  const items = displayedEntries();
   if (!items.length) return;
-  const cols = gridColumnCount();
   let index = items.findIndex((entry) => entry.path === state.anchor);
   if (index < 0) {
     const selected = selectedEntries();
-    index = selected.length
-      ? items.findIndex((entry) => entry.path === selected[selected.length - 1].path)
-      : 0;
+    index = selected.length ? items.findIndex((entry) => entry.path === selected[selected.length - 1].path) : -1;
   }
-  if (index < 0) index = 0;
-  let next = index + deltaX + (deltaY * cols);
-  next = Math.max(0, Math.min(items.length - 1, next));
+  let next = index < 0 ? 0 : Math.max(0, Math.min(items.length - 1, index + deltaX + deltaY));
+  if (index >= 0 && state.view !== "list") {
+    const origin = document.querySelector(`#files .card[data-path="${CSS.escape(items[index].path)}"]`);
+    if (origin) {
+      const bounds = origin.getBoundingClientRect();
+      const x = bounds.left + bounds.width / 2;
+      const y = bounds.top + bounds.height / 2;
+      let best = Infinity;
+      next = index;
+      items.forEach((entry, i) => {
+        if (i === index) return;
+        const card = document.querySelector(`#files .card[data-path="${CSS.escape(entry.path)}"]`);
+        if (!card) return;
+        const rect = card.getBoundingClientRect();
+        const dx = rect.left + rect.width / 2 - x;
+        const dy = rect.top + rect.height / 2 - y;
+        const forward = deltaX ? dx * deltaX : dy * deltaY;
+        if (forward <= 2) return;
+        const sideways = Math.abs(deltaX ? dy : dx);
+        const score = forward + sideways * 3;
+        if (score < best) { best = score; next = i; }
+      });
+    }
+  }
   const entry = items[next];
-  if (!entry) return;
   if (extend) selectRange(entry.path);
   else selectOnly(entry.path);
   scrollSelectedIntoView(entry.path);
-  if (!$("preview").hidden && !entry.dir) {
-    openEntry(entry).catch((err) => toast(err.message, true));
-  }
+  if (!$("preview").hidden && !entry.dir) openEntry(entry).catch((err) => toast(err.message, true));
 }
 
 function renderClipboard() {
@@ -637,41 +1033,83 @@ function openSelectionMenu(x, y, pasteInto) {
   const entries = selectedEntries();
   const write = state.me && !state.me.readonly;
   const clip = state.clipboard && state.clipboard.items.length;
-  // Empty-space menu: New folder and Paste. Selection menu needs at least one item.
-  if (!entries.length && !write) return;
+  // Empty-space menu: folder actions. Selection menu needs at least one item.
+  if (!entries.length && !write && !state.me) return;
   state.menuEntries = entries;
   state.pasteInto = pasteInto;
   const one = entries.length === 1 ? entries[0] : null;
   const allInTrash = entries.length > 0 && entries.every((entry) => inTrashPath(entry.path));
+  const inTrash = inTrashPath(state.path);
+  const bookmarked = state.bookmarks.includes(state.path);
   const buttons = [];
   if (entries.length) {
     buttons.push(`<div class="menu-label">${entries.length === 1 ? esc(entries[0].name) : `${entries.length} items`}</div>`);
   } else {
     buttons.push(`<div class="menu-label">${esc(state.path || "Library")}</div>`);
   }
-  if (!entries.length && write) {
-    buttons.push(`<button type="button" data-menu="mkdir">New folder</button>`);
-    buttons.push(`<button type="button" data-menu="newfile">New file…</button>`);
+  if (!entries.length) {
+    if (write) {
+      buttons.push(`<button type="button" data-menu="mkdir">New folder</button>`);
+      buttons.push(`<button type="button" data-menu="newfile">New file…</button>`);
+      buttons.push(`<button type="button" data-menu="upload">Upload files…</button>`);
+      buttons.push(`<button type="button" data-menu="uploadFolder">Upload folder…</button>`);
+    }
+    if (write && customizableFolder({ path: state.path, dir: true, kind: 'folder' })) buttons.push('<button type="button" data-menu="folderAppearance">Customize folder…</button>');
+    buttons.push(`<button type="button" data-menu="downloadZip">Download folder zip</button>`);
+    buttons.push(`<button type="button" data-menu="search">Search…</button>`);
+    buttons.push(`<button type="button" data-menu="library">Library</button>`);
+    if (write) {
+      buttons.push(`<button type="button" data-menu="bookmark">${bookmarked ? "Remove bookmark" : "Bookmark this folder"}</button>`);
+    }
+    buttons.push(`<button type="button" data-menu="usage">Folder size</button>`);
+    buttons.push(`<button type="button" data-menu="duplicates">Find duplicates…</button>`);
+    buttons.push(`<button type="button" data-menu="activity">Activity</button>`);
+    buttons.push(`<button type="button" data-menu="toggleHidden">${state.hidden ? "Hide dotfiles" : "Show hidden files"}</button>`);
+    if (write && inTrash) {
+      buttons.push(`<button type="button" data-menu="emptyTrash" class="danger">Empty Trash</button>`);
+    }
+    if (write && clip) buttons.push(`<button type="button" data-menu="paste">Paste</button>`);
+  } else {
+    if (one) buttons.push(`<button type="button" data-menu="open">Open</button>`);
+    if (write && entries.every(customizableFolder)) buttons.push(`<button type="button" data-menu="folderAppearance">${entries.length === 1 ? 'Customize folder…' : 'Customize folders…'}</button>`);
+    if (entries.length) buttons.push(`<button type="button" data-menu="download">Download</button>`);
+    if (write && allInTrash) buttons.push(`<button type="button" data-menu="restore">Restore</button>`);
+    if (entries.length) buttons.push(`<button type="button" data-menu="copy">Copy</button>`);
+    if (write && entries.length && !allInTrash) {
+      buttons.push(`<button type="button" data-menu="cut">Cut</button>`);
+    }
+    if (write && clip) buttons.push(`<button type="button" data-menu="paste">Paste</button>`);
+    if (write && entries.length && !allInTrash) {
+      buttons.push(`<button type="button" data-menu="duplicate">Duplicate</button>`);
+      buttons.push(`<button type="button" data-menu="move">Move</button>`);
+      buttons.push(`<button type="button" data-menu="bulkTag">Tag…</button>`);
+    }
+    const convertibles = entries.filter((entry) => entry.kind === "image");
+    if (write && convertibles.length && convertibles.length === entries.length && !allInTrash) {
+      buttons.push(`<button type="button" class="menu-has-sub" data-menu="convertMenu">Convert to…</button>`);
+    }
+    const pdfs = entries.filter((entry) => entry.kind === "pdf");
+    if (write && pdfs.length && pdfs.length === entries.length && !allInTrash) {
+      if (pdfs.length === 1) {
+        buttons.push(`<button type="button" class="menu-has-sub" data-menu="pdfMenu">PDF…</button>`);
+      } else {
+        buttons.push(`<button type="button" data-menu="pdfMerge">Join PDFs</button>`);
+      }
+    }
+    if (write && entries.length && !allInTrash) {
+      buttons.push(`<button type="button" class="menu-has-sub" data-menu="compressMenu">Compress to…</button>`);
+    }
+    if (write && entries.length >= 2 && !allInTrash) {
+      buttons.push(`<button type="button" data-menu="folderWith">New folder with selection</button>`);
+    }
+    if (write && entries.length && !allInTrash) {
+      buttons.push(`<button type="button" data-menu="rename">Rename</button>`);
+    }
+    if (write && entries.length) {
+      buttons.push(`<button type="button" data-menu="delete" class="danger">${allInTrash ? "Delete forever" : "Move to Trash"}</button>`);
+    }
   }
-  if (one) buttons.push(`<button type="button" data-menu="open">Open</button>`);
-  if (entries.length) buttons.push(`<button type="button" data-menu="download">Download</button>`);
-  if (write && allInTrash) buttons.push(`<button type="button" data-menu="restore">Restore</button>`);
-  if (entries.length) buttons.push(`<button type="button" data-menu="copy">Copy</button>`);
-  if (write && entries.length && !allInTrash) {
-    buttons.push(`<button type="button" data-menu="cut">Cut</button>`);
-  }
-  if (write && clip) buttons.push(`<button type="button" data-menu="paste">Paste</button>`);
-  if (write && entries.length && !allInTrash) {
-    buttons.push(`<button type="button" data-menu="duplicate">Duplicate</button>`);
-    buttons.push(`<button type="button" data-menu="move">Move</button>`);
-  }
-  if (write && entries.length >= 2 && !allInTrash) {
-    buttons.push(`<button type="button" data-menu="folderWith">New folder with selection</button>`);
-  }
-  if (write && one && !allInTrash) buttons.push(`<button type="button" data-menu="rename">Rename</button>`);
-  if (write && entries.length) {
-    buttons.push(`<button type="button" data-menu="delete" class="danger">${allInTrash ? "Delete forever" : "Move to Trash"}</button>`);
-  }
+  closeMenuSub();
   const menu = $("menu");
   menu.innerHTML = buttons.join("");
   menu.hidden = false;
@@ -685,12 +1123,14 @@ function closePreview(force = false) {
     if (!window.confirm("You have unsaved edits. Discard them?")) return false;
   }
   clearEditor();
+  disposeActiveModelViewer();
   setPreviewFullscreen(false);
   $("preview").hidden = true;
   state.current = null;
   $("preview-body").innerHTML = "";
   $("preview-path").hidden = true;
   $("preview-path").textContent = "";
+  $("preview-edit-image").hidden = true;
   $("preview-notes").hidden = true;
   $("notes-changed").hidden = true;
   setNotesExpanded(false);
@@ -704,6 +1144,7 @@ function closePreview(force = false) {
 }
 
 function clearEditor() {
+  state.editor?.destroy?.();
   state.editor = null;
 }
 
@@ -726,10 +1167,15 @@ function closeSettings() {
 
 function setSettingsTab(tab) {
   const theme = tab === "theme";
+  const updates = tab === "updates";
+  const users = tab === "users";
   $("settings-tab-theme").setAttribute("aria-selected", theme ? "true" : "false");
-  $("settings-tab-users").setAttribute("aria-selected", theme ? "false" : "true");
+  $("settings-tab-updates").setAttribute("aria-selected", updates ? "true" : "false");
+  $("settings-tab-users").setAttribute("aria-selected", users ? "true" : "false");
   $("settings-theme").hidden = !theme;
-  $("settings-users").hidden = theme;
+  $("settings-updates").hidden = !updates;
+  $("settings-users").hidden = !users;
+  if (updates) refreshUpdatePanel().catch((err) => toast(err.message, true));
 }
 
 function openSettings(tab) {
@@ -737,11 +1183,90 @@ function openSettings(tab) {
   closeLibrary();
   const admin = !!(state.me && state.me.admin);
   $("settings-tab-users").hidden = !admin;
-  if (!admin) tab = "theme";
-  setSettingsTab(tab || "theme");
+  if (!admin && tab === "users") tab = "theme";
+  if (!tab) tab = "theme";
+  setSettingsTab(tab);
   renderThemeGrid();
   $("settings").hidden = false;
-  if (admin) loadUsers().catch((err) => toast(err.message, true));
+  if (admin && tab === "users") loadUsers().catch((err) => toast(err.message, true));
+}
+
+async function refreshUpdatePanel() {
+  const current = (state.me && state.me.version) || "—";
+  $("update-current").textContent = current;
+  $("update-target").textContent = (state.me && state.me.updateTarget) || "—";
+  $("update-error").hidden = true;
+  $("update-error").textContent = "";
+  $("update-notes").hidden = true;
+  $("update-apply-btn").hidden = true;
+  const admin = !!(state.me && state.me.admin);
+  $("update-check-btn").disabled = !admin;
+  if (!admin) {
+    $("update-status").textContent = "Only administrators can check or install updates.";
+    return;
+  }
+  if (!state.me.updatesConfigured) {
+    $("update-status").textContent = "Updates are not configured. Start OwnNAS with --update-url pointing at your VPS latest.json.";
+    return;
+  }
+  $("update-status").textContent = "Click Check for updates to query your update host.";
+}
+
+async function checkForUpdates() {
+  $("update-error").hidden = true;
+  $("update-check-btn").disabled = true;
+  $("update-status").textContent = "Checking…";
+  try {
+    const data = await api("/api/update/check");
+    if (!data.configured) {
+      $("update-status").textContent = "Updates are not configured on this server.";
+      return;
+    }
+    $("update-current").textContent = data.current || "—";
+    $("update-target").textContent = data.target || "—";
+    if (data.notes) {
+      $("update-notes").hidden = false;
+      $("update-notes").textContent = data.notes;
+    } else {
+      $("update-notes").hidden = true;
+    }
+    if (data.available) {
+      const signed = data.signed ? " (signature verified)" : "";
+      $("update-status").textContent = `Version ${data.latest} is available${signed}.`;
+      $("update-apply-btn").hidden = false;
+    } else {
+      $("update-status").textContent = `You’re on the latest version (${data.current}).`;
+      $("update-apply-btn").hidden = true;
+    }
+  } catch (err) {
+    $("update-status").textContent = "Check failed.";
+    $("update-error").hidden = false;
+    $("update-error").textContent = err.message;
+  } finally {
+    $("update-check-btn").disabled = false;
+  }
+}
+
+async function applyUpdate() {
+  if (!await askConfirm("Download and install the new OwnNAS binary? The server will restart briefly.", "Install update")) {
+    return;
+  }
+  $("update-apply-btn").disabled = true;
+  $("update-check-btn").disabled = true;
+  $("update-status").textContent = "Downloading and installing… OwnNAS will restart.";
+  try {
+    const data = await api("/api/update/apply", { method: "POST", json: {} });
+    toast(`Updated to ${data.version || "new version"} — reconnecting…`);
+    setTimeout(() => {
+      location.reload();
+    }, 1500);
+  } catch (err) {
+    $("update-error").hidden = false;
+    $("update-error").textContent = err.message;
+    $("update-status").textContent = "Install failed.";
+    $("update-apply-btn").disabled = false;
+    $("update-check-btn").disabled = false;
+  }
 }
 
 async function loadUsers() {
@@ -812,6 +1337,7 @@ async function openEntry(entry) {
     state.editor.dirty = false;
   }
   clearEditor();
+  disposeActiveModelViewer();
   closeLibrary();
   state.current = entry;
   $("preview").hidden = false;
@@ -830,6 +1356,8 @@ async function openEntry(entry) {
   const imageIndex = images.findIndex((item) => item.path === entry.path);
   $("preview-prev").hidden = imageIndex <= 0;
   $("preview-next").hidden = imageIndex < 0 || imageIndex >= images.length - 1;
+  const canEditImage = write && entry.kind === "image" && !inTrashPath(entry.path);
+  $("preview-edit-image").hidden = !canEditImage;
   if (!inTrashPath(entry.path)) {
     api("/api/recent", { method: "POST", json: { path: entry.path } }).then(() => refreshLibrary()).catch(() => {});
   }
@@ -837,7 +1365,7 @@ async function openEntry(entry) {
   const body = $("preview-body");
   const raw = `/api/raw?path=${encodeURIComponent(entry.path)}`;
   if (entry.kind === "image" || entry.kind === "svg") {
-    body.innerHTML = `<img alt="${esc(entry.name)}" src="${raw}">`;
+    body.innerHTML = `<img alt="${esc(entry.name)}" src="${raw}&t=${entry.modified || Date.now()}">`;
   } else if (entry.kind === "video") {
     const poster = entry.thumb ? ` poster="/api/thumb?path=${encodeURIComponent(entry.path)}&v=${entry.modified}"` : "";
     body.innerHTML = `<video controls playsinline${poster} src="${raw}"></video>`;
@@ -845,6 +1373,42 @@ async function openEntry(entry) {
     body.innerHTML = `<audio controls src="${raw}"></audio>`;
   } else if (entry.kind === "pdf") {
     body.innerHTML = `<iframe title="${esc(entry.name)}" src="${raw}"></iframe>`;
+  } else if (/\.docx$/i.test(entry.name)) {
+    body.innerHTML = '<p class="muted">Loading document…</p>';
+    try {
+      if (entry.size > 25 * 1024 * 1024) throw new Error('Documents up to 25 MB are supported.');
+      const [module, response] = await Promise.all([import('/assets/docx-editor.js'), fetch(`/api/docx?path=${encodeURIComponent(entry.path)}`, { credentials: 'same-origin', cache: 'no-store' })]);
+      if (!response.ok) throw new Error('Could not load document.');
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      let expectedHash = response.headers.get('x-docx-hash');
+      if (!expectedHash) throw new Error('Document version is missing.');
+      if (state.current !== entry) return;
+      const editor = { dirty: false, destroy: null };
+      const mounted = module.mountDocxEditor(body, bytes, {
+        readonly: !write || inTrashPath(entry.path),
+        onChange: dirty => { editor.dirty = dirty; },
+        onSave: async data => {
+          let binary = '';
+          for (let i = 0; i < data.length; i += 8192) binary += String.fromCharCode(...data.subarray(i, i + 8192));
+          const result = await api('/api/write-docx', { method: 'POST', json: { path: entry.path, data: btoa(binary), expected_hash: expectedHash } });
+          expectedHash = result.hash;
+          if (state.editor === editor) {
+            toast('Document saved');
+            invalidateFolderSizes();
+            load(state.path, { keepPreview: true }).catch(err => toast(err.message, true));
+          }
+        },
+      });
+      editor.destroy = () => mounted.destroy(); editor.save = () => mounted.save(); state.editor = editor;
+    } catch (err) {
+      if (state.current === entry) body.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
+    }
+  } else if (entry.kind === "model3d") {
+    openModelPreview(body, entry, raw).catch((err) => {
+      if (state.current && state.current.path === entry.path) {
+        body.innerHTML = `<p class="muted">${esc(err.message || "Could not open 3D preview")}</p>`;
+      }
+    });
   } else {
     body.innerHTML = `<p class="muted">Loading preview…</p>`;
     try {
@@ -857,6 +1421,191 @@ async function openEntry(entry) {
       }
     }
   }
+}
+
+let modelViewerApi = null;
+const MODEL_VIEWER_URL = "/assets/model-viewer.js?v=3";
+
+async function loadModelViewerApi() {
+  if (modelViewerApi) return modelViewerApi;
+  modelViewerApi = await import(MODEL_VIEWER_URL);
+  return modelViewerApi;
+}
+
+// A serial thumbnail queue keeps CAD conversion and GPU use bounded.
+let modelThumbObserver = null;
+const modelThumbQueue = [];
+const queuedModelThumbs = new WeakSet();
+const observedModelThumbs = new Set();
+let modelThumbBusy = false;
+let modelThumbDb = null;
+const modelThumbMemo = new Map();
+const modelThumbUrls = new Map();
+
+function openModelThumbDb() {
+  if (modelThumbDb) return modelThumbDb;
+  modelThumbDb = new Promise((resolve) => {
+    try {
+      const request = indexedDB.open("ownnas-model-thumbnails", 1);
+      request.onupgradeneeded = () => {
+        const store = request.result.createObjectStore("thumbnails", { keyPath: "key" });
+        store.createIndex("created", "created");
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = request.onblocked = () => resolve(null);
+    } catch { resolve(null); }
+  });
+  return modelThumbDb;
+}
+
+async function cachedModelThumb(key) {
+  const db = await openModelThumbDb();
+  if (!db) return null;
+  return new Promise((resolve) => {
+    try {
+      const request = db.transaction("thumbnails").objectStore("thumbnails").get(key);
+      request.onsuccess = () => resolve(request.result?.blob || null);
+      request.onerror = () => resolve(null);
+    } catch { resolve(null); }
+  });
+}
+
+async function storeModelThumb(key, blob) {
+  const db = await openModelThumbDb();
+  if (!db) return;
+  try {
+    const tx = db.transaction("thumbnails", "readwrite");
+    const store = tx.objectStore("thumbnails");
+    store.put({ key, blob, created: Date.now() });
+    const count = store.count();
+    count.onsuccess = () => {
+      let excess = count.result - 256;
+      if (excess <= 0) return;
+      const cursor = store.index("created").openCursor();
+      cursor.onsuccess = () => {
+        if (!cursor.result || excess-- <= 0) return;
+        cursor.result.delete();
+        cursor.result.continue();
+      };
+    };
+    // Storage may be unavailable or full; rendering still works without persistence.
+    tx.onerror = () => {};
+  } catch { /* Cache is optional. */ }
+}
+
+function modelThumbKey(el) {
+  return JSON.stringify(["model-v2", state.me?.libraryId || state.me?.rootName, state.me?.username,
+    el.dataset.modelPath, el.dataset.modelModified, el.dataset.modelSize]);
+}
+
+async function modelThumbBlob(el) {
+  const key = modelThumbKey(el);
+  if (modelThumbMemo.has(key)) return modelThumbMemo.get(key);
+  const promise = (async () => {
+    const cached = await cachedModelThumb(key);
+    if (cached) return cached;
+    const api = await loadModelViewerApi();
+    const blob = await api.renderModelThumbnail({
+      url: `/api/raw?path=${encodeURIComponent(el.dataset.modelPath)}`,
+      name: el.dataset.modelName,
+      size: Number(el.dataset.modelSize),
+    });
+    await storeModelThumb(key, blob);
+    return blob;
+  })();
+  modelThumbMemo.set(key, promise);
+  if (modelThumbMemo.size > 64) modelThumbMemo.delete(modelThumbMemo.keys().next().value);
+  try { return await promise; }
+  catch (err) { modelThumbMemo.delete(key); throw err; }
+}
+
+async function pumpModelThumbnails() {
+  if (modelThumbBusy) return;
+  modelThumbBusy = true;
+  try {
+    while (modelThumbQueue.length) {
+      const el = modelThumbQueue.shift();
+      if (!el.isConnected || !state.me || $("app-view").hidden) { queuedModelThumbs.delete(el); continue; }
+      el.classList.add("thumbnail-loading");
+      el.title = "Generating 3D thumbnail…";
+      try {
+        const blob = await modelThumbBlob(el);
+        if (!el.isConnected) continue;
+        const url = URL.createObjectURL(blob);
+        modelThumbUrls.set(el, url);
+        const image = document.createElement("img");
+        image.alt = "";
+        image.src = url;
+        image.className = "model-thumbnail-image";
+        el.replaceChildren(image);
+        el.title = "";
+      } catch (err) {
+        if (el.isConnected) el.title = `3D thumbnail unavailable: ${err.message || "Could not render model"}`;
+      } finally {
+        el.classList.remove("thumbnail-loading");
+      }
+    }
+  } finally { modelThumbBusy = false; }
+}
+
+function observeModelThumbnails(container) {
+  for (let i = modelThumbQueue.length - 1; i >= 0; i--) {
+    if (!modelThumbQueue[i].isConnected) modelThumbQueue.splice(i, 1);
+  }
+  for (const el of observedModelThumbs) {
+    if (!el.isConnected) { modelThumbObserver?.unobserve(el); observedModelThumbs.delete(el); }
+  }
+  for (const [el, url] of modelThumbUrls) {
+    if (!el.isConnected) { URL.revokeObjectURL(url); modelThumbUrls.delete(el); }
+  }
+  if (!modelThumbObserver && typeof IntersectionObserver !== "undefined") {
+    modelThumbObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting || queuedModelThumbs.has(entry.target)) continue;
+        queuedModelThumbs.add(entry.target);
+        modelThumbObserver.unobserve(entry.target);
+        observedModelThumbs.delete(entry.target);
+        modelThumbQueue.push(entry.target);
+      }
+      pumpModelThumbnails();
+    }, { root: document.querySelector(".explorer-content"), rootMargin: "150px" });
+  }
+  container.querySelectorAll("[data-model-path]").forEach((el) => {
+    if (modelThumbObserver) { modelThumbObserver.observe(el); observedModelThumbs.add(el); }
+    else { queuedModelThumbs.add(el); modelThumbQueue.push(el); }
+  });
+  if (!modelThumbObserver) pumpModelThumbnails();
+}
+
+function disposeActiveModelViewer() {
+  if (modelViewerApi && modelViewerApi.disposeModelViewer) {
+    modelViewerApi.disposeModelViewer();
+  }
+}
+
+function modelExt(name) {
+  const lower = String(name || "").toLowerCase();
+  const dot = lower.lastIndexOf(".");
+  return dot >= 0 ? lower.slice(dot + 1) : "";
+}
+
+function canPreviewModel3d(name, apiMod) {
+  if (apiMod && typeof apiMod.isViewableModel === "function" && apiMod.isViewableModel(name)) {
+    return true;
+  }
+  return ["obj", "stl", "gltf", "glb", "ply", "3mf", "stp", "step", "iges", "igs"].includes(modelExt(name));
+}
+
+async function openModelPreview(body, entry, raw) {
+  body.innerHTML = `<p class="muted">Loading 3D viewer…</p>`;
+  const apiMod = await loadModelViewerApi();
+  if (!state.current || state.current.path !== entry.path) return;
+  if (!canPreviewModel3d(entry.name, apiMod)) {
+    body.innerHTML = `<p class="muted">This 3D format cannot be previewed in the browser.</p>`;
+    return;
+  }
+  body.innerHTML = "";
+  await apiMod.mountModelViewer(body, { url: raw, name: entry.name });
 }
 
 async function loadAnnotations(path) {
@@ -1068,6 +1817,7 @@ function markEditorDirty() {
 async function saveEditor() {
   const ed = state.editor;
   if (!ed || ed.saving) return;
+  if (ed.save) return ed.save();
   syncEditorFromDom();
   if (!ed.dirty) return;
   if (ed.content.length > 1024 * 1024) {
@@ -1406,31 +2156,7 @@ function askConfirm(message, okLabel) {
 }
 
 async function renameEntry(entry) {
-  const name = await askText(
-    "Rename",
-    "New name",
-    entry.name,
-    "Rename",
-    entry.dir ? {} : { watchExtensionFrom: entry.name },
-  );
-  if (name === null) return;
-  const next = name.trim();
-  if (!next || next === entry.name) return;
-  if (!entry.dir) {
-    const fromExt = fileExtension(entry.name);
-    const toExt = fileExtension(next);
-    if (fromExt !== toExt) {
-      const confirmed = await askConfirm(
-        `You are changing the file extension from ${extensionLabel(fromExt)} to ${extensionLabel(toExt)}.\n\n“${entry.name}” → “${next}”\n\nPrograms may no longer open this file correctly.`,
-        "Change extension",
-      );
-      if (!confirmed) return;
-    }
-  }
-  await api("/api/rename", { method: "POST", json: { path: entry.path, name: next } });
-  toast("Renamed");
-  invalidateFolderSizes();
-  await load(state.path);
+  await renameEntries([entry]);
 }
 
 async function deleteEntry(entry) {
@@ -1484,28 +2210,89 @@ async function downloadEntries(entries) {
 }
 
 function showStatus(title, detail = "", percent = null) {
-  const panel = $("status-panel");
-  const bar = $("status-bar");
-  $("status-title").textContent = title;
-  $("status-detail").textContent = detail;
-  panel.hidden = false;
-  if (percent == null) {
-    bar.classList.add("indeterminate");
-    bar.style.width = "";
-  } else {
-    bar.classList.remove("indeterminate");
-    bar.style.width = `${Math.max(0, Math.min(100, Math.round(percent)))}%`;
-  }
+  upsertJob("transfer", {
+    title,
+    detail,
+    percent,
+    cancelable: true,
+    onCancel: () => cancelActiveTransfer(),
+  });
 }
 
 function hideStatus() {
-  const panel = $("status-panel");
-  const bar = $("status-bar");
-  panel.hidden = true;
-  bar.classList.remove("indeterminate");
-  bar.style.width = "0";
-  $("status-title").textContent = "Working…";
-  $("status-detail").textContent = "";
+  removeJob("transfer");
+}
+
+const jobState = {
+  items: new Map(),
+  hidden: false,
+  seq: 0,
+};
+
+function upsertJob(id, { title, detail = "", percent = null, cancelable = false, onCancel = null }) {
+  const existing = jobState.items.get(id) || {};
+  jobState.items.set(id, {
+    id,
+    title,
+    detail,
+    percent,
+    cancelable,
+    onCancel: onCancel || existing.onCancel || null,
+  });
+  if (!jobState.hidden) renderJobsPanel(true);
+  else syncJobsButton();
+}
+
+function removeJob(id) {
+  jobState.items.delete(id);
+  renderJobsPanel(!jobState.hidden);
+}
+
+function syncJobsButton() {
+  const btn = $("jobs-btn");
+  const count = jobState.items.size;
+  btn.hidden = count === 0;
+  const badge = $("jobs-count");
+  if (count > 0) {
+    badge.hidden = false;
+    badge.textContent = String(count);
+  } else {
+    badge.hidden = true;
+  }
+}
+
+function renderJobsPanel(show) {
+  const panel = $("jobs-panel");
+  const list = $("jobs-list");
+  const items = [...jobState.items.values()];
+  syncJobsButton();
+  if (!items.length) {
+    panel.hidden = true;
+    list.innerHTML = "";
+    return;
+  }
+  list.innerHTML = items.map((job) => {
+    const pct = job.percent;
+    const barClass = pct == null ? "status-bar indeterminate" : "status-bar";
+    const width = pct == null ? "" : ` style="width:${Math.max(0, Math.min(100, Math.round(pct)))}%"`;
+    const cancel = job.cancelable
+      ? `<button type="button" data-job-cancel="${esc(job.id)}">Cancel</button>`
+      : "";
+    return `<li class="jobs-item" data-job="${esc(job.id)}">
+      <div class="jobs-item-head">
+        <span class="jobs-item-title">${esc(job.title)}</span>
+        ${cancel}
+      </div>
+      <span class="jobs-item-detail">${esc(job.detail || "")}</span>
+      <div class="status-track"><div class="${barClass}"${width}></div></div>
+    </li>`;
+  }).join("");
+  panel.hidden = !show || jobState.hidden;
+}
+
+function openJobsPanel() {
+  jobState.hidden = false;
+  renderJobsPanel(true);
 }
 
 function cancelActiveDownload() {
@@ -1667,8 +2454,12 @@ async function createFolder() {
 }
 
 const NEW_FILE_KINDS = {
+  docx: { label: "Word document", ext: "docx", defaultName: "Untitled" },
   md: { label: "Markdown", ext: "md", defaultName: "Untitled" },
+  txt: { label: "Text", ext: "txt", defaultName: "Untitled" },
   csv: { label: "CSV", ext: "csv", defaultName: "Untitled" },
+  json: { label: "JSON", ext: "json", defaultName: "Untitled" },
+  html: { label: "HTML", ext: "html", defaultName: "Untitled" },
 };
 
 function syncCreateFileName(kind, forceDefault) {
@@ -2007,9 +2798,12 @@ async function readDrop(dataTransfer) {
 }
 
 function syncControls() {
+  syncTileSize();
   $("sort").value = state.sort;
-  $("sort-dir").textContent = state.direction === "desc" ? "Z–A" : "A–Z";
-  document.querySelectorAll(".view-switch [data-view]").forEach((button) => {
+  $("group-by").value = state.groupBy;
+  $("sort-dir").textContent = state.sort === "name" ? (state.direction === "desc" ? "Z–A" : "A–Z") : (state.direction === "desc" ? "↓" : "↑");
+  $("sort-dir").setAttribute("aria-label", state.direction === "desc" ? "Sort descending" : "Sort ascending");
+  document.querySelectorAll("[data-view]").forEach((button) => {
     button.setAttribute("aria-pressed", button.dataset.view === state.view ? "true" : "false");
   });
   $("hidden-toggle").checked = state.hidden;
@@ -2097,17 +2891,52 @@ $("brand-home").addEventListener("click", () => {
   go("").catch((err) => toast(err.message, true));
 });
 
+// Explicitly focus the file pane before marquee selection prevents default focus.
+document.querySelector(".explorer-content").addEventListener("pointerdown", (event) => {
+  if (event.button !== 0) return;
+  if (event.target.closest("#search-panel, .details-header, button, a, input, textarea, select, [contenteditable]:not([contenteditable=\"false\"])")) return;
+  $("files").focus({ preventScroll: true });
+}, true);
+
 $("files").addEventListener("click", (event) => {
+  if (event.target.closest("[data-column-entry]")) return;
   if (skipNextClick) {
     skipNextClick = false;
     return;
   }
+  const groupButton = event.target.closest("[data-file-group]");
+  if (groupButton) {
+    const key = groupButton.dataset.fileGroup;
+    if (state.collapsedGroups.has(key)) state.collapsedGroups.delete(key);
+    else state.collapsedGroups.add(key);
+    const visible = new Set(displayedEntries().map((entry) => entry.path));
+    state.selected = new Set([...state.selected].filter((path) => visible.has(path)));
+    renderFiles();
+    $("files").focus({ preventScroll: true });
+    return;
+  }
+  const sortButton = event.target.closest("[data-detail-sort]");
+  if (sortButton) {
+    const key = sortButton.dataset.detailSort;
+    state.direction = state.sort === key && state.direction === "asc" ? "desc" : "asc";
+    state.sort = key;
+    localStorage.setItem("ownnas-sort", key);
+    localStorage.setItem("ownnas-dir", state.direction);
+    syncControls();
+    renderFiles();
+    return;
+  }
+  if (event.target.closest(".details-header")) return;
   const tagButton = event.target.closest("[data-filter-tag]");
   if (tagButton) {
     event.stopPropagation();
-    state.filter = tagButton.dataset.filterTag;
-    $("filter").value = state.filter;
+    const tag = tagButton.dataset.filterTag;
+    state.filter = `tag:${tag}`;
+    $("search").value = state.filter;
+    clearDeepSearch();
     renderFiles();
+    $("search").focus();
+    runDeepSearch().catch((err) => toast(err.message, true));
     return;
   }
   const menuButton = event.target.closest("[data-menu-for]");
@@ -2155,7 +2984,7 @@ $("files").addEventListener("click", (event) => {
 
 $("files").addEventListener("mousedown", (event) => {
   if (event.button !== 0) return;
-  if (event.target.closest(".more, button, a, input, [data-filter-tag], [data-menu-for]")) return;
+  if (event.target.closest(".more, button, a, input, .details-header, [data-filter-tag], [data-menu-for]")) return;
   // Keep Ctrl/Shift clicks from selecting card text instead of toggling selection.
   if ((event.ctrlKey || event.metaKey || event.shiftKey) && event.target.closest("[data-path]")) {
     event.preventDefault();
@@ -2271,16 +3100,11 @@ $("files").addEventListener("contextmenu", (event) => {
   openSelectionMenu(event.clientX, event.clientY, state.path);
 });
 
-$("menu").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-menu]");
-  if (!button) return;
-  event.preventDefault();
-  event.stopPropagation();
-  const entries = state.menuEntries.slice();
-  const pasteInto = state.pasteInto;
-  closeMenu();
+function runMenuAction(button, entries, pasteInto) {
+  const format = button.dataset.format || "";
   const action = button.getAttribute("data-menu");
   const one = entries.length === 1 ? entries[0] : null;
+  if (action === "folderAppearance") customizeFolders(entries).catch(err => toast(err.message, true));
   if (action === "open" && one) openEntry(one).catch((err) => toast(err.message, true));
   if (action === "download") {
     downloadEntries(entries).catch((err) => {
@@ -2294,15 +3118,84 @@ $("menu").addEventListener("click", (event) => {
   if (action === "mkdir") createFolder().catch((err) => toast(err.message, true));
   if (action === "newfile") createFile().catch((err) => toast(err.message, true));
   if (action === "folderWith") createFolderWithSelection(entries).catch((err) => toast(err.message, true));
-  if (action === "rename" && one) renameEntry(one).catch((err) => toast(err.message, true));
+  if (action === "rename") renameEntries(entries).catch((err) => toast(err.message, true));
   if (action === "restore") restoreEntries(entries).catch((err) => toast(err.message, true));
   if (action === "delete") deleteEntries(entries).catch((err) => toast(err.message, true));
   if (action === "duplicate") duplicateEntries(entries).catch((err) => toast(err.message, true));
   if (action === "move") moveEntries(entries).catch((err) => toast(err.message, true));
+  if (action === "convert") convertImages(entries, format).catch((err) => toast(err.message, true));
+  if (action === "compress") compressEntries(entries, format).catch((err) => toast(err.message, true));
+  if (action === "pdfExtract") pdfExtractPages(entries).catch((err) => toast(err.message, true));
+  if (action === "pdfSplit") pdfSplitPages(entries).catch((err) => toast(err.message, true));
+  if (action === "pdfRotate") pdfRotatePages(entries).catch((err) => toast(err.message, true));
+  if (action === "pdfMerge") pdfMergeEntries(entries).catch((err) => toast(err.message, true));
+  if (action === "upload") $("upload-input").click();
+  if (action === "uploadFolder") $("folder-input").click();
+  if (action === "downloadZip") $("zip-link").click();
+  if (action === "search") focusSearch();
+  if (action === "library") $("library-btn").click();
+  if (action === "bookmark") $("bookmark-btn").click();
+  if (action === "usage") $("usage-btn").click();
+  if (action === "duplicates") openDuplicatesFinder().catch((err) => toast(err.message, true));
+  if (action === "activity") $("activity-btn").click();
+  if (action === "bulkTag") bulkTagEntries(entries).catch((err) => toast(err.message, true));
+  if (action === "emptyTrash") $("empty-trash-btn").click();
+  if (action === "toggleHidden") {
+    const toggle = $("hidden-toggle");
+    toggle.checked = !toggle.checked;
+    toggle.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+}
+
+$("menu").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-menu]");
+  if (!button) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const action = button.getAttribute("data-menu");
+  if (action === "convertMenu") {
+    openMenuSub("convert", button);
+    return;
+  }
+  if (action === "compressMenu") {
+    openMenuSub("compress", button);
+    return;
+  }
+  if (action === "pdfMenu") {
+    openMenuSub("pdf", button);
+    return;
+  }
+  const entries = state.menuEntries.slice();
+  const pasteInto = state.pasteInto;
+  closeMenu();
+  runMenuAction(button, entries, pasteInto);
 });
 
+$("menu-sub").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-menu]");
+  if (!button) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const entries = state.menuEntries.slice();
+  const pasteInto = state.pasteInto;
+  closeMenu();
+  runMenuAction(button, entries, pasteInto);
+});
+
+// Capture outside clicks before file/menu handlers stop propagation.
+document.addEventListener("pointerdown", (event) => {
+  if (!$("search-panel").hidden && !event.target.closest("#search-panel, .search-wrap")) {
+    clearDeepSearch();
+  }
+}, true);
+
 document.addEventListener("click", (event) => {
-  if (!event.target.closest("#menu") && !event.target.closest(".more")) closeMenu();
+  if (
+    !event.target.closest("#menu")
+    && !event.target.closest("#menu-sub")
+    && !event.target.closest(".more")
+    && !event.target.closest("#fab-menu")
+  ) closeMenu();
 });
 
 $("preview-close").addEventListener("click", () => {
@@ -2417,14 +3310,81 @@ $("preview-delete").addEventListener("click", () => {
   if (state.current) deleteEntry(state.current).catch((err) => toast(err.message, true));
 });
 
-$("filter").addEventListener("input", (event) => {
+$("search").addEventListener("input", (event) => {
   state.filter = event.target.value;
+  if (!state.filter.trim()) clearDeepSearch();
   renderFiles();
+});
+$("search").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    runDeepSearch().catch((err) => toast(err.message, true));
+  }
+  if (event.key === "Escape" && state.filter) {
+    event.preventDefault();
+    event.stopPropagation();
+    state.filter = "";
+    $("search").value = "";
+    clearDeepSearch();
+    renderFiles();
+  }
+});
+$("search-go").addEventListener("click", () => {
+  runDeepSearch().catch((err) => toast(err.message, true));
+});
+$("search-panel-close").addEventListener("click", () => {
+  resetSearch();
+  renderFiles();
+});
+
+$("group-by").addEventListener("change", (event) => {
+  state.groupBy = normalizeGroup(event.target.value);
+  state.collapsedGroups.clear();
+  localStorage.setItem("ownnas-group", state.groupBy);
+  renderFiles();
+});
+
+$("files").addEventListener("pointerdown", (event) => {
+  const handle = event.target.closest("[data-detail-resize]");
+  if (!handle || event.button !== 0) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const column = Number(handle.dataset.detailResize);
+  const start = event.clientX;
+  const initial = state.detailWidths[column];
+  handle.focus({ preventScroll: true });
+  handle.setPointerCapture(event.pointerId);
+  const move = (ev) => {
+    state.detailWidths[column] = Math.max(column === 0 ? 180 : 72, Math.min(800, initial + ev.clientX - start));
+    handle.setAttribute("aria-valuenow", state.detailWidths[column]);
+    applyDetailWidths();
+  };
+  const finish = () => {
+    localStorage.setItem("ownnas-detail-widths", JSON.stringify(state.detailWidths));
+    handle.removeEventListener("pointermove", move);
+    handle.removeEventListener("pointerup", finish);
+    handle.removeEventListener("pointercancel", finish);
+  };
+  handle.addEventListener("pointermove", move);
+  handle.addEventListener("pointerup", finish);
+  handle.addEventListener("pointercancel", finish);
+});
+$("files").addEventListener("keydown", (event) => {
+  const handle = event.target.closest("[data-detail-resize]");
+  if (!handle || !["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const column = Number(handle.dataset.detailResize);
+  state.detailWidths[column] = Math.max(column === 0 ? 180 : 72, Math.min(800, state.detailWidths[column] + (event.key === "ArrowRight" ? 16 : -16)));
+  handle.setAttribute("aria-valuenow", state.detailWidths[column]);
+  applyDetailWidths();
+  localStorage.setItem("ownnas-detail-widths", JSON.stringify(state.detailWidths));
 });
 
 $("sort").addEventListener("change", (event) => {
   state.sort = event.target.value;
   localStorage.setItem("ownnas-sort", state.sort);
+  syncControls();
   renderFiles();
 });
 
@@ -2437,7 +3397,24 @@ $("sort-dir").addEventListener("click", () => {
 
 $("view-icons").addEventListener("click", () => setView("icons"));
 $("view-masonry").addEventListener("click", () => setView("masonry"));
+$("undo-btn").addEventListener("click", undoFileOperation);
+$("view-columns").addEventListener("click", () => setView("columns"));
+$("files").addEventListener("click", event => {
+  const item = event.target.closest("[data-column-entry]");
+  if (!item) return;
+  const entry = columnEntries.get(item.dataset.columnEntry);
+  if (entry?.dir) go(entry.path).catch(err => toast(err.message, true));
+  else if (entry) { selectOnly(entry.path); openEntry(entry).catch(err => toast(err.message, true)); }
+});
 $("view-list").addEventListener("click", () => setView("list"));
+
+$("tile-size").addEventListener("input", (event) => {
+  state.tileSize = normalizeTileSize(event.target.value);
+  syncTileSize();
+});
+$("tile-size").addEventListener("change", () => {
+  localStorage.setItem("ownnas-tile-size", String(state.tileSize));
+});
 
 function setView(view) {
   state.view = normalizeView(view);
@@ -2495,6 +3472,15 @@ window.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     // Let open dialogs handle Escape themselves (and avoid clearing selection mid-prompt).
     if (document.querySelector("dialog[open]")) return;
+    if (!$("search-panel").hidden) {
+      event.preventDefault();
+      clearDeepSearch();
+      return;
+    }
+    if (!$("menu-sub").hidden) {
+      closeMenuSub();
+      return;
+    }
     closeMenu();
     if ($("preview").classList.contains("is-fullscreen")) {
       setPreviewFullscreen(false);
@@ -2520,13 +3506,44 @@ window.addEventListener("keydown", (event) => {
     return;
   }
   if (document.querySelector("dialog[open]")) return;
-  const typing = event.target.closest("input, textarea, select");
+  const typing = event.target.closest("input, textarea, select, [contenteditable]:not([contenteditable=\"false\"])");
   if (typing) return;
+  if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === "z" && !document.querySelector("dialog[open]")) {
+    event.preventDefault(); undoFileOperation(); return;
+  }
+  if (event.key.length === 1 && !event.metaKey && !event.ctrlKey && !event.altKey && !event.isComposing
+      && state.me && !$("app-view").hidden && $("preview").hidden && $("settings").hidden && $("library").hidden
+      && $("menu").hidden && !event.target.closest("[role=separator]")
+      && !(event.key === " " && event.target.closest("button, a"))) {
+    event.preventDefault();
+    const search = $("search");
+    search.focus({ preventScroll: true });
+    search.value = state.filter + event.key;
+    search.setSelectionRange(search.value.length, search.value.length);
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+    return;
+  }
+  if (event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey
+      && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+    if (!state.me || $("app-view").hidden || !$("settings").hidden || !$("library").hidden) return;
+    event.preventDefault();
+    if (event.repeat) return;
+    closeMenu();
+    if (event.key === "ArrowUp") {
+      if (state.path) go(parentPath(state.path)).catch((err) => toast(err.message, true));
+    } else {
+      const entries = selectedEntries();
+      if (entries.length === 1) openEntry(entries[0]).catch((err) => toast(err.message, true));
+    }
+    return;
+  }
   const key = event.key.toLowerCase();
   const command = event.metaKey || event.ctrlKey;
+  if (!command && event.target.closest("button, a, [role=separator]")
+      && ["Enter", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) return;
   if (command && key === "a") {
     event.preventDefault();
-    const items = sortedEntries();
+    const items = displayedEntries();
     state.selected = new Set(items.map((entry) => entry.path));
     state.anchor = items.length ? items[0].path : "";
     paintSelection();
@@ -2574,7 +3591,7 @@ window.addEventListener("paste", (event) => {
   const data = event.clipboardData;
   if (!data) return;
 
-  const editingSensitive = event.target.closest("#login-view, #password-dialog, #text-dialog, #create-file-dialog, #comment-input, #tag-input, #search-input, [data-editor-input], [data-csv-editor]");
+  const editingSensitive = event.target.closest("#login-view, #password-dialog, #text-dialog, #create-file-dialog, #comment-input, #tag-input, #bulk-tag-input, #search, [data-editor-input], [data-csv-editor]");
   const hasFiles = clipboardHasFiles(data);
 
   // File paste should upload even when the folder filter (or similar) is focused.
@@ -2652,6 +3669,56 @@ function pasteFileName(file) {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   return `paste-${stamp}.${ext}`;
 }
+
+const INTERNAL_DRAG = "application/x-ownnas-paths";
+let internalDragPaths = [];
+$("files").addEventListener("dragstart", event => {
+  const item = event.target.closest(".card[data-path], [data-column-entry]");
+  if (!item || state.me?.readonly) return;
+  const path = item.dataset.path || item.dataset.columnEntry;
+  internalDragPaths = state.selected.has(path) ? selectedEntries().map(entry => entry.path) : [path];
+  event.dataTransfer.setData(INTERNAL_DRAG, JSON.stringify(internalDragPaths));
+  event.dataTransfer.effectAllowed = "copyMove";
+});
+function internalDropTarget(event) {
+  const folder = event.target.closest('[data-dir="1"][data-path], [data-dir="1"][data-column-entry]');
+  if (folder) return {element: folder, path: folder.dataset.path || folder.dataset.columnEntry};
+  const column = event.target.closest("[data-column-path]");
+  if (column) return {element: column, path: column.dataset.columnPath};
+  const crumb = event.target.closest("[data-go]");
+  if (crumb) return {element: crumb, path: crumb.dataset.go};
+  if (event.target.closest("#files")) return {element: $("files"), path: state.path};
+  return null;
+}
+window.addEventListener("dragover", event => {
+  if (!internalDragPaths.length || ![...event.dataTransfer.types].includes(INTERNAL_DRAG)) return;
+  const target = internalDropTarget(event);
+  document.querySelectorAll(".folder-drop-target").forEach(el => el.classList.remove("folder-drop-target"));
+  if (!target || internalDragPaths.some(p => target.path === p || target.path.startsWith(p + "/") || parentPath(p) === target.path)) { event.dataTransfer.dropEffect = "none"; return; }
+  event.preventDefault(); target.element.classList.add("folder-drop-target");
+  event.dataTransfer.dropEffect = event.altKey || event.ctrlKey ? "copy" : "move";
+});
+window.addEventListener("dragend", () => {
+  internalDragPaths = [];
+  document.querySelectorAll(".folder-drop-target").forEach(el => el.classList.remove("folder-drop-target"));
+});
+window.addEventListener("drop", async event => {
+  if (![...event.dataTransfer.types].includes(INTERNAL_DRAG)) return;
+  event.preventDefault();
+  const target = internalDropTarget(event);
+  const paths = internalDragPaths.slice(); internalDragPaths = [];
+  document.querySelectorAll(".folder-drop-target").forEach(el => el.classList.remove("folder-drop-target"));
+  if (!target || !paths.length || state.me?.readonly) return;
+  const copy = event.altKey || event.ctrlKey;
+  try {
+    for (const path of paths) {
+      if (path === target.path || target.path.startsWith(path + "/") || parentPath(path) === target.path) continue;
+      await api(copy ? "/api/copy" : "/api/move", {method: "POST", json: {path, dest: target.path}});
+    }
+    toast(copy ? "Copied items" : "Moved items");
+  } catch (err) { toast(err.message, true); }
+  invalidateFolderSizes(); await load(state.path);
+});
 
 let fileDragDepth = 0;
 
@@ -2762,12 +3829,43 @@ $("bookmark-btn").addEventListener("click", async () => {
 
 $("library-btn").addEventListener("click", () => openLibrary());
 $("library-close").addEventListener("click", closeLibrary);
+$("tools-more-btn").addEventListener("click", () => {
+  const actions = document.querySelector(".toolbar-actions");
+  const btn = $("tools-more-btn");
+  const open = !actions.classList.contains("tools-expanded");
+  actions.classList.toggle("tools-expanded", open);
+  btn.setAttribute("aria-expanded", open ? "true" : "false");
+  btn.title = open ? "Fewer actions" : "More actions";
+});
+$("fab-menu").addEventListener("click", (event) => {
+  event.stopPropagation();
+  const menu = $("menu");
+  if (!menu.hidden) {
+    closeMenu();
+    return;
+  }
+  const entries = selectedEntries();
+  let pasteInto = state.path;
+  if (entries.length === 1 && entries[0].dir) pasteInto = entries[0].path;
+  openSelectionMenu(8, 8, pasteInto);
+  const fab = event.currentTarget.getBoundingClientRect();
+  const rect = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(8, Math.min(fab.right - rect.width, window.innerWidth - rect.width - 8))}px`;
+  menu.style.top = `${Math.max(8, fab.top - rect.height - 10)}px`;
+});
 $("settings-btn").addEventListener("click", () => openSettings());
 $("settings-close").addEventListener("click", closeSettings);
 $("settings-tab-theme").addEventListener("click", () => setSettingsTab("theme"));
+$("settings-tab-updates").addEventListener("click", () => setSettingsTab("updates"));
 $("settings-tab-users").addEventListener("click", () => {
   setSettingsTab("users");
   loadUsers().catch((err) => toast(err.message, true));
+});
+$("update-check-btn").addEventListener("click", () => {
+  checkForUpdates().catch((err) => toast(err.message, true));
+});
+$("update-apply-btn").addEventListener("click", () => {
+  applyUpdate().catch((err) => toast(err.message, true));
 });
 $("theme-grid").addEventListener("click", (event) => {
   const button = event.target.closest("[data-theme-id]");
@@ -2835,14 +3933,24 @@ $("empty-trash-btn").addEventListener("click", () => {
   emptyTrash().catch((err) => toast(err.message, true));
 });
 
-$("usage-btn").addEventListener("click", async () => {
-  try {
-    const usage = await api(`/api/usage?path=${encodeURIComponent(state.path)}`);
-    const extra = usage.truncated ? " Count stopped early." : "";
-    toast(`${formatSize(usage.bytes, false)} in ${usage.files} files.${extra}`);
-  } catch (err) {
-    toast(err.message, true);
-  }
+$("usage-btn").addEventListener("click", () => {
+  measureFolderSize().catch((err) => toast(err.message, true));
+});
+
+$("duplicates-btn").addEventListener("click", () => {
+  openDuplicatesFinder().catch((err) => toast(err.message, true));
+});
+
+$("jobs-btn").addEventListener("click", () => openJobsPanel());
+$("jobs-hide").addEventListener("click", () => {
+  jobState.hidden = true;
+  $("jobs-panel").hidden = true;
+});
+$("jobs-list").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-job-cancel]");
+  if (!button) return;
+  const job = jobState.items.get(button.dataset.jobCancel);
+  if (job && job.onCancel) job.onCancel();
 });
 
 $("download-btn").addEventListener("click", () => {
@@ -2866,46 +3974,765 @@ $("zip-link").addEventListener("click", (event) => {
   });
 });
 
-$("status-cancel").addEventListener("click", () => cancelActiveTransfer());
-
-function openTagSearch(tag) {
-  $("search-results").innerHTML = "";
-  $("search-input").value = `tag:${tag}`;
-  $("search-dialog").showModal();
-  runSearch().catch((err) => toast(err.message, true));
-}
-
-async function runSearch() {
-  const data = await api(`/api/search?path=${encodeURIComponent(state.path)}&q=${encodeURIComponent($("search-input").value)}`);
-  const hits = data.hits || [];
-  $("search-results").innerHTML = hits.length
-    ? hits.map((hit) => {
-      const tag = hit.matchedTag ? ` <span class="tag-chip mini">#${esc(hit.matchedTag)}</span>` : "";
-      return `<button type="button" data-hit="${esc(hit.path)}" data-dir="${hit.dir ? "1" : "0"}">${esc(hit.path)}${tag}</button>`;
-    }).join("")
-    : `<span class="muted">No matches</span>`;
-}
-
-$("search-btn").addEventListener("click", () => {
-  $("search-results").innerHTML = "";
-  $("search-dialog").showModal();
-  $("search-input").focus();
-});
-$("search-close").addEventListener("click", () => $("search-dialog").close());
-$("search-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
+async function measureFolderSize() {
+  const label = state.path || (state.me && state.me.rootName) || "Library";
+  const id = `usage-${++jobState.seq}`;
+  const controller = new AbortController();
+  upsertJob(id, {
+    title: "Folder size",
+    detail: `Counting ${label}…`,
+    percent: null,
+    cancelable: true,
+    onCancel: () => controller.abort(),
+  });
   try {
-    await runSearch();
+    const usage = await api(`/api/usage?path=${encodeURIComponent(state.path)}&slow=1`, {
+      signal: controller.signal,
+    });
+    const extra = usage.truncated ? " (count stopped early)" : "";
+    const detail = `${formatSize(usage.bytes, false)} in ${usage.files} files${extra}`;
+    upsertJob(id, { title: "Folder size", detail, percent: 100, cancelable: false });
+    toast(detail);
+    setTimeout(() => removeJob(id), 5000);
+  } catch (err) {
+    removeJob(id);
+    if (isCancelError(err)) {
+      toast("Folder size cancelled");
+      return;
+    }
+    throw err;
+  }
+}
+
+async function compressEntries(entries, format) {
+  const items = (entries || []).filter((entry) => entry && entry.path);
+  if (!items.length || !format) return;
+  const label = String(format).toUpperCase();
+  const id = `compress-${++jobState.seq}`;
+  const controller = new AbortController();
+  upsertJob(id, {
+    title: `Compress to ${label}`,
+    detail: items.length === 1 ? items[0].name : `${items.length} items`,
+    percent: null,
+    cancelable: true,
+    onCancel: () => controller.abort(),
+  });
+  try {
+    const data = await api("/api/compress", {
+      method: "POST",
+      json: {
+        paths: items.map((entry) => entry.path),
+        format,
+      },
+      signal: controller.signal,
+    });
+    invalidateFolderSizes();
+    await load(state.path);
+    const name = (data.path || "").split("/").pop() || label;
+    toast(`Created ${name}`);
+  } catch (err) {
+    if (isCancelError(err)) {
+      toast("Compression cancelled");
+      return;
+    }
+    throw err;
+  } finally {
+    removeJob(id);
+  }
+}
+
+async function pdfExtractPages(entries) {
+  const entry = (entries || []).find((item) => item && item.kind === "pdf");
+  if (!entry) return;
+  let pageCount = 0;
+  try {
+    const info = await api(`/api/pdf/info?path=${encodeURIComponent(entry.path)}`);
+    pageCount = info.pages || 0;
+  } catch (err) {
+    toast(err.message, true);
+    return;
+  }
+  $("pdf-extract-meta").textContent = pageCount
+    ? `“${entry.name}” has ${pageCount} page${pageCount === 1 ? "" : "s"}.`
+    : `“${entry.name}”`;
+  $("pdf-extract-pages").value = pageCount > 1 ? "1" : "1";
+  $("pdf-extract-mode-combined").checked = true;
+  const dialog = $("pdf-extract-dialog");
+  dialog.returnValue = "";
+  dialog.showModal();
+  $("pdf-extract-pages").focus();
+  $("pdf-extract-pages").select();
+  const ok = await new Promise((resolve) => {
+    dialog.addEventListener("close", () => resolve(dialog.returnValue === "ok"), { once: true });
+  });
+  if (!ok) return;
+  const pages = $("pdf-extract-pages").value.trim();
+  const mode = $("pdf-extract-mode-separate").checked ? "separate" : "combined";
+  if (!pages) {
+    toast("Enter at least one page number", true);
+    return;
+  }
+  const id = `pdf-extract-${++jobState.seq}`;
+  upsertJob(id, {
+    title: "Extract PDF pages",
+    detail: entry.name,
+    percent: null,
+  });
+  try {
+    const data = await api("/api/pdf/extract", {
+      method: "POST",
+      json: { path: entry.path, pages, mode },
+    });
+    invalidateFolderSizes();
+    await load(state.path);
+    const count = (data.paths || []).length;
+    toast(count === 1 ? "Created 1 PDF" : `Created ${count} PDFs`);
+  } finally {
+    removeJob(id);
+  }
+}
+
+async function pdfSplitPages(entries) {
+  const entry = (entries || []).find((item) => item && item.kind === "pdf");
+  if (!entry) return;
+  let pageCount = "?";
+  try {
+    const info = await api(`/api/pdf/info?path=${encodeURIComponent(entry.path)}`);
+    pageCount = info.pages || "?";
+  } catch (_) {
+    /* confirm without count */
+  }
+  if (!await askConfirm(
+    `Split “${entry.name}” into individual page PDFs${pageCount !== "?" ? ` (${pageCount} files)` : ""}?`,
+    "Split",
+  )) return;
+  const id = `pdf-split-${++jobState.seq}`;
+  upsertJob(id, {
+    title: "Split PDF",
+    detail: entry.name,
+    percent: null,
+  });
+  try {
+    const data = await api("/api/pdf/split", {
+      method: "POST",
+      json: { path: entry.path },
+    });
+    invalidateFolderSizes();
+    await load(state.path);
+    const count = (data.paths || []).length;
+    toast(`Created ${count} page PDF${count === 1 ? "" : "s"}`);
+  } finally {
+    removeJob(id);
+  }
+}
+
+async function pdfRotatePages(entries) {
+  const entry = (entries || []).find((item) => item && item.kind === "pdf");
+  if (!entry) return;
+  let pageCount = 0;
+  try {
+    const info = await api(`/api/pdf/info?path=${encodeURIComponent(entry.path)}`);
+    pageCount = info.pages || 0;
+  } catch (err) {
+    toast(err.message, true);
+    return;
+  }
+  $("pdf-rotate-meta").textContent = pageCount
+    ? `“${entry.name}” has ${pageCount} page${pageCount === 1 ? "" : "s"}. Leave pages blank to rotate all.`
+    : `“${entry.name}”. Leave pages blank to rotate all.`;
+  $("pdf-rotate-pages").value = "";
+  $("pdf-rotate-degrees").value = "90";
+  const dialog = $("pdf-rotate-dialog");
+  dialog.returnValue = "";
+  dialog.showModal();
+  $("pdf-rotate-pages").focus();
+  const ok = await new Promise((resolve) => {
+    dialog.addEventListener("close", () => resolve(dialog.returnValue === "ok"), { once: true });
+  });
+  if (!ok) return;
+  const pages = $("pdf-rotate-pages").value.trim();
+  const degrees = Number($("pdf-rotate-degrees").value) || 90;
+  const id = `pdf-rotate-${++jobState.seq}`;
+  upsertJob(id, {
+    title: "Rotate PDF",
+    detail: entry.name,
+    percent: null,
+  });
+  try {
+    const data = await api("/api/pdf/rotate", {
+      method: "POST",
+      json: { path: entry.path, pages, degrees },
+    });
+    invalidateFolderSizes();
+    await load(state.path);
+    const name = (data.path || "").split("/").pop() || "rotated.pdf";
+    toast(`Created ${name}`);
+  } finally {
+    removeJob(id);
+  }
+}
+
+async function pdfMergeEntries(entries) {
+  const items = (entries || []).filter((entry) => entry && entry.kind === "pdf");
+  if (items.length < 2) {
+    toast("Select at least two PDFs to join", true);
+    return;
+  }
+  if (!await askConfirm(
+    `Join ${items.length} PDFs into one file (written beside them, originals kept)?`,
+    "Join",
+  )) return;
+  const id = `pdf-merge-${++jobState.seq}`;
+  upsertJob(id, {
+    title: "Join PDFs",
+    detail: `${items.length} files`,
+    percent: null,
+  });
+  try {
+    const data = await api("/api/pdf/merge", {
+      method: "POST",
+      json: { paths: items.map((entry) => entry.path) },
+    });
+    invalidateFolderSizes();
+    await load(state.path);
+    const name = (data.path || "").split("/").pop() || "joined.pdf";
+    toast(`Created ${name}`);
+  } finally {
+    removeJob(id);
+  }
+}
+
+async function convertImages(entries, format) {
+  const images = (entries || []).filter((entry) => entry && entry.kind === "image");
+  if (!images.length || !format) return;
+  const label = format === "jpeg" ? "JPEG" : String(format).toUpperCase();
+  const id = `convert-${++jobState.seq}`;
+  const controller = new AbortController();
+  upsertJob(id, {
+    title: `Convert to ${label}`,
+    detail: images.length === 1 ? images[0].name : `${images.length} images`,
+    percent: 0,
+    cancelable: true,
+    onCancel: () => controller.abort(),
+  });
+  let done = 0;
+  let failed = 0;
+  try {
+    for (const entry of images) {
+      if (controller.signal.aborted) {
+        const err = new Error("Cancelled");
+        err.name = "AbortError";
+        err.cancel = true;
+        throw err;
+      }
+      upsertJob(id, {
+        title: `Convert to ${label}`,
+        detail: `${entry.name} (${done + 1}/${images.length})`,
+        percent: (done / images.length) * 100,
+        cancelable: true,
+        onCancel: () => controller.abort(),
+      });
+      try {
+        await api("/api/convert-image", {
+          method: "POST",
+          json: { path: entry.path, format },
+          signal: controller.signal,
+        });
+        done += 1;
+      } catch (err) {
+        if (isCancelError(err)) throw err;
+        failed += 1;
+        if (images.length === 1) throw err;
+      }
+    }
+    invalidateFolderSizes();
+    await load(state.path);
+    if (failed && !done) throw new Error("Could not convert the selected images");
+    if (failed) toast(`Converted ${done}, skipped ${failed}`, true);
+    else toast(done === 1 ? `Saved as ${label}` : `Converted ${done} images to ${label}`);
+  } catch (err) {
+    if (isCancelError(err)) {
+      toast(done ? `Converted ${done}, then cancelled` : "Conversion cancelled");
+      if (done) {
+        invalidateFolderSizes();
+        await load(state.path);
+      }
+      return;
+    }
+    throw err;
+  } finally {
+    removeJob(id);
+  }
+}
+
+async function bulkTagEntries(entries) {
+  const items = (entries || []).filter((entry) => entry && entry.path);
+  if (!items.length) return;
+
+  const existing = [];
+  const seen = new Set();
+  for (const entry of items) {
+    for (const tag of entry.tags || []) {
+      const key = String(tag).toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      existing.push(String(tag));
+    }
+  }
+  existing.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+
+  const draft = {
+    add: [],
+    remove: new Set(),
+  };
+
+  const renderExisting = () => {
+    const wrap = $("bulk-tag-existing-wrap");
+    const box = $("bulk-tag-existing");
+    if (!existing.length) {
+      wrap.hidden = true;
+      box.innerHTML = "";
+      return;
+    }
+    wrap.hidden = false;
+    box.innerHTML = existing.map((tag) => {
+      const marked = draft.remove.has(tag.toLowerCase());
+      return `<span class="tag-chip${marked ? " is-remove" : ""}">
+        <span>${esc(tag)}</span>
+        <button type="button" data-bulk-existing="${esc(tag)}" aria-label="${marked ? "Keep" : "Remove"} tag ${esc(tag)}">×</button>
+      </span>`;
+    }).join("");
+  };
+
+  const renderPending = () => {
+    $("bulk-tag-pending").innerHTML = draft.add.map((tag) => (
+      `<span class="tag-chip">
+        <span>${esc(tag)}</span>
+        <button type="button" data-bulk-pending="${esc(tag)}" aria-label="Remove tag ${esc(tag)}">×</button>
+      </span>`
+    )).join("");
+  };
+
+  const addPending = (raw) => {
+    const parts = String(raw || "")
+      .split(/[,;\n]+/)
+      .map((part) => part.trim())
+      .filter(Boolean);
+    for (const tag of parts) {
+      if (tag.length > 48) {
+        toast("Tags must be 48 characters or fewer", true);
+        continue;
+      }
+      const key = tag.toLowerCase();
+      if (draft.add.some((item) => item.toLowerCase() === key)) continue;
+      // If it was marked for removal, undo that instead of duplicating as add.
+      if (draft.remove.has(key)) {
+        draft.remove.delete(key);
+        continue;
+      }
+      if (existing.some((item) => item.toLowerCase() === key)) {
+        toast(`“${tag}” is already on the selection`);
+        continue;
+      }
+      draft.add.push(tag);
+    }
+    renderPending();
+    renderExisting();
+  };
+
+  $("bulk-tag-summary").textContent = `Apply to ${items.length} selected item${items.length === 1 ? "" : "s"}.`;
+  $("bulk-tag-input").value = "";
+  renderExisting();
+  renderPending();
+
+  const dialog = $("bulk-tag-dialog");
+  const form = $("bulk-tag-form");
+  const input = $("bulk-tag-input");
+  dialog.showModal();
+  input.focus();
+
+  const onExistingClick = (event) => {
+    const button = event.target.closest("[data-bulk-existing]");
+    if (!button) return;
+    const tag = button.dataset.bulkExisting;
+    const key = tag.toLowerCase();
+    if (draft.remove.has(key)) draft.remove.delete(key);
+    else draft.remove.add(key);
+    renderExisting();
+  };
+  const onPendingClick = (event) => {
+    const button = event.target.closest("[data-bulk-pending]");
+    if (!button) return;
+    const tag = button.dataset.bulkPending;
+    draft.add = draft.add.filter((item) => item.toLowerCase() !== tag.toLowerCase());
+    renderPending();
+  };
+  const onInputKeydown = (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const value = input.value.trim();
+      if (!value) return;
+      addPending(value);
+      input.value = "";
+    }
+    if (event.key === "Backspace" && !input.value && draft.add.length) {
+      draft.add.pop();
+      renderPending();
+    }
+  };
+  const onCancel = () => dialog.close();
+
+  $("bulk-tag-existing").addEventListener("click", onExistingClick);
+  $("bulk-tag-pending").addEventListener("click", onPendingClick);
+  input.addEventListener("keydown", onInputKeydown);
+  $("bulk-tag-cancel").addEventListener("click", onCancel);
+
+  const applied = await new Promise((resolve) => {
+    const onSubmit = (event) => {
+      event.preventDefault();
+      const typed = input.value.trim();
+      if (typed) {
+        addPending(typed);
+        input.value = "";
+      }
+      if (!draft.add.length && !draft.remove.size) {
+        toast("Add a tag or mark one to remove", true);
+        return;
+      }
+      resolve({
+        add: draft.add.slice(),
+        remove: Array.from(draft.remove).map((key) => {
+          const found = existing.find((tag) => tag.toLowerCase() === key);
+          return found || key;
+        }),
+      });
+      dialog.close();
+    };
+    const onClose = () => {
+      form.removeEventListener("submit", onSubmit);
+      $("bulk-tag-existing").removeEventListener("click", onExistingClick);
+      $("bulk-tag-pending").removeEventListener("click", onPendingClick);
+      input.removeEventListener("keydown", onInputKeydown);
+      $("bulk-tag-cancel").removeEventListener("click", onCancel);
+      // Cancel / Escape with no resolve from submit → null
+      resolve(null);
+    };
+    form.addEventListener("submit", onSubmit);
+    dialog.addEventListener("close", onClose, { once: true });
+  });
+
+  if (!applied) return;
+
+  const paths = items.map((entry) => entry.path);
+  for (const tag of applied.remove) {
+    await api("/api/tags/bulk", {
+      method: "POST",
+      json: { paths, tag, action: "remove" },
+    });
+  }
+  for (const tag of applied.add) {
+    await api("/api/tags/bulk", {
+      method: "POST",
+      json: { paths, tag, action: "add" },
+    });
+  }
+  const parts = [];
+  if (applied.add.length) parts.push(`added ${applied.add.length}`);
+  if (applied.remove.length) parts.push(`removed ${applied.remove.length}`);
+  toast(`Tags ${parts.join(", ")}`);
+  await load(state.path);
+  if (state.current) loadAnnotations(state.current.path).catch(() => {});
+}
+
+function fileStem(name) {
+  const base = String(name || "");
+  const index = base.lastIndexOf(".");
+  if (index <= 0) return base;
+  return base.slice(0, index);
+}
+
+function applyRenamePattern(pattern, entry, index, total) {
+  const ext = fileExtension(entry.name);
+  const extPart = ext ? `.${ext}` : "";
+  const parent = entry.path.includes("/")
+    ? entry.path.slice(0, entry.path.lastIndexOf("/")).split("/").pop()
+    : (state.me && state.me.rootName) || "Library";
+  const n = index + 1;
+  return String(pattern)
+    .replaceAll("{name}", fileStem(entry.name))
+    .replaceAll("{ext}", extPart)
+    .replaceAll("{parent}", parent || "Library")
+    .replaceAll("{nnn}", String(n).padStart(3, "0"))
+    .replaceAll("{nn}", String(n).padStart(2, "0"))
+    .replaceAll("{n}", String(n))
+    .replaceAll("{total}", String(total));
+}
+
+function renderRenamePreview(entries, pattern) {
+  const box = $("rename-preview");
+  box.innerHTML = entries.map((entry, index) => {
+    const next = applyRenamePattern(pattern, entry, index, entries.length);
+    const same = next === entry.name;
+    return `<div class="row"><span title="${esc(entry.name)}">${esc(entry.name)}</span><span class="arrow">→</span><span title="${esc(next)}"${same ? ' class="muted"' : ""}>${esc(next)}</span></div>`;
+  }).join("");
+}
+
+async function renameEntries(entries) {
+  const items = (entries || []).filter((entry) => entry && entry.path);
+  if (!items.length) return;
+  const dialog = $("rename-dialog");
+  const input = $("rename-pattern");
+  const hint = $("rename-hint");
+  // Single item: start with the current name so it feels like a normal rename.
+  // Tokens are still optional — type {name}/{ext}/{n} etc. when needed.
+  input.value = items.length === 1 ? items[0].name : "{name}-{nn}{ext}";
+  hint.hidden = items.length === 1;
+  const refresh = () => renderRenamePreview(items, input.value);
+  refresh();
+  dialog.returnValue = "";
+  dialog.showModal();
+  input.focus();
+  input.select();
+  input.addEventListener("input", refresh);
+  const ok = await new Promise((resolve) => {
+    dialog.addEventListener("close", () => {
+      input.removeEventListener("input", refresh);
+      resolve(dialog.returnValue === "ok");
+    }, { once: true });
+  });
+  if (!ok) return;
+  const pattern = input.value.trim();
+  if (!pattern) return;
+  const plan = items.map((entry, index) => ({
+    entry,
+    name: applyRenamePattern(pattern, entry, index, items.length).trim(),
+  })).filter((item) => item.name && item.name !== item.entry.name);
+  if (!plan.length) {
+    toast("Nothing to rename");
+    return;
+  }
+  const names = new Set();
+  for (const item of plan) {
+    if (names.has(item.name.toLowerCase())) {
+      throw new Error(`Pattern produces duplicate name “${item.name}”`);
+    }
+    names.add(item.name.toLowerCase());
+  }
+  for (const item of plan) {
+    if (!item.entry.dir) {
+      const fromExt = fileExtension(item.entry.name);
+      const toExt = fileExtension(item.name);
+      if (fromExt !== toExt) {
+        const confirmed = await askConfirm(
+          plan.length === 1
+            ? `You are changing the file extension from ${extensionLabel(fromExt)} to ${extensionLabel(toExt)}.\n\n“${item.entry.name}” → “${item.name}”\n\nPrograms may no longer open this file correctly.`
+            : `“${item.entry.name}” → “${item.name}” changes the extension. Continue with remaining renames?`,
+          "Change extension",
+        );
+        if (!confirmed) return;
+      }
+    }
+    await api("/api/rename", { method: "POST", json: { path: item.entry.path, name: item.name } });
+  }
+  toast(plan.length === 1 ? "Renamed" : `Renamed ${plan.length} items`);
+  invalidateFolderSizes();
+  await load(state.path);
+}
+
+async function openDuplicatesFinder() {
+  const dialog = $("duplicates-dialog");
+  $("duplicates-status").textContent = "Scanning this folder and subfolders…";
+  $("duplicates-results").innerHTML = "";
+  dialog.showModal();
+  const id = `dupes-${++jobState.seq}`;
+  const controller = new AbortController();
+  upsertJob(id, {
+    title: "Duplicate scan",
+    detail: "Comparing sizes and hashes…",
+    percent: null,
+    cancelable: true,
+    onCancel: () => controller.abort(),
+  });
+  try {
+    const data = await api(`/api/duplicates?path=${encodeURIComponent(state.path)}`, {
+      signal: controller.signal,
+    });
+    const groups = data.groups || [];
+    removeJob(id);
+    if (!groups.length) {
+      $("duplicates-status").textContent = "No duplicates found under this folder.";
+      return;
+    }
+    $("duplicates-status").textContent = `${groups.length} duplicate group${groups.length === 1 ? "" : "s"} (same size + SHA-256).`;
+    $("duplicates-results").innerHTML = groups.map((group, groupIndex) => {
+      const paths = group.paths || [];
+      return `<section class="dup-group" data-group="${groupIndex}">
+        <div class="dup-group-meta">${formatSize(group.size || 0, false)} · ${esc((group.sha256 || "").slice(0, 12))}… · ${paths.length} copies</div>
+        <ul>${paths.map((path) => `<li>
+          <button type="button" data-dup-open="${esc(path)}">${esc(path)}</button>
+          <button type="button" class="danger" data-dup-trash="${esc(path)}">Trash</button>
+        </li>`).join("")}</ul>
+      </section>`;
+    }).join("");
+  } catch (err) {
+    removeJob(id);
+    if (isCancelError(err)) {
+      $("duplicates-status").textContent = "Scan cancelled.";
+      toast("Duplicate scan cancelled");
+      return;
+    }
+    $("duplicates-status").textContent = err.message || "Scan failed";
+    throw err;
+  }
+}
+
+$("duplicates-results").addEventListener("click", async (event) => {
+  const openBtn = event.target.closest("[data-dup-open]");
+  const trashBtn = event.target.closest("[data-dup-trash]");
+  if (openBtn) {
+    const path = openBtn.dataset.dupOpen;
+    const parent = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+    $("duplicates-dialog").close();
+    try {
+      if (state.path !== parent) await go(parent);
+      const entry = findEntry(path);
+      if (entry) await openEntry(entry);
+      else await openEntry({ path, name: path.split("/").pop(), dir: false, size: 0, modified: 0, kind: "file" });
+    } catch (err) {
+      toast(err.message, true);
+    }
+    return;
+  }
+  if (!trashBtn) return;
+  const path = trashBtn.dataset.dupTrash;
+  const name = path.split("/").pop();
+  try {
+    await deleteEntries([{ path, name, dir: false }]);
+    const li = trashBtn.closest("li");
+    if (li) li.remove();
+    toast("Moved to Trash");
   } catch (err) {
     toast(err.message, true);
   }
 });
+
+function focusSearch() {
+  const input = $("search");
+  input.focus();
+  input.select();
+}
+
+function resetSearch() {
+  state.filter = "";
+  $("search").value = "";
+  clearDeepSearch();
+}
+
+function clearDeepSearch() {
+  state.searchHits = [];
+  const panel = $("search-panel");
+  if (panel) panel.hidden = true;
+  const box = $("search-results");
+  if (box) { box.innerHTML = ""; observeModelThumbnails(box); }
+  if (state.searchController) {
+    state.searchController.abort();
+    state.searchController = null;
+  }
+}
+
+function syncSearchHint() {
+  const hint = $("search-hint");
+  if (!hint) return;
+  const ocr = !!(state.me && state.me.ocr);
+  hint.innerHTML = ocr
+    ? `Searching this folder and below for partial file and folder names, tags, and text in documents (including PDFs and OCR’d images). Press Enter. Use <code>tag:family</code> for an exact tag.`
+    : `Searching this folder and below for partial file and folder names, tags, and text in documents (including PDFs). Install <code>tesseract</code> for image OCR. Press Enter. Use <code>tag:family</code> for an exact tag.`;
+}
+
+let searchAbort = null;
+
+function openTagSearch(tag) {
+  state.filter = `tag:${tag}`;
+  $("search").value = state.filter;
+  renderFiles();
+  focusSearch();
+  runDeepSearch().catch((err) => toast(err.message, true));
+}
+
+async function runDeepSearch() {
+  const q = ($("search").value || "").trim();
+  state.filter = q;
+  if (!q) {
+    clearDeepSearch();
+    toast("Type something to search", true);
+    return;
+  }
+  if (state.searchController) state.searchController.abort();
+  const controller = new AbortController();
+  state.searchController = controller;
+  const panel = $("search-panel");
+  const box = $("search-results");
+  panel.hidden = false;
+  syncSearchHint();
+  box.innerHTML = `<span class="search-message muted">Searching…</span>`;
+  try {
+    const data = await api(
+      `/api/search?path=${encodeURIComponent(state.path)}&q=${encodeURIComponent(q)}`,
+      { signal: controller.signal },
+    );
+    if (state.searchController !== controller) return;
+    const hits = data.hits || [];
+    state.searchHits = hits;
+    box.innerHTML = hits.length
+      ? hits.map((hit) => {
+        const kind = hit.dir ? "folder" : (hit.kind || "file");
+        const name = hit.name || hit.path.split("/").pop();
+        const folder = parentPath(hit.path);
+        const extras = [];
+        if (hit.matchedTag) extras.push(`<span class="tag-chip mini">#${esc(hit.matchedTag)}</span>`);
+        if (hit.matchedContent) extras.push(`<span class="search-hit-snippet" title="${esc(hit.matchedContent)}">${esc(hit.matchedContent)}</span>`);
+        const model = kind === "model3d" ? `<span class="model-thumbnail" data-model-path="${esc(hit.path)}" data-model-name="${esc(name)}" data-model-modified="${hit.modified || 0}" data-model-size="${hit.size || 0}"><span class="glyph kind-model3d" aria-hidden="true">${typeIcon("model3d")}</span></span>` : "";
+        const image = !hit.dir && (kind === "image" || kind === "video" || kind === "svg")
+          ? `<img alt="" loading="lazy" src="${kind === "svg" ? "/api/raw" : "/api/thumb"}?path=${encodeURIComponent(hit.path)}">`
+          : "";
+        return `<button class="search-hit" type="button" data-hit="${esc(hit.path)}" data-dir="${hit.dir ? "1" : "0"}" title="${esc(hit.path)}">
+          <span class="search-hit-thumb"><span class="glyph kind-${esc(kind)}" aria-hidden="true">${entryIcon({ ...hit, kind })}</span>${image}${model}</span>
+          <span class="search-hit-details">
+            <span class="search-hit-name">${esc(name)}</span>
+            <span class="search-hit-path">${esc(folder || (state.me && state.me.rootName) || "Library")}</span>
+            ${extras.join("")}
+          </span>
+        </button>`;
+      }).join("")
+      : `<span class="search-message muted">No matches under this folder</span>`;
+    observeModelThumbnails(box);
+    box.querySelectorAll("img").forEach((img) => {
+      img.addEventListener("load", () => img.classList.add("loaded"));
+      img.addEventListener("error", () => img.remove());
+      if (img.complete && img.naturalWidth) img.classList.add("loaded");
+    });
+  } catch (err) {
+    if (state.searchController !== controller) return;
+    if (isCancelError(err)) {
+      box.innerHTML = `<span class="search-message muted">Search cancelled</span>`;
+      return;
+    }
+    box.innerHTML = `<span class="search-message muted">${esc(err.message || "Search failed")}</span>`;
+    throw err;
+  } finally {
+    if (state.searchController === controller) state.searchController = null;
+  }
+}
+
 $("search-results").addEventListener("click", (event) => {
   const button = event.target.closest("[data-hit]");
   if (!button) return;
-  $("search-dialog").close();
-  if (button.dataset.dir === "1") go(button.dataset.hit).catch((err) => toast(err.message, true));
-  else openEntry({ path: button.dataset.hit, name: button.dataset.hit.split("/").pop(), dir: false, size: 0, modified: 0, kind: "file" }).catch((err) => toast(err.message, true));
+  const hit = state.searchHits.find((hit) => hit.path === button.dataset.hit);
+  if (!hit) return;
+  resetSearch();
+  renderFiles();
+  if (hit.dir) go(hit.path).catch((err) => toast(err.message, true));
+  else openEntry({ ...hit, size: hit.size || 0, modified: hit.modified || 0 }).catch((err) => toast(err.message, true));
 });
 
 $("activity-btn").addEventListener("click", async () => {
@@ -2921,8 +4748,183 @@ $("activity-btn").addEventListener("click", async () => {
   }
 });
 
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.onerror = () => reject(new Error("Could not read image data"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function loadImageElement(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("Could not load image"));
+    img.src = url;
+  });
+}
+
+async function openImageEditor(entry) {
+  if (!entry || entry.kind !== "image") return;
+  const body = $("preview-body");
+  const sourceUrl = `/api/raw?path=${encodeURIComponent(entry.path)}&t=${Date.now()}`;
+  body.innerHTML = `<div class="image-editor"><p class="muted">Loading editor…</p></div>`;
+  const img = await loadImageElement(sourceUrl);
+  const editor = {
+    rotation: 0,
+    crop: null,
+    dragging: false,
+    start: null,
+    source: img,
+  };
+  body.innerHTML = `
+    <div class="image-editor" data-image-editor="1">
+      <div class="image-editor-toolbar">
+        <button type="button" data-img="rotate">Rotate 90°</button>
+        <button type="button" data-img="reset-crop">Clear crop</button>
+        <button type="button" data-img="cancel">Cancel</button>
+        <button type="button" data-img="save">Save</button>
+      </div>
+      <p class="muted">Drag on the image to set a crop. Save overwrites the file.</p>
+      <div class="image-editor-stage">
+        <canvas></canvas>
+        <div class="crop-rect" hidden></div>
+      </div>
+    </div>`;
+  const canvas = body.querySelector("canvas");
+  const stage = body.querySelector(".image-editor-stage");
+  const cropEl = body.querySelector(".crop-rect");
+  const ctx = canvas.getContext("2d");
+
+  function draw() {
+    const rad = (editor.rotation % 360) * Math.PI / 180;
+    const swapped = editor.rotation % 180 !== 0;
+    const w = swapped ? img.naturalHeight : img.naturalWidth;
+    const h = swapped ? img.naturalWidth : img.naturalHeight;
+    canvas.width = w;
+    canvas.height = h;
+    ctx.save();
+    ctx.translate(w / 2, h / 2);
+    ctx.rotate(rad);
+    ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
+    ctx.restore();
+    updateCropOverlay();
+  }
+
+  function canvasPoint(event) {
+    const rect = canvas.getBoundingClientRect();
+    const x = ((event.clientX - rect.left) / rect.width) * canvas.width;
+    const y = ((event.clientY - rect.top) / rect.height) * canvas.height;
+    return {
+      x: Math.max(0, Math.min(canvas.width, x)),
+      y: Math.max(0, Math.min(canvas.height, y)),
+    };
+  }
+
+  function updateCropOverlay() {
+    if (!editor.crop) {
+      cropEl.hidden = true;
+      return;
+    }
+    const rect = canvas.getBoundingClientRect();
+    const stageRect = stage.getBoundingClientRect();
+    const scaleX = rect.width / canvas.width;
+    const scaleY = rect.height / canvas.height;
+    const left = rect.left - stageRect.left + editor.crop.x * scaleX;
+    const top = rect.top - stageRect.top + editor.crop.y * scaleY;
+    cropEl.hidden = false;
+    cropEl.style.left = `${left}px`;
+    cropEl.style.top = `${top}px`;
+    cropEl.style.width = `${Math.max(1, editor.crop.w) * scaleX}px`;
+    cropEl.style.height = `${Math.max(1, editor.crop.h) * scaleY}px`;
+  }
+
+  draw();
+
+  stage.addEventListener("pointerdown", (event) => {
+    if (event.target !== canvas && event.target !== stage) return;
+    editor.dragging = true;
+    editor.start = canvasPoint(event);
+    editor.crop = { x: editor.start.x, y: editor.start.y, w: 0, h: 0 };
+    stage.setPointerCapture(event.pointerId);
+    updateCropOverlay();
+  });
+  stage.addEventListener("pointermove", (event) => {
+    if (!editor.dragging || !editor.start) return;
+    const point = canvasPoint(event);
+    const x = Math.min(editor.start.x, point.x);
+    const y = Math.min(editor.start.y, point.y);
+    const w = Math.abs(point.x - editor.start.x);
+    const h = Math.abs(point.y - editor.start.y);
+    editor.crop = { x, y, w, h };
+    updateCropOverlay();
+  });
+  stage.addEventListener("pointerup", () => {
+    editor.dragging = false;
+    if (editor.crop && (editor.crop.w < 2 || editor.crop.h < 2)) editor.crop = null;
+    updateCropOverlay();
+  });
+  window.addEventListener("resize", updateCropOverlay);
+
+  body.querySelector("[data-img='rotate']").addEventListener("click", () => {
+    editor.rotation = (editor.rotation + 90) % 360;
+    editor.crop = null;
+    draw();
+  });
+  body.querySelector("[data-img='reset-crop']").addEventListener("click", () => {
+    editor.crop = null;
+    updateCropOverlay();
+  });
+  body.querySelector("[data-img='cancel']").addEventListener("click", () => {
+    window.removeEventListener("resize", updateCropOverlay);
+    openEntry(entry).catch((err) => toast(err.message, true));
+  });
+  body.querySelector("[data-img='save']").addEventListener("click", async () => {
+    try {
+      const out = document.createElement("canvas");
+      const crop = editor.crop && editor.crop.w >= 2 && editor.crop.h >= 2
+        ? editor.crop
+        : { x: 0, y: 0, w: canvas.width, h: canvas.height };
+      out.width = Math.max(1, Math.round(crop.w));
+      out.height = Math.max(1, Math.round(crop.h));
+      out.getContext("2d").drawImage(
+        canvas,
+        crop.x, crop.y, crop.w, crop.h,
+        0, 0, out.width, out.height,
+      );
+      const ext = fileExtension(entry.name);
+      const mime = ext === "jpg" || ext === "jpeg" ? "image/jpeg"
+        : ext === "webp" ? "image/webp"
+        : "image/png";
+      const quality = mime === "image/jpeg" ? 0.92 : undefined;
+      const blob = await new Promise((resolve, reject) => {
+        out.toBlob((value) => (value ? resolve(value) : reject(new Error("Could not encode image"))), mime, quality);
+      });
+      const data = await blobToBase64(blob);
+      await api("/api/write-image", { method: "POST", json: { path: entry.path, data } });
+      toast("Image saved");
+      window.removeEventListener("resize", updateCropOverlay);
+      invalidateFolderSizes();
+      await load(state.path);
+      const refreshed = findEntry(entry.path) || { ...entry, modified: Date.now() / 1000 };
+      await openEntry(refreshed);
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+}
+
 $("preview-prev").addEventListener("click", () => imageStep(-1));
 $("preview-next").addEventListener("click", () => imageStep(1));
+$("preview-edit-image").addEventListener("click", () => {
+  if (state.current) openImageEditor(state.current).catch((err) => toast(err.message, true));
+});
 $("preview-hash").addEventListener("click", async () => {
   if (!state.current) return;
   $("preview-hash").textContent = "Hashing…";
@@ -2968,3 +4970,5 @@ $("recents").addEventListener("click", async (event) => {
     toast(err.message, true);
   }
 });
+
+window.addEventListener("beforeunload", event => { if (state.editor?.dirty) { event.preventDefault(); event.returnValue = ""; } });

@@ -63,8 +63,9 @@ After sign-in you get a file manager over `--root`:
 - **OwnNAS** in the header jumps to the library root.
 - **Filter** by file name or tag (current folder only).
 - **Sort** by name, date, or size (ascending / descending).
-- **Views**: Icons (square thumbs), Grid (equal-sized cards, 4:3 thumbs), List.
+- **Views**: Icons (square thumbs), Masonry (natural heights), List.
 - **Hidden** toggle to show/hide dotfiles (special OwnNAS folders always appear).
+- **Mobile** (≤820px): filter, sort, and view only in the toolbar; folder actions live in the context menu. A bottom-right **+** button opens that menu (selection menu when items are selected).
 
 ### Selection (Explorer-style)
 
@@ -78,7 +79,7 @@ After sign-in you get a file manager over `--root`:
 ### Context menus
 
 - **Right-click empty space**: New folder, New file, Paste (when clipboard has items).
-- **Right-click selection / ··· menu**: Open, Download, Copy/Cut, Paste, Duplicate, Move, Rename, Trash/Delete, Restore (in Trash).
+- **Right-click selection / ··· menu**: Open, Download, Copy/Cut, Paste, Duplicate, Move, Tag, Rename (optional pattern tokens), PDF tools (extract / split / join / rotate), Trash/Delete, Restore (in Trash).
 - **New folder with selection** (2+ items): creates a folder in the current directory and moves the selected items into it.
 
 ### Clipboard strip
@@ -139,10 +140,11 @@ Opening a file opens the preview panel. Content streams from `/api/raw?path=…`
 
 | Kind | Behavior |
 | --- | --- |
-| **Images / SVG** | Inline image; arrow buttons step through other images in the folder. |
+| **Images / SVG** | Inline image; arrow buttons step through other images in the folder. Raster images (when not readonly) offer **Edit image** for rotate / crop, then overwrite via `/api/write-image`. |
 | **Video** | HTML5 `<video controls playsinline>` with optional poster from `/api/thumb`. |
 | **Audio** | HTML5 `<audio controls>`. |
-| **PDF** | Inline iframe. |
+| **PDF** | Inline iframe. Context menu **PDF…**: extract pages, split into pages, rotate (writes siblings). Multi-select **Join PDFs**. |
+| **3D models** | Interactive Three.js viewer for `obj`, `stl`, `gltf`/`glb`, `ply`, `3mf`. **STEP/IGES** (`stp`/`step`/`iges`/`igs`) are tessellated in a Web Worker via vendored OpenCascade (`occt-import-js`, ~8 MB WASM, first open is slower). |
 | **Text / code / CSV / JSON / Markdown** | Fetched via `/api/meta` and rendered (tables, markdown, highlighted text as appropriate). When not readonly, **Edit** opens an in-browser editor (Markdown preview/edit, CSV grid, plain text). Save with the button or Ctrl/Cmd+S (1 MB max). |
 | **Archives (zip/tar/…)** | Listing / meta preview when supported. |
 | **Other** | Meta panel + download. |
@@ -196,7 +198,7 @@ Conflict policy (per file or “apply to rest”):
 | Ignore | Skip this upload. |
 | Cancel | Abort the batch. |
 
-Uploads show a status panel with progress and cancel.
+Uploads, zip builds, and folder-size counts share a **Background jobs** panel (progress + cancel where applicable). Hide it with Hide; reopen from the Jobs toolbar button while work is still running.
 
 ---
 
@@ -204,7 +206,7 @@ Uploads show a status panel with progress and cancel.
 
 - Single file: preview Download, or selection Download.
 - Multiple items / folders: zipped via `/api/download` or folder zip via `/api/zip`.
-- Progress + cancel in the status panel.
+- Progress + cancel in the Background jobs panel.
 
 ---
 
@@ -214,10 +216,12 @@ Uploads show a status panel with progress and cancel.
 | --- | --- |
 | **Bookmarks** | Pin folders; toggle from the toolbar. |
 | **Recent** | Files you opened (not from Trash). |
-| **Search** | Name (and tag) search under the current path. |
-| **Folder size** | Toolbar measures the current folder. Child folder sizes are cached in SQLite and reused across restarts; OwnNAS invalidates them when it changes files, and a cheap folder fingerprint triggers a paced rescan if the folder was changed outside OwnNAS. |
+| **Search** | One toolbar search bar: typing filters names/tags in the **current folder**; **Enter** (or the magnifier) searches this folder and below. Fast pass covers names, text files, and **PDFs** (text cached under `ownnas-data/text-cache/` after the first extract). A second pass OCRs images when `tesseract` is available (also cached; capped per search). Use `tag:family` for an exact tag. |
+| **Folder size** | Toolbar measures the current folder (runs as a background job). Child folder sizes are cached in SQLite and reused across restarts; OwnNAS invalidates them when it changes files, and a cheap folder fingerprint triggers a paced rescan if the folder was changed outside OwnNAS. |
+| **Find duplicates** | Scans under the current folder for same-size then same SHA-256 groups; open or Trash extras from the dialog. |
 | **Activity** | Recent server-side actions (login, mkdir, move, upload, …). |
 | **SHA-256** | Hash the current preview file (size-capped). |
+| **Background jobs** | Uploads, folder sizing, zip builds, compress, convert, and duplicate scans in one panel. Each job has **Cancel** (aborts the request; server stops cooperatively and cleans up temp files). |
 
 ---
 
@@ -226,9 +230,15 @@ Uploads show a status panel with progress and cancel.
 | Action | Notes |
 | --- | --- |
 | New folder | Toolbar or empty-space menu. |
-| New file | Toolbar or empty-space menu. Formats: Markdown (`.md`), CSV (`.csv`). Opens in preview after create. |
+| New file | Toolbar or empty-space menu. Formats: Markdown (`.md`), Text (`.txt`), CSV (`.csv`), JSON (`.json`), HTML (`.html`). Opens in preview after create. |
 | Edit text / Markdown / CSV | Preview panel Edit → Save (or Ctrl/Cmd+S). Disabled for truncated/binary files and in `--readonly`. |
+| Edit image | Preview **Edit image**: rotate 90°, drag crop, Save (overwrites; JPEG/WebP/PNG by extension). |
+| Convert image | Context menu on raster images: **Convert to** JPEG / PNG / WebP / GIF / BMP / TIFF (writes a sibling file; original kept). |
+| PDF tools | One PDF → **PDF…**: extract pages (`1,3,5-8` as one file or per page), split all pages, rotate 90/180/270°. Two or more PDFs → **Join PDFs**. Outputs are sibling files; originals kept. |
+| Compress | Context menu on a selection: **Compress to** ZIP / TAR / TAR.GZ / TAR.XZ (archive written beside the items). RAR/7z creation is not supported. |
 | Rename / Move / Copy / Duplicate | Context menu or preview actions. |
+| Bulk tag | Selection → Tag… chip editor: type a tag and press Enter to add; × removes pending tags. Existing tags on the selection appear with × to mark them for removal. Apply adds/removes across all selected paths. |
+| Rename | Selection → Rename. Edit the name directly, or optionally use `{name}`, `{ext}`, `{n}` / `{nn}` / `{nnn}`, `{parent}` for one or many items. |
 | Cut / Paste | Same-directory cut is a no-op paste (“already here”). |
 | Trash / Restore / Empty Trash | Soft delete into `.ownnas-trash`. |
 | New folder with selection | Mkdir + move selection into it. |
@@ -255,6 +265,9 @@ ownnas-data/
   thumbs/
     <aa>/
       <sha256>.png   # cached thumbnails
+  text-cache/
+    <aa>/
+      <sha256>.txt   # cached PDF text / OCR for content search
 ```
 
 Inside `--root` (managed by OwnNAS):
@@ -283,8 +296,28 @@ The first account created on a server is an **administrator**. Admins can:
 - Reset passwords
 - Grant / revoke admin
 - Remove accounts (not your own; not the last admin)
+- **Check / install updates** (Settings → Updates) when `--update-url` is set
 
 Existing databases are upgraded automatically: if no admin exists, the oldest account is promoted.
+
+### Updates (self-hosted)
+
+OwnNAS can pull newer binaries from a **static folder you host** (see the repo’s [`releases/`](releases/) directory — upload that tree to your VPS).
+
+1. Put platform binaries in `releases/vX.Y.Z/` with the names listed in `releases/README.md`.
+2. Run `./releases/publish.sh X.Y.Z https://updates.example.com` to write `latest.json` (+ optional signature).
+3. Sync to the VPS (never upload `keys/update.sk`).
+4. Start OwnNAS with:
+
+```bash
+ownnas serve --root /path/to/library \
+  --update-url https://updates.example.com/latest.json \
+  --update-pubkey "$(cat releases/keys/update.pk)"
+```
+
+Admins use **Settings → Updates** to check and install. Install replaces the binary (via `self-replace`), starts a new process with the same arguments, and exits so launchd/systemd/Task Scheduler can keep the service up.
+
+Generate signing keys once: `ownnas update keygen --out releases/keys`.
 
 ---
 
@@ -305,6 +338,8 @@ Existing databases are upgraded automatically: if no admin exists, the oldest ac
 
 - **Rust toolchain + C compiler** to build (SQLite is compiled in).
 - **ffmpeg** optional, for video thumbnails only — not required for video/audio *playback*.
+- **tesseract** optional, for OCR when searching text inside images.
+- **pdftotext** (poppler) optional, for more reliable PDF content search; OwnNAS falls back to a built-in extractor without it.
 - Modern browser with HTML5 media support for in-page play.
 
 ---
@@ -312,3 +347,23 @@ Existing databases are upgraded automatically: if no admin exists, the oldest ac
 ## Related
 
 - [README.md](README.md) — build, first run, background service samples (launchd / systemd / Windows).
+
+## Folder appearance
+
+Right-click a folder and choose **Customize folder…** to select an icon and color.
+Select several folders to apply the same appearance in one operation. The menu
+on an empty part of a folder also customizes the current folder. Root, Archive,
+and Trash keep their built-in appearance. **Reset to default** restores the
+ordinary folder icon and theme color when saved; Cancel discards the selection.
+
+Appearance is shared by users of this NAS and stored in SQLite, not in local
+browser storage. It is returned in directory listings and search results and
+displayed in icon, masonry, details, and column views. It follows folder paths
+through rename, move, copy, duplication, Trash, and restore. Deletion removes it.
+External filesystem renames do not transfer metadata.
+
+Authenticated reads use `GET /api/folder-appearance?path=...`. Writable sessions
+can send `POST /api/folder-appearance` with `{paths: ["folder"], color: "#a855f7",
+icon: "star"}` and the standard `X-OwnNAS: 1` header. Colors are empty (default) or
+six-digit hexadecimal; icons use a fixed allowlist. A batch contains at most 200
+folders and is validated before any metadata is changed.

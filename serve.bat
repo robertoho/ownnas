@@ -7,5 +7,5 @@ if not exist "target\release\ownnas.exe" (
     exit /b 1
 )
 
-.\target\release\ownnas.exe serve --root d:/fotos --username admin
+.\target\release\ownnas.exe serve --root "%USERPROFILE%\Pictures" --username admin
 exit /b %ERRORLEVEL%

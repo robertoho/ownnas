@@ -1,0 +1,17 @@
+.docx-editor { width: 100%; padding: 12px; box-sizing: border-box; }
+.docx-toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; position: sticky; top: 0; z-index: 1; background: var(--bg, #202020); padding: 8px; }
+.docx-status { margin-left: auto; font-size: 12px; }
+.docx-page { background: white; color: #202020; padding: clamp(16px, 5vw, 64px); max-width: 800px; margin: 16px auto; min-height: 600px; font: 16px/1.5 Georgia, serif; overflow-wrap: anywhere; }
+.docx-page p { margin: 0 0 12px; min-height: 1.5em; }
+.docx-page table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+.docx-page td { border: 1px solid #bbb; padding: 8px; vertical-align: top; }
+.docx-run { white-space: pre-wrap; }
+.docx-run[contenteditable=true] { min-width: 4px; min-height: 1em; display: inline-block; }
+.docx-run[contenteditable=true]:focus { outline: 1px solid #597eb8; background: #edf4ff; }
+
+.docx-run[contenteditable=true]:empty::before { content: "Type here"; color: #888; }
+
+.docx-toolbar select { width: auto; max-width: 130px; }
+.docx-color { display: inline-flex; align-items: center; gap: 6px; font: 12px system-ui; }
+.docx-color input { width: 32px; height: 28px; padding: 2px; }
+.docx-toolbar button[aria-pressed=true] { outline: 2px solid var(--accent, #597eb8); }

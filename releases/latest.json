@@ -1,0 +1,7 @@
+{
+  "version": "0.1.0",
+  "notes": "Replace this file by running ./releases/publish.sh after you drop binaries into v0.1.0/.",
+  "publishedAt": "2026-10-01T00:00:00Z",
+  "minVersion": "0.1.0",
+  "artifacts": {}
+}
