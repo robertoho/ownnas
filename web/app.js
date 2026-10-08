@@ -2767,13 +2767,13 @@ async function pasteClipboard(dest) {
   else toast("Already in this folder");
 }
 
-function uploadFiles(fileList, names) {
+function uploadFiles(fileList, names, destination = state.path) {
   const files = [...fileList].map((file, index) => ({
     file,
     name: (names && names[index]) || file.webkitRelativePath || file.name,
   }));
   if (!files.length) return Promise.resolve({ saved: 0, skipped: 0 });
-  return sendUploads(files);
+  return sendUploads(files, destination);
 }
 
 function conflictNote(item, info) {
@@ -2816,10 +2816,10 @@ function choiceFits(choice, info) {
   return choice === "keep" || choice === "ignore";
 }
 
-async function sendUploads(files) {
+async function sendUploads(files, destination = state.path) {
   const plan = await api("/api/upload/conflicts", {
     method: "POST",
-    json: { path: state.path, names: files.map((item) => item.name) },
+    json: { path: destination, names: files.map((item) => item.name) },
   });
   const byName = new Map((plan.items || []).map((item) => [item.name, item]));
   let restChoice = null;
@@ -2865,7 +2865,7 @@ async function sendUploads(files) {
         continue;
       }
       updateProgress(item, index, 0);
-      let posted = await postFile(item, choice, (loaded) => updateProgress(item, index, loaded));
+      let posted = await postFile(item, choice, (loaded) => updateProgress(item, index, loaded), destination);
       if (posted && posted.exists) {
         hideStatus();
         const answer = await askUploadConflict(item, posted);
@@ -2881,7 +2881,7 @@ async function sendUploads(files) {
           continue;
         }
         updateProgress(item, index, 0);
-        posted = await postFile(item, answer.choice, (loaded) => updateProgress(item, index, loaded));
+        posted = await postFile(item, answer.choice, (loaded) => updateProgress(item, index, loaded), destination);
         if (posted && posted.exists) throw new Error("An item with that name already exists");
       }
       loadedBefore += item.file.size;
@@ -2899,7 +2899,7 @@ async function sendUploads(files) {
   return { saved, skipped };
 }
 
-function postFile(item, choice, onProgress) {
+function postFile(item, choice, onProgress, destination = state.path) {
   return new Promise((resolve, reject) => {
     if (uploadAbort) {
       const error = new Error("Upload cancelled");
@@ -2910,7 +2910,7 @@ function postFile(item, choice, onProgress) {
     const xhr = new XMLHttpRequest();
     activeUpload = xhr;
     const params = new URLSearchParams();
-    params.set("path", state.path);
+    params.set("path", destination);
     if (choice) params.set("conflict", choice);
     if (choice === "archive-older") params.set("modified", String(Math.floor(item.file.lastModified / 1000)));
     xhr.open("POST", `/api/upload?${params}`);
@@ -2954,32 +2954,200 @@ function uploadSummary(result) {
   return "Upload finished";
 }
 
-async function readDrop(dataTransfer) {
-  const items = [...dataTransfer.items || []];
-  const collected = [];
-  async function walk(entry, prefix) {
+function transferPath(value) {
+  const parts = String(value || "").replace(/\\/g, "/").split("/").filter(Boolean);
+  if (!parts.length || parts.some((part) => part === "." || part === "..")) {
+    throw new Error("The clipboard contains an invalid folder path");
+  }
+  return parts.join("/");
+}
+
+async function readTransfer(dataTransfer) {
+  const items = [...(dataTransfer?.items || [])];
+  const files = [];
+  const directories = new Set();
+  const seenFiles = new Set();
+  const addDirectory = (name) => directories.add(transferPath(name));
+  const addFile = (file, name) => {
+    if (!file) return;
+    const path = transferPath(name || pasteFileName(file));
+    const key = `${path}|${file.size}|${file.lastModified}|${file.type}`;
+    if (seenFiles.has(key)) return;
+    seenFiles.add(key);
+    files.push({ file, name: path });
+    const parts = path.split("/");
+    for (let index = 1; index < parts.length; index += 1) {
+      directories.add(parts.slice(0, index).join("/"));
+    }
+  };
+  const walkHandle = async (handle, prefix = "") => {
+    if (handle.kind === "file") {
+      addFile(await handle.getFile(), `${prefix}${handle.name}`);
+      return;
+    }
+    const path = `${prefix}${handle.name}`;
+    addDirectory(path);
+    for await (const [, child] of handle.entries()) await walkHandle(child, `${path}/`);
+  };
+  const walkEntry = async (entry, prefix = "") => {
     if (entry.isFile) {
       const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
-      collected.push({ file, name: prefix + file.name });
-    } else if (entry.isDirectory) {
-      const reader = entry.createReader();
-      const children = [];
-      while (true) {
-        const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
-        if (!batch.length) break;
-        children.push(...batch);
-      }
-      for (const child of children) await walk(child, `${prefix}${entry.name}/`);
+      addFile(file, `${prefix}${entry.name}`);
+      return;
+    }
+    if (!entry.isDirectory) return;
+    const path = `${prefix}${entry.name}`;
+    addDirectory(path);
+    const reader = entry.createReader();
+    const children = [];
+    while (true) {
+      const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+      if (!batch.length) break;
+      children.push(...batch);
+    }
+    for (const child of children) await walkEntry(child, `${path}/`);
+  };
+
+  // Prefer File System Access handles, then the older WebKit entry API. Both
+  // preserve directories that contain no files.
+  let handledItems = 0;
+  for (const item of items) {
+    if (item.kind !== "file") continue;
+    let handle = null;
+    if (typeof item.getAsFileSystemHandle === "function") {
+      try {
+        handle = await item.getAsFileSystemHandle();
+      } catch { /* Try the legacy entry and file APIs. */ }
+    }
+    if (handle) {
+      await walkHandle(handle);
+      handledItems += 1;
+      continue;
+    }
+    let entry = null;
+    if (typeof item.webkitGetAsEntry === "function") {
+      try {
+        entry = item.webkitGetAsEntry();
+      } catch { /* Try the plain File fallback. */ }
+    }
+    if (entry) {
+      await walkEntry(entry);
+      handledItems += 1;
+      continue;
+    }
+    if (typeof item.getAsFile === "function") addFile(item.getAsFile());
+  }
+
+  if (!handledItems && !files.length && dataTransfer?.files) {
+    for (const file of dataTransfer.files) {
+      addFile(file, file.webkitRelativePath || pasteFileName(file));
     }
   }
-  if (items.length && items[0].webkitGetAsEntry) {
-    for (const item of items) {
-      const entry = item.webkitGetAsEntry && item.webkitGetAsEntry();
-      if (entry) await walk(entry, "");
-    }
-    if (collected.length) return collected;
+  return { files, directories: [...directories] };
+}
+
+function folderPasteRoots(transfer) {
+  const roots = new Set();
+  for (const path of transfer.directories) roots.add(path.split("/")[0]);
+  for (const item of transfer.files) {
+    if (item.name.includes("/")) roots.add(item.name.split("/")[0]);
   }
-  return [...dataTransfer.files].map((file) => ({ file, name: file.webkitRelativePath || file.name }));
+  return [...roots];
+}
+
+async function statusForUploadNames(destination, names) {
+  const plan = await api("/api/upload/conflicts", {
+    method: "POST",
+    json: { path: destination, names },
+  });
+  return new Map((plan.items || []).map((item) => [item.name, item]));
+}
+
+function askFolderPasteConflict(name, existing) {
+  $("folder-paste-title").textContent = existing.dir ? "Folder already exists" : "Name already exists";
+  $("folder-paste-copy").textContent = existing.dir
+    ? `A folder named “${name}” already exists in this location.`
+    : `An item named “${name}” already exists in this location.`;
+  $("folder-paste-merge").hidden = !existing.dir;
+  const dialog = $("folder-paste-dialog");
+  dialog.showModal();
+  const first = [...dialog.querySelectorAll("button")].find((button) => !button.hidden && button.value !== "cancel");
+  first?.focus();
+  return new Promise((resolve) => {
+    dialog.addEventListener("close", () => {
+      const choice = dialog.returnValue;
+      resolve(choice === "merge" || choice === "keep" ? choice : null);
+    }, { once: true });
+  });
+}
+
+async function keepBothFolderName(destination, name, reserved) {
+  for (let start = 1; start < 10000; start += 100) {
+    const candidates = Array.from({ length: 100 }, (_, offset) => `${name} (${start + offset})`)
+      .filter((candidate) => !reserved.has(candidate));
+    const statuses = await statusForUploadNames(destination, candidates);
+    const available = candidates.find((candidate) => !statuses.get(candidate)?.exists);
+    if (available) return available;
+  }
+  throw new Error(`Could not choose a new name for “${name}”`);
+}
+
+async function pasteExternalTransfer(transfer, destination) {
+  if (!transfer.files.length && !transfer.directories.length) {
+    toast("Nothing to upload from the clipboard", true);
+    return;
+  }
+  const roots = folderPasteRoots(transfer);
+  const rootNames = new Map();
+  // Reserve clipboard roots too, so a generated “(1)” name cannot collide
+  // with another folder in the same paste operation.
+  const reserved = new Set(roots);
+  const statuses = roots.length ? await statusForUploadNames(destination, roots) : new Map();
+  for (const name of roots) {
+    const existing = statuses.get(name);
+    if (!existing?.exists) {
+      rootNames.set(name, name);
+      reserved.add(name);
+      continue;
+    }
+    const choice = await askFolderPasteConflict(name, existing);
+    if (!choice) {
+      toast("Upload cancelled");
+      return;
+    }
+    if (choice === "merge") {
+      rootNames.set(name, name);
+      reserved.add(name);
+    } else {
+      const kept = await keepBothFolderName(destination, name, reserved);
+      rootNames.set(name, kept);
+      reserved.add(kept);
+    }
+  }
+  const rewrite = (name) => {
+    const path = transferPath(name);
+    const slash = path.indexOf("/");
+    const root = slash < 0 ? path : path.slice(0, slash);
+    const mapped = rootNames.get(root);
+    return mapped ? `${mapped}${slash < 0 ? "" : path.slice(slash)}` : path;
+  };
+  const directories = new Set(roots.map((root) => rootNames.get(root) || root));
+  for (const path of transfer.directories) directories.add(rewrite(path));
+  const mappedFiles = transfer.files.map((item) => ({ file: item.file, name: rewrite(item.name) }));
+  if (directories.size) {
+    await api("/api/upload/directories", {
+      method: "POST",
+      json: { path: destination, names: [...directories].sort((a, b) => a.split("/").length - b.split("/").length) },
+    });
+  }
+  const result = mappedFiles.length
+    ? await uploadFiles(mappedFiles.map((item) => item.file), mappedFiles.map((item) => item.name), destination)
+    : { saved: 0, skipped: 0 };
+  toast(mappedFiles.length ? uploadSummary(result) : `Pasted ${directories.size} folders`);
+}
+
+async function readDrop(dataTransfer) {
+  return readTransfer(dataTransfer);
 }
 
 function syncControls() {
@@ -3812,17 +3980,13 @@ window.addEventListener("paste", (event) => {
     if (editingSensitive) return;
     event.preventDefault();
     event.stopPropagation();
-    const pasted = filesFromPaste(data);
-    if (!pasted.length) {
-      toast("Nothing to upload from the clipboard", true);
-      return;
-    }
-    uploadFiles(pasted.map((item) => item.file), pasted.map((item) => item.name))
-      .then(async (result) => {
-        toast(uploadSummary(result));
-        if (state.me) await load(state.path);
-      })
-      .catch((err) => toast(err.cancel ? "Upload cancelled" : err.message, !err.cancel));
+    const destination = state.path;
+    readTransfer(data)
+      .then((transfer) => pasteExternalTransfer(transfer, destination))
+      .catch((err) => toast(err.cancel ? "Upload cancelled" : err.message, !err.cancel))
+      .finally(() => {
+        if (state.me && state.path === destination) load(destination).catch((err) => toast(err.message, true));
+      });
     return;
   }
 
@@ -3842,30 +4006,6 @@ function clipboardHasFiles(clipboardData) {
     if (item.kind === "file") return true;
   }
   return false;
-}
-
-function filesFromPaste(clipboardData) {
-  if (!clipboardData) return [];
-  const out = [];
-  const seen = new Set();
-  const add = (file) => {
-    if (!file) return;
-    const key = `${file.name}|${file.size}|${file.lastModified}|${file.type}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    out.push({ file, name: pasteFileName(file) });
-  };
-
-  // Prefer DataTransferItemList: screenshots and some OS pastes leave `files` empty.
-  for (const item of clipboardData.items || []) {
-    if (item.kind === "file") add(item.getAsFile());
-  }
-  if (out.length) return out;
-
-  if (clipboardData.files && clipboardData.files.length) {
-    for (const file of clipboardData.files) add(file);
-  }
-  return out;
 }
 
 function pasteFileName(file) {
@@ -3972,13 +4112,13 @@ window.addEventListener("drop", async (event) => {
   if (!state.me || state.me.readonly || !draggingFiles(event)) return;
   event.preventDefault();
   try {
-    const items = await readDrop(event.dataTransfer);
-    const result = await uploadFiles(items.map((item) => item.file), items.map((item) => item.name));
-    toast(uploadSummary(result));
+    const destination = state.path;
+    const transfer = await readDrop(event.dataTransfer);
+    await pasteExternalTransfer(transfer, destination);
   } catch (err) {
     toast(err.cancel ? "Upload cancelled" : err.message, !err.cancel);
   }
-  if (state.me) load(state.path).catch((err) => toast(err.message, true));
+  if (state.me && state.path === destination) load(destination).catch((err) => toast(err.message, true));
 });
 
 async function refreshLibrary() {

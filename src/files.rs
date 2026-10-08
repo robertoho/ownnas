@@ -272,6 +272,59 @@ pub fn make_dir(root: &Path, parent_rel: &str, name: &str) -> Result<(), FileErr
     fs::create_dir(&dest).map_err(map_io)
 }
 
+/// Creates a set of folders from an uploaded directory tree. Existing folders are
+/// accepted so merged folder uploads can safely include paths already on disk.
+pub fn ensure_upload_dirs(root: &Path, parent_rel: &str, names: &[String]) -> Result<(), FileError> {
+    let root = root.canonicalize().map_err(map_io)?;
+    let parent = resolve(&root, parent_rel)?;
+    if !parent.full.is_dir() {
+        return Err(FileError::NotADirectory);
+    }
+
+    for name in names {
+        if name
+            .split(['/', '\\'])
+            .any(|part| part == "." || part == "..")
+        {
+            return Err(FileError::InvalidName);
+        }
+        let parts = clean_parts(name)?;
+        if parts.is_empty() || parts.iter().any(|part| !valid_new_component(part)) {
+            return Err(FileError::InvalidName);
+        }
+        let mut cursor = parent.full.clone();
+        for part in parts {
+            let next = cursor.join(part);
+            if next.exists() {
+                let canon = next.canonicalize().map_err(map_io)?;
+                if !canon.starts_with(&root) {
+                    return Err(FileError::Forbidden);
+                }
+                if !canon.is_dir() {
+                    return Err(FileError::AlreadyExists);
+                }
+                cursor = canon;
+                continue;
+            }
+            match fs::create_dir(&next) {
+                Ok(()) => cursor = next,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let canon = next.canonicalize().map_err(map_io)?;
+                    if !canon.starts_with(&root) {
+                        return Err(FileError::Forbidden);
+                    }
+                    if !canon.is_dir() {
+                        return Err(FileError::AlreadyExists);
+                    }
+                    cursor = canon;
+                }
+                Err(error) => return Err(map_io(error)),
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Creates a new empty-ish file of a supported kind in `parent_rel`.
 /// Returns the relative path of the created file.
 pub fn create_file(root: &Path, parent_rel: &str, name: &str, kind: &str) -> Result<String, FileError> {
@@ -2698,6 +2751,28 @@ mod tests {
         fs::create_dir_all(path.join("sub")).unwrap();
         fs::write(path.join("sub").join("note.txt"), b"hello").unwrap();
         path.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn upload_directories_merge_existing_tree_and_reject_files() {
+        let root = scratch();
+        fs::create_dir_all(root.join("sub/Folder/existing")).unwrap();
+        fs::write(root.join("sub/Folder/existing/old.txt"), b"old").unwrap();
+        let names = vec!["Folder".to_string(), "Folder/empty/nested".to_string()];
+        ensure_upload_dirs(&root, "sub", &names).unwrap();
+        assert!(root.join("sub/Folder/existing/old.txt").is_file());
+        assert!(root.join("sub/Folder/empty/nested").is_dir());
+
+        fs::write(root.join("sub/blocked"), b"file").unwrap();
+        assert!(matches!(
+            ensure_upload_dirs(&root, "sub", &["blocked/child".to_string()]),
+            Err(FileError::AlreadyExists)
+        ));
+        assert!(matches!(
+            ensure_upload_dirs(&root, "sub", &["../outside".to_string()]),
+            Err(FileError::InvalidName)
+        ));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

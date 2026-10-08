@@ -199,6 +199,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/rename", post(rename))
         .route("/api/upload", post(upload).layer(DefaultBodyLimit::disable()))
         .route("/api/upload/conflicts", post(upload_conflicts))
+        .route("/api/upload/directories", post(upload_directories))
         .route("/api/entry", axum::routing::delete(delete_entry))
         .route("/api/restore", post(restore_item))
         .route("/api/trash/empty", post(empty_trash))
@@ -462,6 +463,12 @@ struct UploadQuery {
 
 #[derive(Deserialize)]
 struct ConflictBody {
+    path: Option<String>,
+    names: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct UploadDirectoriesBody {
     path: Option<String>,
     names: Vec<String>,
 }
@@ -1958,6 +1965,33 @@ async fn upload_conflicts(
     .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not check the upload"))?
     .map_err(ApiError::from)?;
     Ok(Json(json!({ "items": items })))
+}
+
+async fn upload_directories(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<UploadDirectoriesBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    if body.names.len() > files::MAX_LIST {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "That folder contains too many directories"));
+    }
+    let root = state.root.clone();
+    let parent = rel_of(&body.path);
+    let parent_for_create = parent.clone();
+    let names = body.names;
+    let count = names.len();
+    tokio::task::spawn_blocking(move || files::ensure_upload_dirs(&root, &parent_for_create, &names))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not create uploaded folders"))?
+        .map_err(ApiError::from)?;
+    invalidate_sizes(&state, &parent);
+    if count > 0 {
+        record(&state, &user, "upload-folders", &format!("{count} folder(s)"));
+    }
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn upload(

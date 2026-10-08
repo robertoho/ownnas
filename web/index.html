@@ -474,6 +474,19 @@
     </form>
   </dialog>
 
+  <dialog id="folder-paste-dialog">
+    <form method="dialog">
+      <h3 id="folder-paste-title">Folder already exists</h3>
+      <p id="folder-paste-copy"></p>
+      <p class="muted" id="folder-paste-meta">Merge adds the pasted contents to the existing folder. Keep both creates a new folder with a numbered name.</p>
+      <div class="dialog-actions">
+        <button id="folder-paste-merge" value="merge" type="submit">Merge</button>
+        <button value="keep" type="submit">Keep both</button>
+        <button value="cancel" type="submit" formnovalidate>Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="confirm-dialog">
     <form method="dialog">
       <h3 id="confirm-title">Confirm</h3>

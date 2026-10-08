@@ -2036,8 +2036,8 @@ td, th { border: 1px solid var(--line); padding: 0.3rem 0.45rem; text-align: lef
 }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 .toast.bad { background: var(--danger); color: white; }
-#conflict-dialog { width: min(560px, calc(100vw - 2rem)); }
-#conflict-dialog .dialog-actions { margin-top: 1rem; }
+#conflict-dialog, #folder-paste-dialog { width: min(560px, calc(100vw - 2rem)); }
+#conflict-dialog .dialog-actions, #folder-paste-dialog .dialog-actions { margin-top: 1rem; }
 #activity-dialog {
   width: min(720px, calc(100vw - 2rem));
   max-height: min(80vh, 40rem);
