@@ -108,13 +108,14 @@ function prepareRoot(object, colors) {
     if (!child.isMesh) return;
     child.castShadow = false;
     child.receiveShadow = false;
+    if (child.geometry && !child.geometry.getAttribute("normal")) child.geometry.computeVertexNormals();
     if (!child.material) {
       child.material = defaultMaterial(colors);
       return;
     }
     const mats = Array.isArray(child.material) ? child.material : [child.material];
     for (const mat of mats) {
-      if (mat && mat.side === undefined) mat.side = THREE.DoubleSide;
+      if (mat) mat.side = THREE.DoubleSide;
     }
   });
   return root;
@@ -276,6 +277,7 @@ async function loadModel(url, ext, colors, onStatus, timeoutMs = 120000) {
     if (!geometry.getAttribute("normal")) geometry.computeVertexNormals();
     return prepareRoot(new THREE.Mesh(geometry, defaultMaterial(colors)), colors);
   }
+  if (ext === "3mf") result.rotation.x = -Math.PI / 2;
   return prepareRoot(result, colors);
 }
 

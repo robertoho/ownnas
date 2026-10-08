@@ -30,8 +30,10 @@ const APP_CSS: &str = include_str!("../web/app.css");
 const DOCX_EDITOR_CSS: &str = include_str!("../web/docx-editor.css");
 const DOCX_EDITOR_JS: &str = include_str!("../web/docx-editor.js");
 const ODT_EDITOR_JS: &str = include_str!("../web/odt-editor.js");
+const XLSX_EDITOR_JS: &str = include_str!("../web/xlsx-editor.js");
 const APP_JS: &str = include_str!("../web/app.js");
 const MODEL_VIEWER_JS: &str = include_str!("../web/model-viewer.js");
+const DXF_VIEWER_JS: &str = include_str!("../web/dxf-viewer.js");
 const THREE_MODULE_JS: &str = include_str!("../web/vendor/three/three.module.min.js");
 const THREE_ORBIT_CONTROLS_JS: &str = include_str!("../web/vendor/three/addons/controls/OrbitControls.js");
 const THREE_OBJ_LOADER_JS: &str = include_str!("../web/vendor/three/addons/loaders/OBJLoader.js");
@@ -116,8 +118,10 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/assets/app.js", get(javascript))
         .route("/assets/docx-editor.js", get(docx_editor_javascript))
         .route("/assets/odt-editor.js", get(odt_editor_javascript))
+        .route("/assets/xlsx-editor.js", get(xlsx_editor_javascript))
         .route("/assets/docx-editor.css", get(docx_editor_css))
         .route("/assets/model-viewer.js", get(model_viewer_javascript))
+        .route("/assets/dxf-viewer.js", get(dxf_viewer_javascript))
         .route("/assets/vendor/three/three.module.min.js", get(three_module))
         .route(
             "/assets/vendor/three/addons/controls/OrbitControls.js",
@@ -177,12 +181,14 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/raw", get(raw))
         .route("/api/docx", get(read_docx))
         .route("/api/odt", get(read_odt))
+        .route("/api/xlsx", get(read_xlsx))
         .route("/api/thumb", get(thumb))
         .route("/api/mkdir", post(mkdir))
         .route("/api/create", post(create_entry))
         .route("/api/write", post(write_entry))
         .route("/api/write-docx", post(write_docx_entry).layer(DefaultBodyLimit::max(36 * 1024 * 1024)))
         .route("/api/write-odt", post(write_odt_entry).layer(DefaultBodyLimit::max(36 * 1024 * 1024)))
+        .route("/api/write-xlsx", post(write_xlsx_entry).layer(DefaultBodyLimit::max(36 * 1024 * 1024)))
         .route("/api/write-image", post(write_image_entry))
         .route("/api/convert-image", post(convert_image_entry))
         .route("/api/pdf/info", get(pdf_info))
@@ -698,8 +704,15 @@ async fn odt_editor_javascript() -> impl IntoResponse {
     app_module_javascript(ODT_EDITOR_JS)
 }
 
+async fn xlsx_editor_javascript() -> impl IntoResponse {
+    app_module_javascript(XLSX_EDITOR_JS)
+}
+
 async fn model_viewer_javascript() -> impl IntoResponse {
     app_module_javascript(MODEL_VIEWER_JS)
+}
+async fn dxf_viewer_javascript() -> impl IntoResponse {
+    app_module_javascript(DXF_VIEWER_JS)
 }
 async fn three_module() -> impl IntoResponse {
     module_javascript(THREE_MODULE_JS)
@@ -1198,6 +1211,27 @@ async fn read_odt(
         ("x-odt-hash", hash.as_str()), ("cache-control", "no-store")], bytes).into_response())
 }
 
+async fn read_xlsx(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<Response, ApiError> {
+    use sha2::Digest;
+    require_user(&state, &headers)?;
+    let target = files::resolve(&state.root, &rel_of(&query.path))?;
+    if !target.full.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("xlsx")) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Expected an XLSX file"));
+    }
+    let mut file = tokio::fs::File::open(target.full).await.map_err(|_| ApiError::from(FileError::NotFound))?;
+    let mut bytes = Vec::new();
+    (&mut file).take(25 * 1024 * 1024 + 1).read_to_end(&mut bytes).await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read spreadsheet"))?;
+    if bytes.len() > 25 * 1024 * 1024 { return Err(ApiError::new(StatusCode::BAD_REQUEST, "Spreadsheets up to 25 MB are supported")); }
+    let hash = hex::encode(sha2::Sha256::digest(&bytes));
+    Ok(([(header::CONTENT_TYPE.as_str(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        ("x-xlsx-hash", hash.as_str()), ("cache-control", "no-store")], bytes).into_response())
+}
+
 async fn raw(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
@@ -1281,6 +1315,9 @@ async fn raw(
 
 fn raw_media_type(path: &std::path::Path, name: &str) -> String {
     let kind = files::kind_of(name);
+    if extension_of(name).as_str() == "dxf" {
+        return "text/plain; charset=utf-8".to_string();
+    }
     if kind == "text" || matches!(extension_of(name).as_str(), "html" | "htm" | "xhtml" | "xml" | "js" | "mjs")
     {
         return "text/plain; charset=utf-8".to_string();
@@ -1540,6 +1577,35 @@ async fn write_odt_entry(
         .map_err(ApiError::from)?;
     invalidate_sizes(&state, &parent_rel_path(&body.path));
     record(&state, &user, "edit-document", &body.path);
+    Ok(Json(json!({ "ok": true, "hash": hash })))
+}
+
+#[derive(Deserialize)]
+struct WriteXlsxBody {
+    path: String,
+    data: String,
+    expected_hash: String,
+}
+
+async fn write_xlsx_entry(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<WriteXlsxBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let bytes = base64_decode(&body.data)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Invalid spreadsheet data"))?;
+    let root = state.root.clone();
+    let path = body.path.clone();
+    let expected_hash = body.expected_hash.clone();
+    let hash = tokio::task::spawn_blocking(move || files::write_xlsx_bytes(&root, &path, &bytes, &expected_hash))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not save spreadsheet"))?
+        .map_err(ApiError::from)?;
+    invalidate_sizes(&state, &parent_rel_path(&body.path));
+    record(&state, &user, "edit-spreadsheet", &body.path);
     Ok(Json(json!({ "ok": true, "hash": hash })))
 }
 

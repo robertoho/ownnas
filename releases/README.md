@@ -9,9 +9,9 @@ set the package version in `Cargo.toml`, commit the change, then push a matching
 ```bash
 cargo check  # refresh Cargo.lock after changing Cargo.toml
 git add Cargo.toml Cargo.lock
-git commit -m "Release v0.2.0"
-git tag v0.2.0
-git push origin main v0.2.0
+git commit -m "Release v0.3.0"
+git tag v0.3.0
+git push origin main v0.3.0
 ```
 
 The tag must match the Cargo package version. Actions creates a draft release, builds
@@ -47,7 +47,7 @@ releases/
 2. On your build machine (with the private key):
 
 ```bash
-./releases/publish.sh 0.2.0 https://updates.example.com
+./releases/publish.sh 0.3.0 https://updates.example.com
 ```
 
 3. Sync to the VPS (example):
@@ -89,7 +89,7 @@ Build examples:
 
 ```bash
 cargo build --release
-cp target/release/ownnas releases/v0.2.0/ownnas-$(rustc -vV | sed -n 's/^host: //p')
+cp target/release/ownnas releases/v0.3.0/ownnas-$(rustc -vV | sed -n 's/^host: //p')
 
 # cross-compile as you prefer, then rename into the table above
 ```

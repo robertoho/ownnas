@@ -7,6 +7,54 @@ import vm from 'node:vm';
 import { pathToFileURL } from 'node:url';
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 const realThree = await import(pathToFileURL(path.join(root, 'web/vendor/three/three.module.min.js')));
+class XmlNode {
+  constructor(name, attributes = {}) {
+    this.nodeName = name;
+    this.attributes = Object.entries(attributes).map(([name, value]) => ({ name, value }));
+    this.children = [];
+    this.textContent = '';
+  }
+  getAttribute(name) { return this.attributes.find(attribute => attribute.name === name)?.value ?? null; }
+  descendants() { return this.children.flatMap(child => [child, ...child.descendants()]); }
+  querySelectorAll(selector) {
+    let nodes = [this];
+    for (const part of selector.split(/\s+/)) nodes = nodes.flatMap(node => node.descendants().filter(child => child.nodeName === part));
+    return nodes;
+  }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+}
+class MiniDOMParser {
+  parseFromString(xml) {
+    const stack = [];
+    let rootNode = null;
+    for (const token of String(xml).match(/<!--[\s\S]*?-->|<[^>]+>|[^<]+/g) || []) {
+      if (token.startsWith('<!--') || token.startsWith('<?') || token.startsWith('<!')) continue;
+      if (token.startsWith('</')) { stack.pop(); continue; }
+      if (token.startsWith('<')) {
+        const selfClosing = /\/>$/.test(token);
+        const inside = token.slice(1, selfClosing ? -2 : -1).trim();
+        const match = inside.match(/^([^\s/>]+)/);
+        if (!match) continue;
+        const name = match[1], attributes = {};
+        const attrText = inside.slice(name.length);
+        for (const attr of attrText.matchAll(/([^\s=]+)\s*=\s*(['"])(.*?)\2/g)) attributes[attr[1]] = attr[3];
+        const node = new XmlNode(name, attributes);
+        if (stack.length) stack.at(-1).children.push(node); else rootNode = node;
+        if (!selfClosing) stack.push(node);
+      } else if (stack.length) {
+        stack.at(-1).textContent += token;
+      }
+    }
+    return {
+      documentElement: rootNode,
+      querySelectorAll(selector) {
+        const found = rootNode?.querySelectorAll(selector) || [];
+        return rootNode?.nodeName === selector ? [rootNode, ...found] : found;
+      },
+      querySelector(selector) { return this.querySelectorAll(selector)[0] || null; },
+    };
+  }
+}
 const fixtures = new Map();
 const vertices = [[0,0,0],[1,0,0],[0,1,0],[0,0,1]];
 const faces = [[0,2,1],[0,1,3],[0,3,2],[1,2,3]];
@@ -28,7 +76,7 @@ metallic.meshes[0].primitives[0].material = 0;
 fixtures.set('black-metal.gltf', JSON.stringify(metallic));
 fixtures.set('tiny.obj', vertices.map(v => 'v '+v.map(x=>x*1e-8).join(' ')+'\n').join('') + faces.map(f => 'f '+f.map(i=>i+1).join(' ')+'\n').join(''));
 fixtures.set('huge.obj', vertices.map(v => 'v '+v.map(x=>x*1e8).join(' ')+'\n').join('') + faces.map(f => 'f '+f.map(i=>i+1).join(' ')+'\n').join(''));
-let rendered=0, disposed=0;
+let rendered=0, disposed=0, expect3mfOrientation=false;
 class Renderer {
   domElement={toBlob: cb=>cb(new Blob(['test-capture'],{type:'image/png'}))};
   setSize(width,height){assert.equal(width,480);assert.equal(height,480);}
@@ -39,6 +87,10 @@ class Renderer {
     assert.ok(camera.near>0 && camera.far>camera.near);
     const size=box.getSize(new realThree.Vector3());
     assert.ok(Math.abs(Math.max(size.x,size.y,size.z)-2)<1e-5,'model units must be normalized');
+    if(expect3mfOrientation){
+      assert.ok(size.y>size.x*3.5 && size.y>size.z*3.5,'3MF Z-up coordinates must be converted to Y-up');
+      expect3mfOrientation=false;
+    }
     assert.ok(camera.position.distanceTo(center)>camera.near,'tiny models must not be clipped');
     assert.equal(this.toneMapping,realThree.ACESFilmicToneMapping);
     scene.traverse(object=>{
@@ -60,6 +112,7 @@ const nativeFetch = globalThis.fetch;
 const NativeRequest = globalThis.Request;
 globalThis.Request = class extends NativeRequest { constructor(input, options) { super(typeof input === 'string' ? new URL(input, 'http://localhost/').href : input, options); } };
 const context=vm.createContext({console,setTimeout,clearTimeout,Blob,URL,TextDecoder,TextEncoder,ArrayBuffer,Uint8Array,Float32Array,Headers,Request,Response,
+  DOMParser:MiniDOMParser,
   location:{href:'http://localhost/',origin:'http://localhost'},
   ProgressEvent:class {constructor(type,opts){Object.assign(this,{type},opts);}},
   fetch:async (request)=>{
@@ -85,13 +138,25 @@ async function linker(specifier,parent){
   const filename=specifier.startsWith('/assets/')?path.join(root,'web',specifier.slice('/assets/'.length)):path.resolve(path.dirname(parent.identifier),specifier);
   return getModule(filename);
 }
+const fflate=await getModule(path.join(root,'web/vendor/three/addons/libs/fflate.module.js'));
+await fflate.link(linker);await fflate.evaluate();
+const modelXml='<?xml version="1.0"?><model unit="millimeter"><resources><object id="1" type="model"><mesh><vertices><vertex x="0" y="0" z="0"/><vertex x="1" y="0" z="0"/><vertex x="0" y="1" z="0"/><vertex x="0" y="0" z="4"/></vertices><triangles><triangle v1="0" v2="1" v3="2"/><triangle v1="0" v2="1" v3="3"/><triangle v1="0" v2="2" v3="3"/><triangle v1="1" v2="2" v3="3"/></triangles></mesh></object></resources><build><item objectid="1"/></build></model>';
+const relsXml='<?xml version="1.0"?><Relationships><Relationship Target="/3D/3dmodel.model" Id="rel0" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>';
+fixtures.set('shape.3mf',fflate.namespace.zipSync({
+  '_rels/.rels':new TextEncoder().encode(relsXml),
+  '3D/3dmodel.model':new TextEncoder().encode(modelXml),
+}));
 const model=await getModule(path.join(root,'web/model-viewer.js'));await model.link(linker);await model.evaluate();
 for(const name of ['shape.stl','shape.obj','shape.ply','models/shape.gltf','inline.gltf','shape.glb','black-metal.gltf','tiny.obj','huge.obj']){
   const blob=await model.namespace.renderModelThumbnail({url:'/api/raw?path='+encodeURIComponent(name),name:name.split('/').pop(),size:1000});
   assert.equal(blob.type,'image/png');
 }
-assert.equal(rendered,9);assert.equal(disposed,9);
+expect3mfOrientation=true;
+const threeMfBlob=await model.namespace.renderModelThumbnail({url:'/api/raw?path=shape.3mf',name:'shape.3mf',size:1000});
+assert.equal(threeMfBlob.type,'image/png');
+assert.equal(expect3mfOrientation,false);
+assert.equal(rendered,10);assert.equal(disposed,10);
 await assert.rejects(model.namespace.renderModelThumbnail({url:'/api/raw?path=shape.stl',name:'shape.stl',size:81*1024*1024}),/80 MB/);
 await assert.rejects(model.namespace.renderModelThumbnail({url:'/api/raw?path=external.gltf',name:'external.gltf',size:1000}),/External model resources/);
-assert.equal(disposed,9,'rejected models must not allocate a renderer');
-console.log('PASS: STL, OBJ, PLY, embedded/external-buffer GLTF, GLB, camera framing, disposal, size limit, and external-resource rejection. GPU output is not tested.');
+assert.equal(disposed,10,'rejected models must not allocate a renderer');
+console.log('PASS: STL, OBJ, PLY, GLTF, GLB, 3MF orientation, camera framing, disposal, size limit, and external-resource rejection. GPU output is not tested.');

@@ -145,8 +145,11 @@ Opening a file opens the preview panel. Content streams from `/api/raw?path=…`
 | **Audio** | HTML5 `<audio controls>`. |
 | **PDF** | Inline iframe. Context menu **PDF…**: extract pages, split into pages, rotate (writes siblings). Multi-select **Join PDFs**. |
 | **3D models** | Interactive Three.js viewer for `obj`, `stl`, `gltf`/`glb`, `ply`, `3mf`. **STEP/IGES** (`stp`/`step`/`iges`/`igs`) are tessellated in a Web Worker via vendored OpenCascade (`occt-import-js`, ~8 MB WASM, first open is slower). |
+| **DXF drawings** | Browser canvas viewer with fit-to-view, pan, zoom, layer filtering, and support for lines, polylines, circles, arcs, ellipses, and text. Unsupported entities are skipped. |
+| **DWG drawings** | Recognized as CAD files, but this build does not include a DWG decoder. Export the drawing to DXF in a CAD application to preview it. |
+| **XLSX spreadsheets** | In-browser workbook grid with sheet tabs, cell editing, formulas saved for recalculation by a spreadsheet app, and version-checked save. Protected workbooks open read-only. |
 | **Text / code / CSV / JSON / Markdown** | Fetched via `/api/meta` and rendered (tables, markdown, highlighted text as appropriate). When not readonly, **Edit** opens an in-browser editor (Markdown preview/edit, CSV grid, plain text). Save with the button or Ctrl/Cmd+S (1 MB max). |
-| **Archives (zip/tar/…)** | Listing / meta preview when supported. |
+| **Archives (zip/tar/tar.gz)** | Browse folders and entries in the preview panel. Contents are read-only and stay compressed; nothing is extracted. RAR/7z and other unsupported formats can still be downloaded. |
 | **Other** | Meta panel + download. |
 
 ### Can you play videos and sound online?

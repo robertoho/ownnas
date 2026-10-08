@@ -376,11 +376,14 @@ function typeIcon(kind) {
     audio: `<path d="M5 10.5a1.7 1.7 0 1 0 0 .2V6.2L12 4.8v4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="5" cy="11" r="1.7" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="12" cy="9.5" r="1.7" fill="none" stroke="currentColor" stroke-width="1.5"/>`,
     pdf: `<path d="M4.5 2.5h5L12.5 5v8.5A1.5 1.5 0 0 1 11 15H5A1.5 1.5 0 0 1 3.5 13.5v-10A1 1 0 0 1 4.5 2.5z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M9.5 2.6V5h2.4M5.5 9h5M5.5 11.5h3.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>`,
     model3d: `<path d="M8 2.2 13.2 5v6L8 13.8 2.8 11V5z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M8 2.2V8m0 0 5.2 3M8 8 2.8 11" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>`,
+    cad2d: `<path d="M2.5 12.8h11M3.2 11.1l3-3 2.1 1.6 4.5-5.2" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/><circle cx="3.2" cy="11.1" r=".8" fill="currentColor"/><circle cx="12.8" cy="4.5" r=".8" fill="currentColor"/>`,
     text: `<path d="M4.5 2.5h5L12.5 5v8.5A1.5 1.5 0 0 1 11 15H5A1.5 1.5 0 0 1 3.5 13.5v-10A1 1 0 0 1 4.5 2.5z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M9.5 2.6V5h2.4M5.8 8.5h4.4M5.8 11h3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>`,
     archive: `<path d="M2.4 3.4h11.2v2.2H2.4z" fill="currentColor" opacity="0.2"/><path d="M2.4 3.4h11.2v2.2H2.4z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M3.4 5.6h9.2v7.1A1.3 1.3 0 0 1 11.3 14H4.7A1.3 1.3 0 0 1 3.4 12.7z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M7.15 7.5h1.7v3.2H7.15z" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M7.4 8.9h1.2" stroke="currentColor" stroke-width="1.15" stroke-linecap="round"/>`,
     file: `<path d="M4.5 2.5h5L12.5 5v8.5A1.5 1.5 0 0 1 11 15H5A1.5 1.5 0 0 1 3.5 13.5v-10A1 1 0 0 1 4.5 2.5z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M9.5 2.6V5h2.4" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>`,
   };
-  const body = icons[kind] || icons.file;
+  const body = icons[kind] || (kind === "spreadsheet"
+    ? '<rect x="2.5" y="2.5" width="11" height="11" rx="1" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M2.8 6.2h10.4M2.8 9.7h10.4M6.2 2.8v10.4M9.8 2.8v10.4" stroke="currentColor" stroke-width="1.1"/>'
+    : icons.file);
   const special = kind === "archive-folder" || kind === "trash-folder";
   return `<svg class="type-icon${special ? " type-icon-special" : ""}" viewBox="0 0 16 16" width="28" height="28" aria-hidden="true">${body}</svg>`;
 }
@@ -476,7 +479,7 @@ function sortedEntries() {
 
 function fileTypeLabel(entry) {
   if (entry.dir) return "Folder";
-  const labels = { image: "image", video: "video", audio: "audio", model3d: "3D model", pdf: "document", text: "document", archive: "archive", svg: "image" };
+  const labels = { image: "image", video: "video", audio: "audio", model3d: "3D model", cad2d: "CAD drawing", pdf: "document", text: "document", spreadsheet: "spreadsheet", archive: "archive", svg: "image" };
   const ext = entry.name.includes(".") ? entry.name.split(".").pop().toUpperCase() : "";
   return ext ? `${ext} ${labels[entry.kind] || "file"}` : "File";
 }
@@ -1396,6 +1399,36 @@ async function openEntry(entry) {
     body.innerHTML = `<audio controls src="${raw}"></audio>`;
   } else if (entry.kind === "pdf") {
     body.innerHTML = `<iframe title="${esc(entry.name)}" src="${raw}"></iframe>`;
+  } else if (/\.xlsx$/i.test(entry.name)) {
+    body.innerHTML = '<p class="muted">Loading spreadsheet…</p>';
+    try {
+      if (entry.size > 25 * 1024 * 1024) throw new Error('Spreadsheets up to 25 MB are supported.');
+      const [module, response] = await Promise.all([import('/assets/xlsx-editor.js'), fetch(`/api/xlsx?path=${encodeURIComponent(entry.path)}`, { credentials: 'same-origin', cache: 'no-store' })]);
+      if (!response.ok) throw new Error('Could not load spreadsheet.');
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      let expectedHash = response.headers.get('x-xlsx-hash');
+      if (!expectedHash) throw new Error('Spreadsheet version is missing.');
+      if (state.current !== entry) return;
+      const editor = { dirty: false, destroy: null };
+      const mounted = module.mountXlsxEditor(body, bytes, {
+        readonly: !write || inTrashPath(entry.path),
+        onChange: dirty => { editor.dirty = dirty; },
+        onSave: async data => {
+          let binary = '';
+          for (let i = 0; i < data.length; i += 8192) binary += String.fromCharCode(...data.subarray(i, i + 8192));
+          const result = await api('/api/write-xlsx', { method: 'POST', json: { path: entry.path, data: btoa(binary), expected_hash: expectedHash } });
+          expectedHash = result.hash;
+          if (state.editor === editor) {
+            toast('Spreadsheet saved');
+            invalidateFolderSizes();
+            load(state.path, { keepPreview: true }).catch(err => toast(err.message, true));
+          }
+        },
+      });
+      editor.destroy = () => mounted.destroy(); editor.save = () => mounted.save(); state.editor = editor;
+    } catch (err) {
+      if (state.current === entry) body.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
+    }
   } else if (/\.odt$/i.test(entry.name)) {
     body.innerHTML = '<p class="muted">Loading document…</p>';
     try {
@@ -1456,6 +1489,12 @@ async function openEntry(entry) {
     } catch (err) {
       if (state.current === entry) body.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
     }
+  } else if (entry.kind === "cad2d") {
+    openCadPreview(body, entry, raw).catch((err) => {
+      if (state.current && state.current.path === entry.path) {
+        body.innerHTML = `<p class="muted">${esc(err.message || "Could not open CAD preview")}</p>`;
+      }
+    });
   } else if (entry.kind === "model3d") {
     openModelPreview(body, entry, raw).catch((err) => {
       if (state.current && state.current.path === entry.path) {
@@ -1477,12 +1516,20 @@ async function openEntry(entry) {
 }
 
 let modelViewerApi = null;
-const MODEL_VIEWER_URL = "/assets/model-viewer.js?v=3";
+let dxfViewerApi = null;
+const MODEL_VIEWER_URL = "/assets/model-viewer.js?v=4";
+const DXF_VIEWER_URL = "/assets/dxf-viewer.js?v=1";
 
 async function loadModelViewerApi() {
   if (modelViewerApi) return modelViewerApi;
   modelViewerApi = await import(MODEL_VIEWER_URL);
   return modelViewerApi;
+}
+
+async function loadDxfViewerApi() {
+  if (dxfViewerApi) return dxfViewerApi;
+  dxfViewerApi = await import(DXF_VIEWER_URL);
+  return dxfViewerApi;
 }
 
 // A serial thumbnail queue keeps CAD conversion and GPU use bounded.
@@ -1634,6 +1681,9 @@ function disposeActiveModelViewer() {
   if (modelViewerApi && modelViewerApi.disposeModelViewer) {
     modelViewerApi.disposeModelViewer();
   }
+  if (dxfViewerApi && dxfViewerApi.disposeDxfViewer) {
+    dxfViewerApi.disposeDxfViewer();
+  }
 }
 
 function modelExt(name) {
@@ -1659,6 +1709,14 @@ async function openModelPreview(body, entry, raw) {
   }
   body.innerHTML = "";
   await apiMod.mountModelViewer(body, { url: raw, name: entry.name });
+}
+
+async function openCadPreview(body, entry, raw) {
+  body.innerHTML = `<p class="muted">Loading CAD viewer…</p>`;
+  const apiMod = await loadDxfViewerApi();
+  if (!state.current || state.current.path !== entry.path) return;
+  body.innerHTML = "";
+  await apiMod.mountDxfViewer(body, { url: raw, name: entry.name, size: entry.size });
 }
 
 async function loadAnnotations(path) {
@@ -1724,12 +1782,85 @@ function renderMeta(body, entry, meta) {
     return;
   }
   if (meta.archive) {
-    const rows = meta.archive.map((item) => `<li><span>${esc(item.name)}</span><span class="muted">${item.dir ? "Folder" : esc(formatSize(item.size, false))}</span></li>`).join("");
-    body.innerHTML = `<ul class="archive-list">${rows || "<li>The archive is empty.</li>"}</ul>`;
-    if (meta.archiveTruncated) body.insertAdjacentHTML("beforeend", `<p class="muted">Showing the first entries only.</p>`);
+    mountArchiveBrowser(body, meta.archive, !!meta.archiveTruncated);
     return;
   }
   body.innerHTML = `<p class="muted">${esc(meta.note || "No inline preview for this file. Download it to open it locally.")}</p>`;
+}
+
+function mountArchiveBrowser(body, entries, truncated) {
+  const rootNode = { id: 0, name: "Contents", dir: true, children: new Map() };
+  const nodes = new Map([[0, rootNode]]);
+  let nextId = 1;
+  for (const entry of entries || []) {
+    const normalized = String(entry.name || "").replace(/\\/g, "/");
+    if (!normalized || normalized.startsWith("/") || /^[a-z]:/i.test(normalized)) continue;
+    const parts = normalized.split("/").filter(part => part && part !== ".");
+    if (!parts.length || parts.some(part => part === "..")) continue;
+    let parent = rootNode;
+    for (let index = 0; index < parts.length; index++) {
+      const part = parts[index];
+      let child = parent.children.get(part);
+      if (!child) {
+        child = { id: nextId++, name: part, dir: index < parts.length - 1 || !!entry.dir, children: new Map(), size: 0 };
+        parent.children.set(part, child); nodes.set(child.id, child);
+      }
+      if (index === parts.length - 1) {
+        child.dir = !!entry.dir || child.children.size > 0;
+        child.size = Number(entry.size) || 0;
+      }
+      parent = child;
+    }
+  }
+  const shell = document.createElement("section"); shell.className = "archive-browser";
+  const notice = document.createElement("div"); notice.className = "archive-notice";
+  notice.textContent = "Archived contents · read-only · files remain compressed";
+  const breadcrumbs = document.createElement("nav"); breadcrumbs.className = "archive-breadcrumbs"; breadcrumbs.setAttribute("aria-label", "Archive folder path");
+  const list = document.createElement("ul"); list.className = "archive-list";
+  const footnote = document.createElement("p"); footnote.className = "muted archive-footnote";
+  shell.append(notice, breadcrumbs, list, footnote); body.replaceChildren(shell);
+  let current = rootNode;
+  function render() {
+    breadcrumbs.replaceChildren();
+    const path = [];
+    let cursor = current;
+    while (cursor && cursor !== rootNode) { path.unshift(cursor); cursor = cursor.parent; }
+    const chain = [rootNode, ...path];
+    chain.forEach((node, index) => {
+      if (index) {
+        const separator = document.createElement("span"); separator.textContent = "/"; separator.setAttribute("aria-hidden", "true"); breadcrumbs.append(separator);
+      }
+      const crumb = document.createElement("button"); crumb.type = "button"; crumb.textContent = node.name; crumb.disabled = index === chain.length - 1;
+      crumb.addEventListener("click", () => { current = node; render(); }); breadcrumbs.append(crumb);
+    });
+    list.replaceChildren();
+    const children = [...current.children.values()].sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+    if (current !== rootNode) {
+      const parentRow = document.createElement("li"); parentRow.className = "archive-parent-row";
+      const parentButton = document.createElement("button"); parentButton.type = "button"; parentButton.textContent = "↑ Parent folder";
+      parentButton.addEventListener("click", () => { current = current.parent || rootNode; render(); });
+      parentRow.append(parentButton); list.append(parentRow);
+    }
+    for (const child of children) {
+      const row = document.createElement("li"); row.className = child.dir ? "archive-dir-row" : "archive-file-row";
+      const name = document.createElement(child.dir ? "button" : "span");
+      if (child.dir) {
+        name.type = "button"; name.addEventListener("click", () => { current = child; render(); });
+      }
+      name.className = "archive-entry-name"; name.textContent = child.name; row.append(name);
+      const detail = document.createElement("span"); detail.className = "muted"; detail.textContent = child.dir ? "Archived folder" : formatSize(child.size, false); row.append(detail);
+      list.append(row);
+    }
+    if (!children.length) {
+      const empty = document.createElement("li"); empty.className = "muted archive-empty"; empty.textContent = current === rootNode ? "This archive is empty." : "This archived folder is empty."; list.append(empty);
+    }
+    footnote.textContent = truncated ? "Showing the first entries only. No files have been extracted." : "Select a folder to browse its archived files. No files have been extracted.";
+  }
+  function linkParents(node, parent) {
+    node.parent = parent;
+    for (const child of node.children.values()) linkParents(child, node);
+  }
+  linkParents(rootNode, null); render();
 }
 
 function textFormat(name) {
@@ -2964,7 +3095,13 @@ $("brand-home").addEventListener("click", () => {
 document.querySelector(".explorer-content").addEventListener("pointerdown", (event) => {
   if (event.button !== 0) return;
   if (event.target.closest("#search-panel, .details-header, button, a, input, textarea, select, [contenteditable]:not([contenteditable=\"false\"])")) return;
-  $("files").focus({ preventScroll: true });
+  const files = $("files");
+  files.classList.add("pointer-focused");
+  files.focus({ preventScroll: true });
+}, true);
+
+document.addEventListener("keydown", () => {
+  $("files").classList.remove("pointer-focused");
 }, true);
 
 $("files").addEventListener("click", (event) => {

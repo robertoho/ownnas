@@ -9,7 +9,7 @@ NOTES="${3:-}"
 
 if [[ -z "$VERSION" || -z "$BASE_URL" ]]; then
   echo "Usage: $0 <version> <base-url> [notes]" >&2
-  echo "  Example: $0 0.2.0 https://updates.example.com \"Bug fixes\"" >&2
+  echo "  Example: $0 0.3.0 https://updates.example.com \"Bug fixes\"" >&2
   exit 1
 fi
 

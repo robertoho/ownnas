@@ -1110,12 +1110,14 @@ pub fn kind_of(name: &str) -> &'static str {
         "mp4" | "m4v" | "webm" | "mkv" | "mov" | "avi" | "ogv" | "mpeg" | "mpg" | "wmv" => "video",
         "mp3" | "wav" | "flac" | "ogg" | "opus" | "m4a" | "aac" | "wma" => "audio",
         "pdf" => "pdf",
+        "xlsx" => "spreadsheet",
         "zip" | "jar" | "cbz" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "rar" => "archive",
         "txt" | "md" | "markdown" | "json" | "csv" | "tsv" | "log" | "xml" | "yaml" | "yml"
         | "toml" | "ini" | "conf" | "cfg" | "env" | "nfo" | "properties" | "html" | "htm"
         | "css" | "js" | "mjs" | "ts" | "tsx" | "jsx" | "py" | "rs" | "go" | "java" | "c"
         | "h" | "cpp" | "hpp" | "cs" | "sh" | "bash" | "zsh" | "ps1" | "sql" | "rb" | "php"
         | "lua" | "vue" | "svelte" => "text",
+        "dxf" | "dwg" => "cad2d",
         "obj" | "stl" | "gltf" | "glb" | "ply" | "3mf" | "stp" | "step" | "iges" | "igs" => {
             "model3d"
         }
@@ -3039,6 +3041,76 @@ pub fn write_docx_bytes(root: &Path, rel: &str, bytes: &[u8], expected_hash: &st
     result
 }
 
+/// Save an existing XLSX package, validating its workbook parts and guarding against stale writes.
+pub fn write_xlsx_bytes(root: &Path, rel: &str, bytes: &[u8], expected_hash: &str) -> Result<String, FileError> {
+    static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = SAVE_LOCK.lock().map_err(|_| FileError::Io("Spreadsheet save lock failed"))?;
+    if bytes.is_empty() || bytes.len() > 25 * 1024 * 1024 {
+        return Err(FileError::Rejected("Spreadsheet must be between 1 byte and 25 MB"));
+    }
+    let target = resolve(root, rel)?;
+    if !target.full.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("xlsx")) || is_under_trash(&target.rel) {
+        return Err(FileError::Rejected("Only XLSX files outside Trash can be edited"));
+    }
+    validate_xlsx_package(bytes)?;
+    let old = fs::read(&target.full).map_err(map_io)?;
+    if hex::encode(Sha256::digest(&old)) != expected_hash {
+        return Err(FileError::Rejected("Spreadsheet changed on the server. Reopen it before saving."));
+    }
+    let parent = target.full.parent().ok_or(FileError::Forbidden)?;
+    let tmp = parent.join(format!(".ownnas-xlsx-{}-{}.tmp", std::process::id(), rand::random::<u64>()));
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(map_io)?;
+    let result = (|| {
+        file.write_all(bytes).map_err(map_io)?;
+        file.sync_all().map_err(map_io)?;
+        drop(file);
+        fs::rename(&tmp, &target.full).map_err(map_io)?;
+        Ok(hex::encode(Sha256::digest(bytes)))
+    })();
+    if result.is_err() { let _ = fs::remove_file(&tmp); }
+    result
+}
+
+fn validate_xlsx_package(bytes: &[u8]) -> Result<(), FileError> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|_| FileError::Rejected("Invalid XLSX package"))?;
+    if archive.len() > 4096 { return Err(FileError::Rejected("Too many spreadsheet parts")); }
+    let mut total = 0u64;
+    let mut sheet_part = None;
+    for index in 0..archive.len() {
+        let part = archive.by_index(index).map_err(|_| FileError::Rejected("Invalid spreadsheet part"))?;
+        total = total.saturating_add(part.size());
+        if total > 100 * 1024 * 1024 { return Err(FileError::Rejected("Spreadsheet expands beyond 100 MB")); }
+        let name = part.name();
+        if name.starts_with("_xmlsignatures/") {
+            return Err(FileError::Rejected("Digitally signed spreadsheets cannot be edited"));
+        }
+        if name.starts_with("xl/worksheets/") && name.ends_with(".xml") && sheet_part.is_none() {
+            sheet_part = Some(name.to_string());
+        }
+    }
+    let sheet_part = sheet_part.ok_or(FileError::Rejected("Spreadsheet has no worksheets"))?;
+    for (name, expected) in [
+        ("[Content_Types].xml", "Types"),
+        ("xl/workbook.xml", "workbook"),
+        ("xl/_rels/workbook.xml.rels", "Relationships"),
+    ] {
+        let mut part = archive.by_name(name).map_err(|_| FileError::Rejected("Missing XLSX workbook part"))?;
+        let mut data = String::new();
+        part.read_to_string(&mut data).map_err(|_| FileError::Rejected("Invalid XLSX XML"))?;
+        if data.contains("<!DOCTYPE") || data.contains("<!ENTITY") || !data.contains(expected) {
+            return Err(FileError::Rejected("Invalid XLSX workbook XML"));
+        }
+    }
+    let mut worksheet = archive.by_name(&sheet_part).map_err(|_| FileError::Rejected("Missing XLSX worksheet"))?;
+    let mut data = String::new();
+    worksheet.read_to_string(&mut data).map_err(|_| FileError::Rejected("Invalid XLSX worksheet XML"))?;
+    if data.contains("<!DOCTYPE") || data.contains("<!ENTITY") || !data.contains("worksheet") {
+        return Err(FileError::Rejected("Invalid XLSX worksheet XML"));
+    }
+    Ok(())
+}
+
 fn blank_docx() -> Result<Vec<u8>, FileError> {
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     for (name, data) in [
@@ -3144,6 +3216,19 @@ fn blank_odt() -> Result<Vec<u8>, FileError> {
 }
 
 #[cfg(test)]
+mod file_kind_tests {
+    use super::kind_of;
+
+    #[test]
+    fn classifies_cad_drawings_separately_from_mesh_models() {
+        assert_eq!(kind_of("plan.dxf"), "cad2d");
+        assert_eq!(kind_of("Plan.DWG"), "cad2d");
+        assert_eq!(kind_of("print.3mf"), "model3d");
+        assert_eq!(kind_of("budget.XLSX"), "spreadsheet");
+    }
+}
+
+#[cfg(test)]
 mod document_package_tests {
     use super::*;
     #[test]
@@ -3178,6 +3263,32 @@ mod document_package_tests {
         assert!(write_odt_bytes(&root, &rel, &original, "stale").is_err());
         assert_eq!(write_odt_bytes(&root, &rel, &original, &hash).unwrap(), hash);
         assert!(write_odt_bytes(&root, "../escape.odt", &original, &hash).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn saves_xlsx_with_stale_write_and_package_validation() {
+        let root = std::env::temp_dir().join(format!("ownnas-xlsx-{}", rand::random::<u64>()));
+        fs::create_dir(&root).unwrap();
+        let rel = "budget.xlsx";
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, xml) in [
+            ("[Content_Types].xml", "<Types/>") ,
+            ("xl/workbook.xml", "<workbook/>") ,
+            ("xl/_rels/workbook.xml.rels", "<Relationships/>") ,
+            ("xl/worksheets/sheet1.xml", "<worksheet><sheetData/></worksheet>"),
+        ] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(xml.as_bytes()).unwrap();
+        }
+        let original = zip.finish().unwrap().into_inner();
+        fs::write(root.join(rel), &original).unwrap();
+        let hash = hex::encode(Sha256::digest(&original));
+        assert!(write_xlsx_bytes(&root, rel, b"bad zip", &hash).is_err());
+        assert_eq!(fs::read(root.join(rel)).unwrap(), original);
+        assert!(write_xlsx_bytes(&root, rel, &original, "stale").is_err());
+        assert_eq!(write_xlsx_bytes(&root, rel, &original, &hash).unwrap(), hash);
+        assert!(write_xlsx_bytes(&root, "../escape.xlsx", &original, &hash).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }
