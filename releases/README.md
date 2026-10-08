@@ -1,5 +1,25 @@
 # OwnNAS update host (static)
 
+## Automated GitHub releases
+
+The GitHub Actions workflow in `.github/workflows/release.yml` builds Linux x86_64,
+Windows x86_64, and macOS x86_64 plus Apple Silicon binaries. To publish a release,
+set the package version in `Cargo.toml`, commit the change, then push a matching tag:
+
+```bash
+cargo check  # refresh Cargo.lock after changing Cargo.toml
+git add Cargo.toml Cargo.lock
+git commit -m "Release v0.2.0"
+git tag v0.2.0
+git push origin main v0.2.0
+```
+
+The tag must match the Cargo package version. Actions creates a draft release, builds
+and packages each platform, uploads the archives and SHA-256 files, then publishes
+the release after all builds succeed. To build assets for an existing tag, run
+**Build and publish release** from the Actions tab and enter that tag. This GitHub
+Release workflow is separate from the static updater files described below.
+
 Upload this whole `releases/` folder to your VPS (nginx, Caddy, Apache, or any static file host). OwnNAS instances fetch `latest.json`, then download the matching binary.
 
 ## Layout

@@ -22,3 +22,6 @@ releases/keys/*.sk
 /dist/
 __pycache__/
 *.py[cod]
+
+# Project-specific GitHub SSH credentials
+/.ownnas-ssh/
