@@ -5,9 +5,6 @@
 *.db-shm
 .DS_Store
 Thumbs.db
-releases/keys/update.sk
-releases/keys/*.sk
-
 # Android/Gradle build outputs and generated native libraries
 /android/.gradle
 /android/build
@@ -17,6 +14,16 @@ releases/keys/*.sk
 
 # Locally generated HTTPS certificates and private keys
 /ownnas-tls
+*.pem
+*.p12
+*.pfx
+*.key
+*.sk
+
+# Local environment files may contain credentials
+.env
+.env.*
+!.env.example
 
 # Generated release packages and Python bytecode
 /dist/

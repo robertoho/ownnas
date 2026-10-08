@@ -276,7 +276,7 @@ pub fn make_dir(root: &Path, parent_rel: &str, name: &str) -> Result<(), FileErr
 /// Returns the relative path of the created file.
 pub fn create_file(root: &Path, parent_rel: &str, name: &str, kind: &str) -> Result<String, FileError> {
     let ext = match kind {
-        "md" | "csv" | "txt" | "json" | "html" | "docx" => kind,
+        "md" | "csv" | "txt" | "json" | "html" | "docx" | "odt" => kind,
         _ => return Err(FileError::Rejected("Unsupported file type")),
     };
     let name = finalize_new_filename(name, ext)?;
@@ -317,6 +317,7 @@ pub fn create_file(root: &Path, parent_rel: &str, name: &str, kind: &str) -> Res
             }
         })?;
     if ext == "docx" { file.write_all(&blank_docx()?).map_err(map_io)?; }
+    else if ext == "odt" { file.write_all(&blank_odt()?).map_err(map_io)?; }
     else { file.write_all(body.as_bytes()).map_err(map_io)?; }
     Ok(if parent.rel.is_empty() {
         name
@@ -1375,6 +1376,18 @@ pub fn search(
     }
     let root = root.canonicalize().map_err(map_io)?;
     let mut hits = Vec::new();
+    // Reserve results for directory names before file/content matches can fill
+    // the result cap. This keeps nested folder-name searches useful in busy
+    // libraries where many files happen to match first.
+    let mut folder_seen = 0usize;
+    walk_folder_search(
+        &root,
+        &start.full,
+        &start.rel,
+        &query,
+        &mut hits,
+        &mut folder_seen,
+    );
     let mut seen = 0usize;
     // Phase 1: cheap content (text + PDF cache). This is what makes a single-PDF library feel snappy.
     walk_search(
@@ -1507,6 +1520,65 @@ fn indexed_contains(
         return None;
     }
     content_snippet(&text, query)
+}
+
+fn walk_folder_search(
+    root: &Path,
+    dir: &Path,
+    rel: &str,
+    query: &str,
+    hits: &mut Vec<SearchHit>,
+    seen: &mut usize,
+) {
+    if hits.len() >= 100 || *seen >= 8_000 {
+        return;
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for item in entries {
+        if hits.len() >= 100 || *seen >= 8_000 {
+            return;
+        }
+        let Ok(item) = item else { continue };
+        *seen += 1;
+        let name = item.file_name().to_string_lossy().to_string();
+        let child = item.path();
+        let canon = match child.canonicalize() {
+            Ok(path) if path.starts_with(root) => path,
+            _ => continue,
+        };
+        if !canon.is_dir() {
+            continue;
+        }
+        let child_rel = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
+        if name.to_lowercase().contains(query) {
+            if let Ok(meta) = canon.metadata() {
+                hits.push(SearchHit {
+                    kind: if is_trash_folder(&canon) {
+                        "trash-folder".to_string()
+                    } else if is_archive_folder(&canon) {
+                        "archive-folder".to_string()
+                    } else {
+                        "folder".to_string()
+                    },
+                    name: name.clone(),
+                    path: child_rel.clone(),
+                    dir: true,
+                    size: 0,
+                    modified: modified_secs(&meta),
+                    matched_tag: None,
+                    matched_content: None,
+                });
+            }
+        }
+        walk_folder_search(root, &canon, &child_rel, query, hits, seen);
+    }
 }
 
 fn walk_search(
@@ -2701,19 +2773,52 @@ mod tests {
     #[test]
     fn search_matches_partial_file_and_folder_names() {
         let root = scratch();
-        fs::create_dir(root.join("MyProjectsArchive")).unwrap();
+        fs::create_dir_all(root.join("MyProjectsArchive/ClientFiles/QuarterlyReports"))
+            .unwrap();
         fs::write(root.join("MyProjectsArchive/AnnualReport.DOCX"), b"binary fixture").unwrap();
         fs::write(root.join("content.txt"), b"single character Z in content").unwrap();
-        let options = SearchOptions { ocr: false, cache_dir: root.join(".text-cache") };
+        let options = SearchOptions {
+            ocr: false,
+            cache_dir: root.join(".text-cache"),
+        };
         let folders = search(&root, "", "PROJECTS", &options).unwrap();
         assert!(folders.iter().any(|hit| hit.dir && hit.name == "MyProjectsArchive"));
+        let nested_folders = search(&root, "", "quarterlyrep", &options).unwrap();
+        assert!(nested_folders.iter().any(|hit| {
+            hit.dir && hit.path == "MyProjectsArchive/ClientFiles/QuarterlyReports"
+        }));
         let files = search(&root, "", "ualrep", &options).unwrap();
         assert!(files.iter().any(|hit| !hit.dir && hit.name == "AnnualReport.DOCX"));
         let one_character = search(&root, "", "R", &options).unwrap();
         assert!(one_character.iter().any(|hit| hit.dir && hit.name == "MyProjectsArchive"));
         assert!(one_character.iter().any(|hit| hit.name == "AnnualReport.DOCX"));
-        assert!(search(&root, "", "Z", &options).unwrap().is_empty(), "single character searches only match names");
+        assert!(
+            search(&root, "", "Z", &options).unwrap().is_empty(),
+            "single character searches only match names"
+        );
         assert!(search(&root, "", " ", &options).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recursive_folder_name_hits_are_not_displaced_by_file_matches() {
+        let root = scratch();
+        for index in 0..110 {
+            fs::write(root.join(format!("matching-file-{index:03}.bin")), b"fixture").unwrap();
+        }
+        let nested = root.join("sub/deep/matching-folder");
+        fs::create_dir_all(&nested).unwrap();
+        let options = SearchOptions {
+            ocr: false,
+            cache_dir: root.join(".text-cache"),
+        };
+
+        let hits = search(&root, "", "matching", &options).unwrap();
+
+        assert!(hits.len() <= 100);
+        assert!(hits
+            .iter()
+            .any(|hit| hit.dir && hit.path == "sub/deep/matching-folder"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2947,8 +3052,99 @@ fn blank_docx() -> Result<Vec<u8>, FileError> {
     Ok(zip.finish().map_err(|_| FileError::Io("Could not create document"))?.into_inner())
 }
 
+/// Save an existing OpenDocument Text package, guarding against stale editor writes.
+pub fn write_odt_bytes(root: &Path, rel: &str, bytes: &[u8], expected_hash: &str) -> Result<String, FileError> {
+    static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = SAVE_LOCK.lock().map_err(|_| FileError::Io("Document save lock failed"))?;
+    if bytes.is_empty() || bytes.len() > 25 * 1024 * 1024 {
+        return Err(FileError::Rejected("Document must be between 1 byte and 25 MB"));
+    }
+    let target = resolve(root, rel)?;
+    if !target.full.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("odt")) || is_under_trash(&target.rel) {
+        return Err(FileError::Rejected("Only ODT files outside Trash can be edited"));
+    }
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|_| FileError::Rejected("Invalid ODT package"))?;
+    if archive.len() > 4096 { return Err(FileError::Rejected("Too many document parts")); }
+    let first = archive.by_index(0).map_err(|_| FileError::Rejected("Invalid ODT package"))?;
+    if first.name() != "mimetype" || first.compression() != zip::CompressionMethod::Stored {
+        return Err(FileError::Rejected("ODT mimetype entry must be first and uncompressed"));
+    }
+    drop(first);
+    if bytes.len() < 30 || &bytes[0..4] != b"PK\x03\x04" || u16::from_le_bytes([bytes[8], bytes[9]]) != 0 {
+        return Err(FileError::Rejected("ODT mimetype entry must be first and uncompressed"));
+    }
+    let name_len = u16::from_le_bytes([bytes[26], bytes[27]]) as usize;
+    let extra_len = u16::from_le_bytes([bytes[28], bytes[29]]) as usize;
+    let data_len = u32::from_le_bytes([bytes[18], bytes[19], bytes[20], bytes[21]]) as usize;
+    let data_start = 30usize.saturating_add(name_len).saturating_add(extra_len);
+    if extra_len != 0 || bytes.get(30..30 + name_len) != Some(b"mimetype".as_slice())
+        || bytes.get(data_start..data_start.saturating_add(data_len)) != Some(b"application/vnd.oasis.opendocument.text".as_slice()) {
+        return Err(FileError::Rejected("ODT mimetype header is invalid"));
+    }
+    let mut total = 0u64;
+    for i in 0..archive.len() {
+        let mut part = archive.by_index(i).map_err(|_| FileError::Rejected("Invalid document part"))?;
+        total = total.saturating_add(part.size());
+        if total > 100 * 1024 * 1024 { return Err(FileError::Rejected("Document expands beyond 100 MB")); }
+        if part.name() == "mimetype" {
+            let mut value = String::new();
+            part.read_to_string(&mut value).map_err(|_| FileError::Rejected("Invalid ODT mimetype"))?;
+            if value != "application/vnd.oasis.opendocument.text" { return Err(FileError::Rejected("Invalid ODT mimetype")); }
+        }
+    }
+    for name in ["content.xml", "META-INF/manifest.xml"] {
+        let mut part = archive.by_name(name).map_err(|_| FileError::Rejected("Missing ODT document part"))?;
+        let mut data = String::new();
+        part.read_to_string(&mut data).map_err(|_| FileError::Rejected("Invalid ODT XML"))?;
+        if data.contains("<!DOCTYPE") || data.contains("<!ENTITY") || !data.contains('<') {
+            return Err(FileError::Rejected("Invalid ODT XML"));
+        }
+        if name == "content.xml" && (!data.contains("document-content") || !data.contains("office:text")) {
+            return Err(FileError::Rejected("Invalid ODT content document"));
+        }
+    }
+    if archive.file_names().any(|name| name.to_ascii_lowercase().starts_with("meta-inf/") && name.to_ascii_lowercase().contains("signatures")) {
+        return Err(FileError::Rejected("Digitally signed documents cannot be edited"));
+    }
+    let old = fs::read(&target.full).map_err(map_io)?;
+    if hex::encode(Sha256::digest(&old)) != expected_hash {
+        return Err(FileError::Rejected("Document changed on the server. Reopen it before saving."));
+    }
+    let parent = target.full.parent().ok_or(FileError::Forbidden)?;
+    let tmp = parent.join(format!(".ownnas-odt-{}-{}.tmp", std::process::id(), rand::random::<u64>()));
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(map_io)?;
+    let result = (|| {
+        file.write_all(bytes).map_err(map_io)?;
+        file.sync_all().map_err(map_io)?;
+        drop(file);
+        fs::rename(&tmp, &target.full).map_err(map_io)?;
+        Ok(hex::encode(Sha256::digest(bytes)))
+    })();
+    if result.is_err() { let _ = fs::remove_file(&tmp); }
+    result
+}
+
+fn blank_odt() -> Result<Vec<u8>, FileError> {
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    zip.start_file("mimetype", zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored))
+        .map_err(|_| FileError::Io("Could not create document"))?;
+    zip.write_all(b"application/vnd.oasis.opendocument.text").map_err(map_io)?;
+    for (name, data) in [
+        ("content.xml", r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" office:version="1.3"><office:automatic-styles/><office:body><office:text><text:p/></office:text></office:body></office:document-content>"#),
+        ("styles.xml", r#"<?xml version="1.0" encoding="UTF-8"?><office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" office:version="1.3"><office:font-face-decls/><office:styles/><office:automatic-styles/><office:master-styles/></office:document-styles>"#),
+        ("meta.xml", r#"<?xml version="1.0" encoding="UTF-8"?><office:document-meta xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" office:version="1.3"><office:meta/></office:document-meta>"#),
+        ("settings.xml", r#"<?xml version="1.0" encoding="UTF-8"?><office:document-settings xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" office:version="1.3"><office:settings/></office:document-settings>"#),
+        ("META-INF/manifest.xml", r#"<?xml version="1.0" encoding="UTF-8"?><manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.3"><manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.text"/><manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="meta.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="settings.xml" manifest:media-type="text/xml"/></manifest:manifest>"#),
+    ] {
+        zip.start_file(name, zip::write::SimpleFileOptions::default()).map_err(|_| FileError::Io("Could not create document"))?;
+        zip.write_all(data.as_bytes()).map_err(map_io)?;
+    }
+    Ok(zip.finish().map_err(|_| FileError::Io("Could not create document"))?.into_inner())
+}
+
 #[cfg(test)]
-mod docx_tests {
+mod document_package_tests {
     use super::*;
     #[test]
     fn saves_docx_and_rejects_stale_or_invalid_updates() {
@@ -2962,6 +3158,26 @@ mod docx_tests {
         assert!(write_docx_bytes(&root, &rel, &original, "stale").is_err());
         assert_eq!(write_docx_bytes(&root, &rel, &original, &hash).unwrap(), hash);
         assert!(write_docx_bytes(&root, "../escape.docx", &original, &hash).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn creates_and_saves_odt_with_required_mimetype_header() {
+        let root = std::env::temp_dir().join(format!("ownnas-odt-{}", rand::random::<u64>()));
+        fs::create_dir(&root).unwrap();
+        let rel = create_file(&root, "", "Document", "odt").unwrap();
+        let original = fs::read(root.join(&rel)).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&original)).unwrap();
+        let first = archive.by_index(0).unwrap();
+        assert_eq!(first.name(), "mimetype");
+        assert_eq!(first.compression(), zip::CompressionMethod::Stored);
+        drop(first);
+        let hash = hex::encode(Sha256::digest(&original));
+        assert!(write_odt_bytes(&root, &rel, b"bad zip", &hash).is_err());
+        assert_eq!(fs::read(root.join(&rel)).unwrap(), original);
+        assert!(write_odt_bytes(&root, &rel, &original, "stale").is_err());
+        assert_eq!(write_odt_bytes(&root, &rel, &original, &hash).unwrap(), hash);
+        assert!(write_odt_bytes(&root, "../escape.odt", &original, &hash).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -21,11 +21,14 @@ const state = {
   folderSizes: new Map(),
   selected: new Set(),
   anchor: "",
+  focus: "",
   clipboard: null,
   menuEntries: [],
   pasteInto: "",
   bookmarks: [],
 };
+let updateNoticeVersion = "";
+let updateStatusTimer = null;
 
 function normalizeGroup(value) {
   return ["type", "date", "tag"].includes(value) ? value : "none";
@@ -691,6 +694,7 @@ async function load(path, options = {}) {
   if (data.rootName) state.me.rootName = data.rootName;
   state.selected = new Set();
   state.anchor = "";
+  state.focus = "";
   if (!options.keepPreview) closePreview(true);
   renderCrumbs();
   syncUndo();
@@ -920,6 +924,7 @@ function paintSelection() {
 function selectOnly(path) {
   state.selected = new Set([path]);
   state.anchor = path;
+  state.focus = path;
   paintSelection();
 }
 
@@ -927,6 +932,7 @@ function toggleSelected(path) {
   if (state.selected.has(path)) state.selected.delete(path);
   else state.selected.add(path);
   state.anchor = path;
+  state.focus = path;
   paintSelection();
 }
 
@@ -940,6 +946,7 @@ function selectRange(path) {
   }
   const [start, end] = from < to ? [from, to] : [to, from];
   state.selected = new Set(items.slice(start, end + 1).map((entry) => entry.path));
+  state.focus = path;
   paintSelection();
 }
 
@@ -963,10 +970,12 @@ function scrollSelectedIntoView(path) {
 function moveSelection(deltaX, deltaY, extend) {
   const items = displayedEntries();
   if (!items.length) return;
-  let index = items.findIndex((entry) => entry.path === state.anchor);
+  let index = items.findIndex((entry) => entry.path === state.focus);
+  if (index < 0) index = items.findIndex((entry) => entry.path === state.anchor);
   if (index < 0) {
-    const selected = selectedEntries();
-    index = selected.length ? items.findIndex((entry) => entry.path === selected[selected.length - 1].path) : -1;
+    for (let i = items.length - 1; i >= 0; i -= 1) {
+      if (state.selected.has(items[i].path)) { index = i; break; }
+    }
   }
   let next = index < 0 ? 0 : Math.max(0, Math.min(items.length - 1, index + deltaX + deltaY));
   if (index >= 0 && state.view !== "list") {
@@ -1206,10 +1215,24 @@ async function refreshUpdatePanel() {
     return;
   }
   if (!state.me.updatesConfigured) {
-    $("update-status").textContent = "Updates are not configured. Start OwnNAS with --update-url pointing at your VPS latest.json.";
+    $("update-status").textContent = "Updates are not configured.";
     return;
   }
-  $("update-status").textContent = "Click Check for updates to query your update host.";
+  try {
+    const cached = await api("/api/update/status");
+    if (cached.available) {
+      $("update-status").textContent = `Version ${cached.latest} is available${cached.signed ? " (signature verified)" : ""}.`;
+      $("update-apply-btn").hidden = false;
+      $("update-notes").hidden = !cached.notes;
+      $("update-notes").textContent = cached.notes || "";
+    } else if (cached.error) {
+      $("update-status").textContent = "The daily update check failed. You can try again now.";
+    } else {
+      $("update-status").textContent = cached.checkedAt ? `You’re on the latest version (${current}).` : "The daily update check is running. You can check now.";
+    }
+  } catch {
+    $("update-status").textContent = "The daily update check is running. You can check now.";
+  }
 }
 
 async function checkForUpdates() {
@@ -1373,6 +1396,36 @@ async function openEntry(entry) {
     body.innerHTML = `<audio controls src="${raw}"></audio>`;
   } else if (entry.kind === "pdf") {
     body.innerHTML = `<iframe title="${esc(entry.name)}" src="${raw}"></iframe>`;
+  } else if (/\.odt$/i.test(entry.name)) {
+    body.innerHTML = '<p class="muted">Loading document…</p>';
+    try {
+      if (entry.size > 25 * 1024 * 1024) throw new Error('Documents up to 25 MB are supported.');
+      const [module, response] = await Promise.all([import('/assets/odt-editor.js'), fetch(`/api/odt?path=${encodeURIComponent(entry.path)}`, { credentials: 'same-origin', cache: 'no-store' })]);
+      if (!response.ok) throw new Error('Could not load document.');
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      let expectedHash = response.headers.get('x-odt-hash');
+      if (!expectedHash) throw new Error('Document version is missing.');
+      if (state.current !== entry) return;
+      const editor = { dirty: false, destroy: null };
+      const mounted = module.mountOdtEditor(body, bytes, {
+        readonly: !write || inTrashPath(entry.path),
+        onChange: dirty => { editor.dirty = dirty; },
+        onSave: async data => {
+          let binary = '';
+          for (let i = 0; i < data.length; i += 8192) binary += String.fromCharCode(...data.subarray(i, i + 8192));
+          const result = await api('/api/write-odt', { method: 'POST', json: { path: entry.path, data: btoa(binary), expected_hash: expectedHash } });
+          expectedHash = result.hash;
+          if (state.editor === editor) {
+            toast('Document saved');
+            invalidateFolderSizes();
+            load(state.path, { keepPreview: true }).catch(err => toast(err.message, true));
+          }
+        },
+      });
+      editor.destroy = () => mounted.destroy(); editor.save = () => mounted.save(); state.editor = editor;
+    } catch (err) {
+      if (state.current === entry) body.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
+    }
   } else if (/\.docx$/i.test(entry.name)) {
     body.innerHTML = '<p class="muted">Loading document…</p>';
     try {
@@ -2455,6 +2508,7 @@ async function createFolder() {
 
 const NEW_FILE_KINDS = {
   docx: { label: "Word document", ext: "docx", defaultName: "Untitled" },
+  odt: { label: "OpenDocument text", ext: "odt", defaultName: "Untitled" },
   md: { label: "Markdown", ext: "md", defaultName: "Untitled" },
   txt: { label: "Text", ext: "txt", defaultName: "Untitled" },
   csv: { label: "CSV", ext: "csv", defaultName: "Untitled" },
@@ -2821,12 +2875,27 @@ async function boot() {
     return;
   }
   showApp();
+  if (state.me.admin && state.me.updatesConfigured) {
+    pollUpdateNotice();
+    if (!updateStatusTimer) updateStatusTimer = setInterval(pollUpdateNotice, 15 * 60 * 1000);
+  }
   syncControls();
   try {
     await load(hashToPath());
   } catch (err) {
     toast(err.message, true);
   }
+}
+
+async function pollUpdateNotice() {
+  if (!state.me?.admin || !state.me.updatesConfigured) return;
+  try {
+    const update = await api("/api/update/status");
+    if (update.available && update.latest !== updateNoticeVersion) {
+      updateNoticeVersion = update.latest;
+      toast(`OwnNAS ${update.latest} is available. Open Settings → Updates to install it.`);
+    }
+  } catch {}
 }
 
 boot();
@@ -2957,6 +3026,7 @@ $("files").addEventListener("click", (event) => {
       if (!(event.ctrlKey || event.metaKey)) {
         state.selected = new Set();
         state.anchor = "";
+        state.focus = "";
         paintSelection();
       }
     }
@@ -3050,7 +3120,10 @@ function applyMarqueeSelection() {
     lastHit = card.dataset.path;
   });
   state.selected = next;
-  if (lastHit) state.anchor = lastHit;
+  if (lastHit) {
+    state.anchor = lastHit;
+    state.focus = lastHit;
+  }
   paintSelection();
 }
 
@@ -3096,6 +3169,7 @@ $("files").addEventListener("contextmenu", (event) => {
   }
   state.selected = new Set();
   state.anchor = "";
+  state.focus = "";
   paintSelection();
   openSelectionMenu(event.clientX, event.clientY, state.path);
 });
@@ -3494,6 +3568,7 @@ window.addEventListener("keydown", (event) => {
     if (state.selected.size) {
       state.selected = new Set();
       state.anchor = "";
+      state.focus = "";
       paintSelection();
     }
     return;
@@ -3546,6 +3621,7 @@ window.addEventListener("keydown", (event) => {
     const items = displayedEntries();
     state.selected = new Set(items.map((entry) => entry.path));
     state.anchor = items.length ? items[0].path : "";
+    state.focus = state.anchor;
     paintSelection();
   }
   if (command && key === "c") {

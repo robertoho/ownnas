@@ -1,12 +1,15 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+BINARY="$SCRIPT_DIR/target/release/ownnas"
 
-root="${HOME}/Pictures"
-
-if [[ ! -x target/release/ownnas ]]; then
-    echo "target/release/ownnas was not found. Run ./build.sh first."
+if [[ ! -x "$BINARY" ]]; then
+    echo "OwnNAS has not been built yet. Run $SCRIPT_DIR/build.sh first." >&2
     exit 1
 fi
 
-exec ./target/release/ownnas serve --root "$root" --username admin
+export OWNNAS_ROOT="${OWNNAS_ROOT:-$HOME/Pictures}"
+export OWNNAS_DATA="${OWNNAS_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/ownnas}"
+export OWNNAS_ADDR="${OWNNAS_ADDR:-0.0.0.0:8787}"
+
+exec "$BINARY" serve "$@"

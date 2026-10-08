@@ -18,11 +18,20 @@ cargo build --release
 
 The binary is `target/release/ownnas` (`ownnas.exe` on Windows). Copy that file to the machine that will host the folder. Build on each operating system you want to run it on.
 
+On Linux, `./build.sh` builds the release binary. `./serve.sh` starts it using
+`$HOME/Pictures` as the shared folder, `$XDG_DATA_HOME/ownnas` (or
+`$HOME/.local/share/ownnas`) for its database, and `0.0.0.0:8787` as the listen
+address. Override those defaults with `OWNNAS_ROOT`, `OWNNAS_DATA`, and
+`OWNNAS_ADDR`. The server prompts in the terminal to create the first account;
+you can also set `OWNNAS_USER` and `OWNNAS_PASSWORD` in the environment.
+
 ## Run
 
 ```bash
 ownnas serve --root /path/to/library --username admin --password "a long passphrase"
 ```
+
+On Linux, the equivalent script command is `OWNNAS_ROOT=/path/to/library ./serve.sh`.
 
 On Windows PowerShell:
 
@@ -79,6 +88,7 @@ Save `~/Library/LaunchAgents/com.ownnas.serve.plist`:
     <string>--root</string><string>/absolute/path/to/library</string>
     <string>--data</string><string>/absolute/path/to/ownnas-data</string>
     <string>--addr</string><string>0.0.0.0:8787</string>
+    <string>--restart-by-supervisor</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -105,7 +115,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/absolute/path/to/ownnas serve --root /absolute/path/to/library --data /absolute/path/to/ownnas-data --addr 0.0.0.0:8787
+ExecStart=/absolute/path/to/ownnas serve --root /absolute/path/to/library --data /absolute/path/to/ownnas-data --addr 0.0.0.0:8787 --restart-by-supervisor
 WorkingDirectory=/absolute/path/to/ownnas-data/..
 Restart=on-failure
 RestartSec=3
@@ -125,8 +135,8 @@ sudo systemctl status ownnas
 Easiest options:
 
 1. **Task Scheduler** — create a task that runs at logon:
-   `C:\path\to\ownnas.exe serve --root D:\media --data C:\ownnas-data --addr 0.0.0.0:8787`
-2. **NSSM** — wrap the same command as a Windows service (`nssm install OwnNAS`).
+   `C:\path\to\ownnas.exe serve --root D:\media --data C:\ownnas-data --addr 0.0.0.0:8787 --restart-by-supervisor`
+2. **NSSM** — wrap the same command as a Windows service (`nssm install OwnNAS`) and set its exit action to restart.
 
 Point the task or service at the release binary with absolute paths. Prefer machine start only after the account already exists in `ownnas-data`.
 
@@ -134,9 +144,11 @@ Video thumbnails use `ffmpeg` when it is on `PATH`. Content search OCR for image
 
 Put OwnNAS behind HTTPS and pass `--secure-cookie` if you terminate TLS with a reverse proxy. The login is the application boundary; the VPN is the network boundary.
 
-## Updates (self-hosted)
+## Updates
 
-The [`releases/`](releases/) folder is a static update host you can upload to a VPS. Drop versioned binaries there, run `./releases/publish.sh`, sync to your server, then start OwnNAS with `--update-url` (and optionally `--update-pubkey`). Admins install from **Settings → Updates**. Details: [DOCS.md](DOCS.md) and `releases/README.md`.
+New installations check the signed GitHub release feed once per day. Administrators see an available version in **Settings → Updates** and choose when to install it. `--update-url` and `--update-pubkey` still override the default feed for custom installations. Service-managed installs should pass `--restart-by-supervisor` so the service manager starts the replaced binary after a clean shutdown. Existing installations must first install a release that includes the updater. The release workflow requires the `OWNNAS_UPDATE_PRIVATE_KEY` Actions secret; its matching public key is embedded in the application.
+
+OwnNAS also includes a basic embedded ODT editor. Open an `.odt` file or create one from **New file → OpenDocument text**. Its browser module can be reused in other projects; see [web/odt-editor.md](web/odt-editor.md).
 
 ## Native HTTPS with your own certificates
 

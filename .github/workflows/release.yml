@@ -48,6 +48,8 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
           - os: windows-2025
             target: x86_64-pc-windows-msvc
           - os: macos-15
@@ -102,6 +104,29 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Build signed update feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNNAS_UPDATE_PRIVATE_KEY: ${{ secrets.OWNNAS_UPDATE_PRIVATE_KEY }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          test -n "$OWNNAS_UPDATE_PRIVATE_KEY" || { echo "OWNNAS_UPDATE_PRIVATE_KEY secret is required" >&2; exit 1; }
+          mkdir -p dist
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern 'update-*.json' --dir dist
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "ownnas-*-x86_64-unknown-linux-gnu-binary" --dir dist
+          python scripts/build-update-manifest.py "$RELEASE_TAG" "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body)"
+          BINARY=$(find dist -maxdepth 1 -name 'ownnas-*-x86_64-unknown-linux-gnu-binary' -print -quit)
+          chmod +x "$BINARY"
+          python -c 'import os,pathlib; pathlib.Path("/tmp/ownnas-update.sk").write_text(os.environ["OWNNAS_UPDATE_PRIVATE_KEY"].strip()+"\n")'
+          "$BINARY" update sign --key /tmp/ownnas-update.sk --manifest dist/latest.json
+          rm -f /tmp/ownnas-update.sk
+          gh release upload "$RELEASE_TAG" dist/latest.json dist/latest.json.sig --repo "$GITHUB_REPOSITORY" --clobber
+        shell: bash
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}

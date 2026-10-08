@@ -298,7 +298,7 @@
       <div id="theme-grid" class="theme-grid"></div>
     </section>
     <section id="settings-updates" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-updates" hidden>
-      <p class="muted">OwnNAS can check a static update host you control (`--update-url`).</p>
+      <p class="muted">OwnNAS checks the signed GitHub release feed daily. You choose when to install an update.</p>
       <div class="update-card">
         <p><strong>Installed</strong> <span id="update-current">—</span></p>
         <p><strong>Platform</strong> <span id="update-target" class="muted">—</span></p>
@@ -438,6 +438,7 @@
       <h3>New file</h3>
       <label>Type
         <select id="create-file-kind">
+          <option value="odt">OpenDocument text (.odt)</option>
           <option value="docx">Word document (.docx)</option>
           <option value="md">Markdown (.md)</option>
           <option value="txt">Text (.txt)</option>

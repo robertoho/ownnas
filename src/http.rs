@@ -29,6 +29,7 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_CSS: &str = include_str!("../web/app.css");
 const DOCX_EDITOR_CSS: &str = include_str!("../web/docx-editor.css");
 const DOCX_EDITOR_JS: &str = include_str!("../web/docx-editor.js");
+const ODT_EDITOR_JS: &str = include_str!("../web/odt-editor.js");
 const APP_JS: &str = include_str!("../web/app.js");
 const MODEL_VIEWER_JS: &str = include_str!("../web/model-viewer.js");
 const THREE_MODULE_JS: &str = include_str!("../web/vendor/three/three.module.min.js");
@@ -55,6 +56,10 @@ pub struct AppState {
     pub ffmpeg: bool,
     pub ocr: bool,
     pub update: crate::update::UpdateConfig,
+    pub update_status: Mutex<Option<serde_json::Value>>,
+    pub restart_notify: tokio::sync::Notify,
+    pub restart_requested: std::sync::atomic::AtomicBool,
+    pub supervisor_restart: bool,
     pub attempts: Mutex<AttemptGate>,
 }
 
@@ -96,6 +101,10 @@ pub fn new_state(
         ffmpeg,
         ocr,
         update,
+        update_status: Mutex::new(None),
+        restart_notify: tokio::sync::Notify::new(),
+        restart_requested: std::sync::atomic::AtomicBool::new(false),
+        supervisor_restart: false,
         attempts: Mutex::new(AttemptGate::new()),
     })
 }
@@ -106,6 +115,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/assets/app.css", get(css))
         .route("/assets/app.js", get(javascript))
         .route("/assets/docx-editor.js", get(docx_editor_javascript))
+        .route("/assets/odt-editor.js", get(odt_editor_javascript))
         .route("/assets/docx-editor.css", get(docx_editor_css))
         .route("/assets/model-viewer.js", get(model_viewer_javascript))
         .route("/assets/vendor/three/three.module.min.js", get(three_module))
@@ -155,6 +165,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
         .route("/api/update/check", get(update_check))
+        .route("/api/update/status", get(update_status))
         .route("/api/update/apply", post(update_apply))
         .route("/api/password", post(change_password))
         .route("/api/users", get(list_users).post(create_managed_user))
@@ -165,11 +176,13 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/meta", get(meta))
         .route("/api/raw", get(raw))
         .route("/api/docx", get(read_docx))
+        .route("/api/odt", get(read_odt))
         .route("/api/thumb", get(thumb))
         .route("/api/mkdir", post(mkdir))
         .route("/api/create", post(create_entry))
         .route("/api/write", post(write_entry))
         .route("/api/write-docx", post(write_docx_entry).layer(DefaultBodyLimit::max(36 * 1024 * 1024)))
+        .route("/api/write-odt", post(write_odt_entry).layer(DefaultBodyLimit::max(36 * 1024 * 1024)))
         .route("/api/write-image", post(write_image_entry))
         .route("/api/convert-image", post(convert_image_entry))
         .route("/api/pdf/info", get(pdf_info))
@@ -206,7 +219,8 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
 }
 
 pub async fn serve(state: std::sync::Arc<AppState>, addr: &str, open_browser: bool) -> Result<(), String> {
-    serve_with_shutdown(state, addr, open_browser, None, std::future::pending()).await
+    let shutdown_state = state.clone();
+    serve_with_shutdown(state, addr, open_browser, None, async move { shutdown_state.restart_notify.notified().await }).await
 }
 
 /// Serve HTTPS directly using a supplied PEM certificate chain and private key.
@@ -231,10 +245,13 @@ pub async fn serve_https(
     }
     let handle = axum_server::Handle::new();
     let shutdown_handle = handle.clone();
+    let shutdown_state = state.clone();
     let shutdown = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = shutdown_state.restart_notify.notified() => {},
         }
+        shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
     });
     let result = axum_server::from_tcp_rustls(listener, config)
         .map_err(|err| err.to_string())?
@@ -677,6 +694,10 @@ async fn docx_editor_javascript() -> impl IntoResponse {
     app_module_javascript(DOCX_EDITOR_JS)
 }
 
+async fn odt_editor_javascript() -> impl IntoResponse {
+    app_module_javascript(ODT_EDITOR_JS)
+}
+
 async fn model_viewer_javascript() -> impl IntoResponse {
     app_module_javascript(MODEL_VIEWER_JS)
 }
@@ -846,7 +867,7 @@ async fn update_check(
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Update check failed"))?
         .map_err(|err| ApiError::new(StatusCode::BAD_GATEWAY, err))?;
-    Ok(Json(json!({
+    let value = json!({
         "current": result.current,
         "latest": result.latest,
         "notes": result.notes,
@@ -856,7 +877,20 @@ async fn update_check(
         "signed": result.signed,
         "updateUrl": result.update_url,
         "configured": true,
-    })))
+        "checkedAt": format!("{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
+    });
+    *state.update_status.lock().unwrap_or_else(|e| e.into_inner()) = Some(value.clone());
+    Ok(Json(value))
+}
+
+async fn update_status(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let result = state.update_status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    Ok(Json(result.unwrap_or_else(|| json!({"configured": state.update.url.is_some(), "available": false, "checkedAt": null}))))
 }
 
 async fn update_apply(
@@ -878,12 +912,8 @@ async fn update_apply(
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Update failed"))?
         .map_err(|err| ApiError::new(StatusCode::BAD_GATEWAY, err))?;
     record(&state, &user, "update", &format!("installed {version}"));
-    crate::update::spawn_replaced_binary()
-        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
-    tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        std::process::exit(0);
-    });
+    state.restart_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+    state.restart_notify.notify_one();
     Ok(Json(json!({
         "ok": true,
         "version": version,
@@ -1144,6 +1174,28 @@ async fn read_docx(
     let hash = hex::encode(sha2::Sha256::digest(&bytes));
     Ok(([(header::CONTENT_TYPE.as_str(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
         ("x-docx-hash", hash.as_str()), ("cache-control", "no-store")], bytes).into_response())
+}
+
+async fn read_odt(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<Response, ApiError> {
+    use sha2::Digest;
+    require_user(&state, &headers)?;
+    let target = files::resolve(&state.root, &rel_of(&query.path))?;
+    if !target.full.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("odt")) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Expected an ODT file"));
+    }
+    let mut file = tokio::fs::File::open(target.full).await.map_err(|_| ApiError::from(FileError::NotFound))?;
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    (&mut file).take(25 * 1024 * 1024 + 1).read_to_end(&mut bytes).await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read document"))?;
+    if bytes.len() > 25 * 1024 * 1024 { return Err(ApiError::new(StatusCode::BAD_REQUEST, "Documents up to 25 MB are supported")); }
+    let hash = hex::encode(sha2::Sha256::digest(&bytes));
+    Ok(([(header::CONTENT_TYPE.as_str(), "application/vnd.oasis.opendocument.text"),
+        ("x-odt-hash", hash.as_str()), ("cache-control", "no-store")], bytes).into_response())
 }
 
 async fn raw(
@@ -1454,6 +1506,35 @@ async fn write_docx_entry(
     let root = state.root.clone();
     let path = body.path.clone();
     let hash = tokio::task::spawn_blocking(move || files::write_docx_bytes(&root, &path, &bytes, &body.expected_hash))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not save document"))?
+        .map_err(ApiError::from)?;
+    invalidate_sizes(&state, &parent_rel_path(&body.path));
+    record(&state, &user, "edit-document", &body.path);
+    Ok(Json(json!({ "ok": true, "hash": hash })))
+}
+
+#[derive(Deserialize)]
+struct WriteOdtBody {
+    path: String,
+    data: String,
+    expected_hash: String,
+}
+
+async fn write_odt_entry(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<WriteOdtBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let bytes = base64_decode(&body.data)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Invalid document data"))?;
+    let root = state.root.clone();
+    let path = body.path.clone();
+    let expected_hash = body.expected_hash.clone();
+    let hash = tokio::task::spawn_blocking(move || files::write_odt_bytes(&root, &path, &bytes, &expected_hash))
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not save document"))?
         .map_err(ApiError::from)?;
@@ -2901,6 +2982,17 @@ mod tests {
             .header("content-type", "application/json").body(Body::from(payload)).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(std::fs::read(root.join("Document.docx")).unwrap(), bytes);
+
+        files::create_file(&root, "", "Notes", "odt").unwrap();
+        let response = app.clone().oneshot(Request::builder()
+            .uri("/api/odt?path=Notes.odt").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = app.clone().oneshot(Request::builder()
+            .uri("/api/odt?path=Notes.odt").header("cookie", &cookie)
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("x-odt-hash").is_some());
+        assert!(String::from_utf8_lossy(&body_bytes(response).await).starts_with("PK"));
 
         let escaped = Request::builder()
             .uri("/api/raw?path=../ownnas.db")

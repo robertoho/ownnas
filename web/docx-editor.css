@@ -15,3 +15,10 @@
 .docx-color { display: inline-flex; align-items: center; gap: 6px; font: 12px system-ui; }
 .docx-color input { width: 32px; height: 28px; padding: 2px; }
 .docx-toolbar button[aria-pressed=true] { outline: 2px solid var(--accent, #597eb8); }
+.odt-page { min-height: 600px; }
+.odt-page table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+.odt-page td { border: 1px solid #bbb; padding: 8px; vertical-align: top; }
+.odt-page .odt-list { padding-left: 28px; }
+.odt-page [aria-level="1"] { font-size: 1.8em; font-weight: 700; }
+.odt-page [aria-level="2"] { font-size: 1.5em; font-weight: 700; }
+.odt-page [aria-level="3"] { font-size: 1.25em; font-weight: 700; }

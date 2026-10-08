@@ -141,6 +141,9 @@ struct ServeArgs {
     /// Hex ed25519 public key for latest.json.sig (OWNNAS_UPDATE_PUBKEY)
     #[arg(long, env = "OWNNAS_UPDATE_PUBKEY", value_name = "HEX")]
     update_pubkey: Option<String>,
+    /// Let launchd/systemd/NSSM restart OwnNAS after updates instead of spawning a child
+    #[arg(long, env = "OWNNAS_RESTART_BY_SUPERVISOR", action = clap::ArgAction::SetTrue)]
+    restart_by_supervisor: bool,
 }
 
 #[derive(Subcommand)]
@@ -260,19 +263,21 @@ fn serve(args: ServeArgs) -> Result<(), String> {
         None => first_run_root(&args.data, &mut announced)?,
     };
     let (root, data) = files::prepare_paths(&root, &args.data)?;
+    let update_url = args
+        .update_url
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty());
     let pubkey = match args.update_pubkey.as_deref() {
         Some(value) if !value.trim().is_empty() => Some(update::parse_pubkey_hex(value)?),
+        _ if update_url.is_none() => Some(update::parse_pubkey_hex(update::EMBEDDED_PUBKEY)?),
         _ => None,
     };
     let update = update::UpdateConfig {
-        url: args
-            .update_url
-            .map(|u| u.trim().to_string())
-            .filter(|u| !u.is_empty()),
+        url: Some(update_url.unwrap_or_else(|| update::DEFAULT_URL.to_string())),
         pubkey,
     };
     let saved_root = root.clone();
-    let state = Arc::new(http::new_state(
+    let mut app_state = http::new_state(
         root,
         data,
         args.readonly,
@@ -280,7 +285,9 @@ fn serve(args: ServeArgs) -> Result<(), String> {
         thumbs::ffmpeg_available(),
         content_index::tesseract_available(),
         update,
-    )?);
+    )?;
+    app_state.supervisor_restart = args.restart_by_supervisor;
+    let state = Arc::new(app_state);
     {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
         let count = db::count_users(&conn)?;
@@ -301,12 +308,38 @@ fn serve(args: ServeArgs) -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|_| "Could not start the async runtime".to_string())?;
-    runtime.block_on(async {
+    let server_result = runtime.block_on(async {
+        let update_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                if update_state.update.url.is_some() {
+                    let config = update_state.update.clone();
+                    let result = tokio::task::spawn_blocking(move || update::check(&config)).await;
+                    let mut value = match result {
+                        Ok(Ok(result)) => serde_json::to_value(result).unwrap_or_default(),
+                        Ok(Err(err)) => serde_json::json!({"configured": true, "available": false, "error": err}),
+                        Err(_) => serde_json::json!({"configured": true, "available": false, "error": "Update check failed"}),
+                    };
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("checkedAt".into(), serde_json::Value::String(format!("{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())));
+                    }
+                    *update_state.update_status.lock().unwrap_or_else(|e| e.into_inner()) = Some(value);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
+            }
+        });
         match (args.tls_cert, args.tls_key) {
-            (Some(cert), Some(key)) => http::serve_https(state, &args.addr, args.open, &cert, &key).await,
-            _ => http::serve(state, &args.addr, args.open).await,
+            (Some(cert), Some(key)) => http::serve_https(state.clone(), &args.addr, args.open, &cert, &key).await,
+            _ => http::serve(state.clone(), &args.addr, args.open).await,
         }
-    })
+    });
+    if state.restart_requested.load(std::sync::atomic::Ordering::SeqCst) {
+        if state.supervisor_restart {
+            return server_result;
+        }
+        update::spawn_replaced_binary()?;
+    }
+    server_result
 }
 
 fn interactive() -> bool {

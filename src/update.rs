@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const DEFAULT_URL: &str = "https://github.com/robertoho/ownnas/releases/latest/download/latest.json";
+pub const EMBEDDED_PUBKEY: &str = include_str!("../releases/keys/update.pk");
 
 #[derive(Clone, Debug, Default)]
 pub struct UpdateConfig {

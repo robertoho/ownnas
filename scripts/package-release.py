@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import re
 import tarfile
 import zipfile
@@ -16,6 +17,7 @@ TARGETS = {
     "x86_64-pc-windows-msvc": ("zip", "ownnas.exe"),
     "x86_64-apple-darwin": ("tar.gz", "ownnas"),
     "aarch64-apple-darwin": ("tar.gz", "ownnas"),
+    "aarch64-unknown-linux-gnu": ("tar.gz", "ownnas"),
 }
 
 
@@ -37,6 +39,14 @@ def main() -> None:
     output_dir = Path("dist")
     output_dir.mkdir(exist_ok=True)
     base = f"ownnas-{version}-{args.target}"
+    raw_name = f"{base}-binary" + (".exe" if executable.endswith(".exe") else "")
+    raw_path = output_dir / raw_name
+    raw_path.write_bytes(binary.read_bytes())
+    raw_digest = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+    (output_dir / f"update-{args.target}.json").write_text(
+        json.dumps({"target": args.target, "url": f"https://github.com/robertoho/ownnas/releases/download/v{version}/{raw_name}", "sha256": raw_digest, "size": raw_path.stat().st_size}, separators=(",", ":")),
+        encoding="utf-8",
+    )
     archive = output_dir / f"{base}.{extension}"
     root = f"ownnas-{version}"
     readme = (
