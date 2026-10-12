@@ -2828,9 +2828,12 @@ async function pasteClipboard(dest) {
       break;
     }
   }
-  if (clip.mode === "cut") {
-    state.clipboard = remaining.length ? { mode: "cut", items: remaining } : null;
+  // A paste empties the clipboard; anything that failed stays so it can be retried. If
+  // nothing needed pasting (all already here), keep it for pasting somewhere else.
+  if (error || done) {
+    state.clipboard = remaining.length ? { mode: clip.mode, items: remaining } : null;
     renderClipboard();
+    paintSelection();
   }
   invalidateFolderSizes();
   await load(state.path);
