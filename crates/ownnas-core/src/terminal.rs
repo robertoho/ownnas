@@ -89,6 +89,13 @@ impl Api {
         Ok(())
     }
 
+    /// Gives a terminal a name, shown in every app and in the web app's tabs.
+    pub fn rename_terminal(&self, id: &str, name: &str) -> Result<TerminalInfo, ApiError> {
+        let response = self.post_json("/api/terminals/rename", json!({ "id": id, "name": name }))?;
+        let body: Opened = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
+        Ok(body.terminal)
+    }
+
     pub fn unlock_terminals(&self, password: &str) -> Result<(), ApiError> {
         self.post_json("/api/terminal/unlock", json!({ "password": password }))?;
         Ok(())

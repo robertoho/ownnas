@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.consumeWindowInsets
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -32,6 +33,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.outlined.AttachFile
 import androidx.compose.material.icons.outlined.ContentPaste
 import androidx.compose.material.icons.outlined.Keyboard
@@ -47,6 +49,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -78,6 +81,13 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import app.ownnas.android.ui.AppViewModel
+import app.ownnas.android.ui.ShortcutDialog
+import app.ownnas.android.ui.SnippetDialog
+import app.ownnas.android.ui.SnippetsSheet
+import app.ownnas.android.data.TerminalShortcut
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.material.icons.outlined.Bolt
 import app.ownnas.android.ui.Screen
 import app.ownnas.android.ui.userMessage
 import app.ownnas.core.ClientException
@@ -101,6 +111,26 @@ internal fun agentStatus(info: TerminalInfo): Pair<String, Color>? {
         "done" -> "$label · done" to Color(0xFF22C55E)
         "error" -> "$label · error" to Color(0xFFEF4444)
         else -> "$label · idle" to Color(0xFF9CA3AF)
+    }
+}
+
+/** Grey after a clean exit, red after a failure. */
+internal fun endedColor(info: TerminalInfo): Color =
+    if (info.exitCode == null || info.exitCode == 0u) Color(0xFF9CA3AF) else Color(0xFFEF4444)
+
+internal fun endedText(info: TerminalInfo): String =
+    if (info.exitCode == null || info.exitCode == 0u) "Ended" else "Ended · exit code ${info.exitCode}"
+
+/** A small round badge for the corner of an icon: a stop sign for an ended terminal. */
+@Composable
+internal fun EndedBadge(info: TerminalInfo, modifier: Modifier = Modifier) {
+    Surface(
+        shape = CircleShape,
+        color = endedColor(info),
+        border = androidx.compose.foundation.BorderStroke(2.dp, MaterialTheme.colorScheme.surface),
+        modifier = modifier.size(18.dp),
+    ) {
+        Icon(Icons.Filled.Stop, contentDescription = endedText(info), tint = Color.White, modifier = Modifier.padding(3.dp))
     }
 }
 
@@ -225,15 +255,34 @@ private fun TerminalRow(info: TerminalInfo, onOpen: () -> Unit, onEnd: () -> Uni
     val status = agentStatus(info)
     ListItem(
         modifier = Modifier.clickable(onClick = onOpen),
-        leadingContent = { Icon(Icons.Outlined.Terminal, contentDescription = null) },
-        headlineContent = { Text(titleOf(info), maxLines = 1, overflow = TextOverflow.Ellipsis) },
+        leadingContent = {
+            Box {
+                Icon(
+                    Icons.Outlined.Terminal,
+                    contentDescription = null,
+                    tint = if (info.running) LocalContentColor.current else MaterialTheme.colorScheme.outline,
+                )
+                if (!info.running) EndedBadge(info, Modifier.align(Alignment.BottomEnd).offset(x = 6.dp, y = 6.dp))
+            }
+        },
+        headlineContent = {
+            Text(
+                titleOf(info),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                color = if (info.running) Color.Unspecified else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        },
         supportingContent = {
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(
-                    if (info.running) "/${info.path}" else "Ended${info.exitCode?.let { " with code $it" } ?: ""}",
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                if (info.running) {
+                    Text("/${info.path}", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                } else {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Box(Modifier.size(8.dp).background(endedColor(info), CircleShape))
+                        Text("${endedText(info)} · /${info.path}", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
                 if (status != null) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         Box(Modifier.size(8.dp).background(status.second, CircleShape))
@@ -314,7 +363,7 @@ private val EXTRA_KEYS = listOf(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String) {
+fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String, startup: String? = null) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var session by remember { mutableStateOf<TerminalSession?>(null) }
@@ -325,6 +374,18 @@ fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String) {
     var ending by remember { mutableStateOf(false) }
     var view by remember { mutableStateOf<TerminalView?>(null) }
     var uploading by remember { mutableStateOf<String?>(null) }
+    // The shell has drawn something, so it is ready for a shortcut's command.
+    var output by remember { mutableStateOf(false) }
+    var startupDone by rememberSaveable { mutableStateOf(startup == null) }
+    var snippetsOpen by remember { mutableStateOf(false) }
+    var newSnippet by remember { mutableStateOf(false) }
+    var savingShortcut by remember { mutableStateOf(false) }
+    val snippets by vm.shortcuts.snippets.collectAsStateWithLifecycle()
+
+    /** Types each line and presses Enter, as if typed by hand. */
+    fun run(command: String) {
+        command.lines().filter { it.isNotBlank() }.forEach { session?.typeText(it + "\r") }
+    }
     var info by remember { mutableStateOf<TerminalInfo?>(null) }
     val snackbar = remember { SnackbarHostState() }
 
@@ -353,6 +414,7 @@ fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String) {
         val listener = object : TerminalListener {
             override fun screenChanged() {
                 view?.postInvalidateOnAnimation()
+                if (!output) main.post { output = true }
             }
 
             override fun connectionChanged(connection: TerminalConnection, message: String?) {
@@ -371,6 +433,15 @@ fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String) {
             job.cancel()
             session?.disconnect()
             session?.close()
+        }
+    }
+
+    LaunchedEffect(output, state.first) {
+        if (!startupDone && output && state.first == TerminalConnection.Live && startup != null) {
+            // Let the prompt finish drawing first.
+            delay(400)
+            run(startup)
+            startupDone = true
         }
     }
 
@@ -423,6 +494,7 @@ fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String) {
                     IconButton(onClick = { vm.pop() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") }
                 },
                 actions = {
+                    IconButton(onClick = { snippetsOpen = true }) { Icon(Icons.Outlined.Bolt, contentDescription = "Snippets") }
                     IconButton(onClick = { view?.showKeyboard() }) { Icon(Icons.Outlined.Keyboard, contentDescription = "Keyboard") }
                     IconButton(onClick = {
                         // Copied files and images (a screenshot's "Copy") are uploaded; text pastes as usual.
@@ -451,6 +523,7 @@ fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String) {
                     Box {
                         IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "More") }
                         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                            DropdownMenuItem(text = { Text("Save as shortcut…") }, onClick = { menu = false; savingShortcut = true })
                             DropdownMenuItem(text = { Text("End terminal") }, onClick = { menu = false; ending = true })
                         }
                     }
@@ -522,6 +595,30 @@ fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String) {
                     }
                 }
             }
+        }
+    }
+
+    if (snippetsOpen) {
+        SnippetsSheet(
+            snippets = snippets,
+            onDismiss = { snippetsOpen = false },
+            onRun = { snippetsOpen = false; run(it.command); view?.showKeyboard() },
+            onInsert = { snippetsOpen = false; session?.typeText(it.command); view?.showKeyboard() },
+            onNew = { snippetsOpen = false; newSnippet = true },
+        )
+    }
+    if (newSnippet) {
+        SnippetDialog(null, onDismiss = { newSnippet = false }) { vm.shortcuts.save(it); newSnippet = false }
+    }
+    if (savingShortcut) {
+        ShortcutDialog(
+            vm,
+            TerminalShortcut(name = info?.let(::titleOf) ?: "Terminal", serverId = serverId, path = info?.path ?: "", command = ""),
+            onDismiss = { savingShortcut = false },
+        ) {
+            vm.shortcuts.save(it)
+            savingShortcut = false
+            scope.launch { snackbar.showSnackbar("Saved “${it.name}” in Shortcuts") }
         }
     }
 

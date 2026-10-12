@@ -12,6 +12,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import app.ownnas.android.OwnNasApp
 import app.ownnas.android.data.SavedServer
+import app.ownnas.android.data.TerminalShortcut
 import app.ownnas.android.data.Trust
 import app.ownnas.core.Account
 import app.ownnas.core.ClientException
@@ -50,7 +51,8 @@ sealed interface Screen {
     /** The server's terminals; new ones open in `path`. */
     data class Terminals(val serverId: String, val path: String) : Screen
 
-    data class Terminal(val serverId: String, val terminalId: String) : Screen
+    /** `startup` runs once the shell is ready, for terminals opened by a shortcut. */
+    data class Terminal(val serverId: String, val terminalId: String, val startup: String? = null) : Screen
 
     data object Sync : Screen
 }
@@ -58,6 +60,7 @@ sealed interface Screen {
 class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val hub = (application as OwnNasApp).servers
     val syncs = (application as OwnNasApp).syncs
+    val shortcuts = (application as OwnNasApp).shortcuts
     private val store = hub.store
     val servers = store.servers
 
@@ -111,6 +114,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun remove(id: String) {
         folders.keys.removeAll { it.first == id }
         syncs.pairs.value.filter { it.serverId == id }.forEach { syncs.remove(it.id) }
+        shortcuts.forgetServer(id)
         viewModelScope.launch(Dispatchers.IO) { hub.remove(id) }
     }
 
@@ -256,6 +260,21 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     suspend fun terminals(id: String): List<TerminalInfo> = call(id) { it.terminals() }
 
     suspend fun openTerminal(id: String, path: String): TerminalInfo = call(id) { it.openTerminal(path, 30u, 100u) }
+
+    /**
+     * Opens a shortcut: back into its terminal while that still runs (found by name), otherwise
+     * a new terminal named after it, with the shortcut's command to run.
+     */
+    suspend fun launch(shortcut: TerminalShortcut): Screen.Terminal = call(shortcut.serverId) { server ->
+        val running = server.terminals().firstOrNull { it.running && it.name == shortcut.name }
+        if (running != null) {
+            Screen.Terminal(shortcut.serverId, running.id)
+        } else {
+            val opened = server.openTerminal(shortcut.path, 30u, 100u)
+            runCatching { server.renameTerminal(opened.id, shortcut.name) }
+            Screen.Terminal(shortcut.serverId, opened.id, shortcut.command.takeIf { it.isNotBlank() })
+        }
+    }
 
     suspend fun closeTerminal(id: String, terminalId: String) {
         call(id) { it.closeTerminal(terminalId) }

@@ -80,7 +80,9 @@ import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Surface
 import androidx.compose.ui.graphics.Color
+import app.ownnas.android.ui.terminal.EndedBadge
 import app.ownnas.android.ui.terminal.agentStatus
+import app.ownnas.android.ui.terminal.endedText
 import app.ownnas.core.TerminalInfo
 import kotlinx.coroutines.delay
 import app.ownnas.core.ClientException
@@ -133,8 +135,9 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
     }
     // Like the web app's badge: terminals whose agent wants attention (waiting, finished,
     // stopped) until someone opens them.
-    val attention = terminals.count { it.agent.attention != null }
-    val terminalsByPath = remember(terminals) { terminals.filter { it.running }.groupBy { it.path } }
+    // Ended terminals count too: they stay until closed, and the user should see what happened.
+    val attention = terminals.count { it.agent.attention != null || !it.running }
+    val terminalsByPath = remember(terminals) { terminals.groupBy { it.path } }
 
     LaunchedEffect(reload, revision) {
         refreshing = true
@@ -402,11 +405,13 @@ private fun Listing(
                 },
                 headlineContent = { Text(specialFolderLabel(entry.name), maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 supportingContent = {
-                    val status = here.firstNotNullOfOrNull { info -> agentStatus(info)?.first }
+                    val running = here.filter { it.running }
+                    val status = running.firstNotNullOfOrNull { info -> agentStatus(info)?.first }
                     val terminalNote = when {
                         status != null -> " · $status"
-                        here.size == 1 -> " · terminal open"
-                        here.size > 1 -> " · ${here.size} terminals open"
+                        running.size == 1 -> " · terminal open"
+                        running.size > 1 -> " · ${running.size} terminals open"
+                        here.isNotEmpty() -> " · terminal ${endedText(here.first()).lowercase()}"
                         else -> ""
                     }
                     Text(details(context, entry) + terminalNote, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -431,9 +436,15 @@ private fun Listing(
  */
 @Composable
 private fun TerminalMark(terminals: List<TerminalInfo>, modifier: Modifier) {
+    val running = terminals.filter { it.running }
+    // Only ended terminals here: show that they stopped, and how.
+    if (running.isEmpty()) {
+        EndedBadge(terminals.firstOrNull { it.exitCode != null && it.exitCode != 0u } ?: terminals.first(), modifier.size(20.dp))
+        return
+    }
     val color = when {
-        terminals.any { it.agent.attention != null } -> Color(0xFFF59E0B)
-        else -> terminals.firstNotNullOfOrNull { agentStatus(it)?.second } ?: MaterialTheme.colorScheme.secondary
+        running.any { it.agent.attention != null } -> Color(0xFFF59E0B)
+        else -> running.firstNotNullOfOrNull { agentStatus(it)?.second } ?: MaterialTheme.colorScheme.secondary
     }
     Surface(
         shape = CircleShape,

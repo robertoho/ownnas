@@ -13,6 +13,12 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.outlined.Dns
+import androidx.compose.material.icons.outlined.Bolt
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -26,6 +32,8 @@ import androidx.compose.material3.LargeTopAppBar
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.ScaffoldDefaults
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
@@ -44,12 +52,13 @@ import app.ownnas.android.data.SavedServer
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ServersScreen(vm: AppViewModel) {
+fun ServersScreen(vm: AppViewModel, insets: WindowInsets = ScaffoldDefaults.contentWindowInsets) {
     val servers by vm.servers.collectAsStateWithLifecycle()
     var removing by remember { mutableStateOf<SavedServer?>(null) }
     val scroll = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
     Scaffold(
         modifier = Modifier.nestedScroll(scroll.nestedScrollConnection),
+        contentWindowInsets = insets,
         topBar = {
             LargeTopAppBar(
                 title = { Text("OwnNAS") },
@@ -135,5 +144,32 @@ private fun Welcome(modifier: Modifier, onAdd: () -> Unit) {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Button(onClick = onAdd) { Text("Add server") }
+    }
+}
+
+/** The main screen: servers and shortcuts as tabs at the bottom. */
+@Composable
+fun HomeScreen(vm: AppViewModel) {
+    var tab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(0) }
+    // The tabs bar takes care of the navigation bar; each tab keeps only the top and sides.
+    val insets = WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal)
+    Column(Modifier.fillMaxSize()) {
+        Box(Modifier.weight(1f)) {
+            if (tab == 0) ServersScreen(vm, insets) else ShortcutsTab(vm, insets)
+        }
+        NavigationBar {
+            NavigationBarItem(
+                selected = tab == 0,
+                onClick = { tab = 0 },
+                icon = { Icon(Icons.Outlined.Dns, contentDescription = null) },
+                label = { Text("Servers") },
+            )
+            NavigationBarItem(
+                selected = tab == 1,
+                onClick = { tab = 1 },
+                icon = { Icon(Icons.Outlined.Bolt, contentDescription = null) },
+                label = { Text("Shortcuts") },
+            )
+        }
     }
 }

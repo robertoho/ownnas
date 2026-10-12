@@ -31,6 +31,9 @@ What works now:
   The emulator and the WebSocket run in Rust (`crates/ownnas-core/src/terminal.rs`, using
   the `vt100` crate), so the iOS app can share them.
 
+- Shortcuts tab: terminal shortcuts open a terminal in a server folder and run a command
+  there (such as `tmux new -A -s main`), going back to the same terminal while it runs; and
+  snippets, saved commands to run from the ⚡ button in any terminal.
 - HTTPS with a private certificate: when a server's certificate is not publicly trusted, the
   app shows its SHA-256 fingerprint to compare with the one `ownnas serve` prints, and pins it
   once you confirm, or trusts the `ca.crt` from `ownnas tls generate` (which survives

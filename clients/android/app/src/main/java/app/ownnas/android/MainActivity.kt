@@ -18,7 +18,7 @@ import app.ownnas.android.ui.AppViewModel
 import app.ownnas.android.ui.BrowserScreen
 import app.ownnas.android.ui.ConflictDialog
 import app.ownnas.android.ui.Screen
-import app.ownnas.android.ui.ServersScreen
+import app.ownnas.android.ui.HomeScreen
 import app.ownnas.android.ui.SignInScreen
 import app.ownnas.android.ui.SyncScreen
 import app.ownnas.android.ui.terminal.TerminalScreen
@@ -47,11 +47,11 @@ private fun App(vm: AppViewModel = viewModel()) {
         // Each screen on the stack keeps its scroll position and typed text while covered.
         saveable.SaveableStateProvider(target.toString()) {
             when (target) {
-                Screen.Servers -> ServersScreen(vm)
+                Screen.Servers -> HomeScreen(vm)
                 is Screen.SignIn -> SignInScreen(vm, target.existing)
                 is Screen.Browse -> BrowserScreen(vm, target.serverId, target.path)
                 is Screen.Terminals -> TerminalsScreen(vm, target.serverId, target.path)
-                is Screen.Terminal -> TerminalScreen(vm, target.serverId, target.terminalId)
+                is Screen.Terminal -> TerminalScreen(vm, target.serverId, target.terminalId, target.startup)
                 Screen.Sync -> SyncScreen(vm)
             }
         }

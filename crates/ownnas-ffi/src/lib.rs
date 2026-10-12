@@ -363,6 +363,11 @@ impl Server {
         Ok(self.api.close_terminal(&id)?)
     }
 
+    /// Names a terminal, as shown in every app and in the web app's tabs.
+    pub fn rename_terminal(&self, id: String, name: String) -> Result<TerminalInfo, ClientError> {
+        Ok(self.api.rename_terminal(&id, &name)?.into())
+    }
+
     pub fn unlock_terminals(&self, password: String) -> Result<(), ClientError> {
         Ok(self.api.unlock_terminals(&password)?)
     }
