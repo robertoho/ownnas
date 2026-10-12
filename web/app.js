@@ -3697,6 +3697,11 @@ $("search").addEventListener("input", (event) => {
 $("search").addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     event.preventDefault();
+    const matches = displayedEntries();
+    if (state.filter.trim() && matches.length === 1) {
+      openEntry(matches[0]).catch((err) => toast(err.message, true));
+      return;
+    }
     runDeepSearch().catch((err) => toast(err.message, true));
   }
   if (event.key === "Escape" && state.filter) {
