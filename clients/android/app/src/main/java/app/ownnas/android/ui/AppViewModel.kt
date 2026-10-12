@@ -184,7 +184,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 next.name,
                 next.file.detachFd(),
                 next.size?.toULong(),
-                next.modified?.div(1000),
+                next.modified,
                 choice,
                 tracker,
             )

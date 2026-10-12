@@ -189,6 +189,8 @@ Tags and comments are edited in the preview panel (hidden in `--readonly`).
 - Toolbar: upload files or an entire folder.
 - Drag-and-drop onto the file area.
 - Paste files from the OS clipboard (when not editing a sensitive field).
+- The Android app uploads through the same endpoint, with the same conflict choices.
+- Uploaded files keep their original modification time (`POST /api/upload?mtime=<ms>`).
 
 Conflict policy (per file or “apply to rest”):
 

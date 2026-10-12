@@ -166,15 +166,16 @@ impl Api {
     }
 
     /// Uploads one file into `dir` through the web app's upload endpoint. Without `conflict`,
-    /// a taken name comes back as [`Uploaded::Exists`]. `size` is sent when known;
-    /// `modified` (seconds) is needed for [`Conflict::ArchiveOlder`].
+    /// a taken name comes back as [`Uploaded::Exists`]. `size` is sent when known. `mtime`
+    /// (milliseconds) becomes the saved file's modification time, as the web app sends it, and
+    /// is what [`Conflict::ArchiveOlder`] compares.
     #[allow(clippy::too_many_arguments)]
     pub fn upload_file(
         &self,
         dir: &str,
         name: &str,
         conflict: Option<Conflict>,
-        modified: Option<i64>,
+        mtime: Option<i64>,
         size: Option<u64>,
         body: impl Read,
         progress: Progress,
@@ -188,8 +189,11 @@ impl Api {
         if let Some(conflict) = conflict {
             request = request.query("conflict", conflict.param());
         }
-        if let Some(modified) = modified {
-            request = request.query("modified", &modified.to_string());
+        if let Some(mtime) = mtime.filter(|mtime| *mtime > 0) {
+            request = request.query("mtime", &mtime.to_string());
+            if conflict == Some(Conflict::ArchiveOlder) {
+                request = request.query("modified", &(mtime / 1000).to_string());
+            }
         }
         if let Some(size) = size {
             request = request.set("Content-Length", &(head.len() as u64 + size + tail.len() as u64).to_string());

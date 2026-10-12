@@ -2991,6 +2991,8 @@ function postFile(item, choice, onProgress, destination = state.path) {
     const params = new URLSearchParams();
     params.set("path", destination);
     if (choice) params.set("conflict", choice);
+    // The server gives the saved file this time, so it keeps its original date.
+    if (item.file.lastModified) params.set("mtime", String(item.file.lastModified));
     if (choice === "archive-older") params.set("modified", String(Math.floor(item.file.lastModified / 1000)));
     xhr.open("POST", `/api/upload?${params}`);
     xhr.setRequestHeader("X-OwnNAS", "1");

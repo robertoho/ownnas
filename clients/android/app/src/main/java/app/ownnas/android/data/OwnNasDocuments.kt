@@ -200,7 +200,7 @@ class OwnNasDocuments : DocumentsProvider() {
     private fun upload(id: String, dir: String, name: String, file: File, conflict: Conflict?) {
         val fd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).detachFd()
         val result = servers.blocking(id) {
-            it.uploadFd(dir, name, fd, file.length().toULong(), file.lastModified() / 1000, conflict, Cancellable(null))
+            it.uploadFd(dir, name, fd, file.length().toULong(), file.lastModified(), conflict, Cancellable(null))
         }
         if (result is UploadResult.Exists) throw FileNotFoundException("$name already exists")
     }

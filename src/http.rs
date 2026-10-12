@@ -524,7 +524,10 @@ struct PathQuery {
 struct UploadQuery {
     path: Option<String>,
     conflict: Option<String>,
+    /// The upload's modification time in seconds, compared by "archive older".
     modified: Option<i64>,
+    /// The upload's modification time in milliseconds since the Unix epoch, given to the saved file.
+    mtime: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -2140,7 +2143,16 @@ async fn upload(
                 .await
                 .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload"))?;
         }
-        drop(out);
+        // Keep the file's original modification time when the client sends it.
+        if let Some(mtime) = query.mtime.filter(|mtime| *mtime > 0) {
+            tokio::io::AsyncWriteExt::flush(&mut out)
+                .await
+                .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload"))?;
+            let file = out.into_std().await;
+            let _ = file.set_modified(std::time::UNIX_EPOCH + Duration::from_millis(mtime as u64));
+        } else {
+            drop(out);
+        }
         if let Some(original_name) = archived_as {
             let root = state.root.clone();
             let saved_path = dest.clone();
@@ -4070,6 +4082,46 @@ mod tests {
             .await
             .unwrap()
             .to_vec()
+    }
+
+    #[tokio::test]
+    async fn uploads_ask_on_conflict_and_keep_the_original_time() {
+        let (app, root) = app().await;
+        let login = Request::builder()
+            .method("POST")
+            .uri("/api/login")
+            .header("content-type", "application/json")
+            .header("x-ownnas", "1")
+            .body(Body::from(r#"{"username":"ada","password":"longenough"}"#))
+            .unwrap();
+        let response = app.clone().oneshot(login).await.unwrap();
+        let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string();
+        let upload = |query: &str, bytes: &str| {
+            let body = format!(
+                "--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"photo.jpg\"\r\nContent-Type: application/octet-stream\r\n\r\n{bytes}\r\n--B--\r\n"
+            );
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/upload?path=&{query}"))
+                .header("cookie", &cookie)
+                .header("x-ownnas", "1")
+                .header("content-type", "multipart/form-data; boundary=B")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let original = 1_600_000_000_123i64;
+        let response = app.clone().oneshot(upload(&format!("mtime={original}"), "first")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved = std::fs::metadata(root.join("photo.jpg")).unwrap().modified().unwrap();
+        assert_eq!(saved.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64, original);
+
+        // A taken name is a question for the client, which then picks one of the web app's choices.
+        let response = app.clone().oneshot(upload("", "second")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = app.clone().oneshot(upload("conflict=keep", "second")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(std::fs::read_to_string(root.join("photo (2).jpg")).unwrap(), "second");
+        assert_eq!(std::fs::read_to_string(root.join("photo.jpg")).unwrap(), "first");
     }
 
     #[tokio::test]

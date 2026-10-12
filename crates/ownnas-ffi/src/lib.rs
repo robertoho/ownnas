@@ -232,8 +232,8 @@ impl Server {
 
     /// Uploads from an open file descriptor, which this call takes over and closes, through the
     /// web app's upload endpoint. Without `conflict`, a taken name returns
-    /// [`UploadResult::Exists`] so the app can ask. `modified_secs` is needed for
-    /// [`Conflict::ArchiveOlder`].
+    /// [`UploadResult::Exists`] so the app can ask. `mtime_ms` becomes the saved file's
+    /// modification time and is what [`Conflict::ArchiveOlder`] compares.
     #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
     pub fn upload_fd(
@@ -242,7 +242,7 @@ impl Server {
         name: String,
         fd: i32,
         size: Option<u64>,
-        modified_secs: Option<i64>,
+        mtime_ms: Option<i64>,
         conflict: Option<Conflict>,
         transfer: Arc<dyn Transfer>,
     ) -> Result<UploadResult, ClientError> {
@@ -256,7 +256,7 @@ impl Server {
             &dir,
             &name,
             conflict.map(manage::Conflict::from),
-            modified_secs,
+            mtime_ms,
             size,
             file,
             &|done| transfer.keep_going(done),

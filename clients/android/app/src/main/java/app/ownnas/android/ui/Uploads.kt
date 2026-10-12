@@ -4,6 +4,7 @@ import android.content.ContentResolver
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
+import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.os.SystemClock
 import app.ownnas.core.ClientException
@@ -73,6 +74,8 @@ fun ContentResolver.pendingUploads(serverId: String, dir: String, uris: List<Uri
                     column(OpenableColumns.DISPLAY_NAME)?.let { name = cursor.getString(it) }
                     column(OpenableColumns.SIZE)?.let { size = cursor.getLong(it) }
                     column(DocumentsContract.Document.COLUMN_LAST_MODIFIED)?.let { modified = cursor.getLong(it) }
+                    // The photo picker offers when a photo or video was taken instead.
+                    if (modified == null) column(MediaStore.MediaColumns.DATE_TAKEN)?.let { modified = cursor.getLong(it) }
                 }
             }
         }
@@ -91,7 +94,7 @@ class ConflictPrompt(
     val incomingSize: Long?,
     /** Milliseconds; without it, "Archive older" cannot be offered. */
     val incomingModified: Long?,
-    /** More files from the same pick are waiting, so "use this choice for the rest" applies. */
+    /** More files from the same pick are waiting. */
     val more: Boolean,
 ) {
     internal val reply = CompletableDeferred<ConflictAnswer?>()

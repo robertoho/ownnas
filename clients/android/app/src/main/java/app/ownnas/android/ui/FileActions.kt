@@ -292,14 +292,13 @@ fun ConflictDialog(prompt: ConflictPrompt) {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(if (existing.dir) "A folder named “${prompt.name}” already exists." else "“${prompt.name}” already exists.")
                 Text(note, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                if (prompt.more) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.fillMaxWidth().clickable { rest = !rest },
-                    ) {
-                        Checkbox(checked = rest, onCheckedChange = { rest = it })
-                        Text("Use this choice for the remaining files")
-                    }
+                // Shown even for a single file, exactly as the web app's dialog does.
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth().clickable { rest = !rest },
+                ) {
+                    Checkbox(checked = rest, onCheckedChange = { rest = it })
+                    Text("Use this choice for the remaining files")
                 }
                 Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End) {
                     choices.forEach { (choice, label) ->
