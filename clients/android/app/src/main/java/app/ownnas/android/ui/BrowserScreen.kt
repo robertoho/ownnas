@@ -29,6 +29,8 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.outlined.Audiotrack
+import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Inventory2
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.FolderZip
 import androidx.compose.material.icons.outlined.Image
@@ -177,10 +179,10 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
             TopAppBar(
                 title = {
                     Column {
-                        Text(path.substringAfterLast('/').ifEmpty { server.name }, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(specialFolderLabel(path.substringAfterLast('/')).ifEmpty { server.name }, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         if (path.isNotEmpty()) {
                             Text(
-                                "${server.name}/$path",
+                                "${server.name}/" + path.split('/').joinToString("/", transform = ::specialFolderLabel),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,
@@ -286,7 +288,10 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
             onDismiss = { dialog = null },
             onConfirm = {
                 dialog = null
-                act { vm.trash(serverId, shown.entry); "Moved ${shown.entry.name} to the Trash" }
+                act {
+                    vm.trash(serverId, shown.entry)
+                    if (inTrash(shown.entry.path)) "Deleted ${shown.entry.name}" else "Moved ${shown.entry.name} to the Trash"
+                }
             },
         )
         null -> {}
@@ -327,7 +332,7 @@ private fun Listing(
             ListItem(
                 modifier = Modifier.combinedClickable(onClick = { onOpen(entry) }, onLongClick = { menu = true }),
                 leadingContent = { Thumbnail(vm, serverId, entry) },
-                headlineContent = { Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                headlineContent = { Text(specialFolderLabel(entry.name), maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 supportingContent = { Text(details(context, entry), maxLines = 1) },
                 trailingContent = {
                     Box {
@@ -387,7 +392,19 @@ private fun Message(text: String) {
     }
 }
 
+/** The web app's names for OwnNAS's own folders. */
+fun specialFolderLabel(name: String) = when (name) {
+    ".ownnas-trash", "Trash" -> "Trash"
+    ".ownnas-archive", "Archive" -> "Archive"
+    else -> name
+}
+
+fun inTrash(path: String) =
+    path == ".ownnas-trash" || path.startsWith(".ownnas-trash/") || path == "Trash" || path.startsWith("Trash/")
+
 private fun iconFor(entry: Entry): ImageVector = when {
+    entry.kind == "trash-folder" || entry.path == ".ownnas-trash" -> Icons.Outlined.Delete
+    entry.kind == "archive-folder" || entry.path == ".ownnas-archive" -> Icons.Outlined.Inventory2
     entry.dir -> Icons.Filled.Folder
     else -> when (entry.kind) {
         "image", "svg" -> Icons.Outlined.Image

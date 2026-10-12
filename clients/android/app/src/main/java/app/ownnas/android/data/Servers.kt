@@ -32,7 +32,7 @@ class Servers(private val context: Context, val store: ServerStore) {
     private fun connection(id: String): Server = connections.getOrPut(id) {
         val saved = store.find(id) ?: throw ClientException.NotFound()
         val token = store.token(id) ?: throw ClientException.Unauthorized()
-        Server(saved.address, token, null)
+        Server(saved.address, token, saved.trust.caPem?.toByteArray(), saved.trust.pinned)
     }
 
     /** Runs a server call. A rejected token is forgotten, so the app asks to sign in again. */
@@ -51,12 +51,13 @@ class Servers(private val context: Context, val store: ServerStore) {
     /** Who is signed in, and whether the server takes changes. Fetched once per app run. */
     fun account(id: String): Account = accounts[id] ?: blocking(id) { it.account() }.also { accounts[id] = it }
 
-    fun signIn(address: String, username: String, password: String): SavedServer {
+    fun signIn(address: String, username: String, password: String, trust: Trust): SavedServer {
         val normalized = normalizeAddress(address)
-        val token = signIn(normalized, username.trim(), password, null)
-        val server = Server(normalized, token, null)
+        val ca = trust.caPem?.toByteArray()
+        val token = signIn(normalized, username.trim(), password, ca, trust.pinned)
+        val server = Server(normalized, token, ca, trust.pinned)
         val account = server.account()
-        val saved = store.save(normalized, account.username, account.rootName, token)
+        val saved = store.save(normalized, account.username, account.rootName, token, trust)
         connections.put(saved.id, server)?.close()
         accounts[saved.id] = account
         notifyRoots()

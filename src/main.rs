@@ -339,7 +339,13 @@ fn serve(args: ServeArgs) -> Result<(), String> {
             }
         });
         match (args.tls_cert, args.tls_key) {
-            (Some(cert), Some(key)) => http::serve_https(state.clone(), &args.addr, args.open, &cert, &key).await,
+            (Some(cert), Some(key)) => {
+                // Apps that pin the certificate show this fingerprint to compare against.
+                if let Some(print) = tls::fingerprint_file(&cert) {
+                    println!("HTTPS certificate SHA-256: {print}");
+                }
+                http::serve_https(state.clone(), &args.addr, args.open, &cert, &key).await
+            }
             _ => http::serve(state.clone(), &args.addr, args.open).await,
         }
     });

@@ -14,6 +14,7 @@ import android.provider.DocumentsProvider
 import android.webkit.MimeTypeMap
 import app.ownnas.android.OwnNasApp
 import app.ownnas.android.R
+import app.ownnas.android.ui.specialFolderLabel
 import app.ownnas.core.ClientException
 import app.ownnas.core.Conflict
 import app.ownnas.core.Entry
@@ -180,7 +181,7 @@ class OwnNasDocuments : DocumentsProvider() {
         }
         cursor.newRow().apply {
             add(Document.COLUMN_DOCUMENT_ID, Servers.documentId(id, entry.path))
-            add(Document.COLUMN_DISPLAY_NAME, entry.name)
+            add(Document.COLUMN_DISPLAY_NAME, specialFolderLabel(entry.name))
             add(Document.COLUMN_MIME_TYPE, mimeType(entry))
             add(Document.COLUMN_SIZE, if (entry.dir) null else entry.size.toLong())
             add(Document.COLUMN_LAST_MODIFIED, entry.modified)

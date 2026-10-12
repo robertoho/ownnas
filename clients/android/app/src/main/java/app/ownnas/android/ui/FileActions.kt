@@ -67,7 +67,7 @@ fun EntryMenu(entry: Entry, writable: Boolean, expanded: Boolean, onDismiss: () 
         if (!entry.dir) MenuItem("Share", Icons.Outlined.Share) { pick(EntryAction.Share) }
         if (writable) {
             MenuItem("Rename", Icons.Outlined.DriveFileRenameOutline) { pick(EntryAction.Rename) }
-            MenuItem("Move to Trash", Icons.Outlined.Delete) { pick(EntryAction.Trash) }
+            MenuItem(if (inTrash(entry.path)) "Delete permanently" else "Move to Trash", Icons.Outlined.Delete) { pick(EntryAction.Trash) }
         }
         if (entry.dir && !writable) {
             DropdownMenuItem(text = { Text("This server is read-only") }, enabled = false, onClick = {})
@@ -145,6 +145,17 @@ fun NameDialog(
 
 @Composable
 fun TrashDialog(entry: Entry, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    if (inTrash(entry.path)) {
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            icon = { Icon(Icons.Outlined.Delete, contentDescription = null) },
+            title = { Text("Delete permanently?") },
+            text = { Text("“${entry.name}” is already in the Trash. Deleting it here cannot be undone.") },
+            confirmButton = { TextButton(onClick = onConfirm) { Text("Delete") } },
+            dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        )
+        return
+    }
     AlertDialog(
         onDismissRequest = onDismiss,
         icon = { Icon(Icons.Outlined.Delete, contentDescription = null) },

@@ -15,6 +15,15 @@ data class SavedServer(
     val address: String,
     val username: String,
     val name: String,
+    val trust: Trust = Trust(),
+)
+
+/** Certificates to trust for an HTTPS server beyond the public ones. */
+data class Trust(
+    /** A private CA in PEM, such as the `ca.crt` from `ownnas tls generate`. */
+    val caPem: String? = null,
+    /** SHA-256 fingerprints of server certificates the user accepted. */
+    val pinned: List<String> = emptyList(),
 )
 
 /** Saved servers in shared preferences, with each sign-in token sealed by [SecretBox]. */
@@ -28,9 +37,9 @@ class ServerStore(context: Context) {
     fun token(id: String): String? = prefs.getString(tokenKey(id), null)?.let(SecretBox::open)
 
     /** Adds the server, or replaces the saved one with the same address and username. */
-    fun save(address: String, username: String, name: String, token: String): SavedServer {
+    fun save(address: String, username: String, name: String, token: String, trust: Trust): SavedServer {
         val existing = list.value.firstOrNull { it.address == address && it.username == username }
-        val server = SavedServer(existing?.id ?: UUID.randomUUID().toString(), address, username, name)
+        val server = SavedServer(existing?.id ?: UUID.randomUUID().toString(), address, username, name, trust)
         val updated = if (existing == null) list.value + server else list.value.map { if (it.id == server.id) server else it }
         prefs.edit {
             putString(LIST_KEY, encode(updated))
@@ -57,7 +66,12 @@ class ServerStore(context: Context) {
         val array = runCatching { JSONArray(prefs.getString(LIST_KEY, "[]")) }.getOrDefault(JSONArray())
         return (0 until array.length()).map { index ->
             val item = array.getJSONObject(index)
-            SavedServer(item.getString("id"), item.getString("address"), item.getString("username"), item.getString("name"))
+            val pins = item.optJSONArray("pinned")
+            val trust = Trust(
+                caPem = item.optString("caPem").takeIf { it.isNotEmpty() },
+                pinned = if (pins == null) emptyList() else (0 until pins.length()).map(pins::getString),
+            )
+            SavedServer(item.getString("id"), item.getString("address"), item.getString("username"), item.getString("name"), trust)
         }
     }
 
@@ -68,6 +82,8 @@ class ServerStore(context: Context) {
                 .put("address", server.address)
                 .put("username", server.username)
                 .put("name", server.name)
+                .put("caPem", server.trust.caPem ?: "")
+                .put("pinned", JSONArray(server.trust.pinned))
         },
     ).toString()
 

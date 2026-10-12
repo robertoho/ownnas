@@ -243,6 +243,10 @@ serve HTTP. You can also supply an existing PEM certificate chain and matching
 unencrypted PEM private key. Both TLS options are required together; invalid
 certificates or keys prevent HTTPS startup rather than falling back to HTTP.
 
+At startup `ownnas serve` prints `HTTPS certificate SHA-256: …`. The Android app shows the same
+fingerprint the first time it connects, and trusts the server once you confirm it matches, or
+when you pick `ca.crt` instead.
+
 Distribute **only `ca.crt` or `ca.cer`** to users, through a trusted channel. Never
 include `ca.key` or `server.key` in downloads or FTP uploads. Each installation
 should have its own private keys. Keep the certificate directory outside the shared folder. Restrict access to the key files on Windows

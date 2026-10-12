@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ownnas_core::api::{Api, ApiError};
+use ownnas_core::trust::Trust;
 use ownnas_core::{browse, manage, terminal};
 
 uniffi::setup_scaffolding!();
@@ -19,6 +20,8 @@ pub enum ClientError {
     Cancelled,
     /// Terminals have their own password: ask for it and call [`Server::unlock_terminals`].
     Locked,
+    /// The server's HTTPS certificate is not trusted: offer [`server_fingerprint`] to pin, or a CA file.
+    Untrusted,
     Failed { reason: String },
 }
 
@@ -30,6 +33,7 @@ impl std::fmt::Display for ClientError {
             ClientError::Conflict => write!(f, "Changed on the server"),
             ClientError::Cancelled => write!(f, "Cancelled"),
             ClientError::Locked => write!(f, "Enter the terminal password"),
+            ClientError::Untrusted => write!(f, "The server's certificate is not trusted"),
             ClientError::Failed { reason } => write!(f, "{reason}"),
         }
     }
@@ -43,6 +47,7 @@ impl From<ApiError> for ClientError {
             ApiError::Conflict => ClientError::Conflict,
             ApiError::Cancelled => ClientError::Cancelled,
             ApiError::Locked => ClientError::Locked,
+            ApiError::Untrusted => ClientError::Untrusted,
             ApiError::Other(reason) => ClientError::Failed { reason },
         }
     }
@@ -142,11 +147,30 @@ pub fn normalize_address(input: String) -> Result<String, ClientError> {
     browse::normalize_address(&input).map_err(failed)
 }
 
-/// Signs in with a password and returns a token for [`Server::new`].
+fn trust(ca_pem: Option<Vec<u8>>, pinned: Vec<String>) -> Trust {
+    Trust { ca_pem, pinned }
+}
+
+/// Signs in with a password and returns a token for [`Server::new`]. `ca_pem` is a private
+/// CA to trust (the `ca.crt` from `ownnas tls generate`); `pinned` are certificate
+/// fingerprints the user accepted.
 #[uniffi::export]
-pub fn sign_in(address: String, username: String, password: String, ca_pem: Option<Vec<u8>>) -> Result<String, ClientError> {
-    let api = Api::new(&address, None, ca_pem.as_deref()).map_err(failed)?;
+pub fn sign_in(
+    address: String,
+    username: String,
+    password: String,
+    ca_pem: Option<Vec<u8>>,
+    pinned: Vec<String>,
+) -> Result<String, ClientError> {
+    let api = Api::with_trust(&address, None, &trust(ca_pem, pinned)).map_err(failed)?;
     Ok(api.login(&username, &password)?)
+}
+
+/// The SHA-256 fingerprint (`AB:CD:…`) of the certificate an `https://` server presents, to
+/// compare with what `ownnas serve` prints before pinning it.
+#[uniffi::export]
+pub fn server_fingerprint(address: String) -> Result<String, ClientError> {
+    ownnas_core::trust::server_fingerprint(&address).map_err(failed)
 }
 
 /// One signed-in server.
@@ -158,8 +182,8 @@ pub struct Server {
 #[uniffi::export]
 impl Server {
     #[uniffi::constructor]
-    pub fn new(address: String, token: String, ca_pem: Option<Vec<u8>>) -> Result<Arc<Self>, ClientError> {
-        let api = Api::new(&address, Some(token), ca_pem.as_deref()).map_err(failed)?;
+    pub fn new(address: String, token: String, ca_pem: Option<Vec<u8>>, pinned: Vec<String>) -> Result<Arc<Self>, ClientError> {
+        let api = Api::with_trust(&address, Some(token), &trust(ca_pem, pinned)).map_err(failed)?;
         Ok(Arc::new(Server { api }))
     }
 

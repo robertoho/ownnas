@@ -10,6 +10,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import app.ownnas.android.OwnNasApp
 import app.ownnas.android.data.SavedServer
+import app.ownnas.android.data.Trust
 import app.ownnas.core.Account
 import app.ownnas.core.ClientException
 import app.ownnas.core.Conflict
@@ -17,6 +18,7 @@ import app.ownnas.core.Entry
 import app.ownnas.core.UploadResult
 import app.ownnas.core.Folder
 import app.ownnas.core.Server
+import app.ownnas.core.serverFingerprint
 import app.ownnas.core.TerminalInfo
 import app.ownnas.core.TerminalListener
 import app.ownnas.core.TerminalSession
@@ -90,8 +92,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun <T> call(id: String, block: (Server) -> T): T = hub.call(id, block)
 
-    suspend fun signIn(address: String, username: String, password: String): SavedServer =
-        withContext(Dispatchers.IO) { hub.signIn(address, username, password) }
+    suspend fun signIn(address: String, username: String, password: String, trust: Trust): SavedServer =
+        withContext(Dispatchers.IO) { hub.signIn(address, username, password, trust) }
+
+    /** The certificate fingerprint an `https://` server presents, before trusting it. */
+    suspend fun fingerprint(address: String): String =
+        withContext(Dispatchers.IO) { serverFingerprint(normalizeAddress(address)) }
 
     fun remove(id: String) {
         folders.keys.removeAll { it.first == id }
@@ -295,6 +301,7 @@ fun Throwable.userMessage(): String = when (this) {
     is ClientException.Conflict -> "This changed on the server. Try again."
     is ClientException.Cancelled -> "Cancelled"
     is ClientException.Locked -> "Enter the terminal password"
+    is ClientException.Untrusted -> "The server's certificate changed or is not trusted. Sign in again to check it."
     is ClientException.Failed -> reason
     else -> message ?: "Something went wrong"
 }

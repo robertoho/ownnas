@@ -27,6 +27,12 @@ What works now:
   The emulator and the WebSocket run in Rust (`crates/ownnas-core/src/terminal.rs`, using
   the `vt100` crate), so the iOS app can share them.
 
+- HTTPS with a private certificate: when a server's certificate is not publicly trusted, the
+  app shows its SHA-256 fingerprint to compare with the one `ownnas serve` prints, and pins it
+  once you confirm, or trusts the `ca.crt` from `ownnas tls generate` (which survives
+  certificate renewals). Trust is stored per server and also covers terminals and the
+  file picker.
+
 Uploads run while the app is open; background transfers come with sync.
 
 ## Build

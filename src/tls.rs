@@ -67,6 +67,16 @@ pub fn generate(out: &Path, hosts: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// The SHA-256 of the first certificate in a PEM file, as `AB:CD:…`.
+pub fn fingerprint_file(path: &Path) -> Option<String> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
+    use sha2::Digest;
+    let pem = std::fs::read(path).ok()?;
+    let cert = CertificateDer::pem_slice_iter(&pem).next()?.ok()?;
+    let digest = sha2::Sha256::digest(cert.as_ref());
+    Some(digest.iter().map(|byte| format!("{byte:02X}")).collect::<Vec<_>>().join(":"))
+}
+
 fn write_file(path: &Path, bytes: &[u8], secret: bool) -> Result<(), String> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);

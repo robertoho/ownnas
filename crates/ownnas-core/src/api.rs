@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::model::{Node, Stamp};
+use crate::trust::{client_config, untrusted, Trust};
 
 pub struct Api {
     agent: ureq::Agent,
@@ -47,6 +48,8 @@ pub enum ApiError {
     Conflict,
     Unauthorized,
     NotFound,
+    /// The server's HTTPS certificate is not trusted; offer to trust it (see `trust`).
+    Untrusted,
     /// Terminals have their own password; unlock them with it first.
     Locked,
     /// The caller stopped the transfer.
@@ -61,6 +64,7 @@ impl std::fmt::Display for ApiError {
             ApiError::Unauthorized => write!(f, "the server rejected the sign-in token; run `ownnas-sync setup` again"),
             ApiError::NotFound => write!(f, "not found on the server"),
             ApiError::Locked => write!(f, "enter the terminal password"),
+            ApiError::Untrusted => write!(f, "the server's certificate is not trusted"),
             ApiError::Cancelled => write!(f, "cancelled"),
             ApiError::Other(message) => write!(f, "{message}"),
         }
@@ -80,6 +84,7 @@ pub(crate) fn map_err(err: ureq::Error) -> ApiError {
             let message = body["error"].as_str().map(str::to_string).unwrap_or_else(|| format!("HTTP {code}"));
             ApiError::Other(message)
         }
+        ureq::Error::Transport(transport) if untrusted(&transport) => ApiError::Untrusted,
         ureq::Error::Transport(transport) => ApiError::Other(transport.to_string()),
     }
 }
@@ -94,28 +99,12 @@ fn base_param(base: Option<Stamp>) -> String {
 impl Api {
     /// `ca_pem` adds a private CA (such as the one `ownnas tls` generates) to the public roots.
     pub fn new(server: &str, token: Option<String>, ca_pem: Option<&[u8]>) -> Result<Self, String> {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        if let Some(pem) = ca_pem {
-            use rustls::pki_types::{pem::PemObject, CertificateDer};
-            let mut added = 0;
-            for cert in CertificateDer::pem_slice_iter(pem) {
-                let cert = cert.map_err(|err| format!("Could not read the CA certificate: {err}"))?;
-                roots
-                    .add(cert)
-                    .map_err(|err| format!("Could not use the CA certificate: {err}"))?;
-                added += 1;
-            }
-            if added == 0 {
-                return Err("The CA certificate file has no PEM certificates".into());
-            }
-        }
-        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .map_err(|err| err.to_string())?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let tls = Arc::new(tls);
+        Self::with_trust(server, token, &Trust { ca_pem: ca_pem.map(<[u8]>::to_vec), pinned: Vec::new() })
+    }
+
+    /// Like [`Api::new`], also accepting server certificates pinned by fingerprint.
+    pub fn with_trust(server: &str, token: Option<String>, trust: &Trust) -> Result<Self, String> {
+        let tls = client_config(trust)?;
         let agent = ureq::AgentBuilder::new()
             .tls_config(tls.clone())
             .timeout_connect(Duration::from_secs(15))
