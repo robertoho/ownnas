@@ -3007,6 +3007,9 @@ fn pasted_file_name(name: &str) -> String {
     if clean.trim_matches('_').is_empty() { "pasted-file".to_string() } else { clean }
 }
 
+/// Folder, in the terminal's folder, that holds files pasted into it until the terminal closes.
+const PASTED_DIR: &str = "pasted";
+
 /// Stores a file pasted or dropped into a terminal and returns its path on the server.
 async fn terminal_upload(
     State(state): State<std::sync::Arc<AppState>>,
@@ -3021,11 +3024,41 @@ async fn terminal_upload(
         .terminals
         .get(&query.id)
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That terminal is closed"))?;
-    let dir = state.terminal_uploads.join(&query.id);
+    // A `pasted` folder where the terminal is, so agents running there can find and read the
+    // files: many only look inside their own folder.
+    let located = {
+        let root = state.root.clone();
+        let session = session.clone();
+        tokio::task::spawn_blocking(move || {
+            let root = root.canonicalize().ok()?;
+            [session.current_dir(), session.cwd().to_path_buf()].into_iter().find_map(|candidate| {
+                let dir = candidate.canonicalize().ok()?;
+                let rel = dir.strip_prefix(&root).ok()?.to_string_lossy().replace('\\', "/");
+                if files::is_under_trash(&rel) {
+                    return None;
+                }
+                let rel = if rel.is_empty() { PASTED_DIR.to_string() } else { format!("{rel}/{PASTED_DIR}") };
+                Some((dir.join(PASTED_DIR), rel))
+            })
+        })
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the pasted file"))?
+    };
+    // Outside the library (or in the Trash), fall back to the server's own folder.
+    let (dir, library_dir) = match located {
+        Some((dir, rel)) => (dir, Some(rel)),
+        None => (state.terminal_uploads.join(&query.id), None),
+    };
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the pasted file"))?;
-    session.track_uploads(&dir);
+    if library_dir.is_some() {
+        // Keep pasted files out of `git status`, so agents do not commit them.
+        let ignore = dir.join(".gitignore");
+        if !tokio::fs::try_exists(&ignore).await.unwrap_or(true) {
+            let _ = tokio::fs::write(&ignore, crate::terminal::PASTED_GITIGNORE).await;
+        }
+    }
     let name = pasted_file_name(query.name.as_deref().unwrap_or(""));
     let (stem, ext) = match name.rfind('.') {
         Some(index) if index > 0 => (&name[..index], &name[index..]),
@@ -3060,6 +3093,10 @@ async fn terminal_upload(
             io::ErrorKind::ConnectionAborted => ApiError::new(StatusCode::BAD_REQUEST, "The upload was interrupted"),
             _ => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the pasted file"),
         });
+    }
+    session.track_upload(&dest);
+    if let Some(rel) = library_dir {
+        invalidate_sizes(&state, &rel);
     }
     Ok(Json(json!({ "path": dest.display().to_string() })))
 }

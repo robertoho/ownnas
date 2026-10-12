@@ -144,7 +144,8 @@ pub struct Session {
     shell_pid: Option<u32>,
     name: Mutex<Option<String>>,
     /// Folder holding files pasted into this terminal; deleted with the terminal.
-    uploads: Mutex<Option<PathBuf>>,
+    /// Files pasted into this terminal, removed with it.
+    uploads: Mutex<Vec<PathBuf>>,
     agent: Mutex<Agent>,
     changes: broadcast::Sender<()>,
     screen: Mutex<Screen>,
@@ -176,13 +177,33 @@ impl Session {
     }
 
     /// Remembers the folder of files pasted into this terminal, for cleanup.
-    pub fn track_uploads(&self, dir: &Path) {
-        *self.uploads.lock().unwrap_or_else(|err| err.into_inner()) = Some(dir.to_path_buf());
+    pub fn track_upload(&self, file: &Path) {
+        self.uploads.lock().unwrap_or_else(|err| err.into_inner()).push(file.to_path_buf());
     }
 
+    /// Deletes the files this terminal pasted, and their folders only once nothing else is in them.
     fn remove_uploads(&self) {
-        if let Some(dir) = self.uploads.lock().unwrap_or_else(|err| err.into_inner()).take() {
-            let _ = std::fs::remove_dir_all(dir);
+        let files = std::mem::take(&mut *self.uploads.lock().unwrap_or_else(|err| err.into_inner()));
+        let mut folders: Vec<PathBuf> = Vec::new();
+        for file in files {
+            let _ = std::fs::remove_file(&file);
+            if let Some(parent) = file.parent() {
+                if !folders.iter().any(|folder| folder == parent) {
+                    folders.push(parent.to_path_buf());
+                }
+            }
+        }
+        for folder in folders {
+            // The `.gitignore` that pasting added goes once it is all that is left.
+            let ignore = folder.join(".gitignore");
+            let only_ignore = std::fs::read_dir(&folder)
+                .map(|entries| entries.flatten().all(|entry| entry.file_name() == ".gitignore"))
+                .unwrap_or(false);
+            if only_ignore && std::fs::read(&ignore).is_ok_and(|bytes| bytes == PASTED_GITIGNORE.as_bytes()) {
+                let _ = std::fs::remove_file(&ignore);
+            }
+            // Fails, and so keeps the folder, while anyone else's files are in it.
+            let _ = std::fs::remove_dir(folder);
         }
     }
 
@@ -336,6 +357,9 @@ impl Session {
         }
     }
 }
+
+/// Written into the folder of pasted files so git ignores everything in it.
+pub const PASTED_GITIGNORE: &str = "# Files pasted into OwnNAS terminals; removed when the terminal closes.\n*\n";
 
 impl Drop for Session {
     fn drop(&mut self) {
@@ -605,7 +629,7 @@ fn spawn_session(
         cwd: cwd.to_path_buf(),
         shell_pid,
         name: Mutex::new(None),
-        uploads: Mutex::new(None),
+        uploads: Mutex::new(Vec::new()),
         agent: Mutex::new(Agent::default()),
         changes,
         screen: Mutex::new(Screen {

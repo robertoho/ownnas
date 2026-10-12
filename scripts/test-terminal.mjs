@@ -275,12 +275,13 @@ try {
     assert.equal(agent.name, null, 'the agent is forgotten when it exits');
   }
 
-  // Files pasted into a terminal go to its own temporary folder, removed with the terminal.
+  // Files pasted into a terminal go to a `pasted` folder where the terminal is, so agents running
+  // there can find them, and are removed with the terminal.
   const upload = (name, body, headers = { 'x-ownnas': '1' }) => fetch(`${base}/api/terminals/upload?id=${agentTerminal}&name=${encodeURIComponent(name)}`, { method: 'POST', headers: { cookie, ...headers }, body });
   let pasted = await upload('my screen shot.png', 'png-bytes');
   assert.equal(pasted.status, 200);
   const firstPath = (await pasted.json()).path;
-  assert.ok(firstPath.startsWith(path.join(tmp, 'data', 'terminal-uploads', agentTerminal)), firstPath);
+  assert.equal(path.dirname(firstPath), path.join(await fs.realpath(library), 'proj', 'pasted'), firstPath);
   assert.ok(firstPath.endsWith(`${path.sep}my_screen_shot.png`), 'names are made safe to type');
   assert.equal(await fs.readFile(firstPath, 'utf8'), 'png-bytes');
   const secondPath = (await (await upload('my screen shot.png', 'again')).json()).path;
@@ -324,8 +325,13 @@ try {
   assert.deepEqual(JSON.parse(await fs.readFile(path.join(home, '.claude', 'settings.json'), 'utf8')), { theme: 'dark' });
   await assert.rejects(fs.access(path.join(home, '.config', 'opencode', 'plugins', 'ownnas.js')));
   shell.socket.close();
+  // Someone else's file in the same folder stays; only the terminal's own pastes go.
+  await fs.writeFile(path.join(path.dirname(firstPath), 'mine.txt'), 'keep');
   await call('DELETE', `/api/terminals?id=${agentTerminal}`);
-  await assert.rejects(fs.access(path.dirname(firstPath)), 'pasted files are deleted with the terminal');
+  await assert.rejects(fs.access(firstPath), 'pasted files are deleted with the terminal');
+  await assert.rejects(fs.access(secondPath));
+  assert.equal(await fs.readFile(path.join(path.dirname(firstPath), 'mine.txt'), 'utf8'), 'keep');
+  await fs.rm(path.join(path.dirname(firstPath), 'mine.txt'));
 
   // Signing out locks terminals again.
   const running = (await call('POST', '/api/terminals', { path: '' })).data.terminal.id;

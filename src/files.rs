@@ -923,7 +923,7 @@ fn is_trash_root(rel: &str) -> bool {
     rel == TRASH_DIR || rel == LEGACY_TRASH_DIR
 }
 
-fn is_under_trash(rel: &str) -> bool {
+pub(crate) fn is_under_trash(rel: &str) -> bool {
     is_trash_root(rel)
         || rel.starts_with(&format!("{TRASH_DIR}/"))
         || rel.starts_with(&format!("{LEGACY_TRASH_DIR}/"))
