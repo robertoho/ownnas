@@ -134,6 +134,17 @@ internal fun EndedBadge(info: TerminalInfo, modifier: Modifier = Modifier) {
     }
 }
 
+/**
+ * A shortcut that recreates this terminal: same folder, and the coding agent running in it
+ * (agent ids are their commands: opencode, claude, codex, …).
+ */
+internal fun shortcutFrom(info: TerminalInfo, serverId: String, serverName: String): TerminalShortcut {
+    val folder = info.path.substringAfterLast('/').ifEmpty { serverName }
+    val name = info.name?.takeIf { it.isNotBlank() }
+        ?: listOfNotNull(info.agent.label ?: info.agent.name, folder).distinct().joinToString(" · ")
+    return TerminalShortcut(name = name, serverId = serverId, path = info.path, command = info.agent.name ?: "")
+}
+
 internal fun titleOf(info: TerminalInfo) =
     info.name?.takeIf { it.isNotBlank() } ?: info.title?.takeIf { it.isNotBlank() } ?: info.path.ifEmpty { "/" }
 
@@ -150,6 +161,7 @@ fun TerminalsScreen(vm: AppViewModel, serverId: String, path: String) {
     var refreshing by remember { mutableStateOf(false) }
     var ending by remember { mutableStateOf<TerminalInfo?>(null) }
     var opening by remember { mutableStateOf(false) }
+    var saving by remember { mutableStateOf<TerminalInfo?>(null) }
 
     // Agents change state on their own, so keep the list fresh while it is showing.
     LaunchedEffect(reload) {
@@ -214,8 +226,26 @@ fun TerminalsScreen(vm: AppViewModel, serverId: String, path: String) {
                 list == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { if (!locked) CircularProgressIndicator() }
                 list.isEmpty() -> Centered("No terminals are open. Start one in this folder with the button below.")
                 else -> LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 88.dp)) {
-                    items(list, key = { it.id }) { info -> TerminalRow(info, onOpen = { vm.push(Screen.Terminal(serverId, info.id)) }, onEnd = { ending = info }) }
+                    items(list, key = { it.id }) { info ->
+                        TerminalRow(
+                            info,
+                            onOpen = { vm.push(Screen.Terminal(serverId, info.id)) },
+                            onEnd = { ending = info },
+                            onShortcut = { saving = info },
+                        )
+                    }
                 }
+            }
+        }
+    }
+
+    saving?.let { info ->
+        ShortcutDialog(vm, shortcutFrom(info, serverId, server.name), onDismiss = { saving = null }) { shortcut ->
+            saving = null
+            scope.launch {
+                vm.saveShortcutFrom(info.id, shortcut)
+                snackbar.showSnackbar("Saved “${shortcut.name}” in Shortcuts")
+                reload++
             }
         }
     }
@@ -250,7 +280,7 @@ fun TerminalsScreen(vm: AppViewModel, serverId: String, path: String) {
 }
 
 @Composable
-private fun TerminalRow(info: TerminalInfo, onOpen: () -> Unit, onEnd: () -> Unit) {
+private fun TerminalRow(info: TerminalInfo, onOpen: () -> Unit, onEnd: () -> Unit, onShortcut: () -> Unit) {
     var menu by remember { mutableStateOf(false) }
     val status = agentStatus(info)
     ListItem(
@@ -297,6 +327,7 @@ private fun TerminalRow(info: TerminalInfo, onOpen: () -> Unit, onEnd: () -> Uni
             Box {
                 IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "Actions") }
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                    if (info.running) DropdownMenuItem(text = { Text("Save as shortcut…") }, onClick = { menu = false; onShortcut() })
                     DropdownMenuItem(text = { Text("End terminal") }, onClick = { menu = false; onEnd() })
                 }
             }
@@ -611,14 +642,18 @@ fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String, start
         SnippetDialog(null, onDismiss = { newSnippet = false }) { vm.shortcuts.save(it); newSnippet = false }
     }
     if (savingShortcut) {
+        val serverName = vm.server(serverId)?.name ?: ""
         ShortcutDialog(
             vm,
-            TerminalShortcut(name = info?.let(::titleOf) ?: "Terminal", serverId = serverId, path = info?.path ?: "", command = ""),
+            info?.let { shortcutFrom(it, serverId, serverName) }
+                ?: TerminalShortcut(name = "Terminal", serverId = serverId, path = "", command = ""),
             onDismiss = { savingShortcut = false },
         ) {
-            vm.shortcuts.save(it)
             savingShortcut = false
-            scope.launch { snackbar.showSnackbar("Saved “${it.name}” in Shortcuts") }
+            scope.launch {
+                vm.saveShortcutFrom(terminalId, it)
+                snackbar.showSnackbar("Saved “${it.name}” in Shortcuts")
+            }
         }
     }
 

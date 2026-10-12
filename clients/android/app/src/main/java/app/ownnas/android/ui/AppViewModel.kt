@@ -276,6 +276,19 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    suspend fun renameTerminal(id: String, terminalId: String, name: String) {
+        call(id) { it.renameTerminal(terminalId, name) }
+    }
+
+    /**
+     * Saves a shortcut made from an open terminal and names that terminal after it, so the
+     * shortcut goes straight back to it while it runs.
+     */
+    suspend fun saveShortcutFrom(terminalId: String, shortcut: TerminalShortcut) {
+        shortcuts.save(shortcut)
+        runCatching { renameTerminal(shortcut.serverId, terminalId, shortcut.name) }
+    }
+
     suspend fun closeTerminal(id: String, terminalId: String) {
         call(id) { it.closeTerminal(terminalId) }
     }

@@ -62,7 +62,11 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.ownnas.android.data.Snippet
 import app.ownnas.android.data.TerminalShortcut
+import app.ownnas.android.ui.terminal.shortcutFrom
+import app.ownnas.android.ui.terminal.titleOf
 import app.ownnas.core.ClientException
+import app.ownnas.core.TerminalInfo
+import androidx.compose.runtime.produceState
 import kotlinx.coroutines.launch
 
 /** What the editor is showing: a new or existing shortcut or snippet. */
@@ -83,6 +87,9 @@ fun ShortcutsTab(vm: AppViewModel, insets: WindowInsets) {
     var editing by remember { mutableStateOf<Editing?>(null) }
     var adding by remember { mutableStateOf(false) }
     var opening by remember { mutableStateOf<String?>(null) }
+    var choosing by remember { mutableStateOf(false) }
+    // A shortcut being made from an open terminal, which gets named after it once saved.
+    var fromTerminal by remember { mutableStateOf<Pair<String, TerminalShortcut>?>(null) }
 
     fun open(shortcut: TerminalShortcut) {
         opening = shortcut.id
@@ -107,6 +114,12 @@ fun ShortcutsTab(vm: AppViewModel, insets: WindowInsets) {
             Box {
                 FloatingActionButton(onClick = { adding = true }) { Icon(Icons.Filled.Add, contentDescription = "Add") }
                 DropdownMenu(expanded = adding, onDismissRequest = { adding = false }) {
+                    DropdownMenuItem(
+                        text = { Text("From an open terminal…") },
+                        leadingIcon = { Icon(Icons.Outlined.Terminal, null) },
+                        enabled = servers.isNotEmpty(),
+                        onClick = { adding = false; choosing = true },
+                    )
                     DropdownMenuItem(
                         text = { Text("Terminal shortcut") },
                         leadingIcon = { Icon(Icons.Outlined.Terminal, null) },
@@ -190,6 +203,19 @@ fun ShortcutsTab(vm: AppViewModel, insets: WindowInsets) {
                     )
                 }
             }
+        }
+    }
+
+    if (choosing) {
+        OpenTerminalsDialog(vm, onDismiss = { choosing = false }) { serverId, info ->
+            choosing = false
+            fromTerminal = info.id to shortcutFrom(info, serverId, vm.server(serverId)?.name ?: "")
+        }
+    }
+    fromTerminal?.let { (terminalId, prefilled) ->
+        ShortcutDialog(vm, prefilled, onDismiss = { fromTerminal = null }) { saved ->
+            fromTerminal = null
+            scope.launch { vm.saveShortcutFrom(terminalId, saved) }
         }
     }
 
@@ -373,4 +399,46 @@ fun SnippetsSheet(snippets: List<Snippet>, onDismiss: () -> Unit, onRun: (Snippe
             TextButton(onClick = onNew, modifier = Modifier.padding(horizontal = 12.dp)) { Text("New snippet") }
         }
     }
+}
+
+/** Running terminals on every server, to pick one to make a shortcut from. */
+@Composable
+private fun OpenTerminalsDialog(vm: AppViewModel, onDismiss: () -> Unit, onPick: (String, TerminalInfo) -> Unit) {
+    val servers by vm.servers.collectAsStateWithLifecycle()
+    val found by produceState<List<Pair<String, TerminalInfo>>?>(null, servers) {
+        value = servers.flatMap { server ->
+            // Servers without terminals, or locked ones, simply have nothing to offer.
+            runCatching { vm.terminals(server.id) }.getOrDefault(emptyList()).filter { it.running }.map { server.id to it }
+        }
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Make a shortcut from") },
+        text = {
+            val list = found
+            when {
+                list == null -> Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+                list.isEmpty() -> Text("No terminals are open. Open one from a folder first, then come back.")
+                else -> Column(Modifier.verticalScroll(rememberScrollState())) {
+                    list.forEach { (serverId, info) ->
+                        ListItem(
+                            modifier = Modifier.clickable { onPick(serverId, info) },
+                            leadingContent = { Icon(Icons.Outlined.Terminal, null) },
+                            headlineContent = { Text(titleOf(info), maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                            supportingContent = {
+                                val agent = info.agent.label ?: info.agent.name
+                                Text(
+                                    listOfNotNull("${vm.server(serverId)?.name ?: ""}/${info.path}".trimEnd('/'), agent).joinToString(" · "),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            },
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
