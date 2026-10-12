@@ -50,4 +50,4 @@ lto = "thin"
 strip = true
 
 [workspace]
-members = ["clients/desktop"]
+members = ["clients/desktop", "crates/ownnas-core", "crates/ownnas-ffi"]

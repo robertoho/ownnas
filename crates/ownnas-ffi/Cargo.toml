@@ -1,0 +1,22 @@
+[package]
+name = "ownnas-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "UniFFI bindings to ownnas-core for the native apps (Kotlin now, Swift later)"
+
+[lib]
+name = "ownnas_ffi"
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+# Generates the Kotlin (or Swift) sources from a built library: see clients/android/README.md.
+name = "uniffi-bindgen"
+path = "src/bindgen.rs"
+required-features = ["cli"]
+
+[features]
+cli = ["uniffi/cli"]
+
+[dependencies]
+ownnas-core = { path = "../ownnas-core" }
+uniffi = "0.32"

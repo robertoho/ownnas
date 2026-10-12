@@ -1,0 +1,7 @@
+//! Client library for OwnNAS servers, shared by the `ownnas-sync` CLI and the native apps.
+pub mod api;
+pub mod browse;
+pub mod engine;
+pub mod local;
+pub mod model;
+pub mod plan;

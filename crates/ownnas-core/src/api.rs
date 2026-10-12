@@ -59,7 +59,7 @@ impl std::fmt::Display for ApiError {
     }
 }
 
-fn map_err(err: ureq::Error) -> ApiError {
+pub(crate) fn map_err(err: ureq::Error) -> ApiError {
     match err {
         ureq::Error::Status(401, _) => ApiError::Unauthorized,
         ureq::Error::Status(404, _) => ApiError::NotFound,
@@ -123,7 +123,7 @@ impl Api {
         format!("{}{}", self.server, path)
     }
 
-    fn request(&self, method: &str, path: &str) -> ureq::Request {
+    pub(crate) fn request(&self, method: &str, path: &str) -> ureq::Request {
         let request = self.agent.request(method, &self.url(path));
         match &self.token {
             Some(token) => request.set("Authorization", &format!("Bearer {token}")),

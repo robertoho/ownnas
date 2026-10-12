@@ -1,0 +1,128 @@
+package app.ownnas.android.ui
+
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.outlined.Dns
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExtendedFloatingActionButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LargeTopAppBar
+import androidx.compose.material3.ListItem
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import app.ownnas.android.data.SavedServer
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ServersScreen(vm: AppViewModel) {
+    val servers by vm.servers.collectAsStateWithLifecycle()
+    var removing by remember { mutableStateOf<SavedServer?>(null) }
+    val scroll = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
+    Scaffold(
+        modifier = Modifier.nestedScroll(scroll.nestedScrollConnection),
+        topBar = { LargeTopAppBar(title = { Text("OwnNAS") }, scrollBehavior = scroll) },
+        floatingActionButton = {
+            if (servers.isNotEmpty()) {
+                ExtendedFloatingActionButton(
+                    onClick = { vm.push(Screen.SignIn()) },
+                    icon = { Icon(Icons.Filled.Add, contentDescription = null) },
+                    text = { Text("Add server") },
+                )
+            }
+        },
+    ) { padding ->
+        if (servers.isEmpty()) {
+            Welcome(Modifier.padding(padding)) { vm.push(Screen.SignIn()) }
+        } else {
+            LazyColumn(contentPadding = padding) {
+                items(servers, key = { it.id }) { server ->
+                    ServerRow(
+                        server = server,
+                        onOpen = { vm.push(Screen.Browse(server.id, "")) },
+                        onSignIn = { vm.push(Screen.SignIn(server)) },
+                        onRemove = { removing = server },
+                    )
+                }
+            }
+        }
+    }
+    removing?.let { server ->
+        AlertDialog(
+            onDismissRequest = { removing = null },
+            title = { Text("Remove ${server.name}?") },
+            text = { Text("This signs ${server.username} out on this phone. Nothing on the server is deleted.") },
+            confirmButton = {
+                TextButton(onClick = { vm.remove(server.id); removing = null }) { Text("Remove") }
+            },
+            dismissButton = { TextButton(onClick = { removing = null }) { Text("Cancel") } },
+        )
+    }
+}
+
+@Composable
+private fun ServerRow(server: SavedServer, onOpen: () -> Unit, onSignIn: () -> Unit, onRemove: () -> Unit) {
+    var menu by remember { mutableStateOf(false) }
+    ListItem(
+        modifier = Modifier.clickable(onClick = onOpen),
+        leadingContent = { Icon(Icons.Outlined.Dns, contentDescription = null) },
+        headlineContent = { Text(server.name) },
+        supportingContent = { Text("${server.username} · ${server.address.substringAfter("://")}") },
+        trailingContent = {
+            Box {
+                IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "More") }
+                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                    DropdownMenuItem(text = { Text("Sign in again") }, onClick = { menu = false; onSignIn() })
+                    DropdownMenuItem(text = { Text("Remove") }, onClick = { menu = false; onRemove() })
+                }
+            }
+        },
+    )
+}
+
+@Composable
+private fun Welcome(modifier: Modifier, onAdd: () -> Unit) {
+    Column(
+        modifier = modifier.fillMaxSize().padding(32.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterVertically),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Icon(Icons.Outlined.Dns, contentDescription = null, modifier = Modifier.size(56.dp), tint = MaterialTheme.colorScheme.primary)
+        Text("Connect to your OwnNAS", style = MaterialTheme.typography.headlineSmall)
+        Text(
+            "Sign in with the address, username, and password you use in the browser.",
+            style = MaterialTheme.typography.bodyMedium,
+            textAlign = TextAlign.Center,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Button(onClick = onAdd) { Text("Add server") }
+    }
+}

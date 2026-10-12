@@ -1,18 +1,13 @@
 //! `ownnas-sync`: keeps a local folder and a folder on an OwnNAS server in sync.
-mod api;
-mod engine;
-mod local;
-mod model;
-mod plan;
-
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
-use api::Api;
-use model::Config;
+use ownnas_core::api::Api;
+use ownnas_core::model::{self, Config};
+use ownnas_core::{engine, local};
 
 #[derive(Parser)]
 #[command(name = "ownnas-sync", version, about = "Two-way folder sync with an OwnNAS server")]
