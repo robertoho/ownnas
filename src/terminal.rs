@@ -545,6 +545,8 @@ fn spawn_session(
     command.cwd(cwd);
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
+    // macOS and BSD `ls` only color their output when asked; GNU `ls` ignores this.
+    command.env("CLICOLOR", "1");
     command.env("TERM_PROGRAM", "OwnNAS");
     // Never hand server secrets (such as OWNNAS_PASSWORD) to the shell.
     for (key, _) in std::env::vars_os() {

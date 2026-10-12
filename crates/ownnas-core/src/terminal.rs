@@ -581,9 +581,11 @@ fn snapshot_of(screen: &vt100::Screen, title: Option<String>) -> Snapshot {
             let text = if cell.has_contents() { cell.contents() } else { " " };
             let (mut fg, mut bg) = (color(cell.fgcolor(), cell.bold()), color(cell.bgcolor(), false));
             if cell.inverse() {
-                // 1 stands for "the default color of the other side", resolved by the app.
-                let swap = |c: u32, other_default: u32| if c == 0 { other_default } else { c };
-                (fg, bg) = (swap(bg, INVERSE_DEFAULT_BG), swap(fg, INVERSE_DEFAULT_FG));
+                // Text takes the background's color and the reverse; a default color on either
+                // side becomes a marker the app resolves with its theme.
+                let text = if bg == 0 { DEFAULT_BACKGROUND } else { bg };
+                let fill = if fg == 0 { DEFAULT_FOREGROUND } else { fg };
+                (fg, bg) = (text, fill);
             }
             let looks = (fg, bg, cell.bold(), cell.dim(), cell.italic(), cell.underline());
             match runs.last_mut() {
@@ -628,10 +630,11 @@ fn snapshot_of(screen: &vt100::Screen, title: Option<String>) -> Snapshot {
     }
 }
 
-/// Inverse text on the default colors: the app draws the default background as text and the
-/// default foreground as the background. Real colors always have an alpha of 0xFF.
-pub const INVERSE_DEFAULT_FG: u32 = 1;
-pub const INVERSE_DEFAULT_BG: u32 = 2;
+/// Markers for inverse text on the default colors, which only the app's theme knows: "the
+/// default background color" (used for text) and "the default text color" (used to fill).
+/// Real colors always have an alpha of 0xFF, and 0 is each side's own default.
+pub const DEFAULT_BACKGROUND: u32 = 1;
+pub const DEFAULT_FOREGROUND: u32 = 2;
 
 /// xterm.js's default palette, so terminals look the same as in the web app.
 const ANSI: [u32; 16] = [
@@ -705,6 +708,17 @@ mod tests {
         assert_eq!(shell_quote("/tmp/up/shot.png"), "/tmp/up/shot.png");
         assert_eq!(shell_quote("/tmp/my shot.png"), "'/tmp/my shot.png'");
         assert_eq!(shell_quote("/tmp/it's.png"), "'/tmp/it'\\''s.png'");
+    }
+
+    #[test]
+    fn inverse_text_swaps_its_colors() {
+        let mut parser = vt100::Parser::new_with_callbacks(1, 10, 0, Titles::default());
+        parser.process(b"\x1b[7mab\x1b[0m\x1b[7;31mc");
+        let line = &snapshot_of(parser.screen(), None).lines[0];
+        // Default colors: drawn with the theme's background as text on its text color.
+        assert_eq!((line[0].text.as_str(), line[0].fg, line[0].bg), ("ab", DEFAULT_BACKGROUND, DEFAULT_FOREGROUND));
+        // Red text inverted: background-colored text on red.
+        assert_eq!((line[1].text.as_str(), line[1].fg, line[1].bg), ("c", DEFAULT_BACKGROUND, 0xffcc0000));
     }
 
     #[test]
