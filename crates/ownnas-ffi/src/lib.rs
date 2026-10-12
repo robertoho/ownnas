@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ownnas_core::api::{Api, ApiError};
-use ownnas_core::{browse, manage};
+use ownnas_core::{browse, manage, terminal};
 
 uniffi::setup_scaffolding!();
 
@@ -17,6 +17,8 @@ pub enum ClientError {
     Conflict,
     /// [`Transfer::keep_going`] returned false.
     Cancelled,
+    /// Terminals have their own password: ask for it and call [`Server::unlock_terminals`].
+    Locked,
     Failed { reason: String },
 }
 
@@ -27,6 +29,7 @@ impl std::fmt::Display for ClientError {
             ClientError::NotFound => write!(f, "Not found on the server"),
             ClientError::Conflict => write!(f, "Changed on the server"),
             ClientError::Cancelled => write!(f, "Cancelled"),
+            ClientError::Locked => write!(f, "Enter the terminal password"),
             ClientError::Failed { reason } => write!(f, "{reason}"),
         }
     }
@@ -39,6 +42,7 @@ impl From<ApiError> for ClientError {
             ApiError::NotFound => ClientError::NotFound,
             ApiError::Conflict => ClientError::Conflict,
             ApiError::Cancelled => ClientError::Cancelled,
+            ApiError::Locked => ClientError::Locked,
             ApiError::Other(reason) => ClientError::Failed { reason },
         }
     }
@@ -266,5 +270,227 @@ impl Server {
             manage::Uploaded::Skipped => UploadResult::Skipped,
             manage::Uploaded::Exists(existing) => UploadResult::Exists { existing: existing.into() },
         })
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct Agent {
+    /// Agent id such as "claude"; `None` when no coding agent runs in the terminal.
+    pub name: Option<String>,
+    pub label: Option<String>,
+    /// "working", "waiting" (needs you), "idle", "done", or "error".
+    pub status: Option<String>,
+    pub detail: Option<String>,
+    pub attention: Option<String>,
+    pub last_message: Option<String>,
+}
+
+#[derive(uniffi::Record)]
+pub struct TerminalInfo {
+    pub id: String,
+    pub path: String,
+    pub owner: String,
+    /// Milliseconds since the Unix epoch.
+    pub created: i64,
+    pub running: bool,
+    pub exit_code: Option<u32>,
+    pub title: Option<String>,
+    pub name: Option<String>,
+    pub agent: Agent,
+}
+
+impl From<terminal::TerminalInfo> for TerminalInfo {
+    fn from(info: terminal::TerminalInfo) -> Self {
+        TerminalInfo {
+            id: info.id,
+            path: info.path,
+            owner: info.owner,
+            created: info.created.saturating_mul(1000),
+            running: info.running,
+            exit_code: info.exit_code,
+            title: info.title,
+            name: info.name,
+            agent: Agent {
+                name: info.agent.name,
+                label: info.agent.label,
+                status: info.agent.status,
+                detail: info.agent.detail,
+                attention: info.agent.attention,
+                last_message: info.agent.last_message,
+            },
+        }
+    }
+}
+
+#[uniffi::export]
+impl Server {
+    /// Every open terminal; [`ClientError::Locked`] means ask for the terminal password.
+    pub fn terminals(&self) -> Result<Vec<TerminalInfo>, ClientError> {
+        Ok(self.api.terminals()?.into_iter().map(TerminalInfo::from).collect())
+    }
+
+    /// Starts a shell in the folder `path`.
+    pub fn open_terminal(&self, path: String, rows: u16, cols: u16) -> Result<TerminalInfo, ClientError> {
+        Ok(self.api.open_terminal(&path, cols, rows)?.into())
+    }
+
+    /// Ends a terminal and everything running in it.
+    pub fn close_terminal(&self, id: String) -> Result<(), ClientError> {
+        Ok(self.api.close_terminal(&id)?)
+    }
+
+    pub fn unlock_terminals(&self, password: String) -> Result<(), ClientError> {
+        Ok(self.api.unlock_terminals(&password)?)
+    }
+
+    pub fn mark_terminal_seen(&self, id: String) -> Result<(), ClientError> {
+        Ok(self.api.mark_terminal_seen(&id)?)
+    }
+
+    /// Connects to a terminal's screen. It reconnects by itself until closed.
+    pub fn connect_terminal(
+        &self,
+        id: String,
+        rows: u16,
+        cols: u16,
+        listener: Arc<dyn TerminalListener>,
+    ) -> Result<Arc<TerminalSession>, ClientError> {
+        let session = terminal::Session::connect(&self.api, &id, rows, cols, Arc::new(Relay(listener)))?;
+        Ok(Arc::new(TerminalSession { session }))
+    }
+}
+
+#[derive(uniffi::Enum, Clone, Copy)]
+pub enum TerminalConnection {
+    Connecting,
+    Live,
+    Reconnecting,
+    Exited { code: Option<u32> },
+    Closed,
+}
+
+/// Hears about a terminal session, on the session's own thread.
+#[uniffi::export(with_foreign)]
+pub trait TerminalListener: Send + Sync {
+    /// The screen changed; draw a new [`TerminalSession::snapshot`] when convenient.
+    fn screen_changed(&self);
+    fn connection_changed(&self, connection: TerminalConnection, message: Option<String>);
+}
+
+struct Relay(Arc<dyn TerminalListener>);
+
+impl terminal::Listener for Relay {
+    fn screen_changed(&self) {
+        self.0.screen_changed();
+    }
+
+    fn connection_changed(&self, connection: terminal::Connection, message: Option<String>) {
+        let connection = match connection {
+            terminal::Connection::Connecting => TerminalConnection::Connecting,
+            terminal::Connection::Live => TerminalConnection::Live,
+            terminal::Connection::Reconnecting => TerminalConnection::Reconnecting,
+            terminal::Connection::Exited(code) => TerminalConnection::Exited { code },
+            terminal::Connection::Closed => TerminalConnection::Closed,
+        };
+        self.0.connection_changed(connection, message);
+    }
+}
+
+/// A run of cells that look the same. Colors are 0xAARRGGBB; 0 is the theme's default color,
+/// 1 the default background drawn as text (inverse), and 2 the default text color drawn as
+/// background.
+#[derive(uniffi::Record)]
+pub struct TerminalRun {
+    pub col: u16,
+    pub width: u16,
+    pub text: String,
+    pub fg: u32,
+    pub bg: u32,
+    pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
+    pub underline: bool,
+}
+
+#[derive(uniffi::Record)]
+pub struct TerminalScreen {
+    pub rows: u16,
+    pub cols: u16,
+    pub lines: Vec<Vec<TerminalRun>>,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    pub cursor_visible: bool,
+    pub scrolled_back: u32,
+    pub application_cursor: bool,
+    pub title: Option<String>,
+}
+
+#[derive(uniffi::Object)]
+pub struct TerminalSession {
+    session: terminal::Session,
+}
+
+#[uniffi::export]
+impl TerminalSession {
+    pub fn snapshot(&self) -> TerminalScreen {
+        let snapshot = self.session.snapshot();
+        TerminalScreen {
+            rows: snapshot.rows,
+            cols: snapshot.cols,
+            lines: snapshot
+                .lines
+                .into_iter()
+                .map(|line| {
+                    line.into_iter()
+                        .map(|run| TerminalRun {
+                            col: run.col,
+                            width: run.width,
+                            text: run.text,
+                            fg: run.fg,
+                            bg: run.bg,
+                            bold: run.bold,
+                            dim: run.dim,
+                            italic: run.italic,
+                            underline: run.underline,
+                        })
+                        .collect()
+                })
+                .collect(),
+            cursor_row: snapshot.cursor_row,
+            cursor_col: snapshot.cursor_col,
+            cursor_visible: snapshot.cursor_visible,
+            scrolled_back: snapshot.scrolled_back,
+            application_cursor: snapshot.application_cursor,
+            title: snapshot.title,
+        }
+    }
+
+    /// Text typed on the keyboard; returns the view to the live screen.
+    pub fn type_text(&self, text: String) {
+        self.session.type_text(&text);
+    }
+
+    /// Raw bytes, such as an escape sequence for a special key.
+    pub fn send_bytes(&self, bytes: Vec<u8>) {
+        self.session.scroll_to(0);
+        self.session.send(bytes);
+    }
+
+    pub fn paste(&self, text: String) {
+        self.session.paste(&text);
+    }
+
+    pub fn resize(&self, rows: u16, cols: u16) {
+        self.session.resize(rows, cols);
+    }
+
+    /// Positive scrolls back into history. Returns how far back the view now is.
+    pub fn scroll_by(&self, lines: i32) -> u32 {
+        self.session.scroll_by(lines)
+    }
+
+    /// Disconnects; the shell keeps running on the server.
+    pub fn disconnect(&self) {
+        self.session.close();
     }
 }

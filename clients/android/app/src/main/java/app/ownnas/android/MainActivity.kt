@@ -20,6 +20,8 @@ import app.ownnas.android.ui.ConflictDialog
 import app.ownnas.android.ui.Screen
 import app.ownnas.android.ui.ServersScreen
 import app.ownnas.android.ui.SignInScreen
+import app.ownnas.android.ui.terminal.TerminalScreen
+import app.ownnas.android.ui.terminal.TerminalsScreen
 import app.ownnas.android.ui.theme.OwnNasTheme
 
 class MainActivity : ComponentActivity() {
@@ -47,6 +49,8 @@ private fun App(vm: AppViewModel = viewModel()) {
                 Screen.Servers -> ServersScreen(vm)
                 is Screen.SignIn -> SignInScreen(vm, target.existing)
                 is Screen.Browse -> BrowserScreen(vm, target.serverId, target.path)
+                is Screen.Terminals -> TerminalsScreen(vm, target.serverId, target.path)
+                is Screen.Terminal -> TerminalScreen(vm, target.serverId, target.terminalId)
             }
         }
     }

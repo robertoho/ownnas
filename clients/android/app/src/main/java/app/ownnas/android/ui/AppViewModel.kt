@@ -17,6 +17,9 @@ import app.ownnas.core.Entry
 import app.ownnas.core.UploadResult
 import app.ownnas.core.Folder
 import app.ownnas.core.Server
+import app.ownnas.core.TerminalInfo
+import app.ownnas.core.TerminalListener
+import app.ownnas.core.TerminalSession
 import app.ownnas.core.normalizeAddress
 import app.ownnas.core.signIn
 import kotlinx.coroutines.Dispatchers
@@ -39,6 +42,11 @@ sealed interface Screen {
     data class SignIn(val existing: SavedServer? = null) : Screen
 
     data class Browse(val serverId: String, val path: String) : Screen
+
+    /** The server's terminals; new ones open in `path`. */
+    data class Terminals(val serverId: String, val path: String) : Screen
+
+    data class Terminal(val serverId: String, val terminalId: String) : Screen
 }
 
 class AppViewModel(application: Application) : AndroidViewModel(application) {
@@ -229,6 +237,25 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    suspend fun terminals(id: String): List<TerminalInfo> = call(id) { it.terminals() }
+
+    suspend fun openTerminal(id: String, path: String): TerminalInfo = call(id) { it.openTerminal(path, 30u, 100u) }
+
+    suspend fun closeTerminal(id: String, terminalId: String) {
+        call(id) { it.closeTerminal(terminalId) }
+    }
+
+    suspend fun unlockTerminals(id: String, password: String) {
+        call(id) { it.unlockTerminals(password) }
+    }
+
+    suspend fun markTerminalSeen(id: String, terminalId: String) {
+        runCatching { call(id) { it.markTerminalSeen(terminalId) } }
+    }
+
+    suspend fun connectTerminal(id: String, terminalId: String, listener: TerminalListener): TerminalSession =
+        call(id) { it.connectTerminal(terminalId, 30u, 100u, listener) }
+
     /** The last listing of a folder, to show while it reloads. */
     fun cachedFolder(id: String, path: String): Folder? = folders[id to path]
 
@@ -267,6 +294,7 @@ fun Throwable.userMessage(): String = when (this) {
     is ClientException.NotFound -> "This is no longer on the server."
     is ClientException.Conflict -> "This changed on the server. Try again."
     is ClientException.Cancelled -> "Cancelled"
+    is ClientException.Locked -> "Enter the terminal password"
     is ClientException.Failed -> reason
     else -> message ?: "Something went wrong"
 }

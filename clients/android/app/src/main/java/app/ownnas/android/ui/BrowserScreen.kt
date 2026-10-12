@@ -34,6 +34,7 @@ import androidx.compose.material.icons.outlined.FolderZip
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.PictureAsPdf
+import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -101,9 +102,10 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
     var adding by remember { mutableStateOf(false) }
     val revision by vm.revision.collectAsStateWithLifecycle()
     val uploads by vm.uploads.collectAsStateWithLifecycle()
-    val writable by produceState(false, serverId) {
-        value = runCatching { !vm.account(serverId).readonly }.getOrDefault(false)
+    val account by produceState<app.ownnas.core.Account?>(null, serverId) {
+        value = runCatching { vm.account(serverId) }.getOrNull()
     }
+    val writable = account?.readonly == false
 
     LaunchedEffect(reload, revision) {
         refreshing = true
@@ -190,6 +192,14 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
                 navigationIcon = {
                     IconButton(onClick = { vm.pop() }) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+                actions = {
+                    // Shown to administrators when terminals are turned on, as in the web app.
+                    if (account?.terminal == true) {
+                        IconButton(onClick = { vm.push(Screen.Terminals(serverId, path)) }) {
+                            Icon(Icons.Outlined.Terminal, contentDescription = "Terminals")
+                        }
                     }
                 },
             )

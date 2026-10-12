@@ -21,6 +21,12 @@ What works now:
 - Each signed-in server appears in the system file picker and the Files app, so any app can
   open, attach, save into, rename, and delete files there (`data/OwnNasDocuments.kt`).
 
+- Terminals, for administrators when the server has them turned on: the list shows each
+  terminal's coding-agent status, and a terminal opens in a native view with the web app's
+  extra keys (Esc, Tab, Ctrl, Alt, arrows, …). Drag to scroll back, pinch to resize the text.
+  The emulator and the WebSocket run in Rust (`crates/ownnas-core/src/terminal.rs`, using
+  the `vt100` crate), so the iOS app can share them.
+
 Uploads run while the app is open; background transfers come with sync.
 
 ## Build

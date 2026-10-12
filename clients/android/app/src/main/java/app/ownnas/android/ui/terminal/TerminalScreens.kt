@@ -1,0 +1,446 @@
+package app.ownnas.android.ui.terminal
+
+import android.content.ClipboardManager
+import android.os.Handler
+import android.os.Looper
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.consumeWindowInsets
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.outlined.ContentPaste
+import androidx.compose.material.icons.outlined.Keyboard
+import androidx.compose.material.icons.outlined.Terminal
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExtendedFloatingActionButton
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.ListItem
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
+import app.ownnas.android.ui.AppViewModel
+import app.ownnas.android.ui.Screen
+import app.ownnas.android.ui.userMessage
+import app.ownnas.core.ClientException
+import app.ownnas.core.TerminalConnection
+import app.ownnas.core.TerminalInfo
+import app.ownnas.core.TerminalListener
+import app.ownnas.core.TerminalSession
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+
+/** How an agent's status reads and looks, as in the web app's terminal tabs. */
+private fun agentStatus(info: TerminalInfo): Pair<String, Color>? {
+    val agent = info.agent
+    if (agent.name == null) return null
+    val label = agent.label ?: agent.name!!
+    return when (agent.status) {
+        "working" -> "$label · working" to Color(0xFF3B82F6)
+        "waiting" -> "$label · needs you" to Color(0xFFF59E0B)
+        "done" -> "$label · done" to Color(0xFF22C55E)
+        "error" -> "$label · error" to Color(0xFFEF4444)
+        else -> "$label · idle" to Color(0xFF9CA3AF)
+    }
+}
+
+private fun titleOf(info: TerminalInfo) =
+    info.name?.takeIf { it.isNotBlank() } ?: info.title?.takeIf { it.isNotBlank() } ?: info.path.ifEmpty { "/" }
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun TerminalsScreen(vm: AppViewModel, serverId: String, path: String) {
+    val server = vm.server(serverId) ?: return
+    val scope = rememberCoroutineScope()
+    val snackbar = remember { SnackbarHostState() }
+    var terminals by remember { mutableStateOf<List<TerminalInfo>?>(null) }
+    var error by remember { mutableStateOf<Throwable?>(null) }
+    var locked by remember { mutableStateOf(false) }
+    var reload by remember { mutableIntStateOf(0) }
+    var refreshing by remember { mutableStateOf(false) }
+    var ending by remember { mutableStateOf<TerminalInfo?>(null) }
+    var opening by remember { mutableStateOf(false) }
+
+    // Agents change state on their own, so keep the list fresh while it is showing.
+    LaunchedEffect(reload) {
+        while (true) {
+            try {
+                terminals = vm.terminals(serverId)
+                error = null
+            } catch (err: ClientException.Locked) {
+                locked = true
+                return@LaunchedEffect
+            } catch (err: Exception) {
+                error = err
+            } finally {
+                refreshing = false
+            }
+            delay(3000)
+        }
+    }
+
+    fun open() {
+        opening = true
+        scope.launch {
+            try {
+                val info = vm.openTerminal(serverId, path)
+                vm.push(Screen.Terminal(serverId, info.id))
+            } catch (err: ClientException.Locked) {
+                locked = true
+            } catch (err: Exception) {
+                snackbar.showSnackbar(err.userMessage())
+            } finally {
+                opening = false
+            }
+        }
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Terminals") },
+                navigationIcon = {
+                    IconButton(onClick = { vm.pop() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") }
+                },
+            )
+        },
+        floatingActionButton = {
+            ExtendedFloatingActionButton(
+                onClick = { if (!opening) open() },
+                icon = { if (opening) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) else Icon(Icons.Filled.Add, null) },
+                text = { Text("New in ${path.substringAfterLast('/').ifEmpty { server.name }}") },
+            )
+        },
+        snackbarHost = { SnackbarHost(snackbar) },
+    ) { padding ->
+        PullToRefreshBox(
+            isRefreshing = refreshing,
+            onRefresh = { refreshing = true; reload++ },
+            modifier = Modifier.padding(padding).fillMaxSize(),
+        ) {
+            val list = terminals
+            when {
+                list == null && error != null -> Centered(error!!.userMessage())
+                list == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { if (!locked) CircularProgressIndicator() }
+                list.isEmpty() -> Centered("No terminals are open. Start one in this folder with the button below.")
+                else -> LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 88.dp)) {
+                    items(list, key = { it.id }) { info -> TerminalRow(info, onOpen = { vm.push(Screen.Terminal(serverId, info.id)) }, onEnd = { ending = info }) }
+                }
+            }
+        }
+    }
+
+    if (locked) {
+        UnlockDialog(
+            onDismiss = { locked = false; vm.pop() },
+            onUnlock = { password ->
+                vm.unlockTerminals(serverId, password)
+                locked = false
+                reload++
+            },
+        )
+    }
+    ending?.let { info ->
+        AlertDialog(
+            onDismissRequest = { ending = null },
+            title = { Text("End this terminal?") },
+            text = { Text("“${titleOf(info)}” and everything running in it stop on the server.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    ending = null
+                    scope.launch {
+                        runCatching { vm.closeTerminal(serverId, info.id) }.onFailure { snackbar.showSnackbar(it.userMessage()) }
+                        reload++
+                    }
+                }) { Text("End terminal") }
+            },
+            dismissButton = { TextButton(onClick = { ending = null }) { Text("Cancel") } },
+        )
+    }
+}
+
+@Composable
+private fun TerminalRow(info: TerminalInfo, onOpen: () -> Unit, onEnd: () -> Unit) {
+    var menu by remember { mutableStateOf(false) }
+    val status = agentStatus(info)
+    ListItem(
+        modifier = Modifier.clickable(onClick = onOpen),
+        leadingContent = { Icon(Icons.Outlined.Terminal, contentDescription = null) },
+        headlineContent = { Text(titleOf(info), maxLines = 1, overflow = TextOverflow.Ellipsis) },
+        supportingContent = {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    if (info.running) "/${info.path}" else "Ended${info.exitCode?.let { " with code $it" } ?: ""}",
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (status != null) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Box(Modifier.size(8.dp).background(status.second, CircleShape))
+                        Text(status.first, style = MaterialTheme.typography.labelMedium)
+                    }
+                    val detail = info.agent.attention ?: info.agent.detail
+                    if (detail != null) Text(detail, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        },
+        trailingContent = {
+            Box {
+                IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "Actions") }
+                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                    DropdownMenuItem(text = { Text("End terminal") }, onClick = { menu = false; onEnd() })
+                }
+            }
+        },
+    )
+}
+
+@Composable
+private fun Centered(text: String) {
+    Box(Modifier.fillMaxSize().padding(32.dp), contentAlignment = Alignment.Center) {
+        Text(text, textAlign = TextAlign.Center, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+/** Terminals can have their own password on top of the account's. */
+@Composable
+private fun UnlockDialog(onDismiss: () -> Unit, onUnlock: suspend (String) -> Unit) {
+    var password by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Terminal password") },
+        text = {
+            OutlinedTextField(
+                value = password,
+                onValueChange = { password = it },
+                label = { Text("Password") },
+                singleLine = true,
+                isError = error != null,
+                supportingText = error?.let { { Text(it) } },
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+            )
+        },
+        confirmButton = {
+            TextButton(
+                enabled = password.isNotEmpty() && !busy,
+                onClick = {
+                    busy = true
+                    scope.launch {
+                        try {
+                            onUnlock(password)
+                        } catch (err: Exception) {
+                            error = err.userMessage()
+                        } finally {
+                            busy = false
+                        }
+                    }
+                },
+            ) { Text("Unlock") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+/** The web terminal's extra keys, for what a phone keyboard lacks. */
+private val EXTRA_KEYS = listOf(
+    "Esc" to "\u001b", "Tab" to "\t", "⇤" to "\u001b[Z", "←" to null, "↑" to null, "↓" to null, "→" to null,
+    "Home" to "\u001b[H", "End" to "\u001b[F", "PgUp" to "\u001b[5~", "PgDn" to "\u001b[6~", "^C" to "\u0003",
+    "|" to "|", "/" to "/", "~" to "~", "-" to "-",
+)
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var session by remember { mutableStateOf<TerminalSession?>(null) }
+    var state by remember { mutableStateOf<Pair<TerminalConnection, String?>>(TerminalConnection.Connecting to null) }
+    var title by remember { mutableStateOf<String?>(null) }
+    var ctrl by remember { mutableStateOf(false) }
+    var alt by remember { mutableStateOf(false) }
+    var ending by remember { mutableStateOf(false) }
+    var view by remember { mutableStateOf<TerminalView?>(null) }
+
+    DisposableEffect(serverId, terminalId) {
+        val main = Handler(Looper.getMainLooper())
+        // Called on the session's thread: redraw directly, move state changes to the main thread.
+        val listener = object : TerminalListener {
+            override fun screenChanged() {
+                view?.postInvalidateOnAnimation()
+            }
+
+            override fun connectionChanged(connection: TerminalConnection, message: String?) {
+                main.post { state = connection to message }
+            }
+        }
+        val job = scope.launch {
+            try {
+                session = vm.connectTerminal(serverId, terminalId, listener)
+                vm.markTerminalSeen(serverId, terminalId)
+            } catch (err: Exception) {
+                state = TerminalConnection.Closed to err.userMessage()
+            }
+        }
+        onDispose {
+            job.cancel()
+            session?.disconnect()
+            session?.close()
+        }
+    }
+
+    // The program's title wins; otherwise the terminal's name or folder, as in the web tabs.
+    // The agent's status is refreshed with it.
+    var info by remember { mutableStateOf<TerminalInfo?>(null) }
+    LaunchedEffect(serverId, terminalId) {
+        while (true) {
+            runCatching { vm.terminals(serverId).firstOrNull { it.id == terminalId } }.getOrNull()?.let { info = it }
+            title = session?.snapshot()?.title ?: info?.let(::titleOf)
+            delay(3000)
+        }
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column {
+                        Text(title ?: "Terminal", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        val status = when (val c = state.first) {
+                            TerminalConnection.Connecting -> "Connecting…"
+                            TerminalConnection.Live -> info?.let(::agentStatus)?.first
+                            TerminalConnection.Reconnecting -> "Connection lost. Reconnecting…"
+                            is TerminalConnection.Exited -> "Ended${c.code?.let { " with code $it" } ?: ""}"
+                            TerminalConnection.Closed -> state.second ?: "Disconnected"
+                        }
+                        if (status != null) Text(status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+                    }
+                },
+                navigationIcon = {
+                    IconButton(onClick = { vm.pop() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") }
+                },
+                actions = {
+                    IconButton(onClick = { view?.showKeyboard() }) { Icon(Icons.Outlined.Keyboard, contentDescription = "Keyboard") }
+                    IconButton(onClick = {
+                        val clip = context.getSystemService(ClipboardManager::class.java)?.primaryClip
+                        val text = clip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(context)?.toString()
+                        if (!text.isNullOrEmpty()) session?.paste(text)
+                    }) { Icon(Icons.Outlined.ContentPaste, contentDescription = "Paste") }
+                    var menu by remember { mutableStateOf(false) }
+                    Box {
+                        IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "More") }
+                        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                            DropdownMenuItem(text = { Text("End terminal") }, onClick = { menu = false; ending = true })
+                        }
+                    }
+                },
+            )
+        },
+    ) { padding ->
+        // The Scaffold already leaves room for the navigation bar; the keyboard replaces it.
+        Column(Modifier.padding(padding).consumeWindowInsets(padding).fillMaxSize().imePadding()) {
+            AndroidView(
+                factory = { ctx ->
+                    TerminalView(ctx) { _, _ -> }.also {
+                        view = it
+                        it.onModifiersUsed = { ctrl = false; alt = false }
+                        // Ready to type as soon as the terminal opens.
+                        it.post { it.showKeyboard() }
+                    }
+                },
+                update = { it.session = session },
+                modifier = Modifier.weight(1f).fillMaxWidth().background(Color(0xFF151810)),
+            )
+            Surface(color = MaterialTheme.colorScheme.surfaceContainer) {
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 4.dp, vertical = 2.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    FilterChip(selected = ctrl, onClick = { ctrl = !ctrl; view?.ctrlArmed = ctrl }, label = { Text("Ctrl") })
+                    FilterChip(selected = alt, onClick = { alt = !alt; view?.altArmed = alt }, label = { Text("Alt") })
+                    for ((label, bytes) in EXTRA_KEYS) {
+                        TextButton(onClick = {
+                            val application = session?.snapshot()?.applicationCursor == true
+                            val arrow = mapOf("↑" to 'A', "↓" to 'B', "→" to 'C', "←" to 'D')[label]
+                            val sequence = bytes ?: if (application) "\u001bO$arrow" else "\u001b[$arrow"
+                            view?.send(sequence.toByteArray())
+                        }) { Text(label, fontFamily = FontFamily.Monospace) }
+                    }
+                }
+            }
+        }
+    }
+
+    if (ending) {
+        AlertDialog(
+            onDismissRequest = { ending = false },
+            title = { Text("End this terminal?") },
+            text = { Text("The shell and everything running in it stop on the server.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    ending = false
+                    scope.launch {
+                        runCatching { vm.closeTerminal(serverId, terminalId) }
+                        vm.pop()
+                    }
+                }) { Text("End terminal") }
+            },
+            dismissButton = { TextButton(onClick = { ending = false }) { Text("Cancel") } },
+        )
+    }
+}

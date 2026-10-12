@@ -10,8 +10,10 @@ use crate::model::{Node, Stamp};
 
 pub struct Api {
     agent: ureq::Agent,
-    server: String,
-    token: Option<String>,
+    pub(crate) server: String,
+    pub(crate) token: Option<String>,
+    /// Also used for terminal WebSockets, so they trust the same certificates.
+    pub(crate) tls: Arc<rustls::ClientConfig>,
 }
 
 #[derive(Deserialize)]
@@ -45,6 +47,8 @@ pub enum ApiError {
     Conflict,
     Unauthorized,
     NotFound,
+    /// Terminals have their own password; unlock them with it first.
+    Locked,
     /// The caller stopped the transfer.
     Cancelled,
     Other(String),
@@ -56,6 +60,7 @@ impl std::fmt::Display for ApiError {
             ApiError::Conflict => write!(f, "changed on the server"),
             ApiError::Unauthorized => write!(f, "the server rejected the sign-in token; run `ownnas-sync setup` again"),
             ApiError::NotFound => write!(f, "not found on the server"),
+            ApiError::Locked => write!(f, "enter the terminal password"),
             ApiError::Cancelled => write!(f, "cancelled"),
             ApiError::Other(message) => write!(f, "{message}"),
         }
@@ -68,11 +73,11 @@ pub(crate) fn map_err(err: ureq::Error) -> ApiError {
         ureq::Error::Status(404, _) => ApiError::NotFound,
         ureq::Error::Status(409, _) => ApiError::Conflict,
         ureq::Error::Status(code, response) => {
-            let message = response
-                .into_json::<serde_json::Value>()
-                .ok()
-                .and_then(|body| body["error"].as_str().map(str::to_string))
-                .unwrap_or_else(|| format!("HTTP {code}"));
+            let body = response.into_json::<serde_json::Value>().unwrap_or_default();
+            if body["locked"] == true {
+                return ApiError::Locked;
+            }
+            let message = body["error"].as_str().map(str::to_string).unwrap_or_else(|| format!("HTTP {code}"));
             ApiError::Other(message)
         }
         ureq::Error::Transport(transport) => ApiError::Other(transport.to_string()),
@@ -110,8 +115,9 @@ impl Api {
             .map_err(|err| err.to_string())?
             .with_root_certificates(roots)
             .with_no_client_auth();
+        let tls = Arc::new(tls);
         let agent = ureq::AgentBuilder::new()
-            .tls_config(Arc::new(tls))
+            .tls_config(tls.clone())
             .timeout_connect(Duration::from_secs(15))
             .timeout_read(Duration::from_secs(120))
             .build();
@@ -119,6 +125,7 @@ impl Api {
             agent,
             server: server.trim_end_matches('/').to_string(),
             token,
+            tls,
         })
     }
 
