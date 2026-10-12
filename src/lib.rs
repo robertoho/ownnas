@@ -10,6 +10,7 @@ pub mod db;
 pub mod files;
 pub mod http;
 pub mod pdf_ops;
+pub mod terminal;
 pub mod preview;
 pub mod thumbs;
 pub mod tls;

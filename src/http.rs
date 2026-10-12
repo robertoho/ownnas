@@ -47,6 +47,13 @@ const THREE_BUFFER_GEOMETRY_UTILS_JS: &str =
 const OCCT_IMPORT_JS: &str = include_str!("../web/vendor/occt/occt-import-js.js");
 const OCCT_WORKER_JS: &str = include_str!("../web/vendor/occt/ownnas-occt-worker.js");
 const OCCT_WASM: &[u8] = include_bytes!("../web/vendor/occt/occt-import-js.wasm");
+const TERMINAL_HTML: &str = include_str!("../web/terminal.html");
+const TERMINAL_JS: &str = include_str!("../web/terminal.js");
+const TERMINAL_PANEL_JS: &str = include_str!("../web/terminal-panel.js");
+const TERMINAL_CSS: &str = include_str!("../web/terminal.css");
+const XTERM_JS: &str = include_str!("../web/vendor/xterm/xterm.mjs");
+const XTERM_FIT_JS: &str = include_str!("../web/vendor/xterm/addon-fit.mjs");
+const XTERM_CSS: &str = include_str!("../web/vendor/xterm/xterm.css");
 
 pub struct AppState {
     pub db: Mutex<rusqlite::Connection>,
@@ -63,6 +70,9 @@ pub struct AppState {
     pub restart_requested: std::sync::atomic::AtomicBool,
     pub supervisor_restart: bool,
     pub attempts: Mutex<AttemptGate>,
+    /// Served over native HTTPS (`--tls-cert`).
+    pub https: bool,
+    pub terminals: crate::terminal::Terminals,
 }
 
 pub struct AttemptGate {
@@ -108,6 +118,8 @@ pub fn new_state(
         restart_requested: std::sync::atomic::AtomicBool::new(false),
         supervisor_restart: false,
         attempts: Mutex::new(AttemptGate::new()),
+        https: false,
+        terminals: crate::terminal::Terminals::default(),
     })
 }
 
@@ -222,6 +234,27 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/tags", post(add_tag).delete(remove_tag))
         .route("/api/tags/bulk", post(bulk_tags))
         .route("/api/comments", post(add_comment).delete(remove_comment))
+        .route("/terminal", get(terminal_page))
+        .route("/assets/terminal.js", get(terminal_javascript))
+        .route("/assets/terminal-panel.js", get(terminal_panel_javascript))
+        .route("/assets/terminal.css", get(terminal_css))
+        .route("/assets/vendor/xterm/xterm.mjs", get(xterm_module))
+        .route("/assets/vendor/xterm/addon-fit.mjs", get(xterm_fit_module))
+        .route("/assets/vendor/xterm/xterm.css", get(xterm_css))
+        .route("/api/terminal/config", get(terminal_config).post(set_terminal_config))
+        .route("/api/terminal/unlock", post(terminal_unlock))
+        .route("/api/terminal/lock", post(terminal_lock))
+        .route("/api/terminals", get(list_terminals).post(open_terminal).delete(close_terminal))
+        .route("/api/terminals/ws", get(terminal_socket))
+        .route("/api/sync/tree", get(sync_tree))
+        .route(
+            "/api/sync/file",
+            get(sync_download)
+                .put(sync_upload)
+                .layer(DefaultBodyLimit::disable()),
+        )
+        .route("/api/sync/mkdir", post(sync_mkdir))
+        .route("/api/sync/delete", post(sync_delete))
         .with_state(state)
 }
 
@@ -263,7 +296,7 @@ pub async fn serve_https(
     let result = axum_server::from_tcp_rustls(listener, config)
         .map_err(|err| err.to_string())?
         .handle(handle)
-        .serve(router(state).into_make_service())
+        .serve(router(state).into_make_service_with_connect_info::<SocketAddr>())
         .await
         .map_err(|err| format!("HTTPS server stopped: {err}"));
     shutdown.abort();
@@ -311,7 +344,7 @@ where
         let url = format!("http://127.0.0.1:{}", bound.port());
         open_url(&url);
     }
-    let app = router(state);
+    let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await
@@ -438,6 +471,10 @@ impl Drop for CancelOnDrop {
 struct LoginBody {
     username: String,
     password: String,
+    /// Native clients ask for the session token in the response body and send it back as
+    /// `Authorization: Bearer <token>` instead of a cookie.
+    #[serde(default)]
+    token: bool,
 }
 
 #[derive(Deserialize)]
@@ -557,13 +594,26 @@ fn rel_of(value: &Option<String>) -> String {
 }
 
 fn check_csrf(headers: &HeaderMap) -> Result<(), ApiError> {
+    // Browsers never attach a bearer token on their own, so it cannot be forged cross-site.
+    if bearer_token(headers).is_some() {
+        return Ok(());
+    }
     match headers.get("x-ownnas").and_then(|v| v.to_str().ok()) {
         Some("1") => Ok(()),
         _ => Err(ApiError::new(StatusCode::FORBIDDEN, "Missing request header")),
     }
 }
 
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let token = raw.strip_prefix("Bearer ")?.trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
 fn session_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(token) = bearer_token(headers) {
+        return Some(token);
+    }
     let raw = headers.get(header::COOKIE)?.to_str().ok()?;
     auth::read_cookie(raw, COOKIE_NAME)
 }
@@ -816,7 +866,11 @@ async fn login(
             header::SET_COOKIE,
             auth::session_cookie(&token, state.secure_cookie),
         )],
-        Json(json!({ "username": user.username })),
+        Json(if body.token {
+            json!({ "username": user.username, "token": token })
+        } else {
+            json!({ "username": user.username })
+        }),
     ))
 }
 
@@ -831,6 +885,7 @@ async fn logout(
             let _ = db::log_event(&conn, Some(user.id), &user.username, "sign-out", "");
         }
         let _ = db::delete_session(&conn, &token);
+        state.terminals.lock(Some(&auth::token_hash(&token)));
     }
     Ok((
         [(
@@ -860,6 +915,7 @@ async fn me(
         "updatesConfigured": state.update.url.is_some(),
         "updatesSigned": state.update.pubkey.is_some(),
         "updateTarget": crate::update::current_target(),
+        "terminal": user.is_admin && terminal_enabled(&state),
     })))
 }
 
@@ -2074,6 +2130,631 @@ async fn upload(
         record(&state, &user, "upload", &format!("{saved} file(s)"));
     }
     Ok(Json(json!({ "saved": saved, "skipped": skipped })))
+}
+
+#[derive(Deserialize)]
+struct SyncQuery {
+    path: Option<String>,
+    /// Expected current version: `none`, `dir`, or `<size>:<mtime-ms>`.
+    base: Option<String>,
+    /// Modification time (ms since the Unix epoch) to give an uploaded file.
+    mtime: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct SyncPathBody {
+    path: String,
+    base: Option<String>,
+}
+
+fn sync_conflict(current: Option<files::SyncEntry>) -> ApiError {
+    ApiError {
+        status: StatusCode::CONFLICT,
+        body: json!({ "error": "The item changed on the server", "current": current }),
+    }
+}
+
+async fn sync_tree(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<SyncQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let root = state.root.clone();
+    let rel = rel_of(&query.path);
+    let entries = tokio::task::spawn_blocking(move || files::sync_tree(&root, &rel))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not list the folder"))?
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "readonly": state.readonly, "entries": entries })))
+}
+
+async fn sync_download(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<SyncQuery>,
+) -> Result<Response, ApiError> {
+    require_user(&state, &headers)?;
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    if resolved.full.is_dir() {
+        return Err(FileError::IsADirectory.into());
+    }
+    let file = tokio::fs::File::open(&resolved.full)
+        .await
+        .map_err(|_| ApiError::from(FileError::NotFound))?;
+    // Stamp from the open handle so the version matches the bytes being sent.
+    let meta = file
+        .metadata()
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the file"))?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    let len = meta.len();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, len)
+        .header("x-ownnas-size", len)
+        .header("x-ownnas-mtime", mtime)
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from_stream(ReaderStream::new(file.take(len))))
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not send the file"))
+}
+
+async fn sync_upload(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<SyncQuery>,
+    body: Body,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let base = files::SyncBase::parse(query.base.as_deref())?;
+    let root = state.root.clone();
+    let rel = rel_of(&query.path);
+    let (rel, dest, temp) = tokio::task::spawn_blocking(move || files::sync_prepare_write(&root, &rel))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload"))?
+        .map_err(ApiError::from)?;
+    let stored = async {
+        let mut out = tokio::fs::File::create(&temp).await?;
+        let mut stream = body.into_data_stream();
+        while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+            let chunk = chunk.map_err(|err| io::Error::new(io::ErrorKind::ConnectionAborted, err))?;
+            tokio::io::AsyncWriteExt::write_all(&mut out, &chunk).await?;
+        }
+        tokio::io::AsyncWriteExt::flush(&mut out).await?;
+        out.sync_all().await
+    }
+    .await;
+    if let Err(err) = stored {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(if err.kind() == io::ErrorKind::ConnectionAborted {
+            ApiError::new(StatusCode::BAD_REQUEST, "The upload was interrupted")
+        } else {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload")
+        });
+    }
+    let mtime = query.mtime;
+    let committed_rel = rel.clone();
+    let outcome = tokio::task::spawn_blocking(move || files::sync_commit_write(&committed_rel, &dest, &temp, base, mtime))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload"))?
+        .map_err(ApiError::from)?;
+    match outcome {
+        files::SyncOutcome::Done(entry) => {
+            invalidate_sizes(&state, &rel);
+            record(&state, &user, "sync-upload", &rel);
+            Ok(Json(json!({ "entry": entry })))
+        }
+        files::SyncOutcome::Conflict(current) => Err(sync_conflict(current)),
+    }
+}
+
+async fn sync_mkdir(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<SyncPathBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    require_user(&state, &headers)?;
+    require_write(&state)?;
+    let root = state.root.clone();
+    let entry = tokio::task::spawn_blocking(move || files::sync_mkdir(&root, &body.path))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not create the folder"))?
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "entry": entry })))
+}
+
+async fn sync_delete(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<SyncPathBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let base = files::SyncBase::parse(body.base.as_deref())?;
+    let root = state.root.clone();
+    let rel = body.path.clone();
+    let outcome = tokio::task::spawn_blocking(move || files::sync_delete(&root, &rel, base))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not delete the item"))?
+        .map_err(ApiError::from)?;
+    match outcome {
+        files::SyncOutcome::Done(trashed) => {
+            match &trashed {
+                Some(to) => rewrite_meta(&state, &body.path, to),
+                None => delete_meta(&state, &body.path),
+            }
+            invalidate_sizes(&state, &body.path);
+            record(&state, &user, "sync-delete", &body.path);
+            Ok(Json(json!({ "ok": true, "trashed": trashed })))
+        }
+        files::SyncOutcome::Conflict(current) => Err(sync_conflict(current)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Terminals
+// ---------------------------------------------------------------------------
+
+/// The client's socket address (absent only in tests without a listener).
+struct Peer(Option<SocketAddr>);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for Peer {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut axum::http::request::Parts, _: &S) -> Result<Self, Self::Rejection> {
+        Ok(Peer(
+            parts
+                .extensions
+                .get::<axum::extract::ConnectInfo<SocketAddr>>()
+                .map(|info| info.0),
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalConfigBody {
+    account_password: String,
+    enabled: Option<bool>,
+    /// New terminal password; empty removes it.
+    password: Option<String>,
+    /// Shell command; empty uses the default.
+    shell: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TerminalUnlockBody {
+    password: String,
+}
+
+#[derive(Deserialize)]
+struct TerminalOpenBody {
+    path: Option<String>,
+    cols: Option<u16>,
+    rows: Option<u16>,
+}
+
+#[derive(Deserialize)]
+struct TerminalIdQuery {
+    id: String,
+}
+
+fn setting(state: &AppState, key: &str) -> Option<String> {
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    db::get_setting(&conn, key).ok().flatten()
+}
+
+fn terminal_enabled(state: &AppState) -> bool {
+    !state.readonly
+        && crate::terminal::available()
+        && setting(state, crate::terminal::SETTING_ENABLED).as_deref() == Some("1")
+}
+
+/// Loopback, private LAN, link-local, and CGNAT (Tailscale and similar VPNs) addresses.
+fn local_network(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || (a == 100 && (64..128).contains(&b))
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return local_network(std::net::IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
+            v6.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// Terminals are refused over plain HTTP from the open internet. A reverse proxy on this
+/// machine is trusted to report the real client and scheme.
+fn terminal_transport_ok(state: &AppState, headers: &HeaderMap, peer: &Peer) -> bool {
+    if state.https {
+        return true;
+    }
+    let Some(peer) = peer.0 else { return false };
+    if peer.ip().is_loopback() {
+        let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+        if header("x-forwarded-proto").is_some_and(|proto| proto.eq_ignore_ascii_case("https")) {
+            return true;
+        }
+        if let Some(forwarded) = header("x-forwarded-for") {
+            return forwarded
+                .split(',')
+                .next()
+                .and_then(|ip| ip.trim().parse().ok())
+                .is_some_and(local_network);
+        }
+        return true;
+    }
+    local_network(peer.ip())
+}
+
+fn terminal_locked_error() -> ApiError {
+    ApiError {
+        status: StatusCode::FORBIDDEN,
+        body: json!({ "error": "Enter the terminal password", "locked": true }),
+    }
+}
+
+/// Checks everything needed to use terminals and returns the user and their token hash.
+fn terminal_access(state: &AppState, headers: &HeaderMap, peer: &Peer) -> Result<(User, String), ApiError> {
+    let (user, token) = require_user(state, headers)?;
+    require_admin(&user)?;
+    if !crate::terminal::available() {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "Terminals are not available on this platform"));
+    }
+    require_write(state)?;
+    if !terminal_enabled(state) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Terminals are turned off. An administrator can turn them on in Settings.",
+        ));
+    }
+    if !terminal_transport_ok(state, headers, peer) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Terminals need HTTPS when you connect from outside your network or VPN",
+        ));
+    }
+    let token_hash = auth::token_hash(&token);
+    if setting(state, crate::terminal::SETTING_PASSWORD).is_some() && !state.terminals.is_unlocked(&token_hash) {
+        return Err(terminal_locked_error());
+    }
+    Ok((user, token_hash))
+}
+
+async fn terminal_config(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    peer: Peer,
+) -> Result<impl IntoResponse, ApiError> {
+    let (user, token) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    Ok(Json(json!({
+        "available": crate::terminal::available() && !state.readonly,
+        "enabled": terminal_enabled(&state),
+        "passwordSet": setting(&state, crate::terminal::SETTING_PASSWORD).is_some(),
+        "unlocked": state.terminals.is_unlocked(&auth::token_hash(&token)),
+        "secureTransport": terminal_transport_ok(&state, &headers, &peer),
+        "shell": setting(&state, crate::terminal::SETTING_SHELL).unwrap_or_default(),
+        "defaultShell": crate::terminal::default_shell(),
+    })))
+}
+
+async fn set_terminal_config(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<TerminalConfigBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    if state.readonly || !crate::terminal::available() {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "Terminals are not available on this server"));
+    }
+    // A stolen session cookie must not be enough to turn on a shell or change its password.
+    let gate_key = format!("terminal-settings:{}", user.username);
+    {
+        let mut gate = state.attempts.lock().unwrap_or_else(|err| err.into_inner());
+        if !login_allowed(&mut gate, &gate_key) {
+            return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Too many attempts. Wait a few minutes and try again."));
+        }
+    }
+    if !auth::verify_password(&body.account_password, &user.password_hash) {
+        let mut gate = state.attempts.lock().unwrap_or_else(|err| err.into_inner());
+        login_failed(&mut gate, &gate_key);
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "Your account password is not correct"));
+    }
+    login_succeeded(&mut state.attempts.lock().unwrap_or_else(|err| err.into_inner()), &gate_key);
+    let password_hash = match body.password.as_deref() {
+        Some("") => Some(None),
+        Some(password) => {
+            auth::validate_password(password).map_err(|message| ApiError::new(StatusCode::BAD_REQUEST, message))?;
+            Some(Some(auth::hash_password(password).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?))
+        }
+        None => None,
+    };
+    {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        let save = |key: &str, value: Option<&str>| {
+            db::set_setting(&conn, key, value).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))
+        };
+        if let Some(enabled) = body.enabled {
+            save(crate::terminal::SETTING_ENABLED, Some(if enabled { "1" } else { "0" }))?;
+        }
+        if let Some(hash) = &password_hash {
+            save(crate::terminal::SETTING_PASSWORD, hash.as_deref())?;
+        }
+        if let Some(shell) = &body.shell {
+            let shell = shell.trim();
+            save(crate::terminal::SETTING_SHELL, (!shell.is_empty()).then_some(shell))?;
+        }
+    }
+    if body.enabled == Some(false) {
+        state.terminals.kill_all();
+    }
+    if password_hash.is_some() || body.enabled == Some(false) {
+        state.terminals.lock(None);
+    }
+    record(&state, &user, "terminal-settings", if terminal_enabled(&state) { "on" } else { "off" });
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn terminal_unlock(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<TerminalUnlockBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, token) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let Some(hash) = setting(&state, crate::terminal::SETTING_PASSWORD) else {
+        return Ok(Json(json!({ "ok": true })));
+    };
+    let gate_key = format!("terminal:{}", user.username);
+    {
+        let mut gate = state.attempts.lock().unwrap_or_else(|err| err.into_inner());
+        if !login_allowed(&mut gate, &gate_key) {
+            return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Too many attempts. Wait a few minutes and try again."));
+        }
+    }
+    if !auth::verify_password(&body.password, &hash) {
+        let mut gate = state.attempts.lock().unwrap_or_else(|err| err.into_inner());
+        login_failed(&mut gate, &gate_key);
+        record(&state, &user, "terminal-unlock-failed", "");
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "That terminal password is not correct"));
+    }
+    login_succeeded(&mut state.attempts.lock().unwrap_or_else(|err| err.into_inner()), &gate_key);
+    state.terminals.unlock(&auth::token_hash(&token));
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn terminal_lock(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (_, token) = require_user(&state, &headers)?;
+    state.terminals.lock(Some(&auth::token_hash(&token)));
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn list_terminals(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    peer: Peer,
+) -> Result<impl IntoResponse, ApiError> {
+    terminal_access(&state, &headers, &peer)?;
+    Ok(Json(json!({ "terminals": state.terminals.list() })))
+}
+
+async fn open_terminal(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    peer: Peer,
+    Json(body): Json<TerminalOpenBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = terminal_access(&state, &headers, &peer)?;
+    let resolved = files::resolve(&state.root, &rel_of(&body.path))?;
+    if !resolved.full.is_dir() {
+        return Err(FileError::NotADirectory.into());
+    }
+    let shell = setting(&state, crate::terminal::SETTING_SHELL);
+    let label = resolved.rel.clone();
+    let username = user.username.clone();
+    let worker = state.clone();
+    let info = tokio::task::spawn_blocking(move || {
+        worker.terminals.spawn(
+            &resolved.full,
+            &resolved.rel,
+            shell.as_deref(),
+            &username,
+            body.cols.unwrap_or(100),
+            body.rows.unwrap_or(30),
+        )
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not open a terminal"))?
+    .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    record(&state, &user, "terminal-open", if label.is_empty() { "/" } else { &label });
+    Ok(Json(json!({ "terminal": info })))
+}
+
+async fn close_terminal(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    peer: Peer,
+    Query(query): Query<TerminalIdQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = terminal_access(&state, &headers, &peer)?;
+    let session = state
+        .terminals
+        .remove(&query.id)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That terminal is already closed"))?;
+    let path = session.info().path;
+    record(&state, &user, "terminal-close", if path.is_empty() { "/" } else { &path });
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Browsers send cookies on cross-site WebSocket requests, so the Origin must match.
+fn same_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|value| value.to_str().ok()) else {
+        return true;
+    };
+    let origin_host = origin.split_once("://").map(|(_, host)| host).unwrap_or(origin);
+    ["x-forwarded-host", "host"].iter().any(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|host| host.eq_ignore_ascii_case(origin_host))
+    })
+}
+
+async fn terminal_socket(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    peer: Peer,
+    Query(query): Query<TerminalIdQuery>,
+    upgrade: axum::extract::ws::WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    if !same_origin(&headers) {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "Cross-site terminal connections are not allowed"));
+    }
+    terminal_access(&state, &headers, &peer)?;
+    let session = state
+        .terminals
+        .get(&query.id)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That terminal is closed"))?;
+    Ok(upgrade.on_upgrade(move |socket| terminal_pump(socket, session)))
+}
+
+fn exit_message(code: Option<u32>) -> axum::extract::ws::Message {
+    axum::extract::ws::Message::Text(json!({ "type": "exit", "code": code }).to_string().into())
+}
+
+async fn terminal_pump(mut socket: axum::extract::ws::WebSocket, session: std::sync::Arc<crate::terminal::Session>) {
+    use axum::extract::ws::Message;
+    use crate::terminal::Event;
+    use tokio::sync::broadcast::error::RecvError;
+
+    let (scrollback, exit, mut events) = session.attach();
+    if socket.send(Message::Binary(scrollback.into())).await.is_err() {
+        return;
+    }
+    if let Some(code) = exit {
+        let _ = socket.send(exit_message(code)).await;
+        return;
+    }
+    loop {
+        tokio::select! {
+            event = events.recv() => match event {
+                Ok(Event::Output(bytes)) => {
+                    if socket.send(Message::Binary(bytes.as_ref().clone().into())).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Event::Exit(code)) => {
+                    let _ = socket.send(exit_message(code)).await;
+                    break;
+                }
+                Err(RecvError::Lagged(_)) => {
+                    // This browser fell behind: redraw it from the scrollback.
+                    let (scrollback, _, fresh) = session.attach();
+                    events = fresh;
+                    let reset = Message::Text(json!({ "type": "reset" }).to_string().into());
+                    if socket.send(reset).await.is_err() || socket.send(Message::Binary(scrollback.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(RecvError::Closed) => break,
+            },
+            message = socket.recv() => match message {
+                Some(Ok(Message::Binary(bytes))) => session.write(bytes.to_vec()),
+                Some(Ok(Message::Text(text))) => {
+                    let Ok(control) = serde_json::from_str::<serde_json::Value>(text.as_str()) else { continue };
+                    match control["type"].as_str() {
+                        Some("input") => {
+                            if let Some(data) = control["data"].as_str() {
+                                session.write(data.as_bytes().to_vec());
+                            }
+                        }
+                        Some("resize") => {
+                            let size = |key: &str| control[key].as_u64().map(|value| value.min(u16::MAX as u64) as u16);
+                            if let (Some(cols), Some(rows)) = (size("cols"), size("rows")) {
+                                session.resize(cols, rows);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            },
+        }
+    }
+}
+
+async fn terminal_page() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::X_FRAME_OPTIONS, "SAMEORIGIN"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                // xterm.js writes its colors and cell sizes into <style> elements. This page
+                // shows only terminal output, so inline styles are allowed here and nowhere else.
+                "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'",
+            ),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ],
+        TERMINAL_HTML,
+    )
+}
+
+async fn terminal_javascript() -> impl IntoResponse {
+    app_module_javascript(TERMINAL_JS)
+}
+
+async fn terminal_panel_javascript() -> impl IntoResponse {
+    app_module_javascript(TERMINAL_PANEL_JS)
+}
+
+async fn terminal_css() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/css; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], TERMINAL_CSS)
+}
+
+async fn xterm_module() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, "public, max-age=86400")],
+        XTERM_JS,
+    )
+}
+
+async fn xterm_fit_module() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, "public, max-age=86400")],
+        XTERM_FIT_JS,
+    )
+}
+
+async fn xterm_css() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/css; charset=utf-8"), (header::CACHE_CONTROL, "public, max-age=86400")], XTERM_CSS)
 }
 
 fn record(state: &AppState, user: &User, action: &str, detail: &str) {

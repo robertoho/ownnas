@@ -4,6 +4,7 @@ mod db;
 mod files;
 mod http;
 mod pdf_ops;
+mod terminal;
 mod preview;
 mod thumbs;
 mod tls;
@@ -287,6 +288,7 @@ fn serve(args: ServeArgs) -> Result<(), String> {
         update,
     )?;
     app_state.supervisor_restart = args.restart_by_supervisor;
+    app_state.https = args.tls_cert.is_some();
     let state = Arc::new(app_state);
     {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());

@@ -2735,6 +2735,287 @@ fn copy_path(src: &Path, dest: &Path, copied: &mut usize) -> Result<(), FileErro
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Sync API support (used by the desktop/mobile sync clients)
+// ---------------------------------------------------------------------------
+
+/// Prefix of the temporary files a sync upload writes before it is committed.
+pub const SYNC_PART_PREFIX: &str = ".ownnas-part-";
+
+/// Serializes the compare-and-swap step of sync writes and deletes.
+static SYNC_COMMIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The version a sync client compares against: size plus modification time in milliseconds.
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SyncStamp {
+    pub size: u64,
+    pub mtime: i64,
+}
+
+#[derive(Serialize, Debug)]
+pub struct SyncEntry {
+    pub path: String,
+    pub dir: bool,
+    pub size: u64,
+    pub mtime: i64,
+}
+
+/// What a client believes is at a path before it writes or deletes it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SyncBase {
+    /// The client does not care what is there (no `base` parameter).
+    Any,
+    /// Nothing should exist at the path.
+    Absent,
+    /// A folder should exist at the path.
+    Dir,
+    /// A file with this stamp should exist at the path.
+    File(SyncStamp),
+}
+
+impl SyncBase {
+    pub fn parse(value: Option<&str>) -> Result<Self, FileError> {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::Any);
+        };
+        match value {
+            "none" => return Ok(Self::Absent),
+            "dir" => return Ok(Self::Dir),
+            _ => {}
+        }
+        let (size, mtime) = value
+            .split_once(':')
+            .ok_or(FileError::Rejected("The base version is not valid"))?;
+        Ok(Self::File(SyncStamp {
+            size: size.parse().map_err(|_| FileError::Rejected("The base version is not valid"))?,
+            mtime: mtime.parse().map_err(|_| FileError::Rejected("The base version is not valid"))?,
+        }))
+    }
+}
+
+/// Result of a compare-and-swap sync operation.
+pub enum SyncOutcome<T> {
+    Done(T),
+    /// The path no longer matches the client's base; carries what is there now.
+    Conflict(Option<SyncEntry>),
+}
+
+fn sync_stamp(meta: &Metadata) -> SyncStamp {
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    SyncStamp { size: meta.len(), mtime }
+}
+
+fn sync_internal_name(name: &str) -> bool {
+    name.starts_with(SYNC_PART_PREFIX)
+        || matches!(
+            name,
+            ARCHIVE_MARK | TRASH_MARK | TRASH_LOG | ARCHIVE_LOG | TRASH_DIR | ARCHIVE_DIR
+        )
+}
+
+/// True when `rel` names (or sits inside) a folder OwnNAS manages itself.
+fn sync_reserved(root: &Path, parts: &[String]) -> bool {
+    let mut path = root.to_path_buf();
+    for part in parts {
+        if sync_internal_name(part) {
+            return true;
+        }
+        path.push(part);
+        if path.is_dir() && (is_trash_folder(&path) || is_archive_folder(&path)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn sync_current(full: &Path, rel: &str) -> Option<SyncEntry> {
+    let meta = fs::symlink_metadata(full).ok()?;
+    let stamp = sync_stamp(&meta);
+    Some(SyncEntry {
+        path: rel.to_string(),
+        dir: meta.is_dir(),
+        size: if meta.is_dir() { 0 } else { stamp.size },
+        mtime: stamp.mtime,
+    })
+}
+
+fn sync_matches(current: &Option<SyncEntry>, base: SyncBase) -> bool {
+    match (base, current) {
+        (SyncBase::Any, _) => true,
+        (SyncBase::Absent, None) => true,
+        (SyncBase::Dir, Some(entry)) => entry.dir,
+        (SyncBase::File(stamp), Some(entry)) => {
+            !entry.dir && entry.size == stamp.size && entry.mtime == stamp.mtime
+        }
+        _ => false,
+    }
+}
+
+/// Recursively lists every file and folder below `rel`, skipping symlinks and OwnNAS's own
+/// Trash/Archive folders. Paths are relative to the shared root.
+pub fn sync_tree(root: &Path, rel: &str) -> Result<Vec<SyncEntry>, FileError> {
+    let resolved = resolve(root, rel)?;
+    if !resolved.full.is_dir() {
+        return Err(FileError::NotADirectory);
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![(resolved.full.clone(), resolved.rel.clone())];
+    while let Some((dir, dir_rel)) = stack.pop() {
+        let Ok(items) = fs::read_dir(&dir) else { continue };
+        for item in items.flatten() {
+            let name = item.file_name().to_string_lossy().to_string();
+            if sync_internal_name(&name) {
+                continue;
+            }
+            let Ok(meta) = fs::symlink_metadata(item.path()) else { continue };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let path = if dir_rel.is_empty() { name } else { format!("{dir_rel}/{name}") };
+            if meta.is_dir() {
+                let full = item.path();
+                if is_trash_folder(&full) || is_archive_folder(&full) {
+                    continue;
+                }
+                out.push(SyncEntry { path: path.clone(), dir: true, size: 0, mtime: sync_stamp(&meta).mtime });
+                stack.push((full, path));
+            } else if meta.is_file() {
+                let stamp = sync_stamp(&meta);
+                out.push(SyncEntry { path, dir: false, size: stamp.size, mtime: stamp.mtime });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// Validates a sync destination and creates its parent folders. Returns the canonical
+/// destination path and a temporary file path in the same folder.
+pub fn sync_prepare_write(root: &Path, rel: &str) -> Result<(String, PathBuf, PathBuf), FileError> {
+    let parts = clean_parts(rel)?;
+    let Some((name, parents)) = parts.split_last() else {
+        return Err(FileError::Forbidden);
+    };
+    if !valid_new_component(name) || parents.iter().any(|part| !valid_new_component(part)) {
+        return Err(FileError::InvalidName);
+    }
+    let root = root.canonicalize().map_err(map_io)?;
+    if sync_reserved(&root, &parts) {
+        return Err(FileError::Rejected("That path is managed by OwnNAS"));
+    }
+    let parent_rel = parents.join("/");
+    let parent = sync_make_dirs(&root, &parent_rel)?;
+    let dest = parent.join(name);
+    if dest.is_dir() {
+        return Err(FileError::IsADirectory);
+    }
+    let mut suffix = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut suffix);
+    let temp = parent.join(format!("{SYNC_PART_PREFIX}{}", hex::encode(suffix)));
+    Ok((parts.join("/"), dest, temp))
+}
+
+/// Creates `rel` and any missing parents, refusing to leave the shared root.
+fn sync_make_dirs(root: &Path, rel: &str) -> Result<PathBuf, FileError> {
+    let mut full = root.to_path_buf();
+    for part in clean_parts(rel)? {
+        full.push(&part);
+        if !full.exists() {
+            fs::create_dir(&full).or_else(|err| {
+                if err.kind() == io::ErrorKind::AlreadyExists { Ok(()) } else { Err(map_io(err)) }
+            })?;
+        }
+        let canon = full.canonicalize().map_err(map_io)?;
+        if !canon.starts_with(root) {
+            return Err(FileError::Forbidden);
+        }
+        if !canon.is_dir() {
+            return Err(FileError::NotADirectory);
+        }
+        full = canon;
+    }
+    Ok(full)
+}
+
+pub fn sync_mkdir(root: &Path, rel: &str) -> Result<SyncEntry, FileError> {
+    let parts = clean_parts(rel)?;
+    if parts.is_empty() || parts.iter().any(|part| !valid_new_component(part)) {
+        return Err(FileError::InvalidName);
+    }
+    let root = root.canonicalize().map_err(map_io)?;
+    if sync_reserved(&root, &parts) {
+        return Err(FileError::Rejected("That path is managed by OwnNAS"));
+    }
+    let rel = parts.join("/");
+    let full = sync_make_dirs(&root, &rel)?;
+    sync_current(&full, &rel).ok_or(FileError::NotFound)
+}
+
+/// Moves an uploaded temporary file into place if the destination still matches `base`.
+pub fn sync_commit_write(
+    rel: &str,
+    dest: &Path,
+    temp: &Path,
+    base: SyncBase,
+    mtime: Option<i64>,
+) -> Result<SyncOutcome<SyncEntry>, FileError> {
+    let _guard = SYNC_COMMIT.lock().unwrap_or_else(|err| err.into_inner());
+    let current = sync_current(dest, rel);
+    if !sync_matches(&current, base) || current.as_ref().is_some_and(|entry| entry.dir) {
+        let _ = fs::remove_file(temp);
+        return Ok(SyncOutcome::Conflict(current));
+    }
+    if let Some(mtime) = mtime.filter(|mtime| *mtime > 0) {
+        let time = UNIX_EPOCH + std::time::Duration::from_millis(mtime as u64);
+        if let Ok(file) = fs::OpenOptions::new().write(true).open(temp) {
+            let _ = file.set_modified(time);
+        }
+    }
+    if let Err(err) = fs::rename(temp, dest) {
+        let _ = fs::remove_file(temp);
+        return Err(map_io(err));
+    }
+    sync_current(dest, rel).map(SyncOutcome::Done).ok_or(FileError::NotFound)
+}
+
+/// Deletes a file (to the Trash) or an empty folder if it still matches `base`.
+/// Returns the Trash path of a trashed file.
+pub fn sync_delete(root: &Path, rel: &str, base: SyncBase) -> Result<SyncOutcome<Option<String>>, FileError> {
+    let parts = clean_parts(rel)?;
+    if parts.is_empty() {
+        return Err(FileError::Forbidden);
+    }
+    let root = root.canonicalize().map_err(map_io)?;
+    if sync_reserved(&root, &parts) {
+        return Err(FileError::Rejected("That path is managed by OwnNAS"));
+    }
+    let _guard = SYNC_COMMIT.lock().unwrap_or_else(|err| err.into_inner());
+    let resolved = match resolve(&root, rel) {
+        Ok(resolved) => resolved,
+        Err(FileError::NotFound) => return Ok(SyncOutcome::Done(None)),
+        Err(err) => return Err(err),
+    };
+    let current = sync_current(&resolved.full, &resolved.rel);
+    if !sync_matches(&current, base) {
+        return Ok(SyncOutcome::Conflict(current));
+    }
+    if resolved.full.is_dir() {
+        // Only empty folders: anything still inside was not seen by the client.
+        let mut items = fs::read_dir(&resolved.full).map_err(map_io)?;
+        if items.next().is_some() {
+            return Ok(SyncOutcome::Conflict(current));
+        }
+        fs::remove_dir(&resolved.full).map_err(map_io)?;
+        return Ok(SyncOutcome::Done(None));
+    }
+    trash_entry(&root, &resolved.rel).map(|path| SyncOutcome::Done(Some(path)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

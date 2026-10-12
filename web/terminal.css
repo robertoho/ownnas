@@ -1,0 +1,57 @@
+/* Standalone terminal page (/terminal), shown in an iframe or its own tab. */
+html, body.terminal-page {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+body.terminal-page {
+  display: flex;
+  flex-direction: column;
+  background: var(--panel-deep);
+  color: var(--text);
+}
+.terminal-host {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  padding: 6px 0 0 8px;
+}
+.terminal-host .xterm { height: 100%; }
+/* xterm draws its own scrollbar; hide the native one and xterm's black default in the
+   few pixels left below the last row. */
+.terminal-host .xterm .xterm-viewport {
+  background-color: transparent;
+  scrollbar-width: none;
+}
+.terminal-host .xterm .xterm-viewport::-webkit-scrollbar { display: none; }
+.terminal-status {
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  margin: 0;
+  padding: 0.35rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-2);
+  color: var(--muted);
+  font: 0.85rem var(--sans);
+}
+.terminal-keys {
+  display: flex;
+  gap: 4px;
+  padding: 6px;
+  overflow-x: auto;
+  border-top: 1px solid var(--line);
+  background: var(--bg-2);
+}
+.terminal-keys[hidden] { display: none; }
+.terminal-keys button {
+  flex: 0 0 auto;
+  min-width: 2.6rem;
+  padding: 0.45rem 0.6rem;
+  font: 0.9rem var(--mono);
+}
+.terminal-keys button[aria-pressed="true"] {
+  background: var(--accent);
+  color: var(--accent-ink);
+}

@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Terminal · OwnNAS</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <link rel="stylesheet" href="/assets/vendor/xterm/xterm.css">
+  <link rel="stylesheet" href="/assets/terminal.css">
+</head>
+<body class="terminal-page">
+  <div id="terminal" class="terminal-host"></div>
+  <p id="terminal-status" class="terminal-status" role="status" hidden></p>
+  <div id="terminal-keys" class="terminal-keys" hidden>
+    <button type="button" data-key="esc">Esc</button>
+    <button type="button" data-key="tab">Tab</button>
+    <button type="button" data-key="ctrl" aria-pressed="false">Ctrl</button>
+    <button type="button" data-key="up" aria-label="Up">↑</button>
+    <button type="button" data-key="down" aria-label="Down">↓</button>
+    <button type="button" data-key="left" aria-label="Left">←</button>
+    <button type="button" data-key="right" aria-label="Right">→</button>
+    <button type="button" data-key="ctrl-c">^C</button>
+    <button type="button" data-key="paste">Paste</button>
+  </div>
+  <script type="module" src="/assets/terminal.js"></script>
+</body>
+</html>

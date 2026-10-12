@@ -67,6 +67,52 @@ supports arm64, 32-bit ARM, and x86_64. Open `android/` in Android Studio or
 run `android\\gradlew.bat assembleDebug` on Windows. See [android/README.md](android/README.md)
 for the storage model and build details.
 
+## Sync a folder with your computer
+
+`ownnas-sync` is a separate command-line client (in `clients/desktop`) that keeps a local
+folder and a folder on the server in sync in both directions. It builds on Windows, macOS,
+and Linux:
+
+```bash
+cargo build --release -p ownnas-sync
+ownnas-sync setup ~/OwnNAS --server https://nas.example:8787 --username alice --remote Documents
+ownnas-sync run ~/OwnNAS --watch
+```
+
+`setup` signs in once and stores a token in `~/OwnNAS/.ownnas-sync/config.json`; the
+password is not saved. Pass `--ca-cert ca.crt` when the server uses a certificate from
+`ownnas tls generate`. `run` syncs once; `--watch` syncs again every 30 seconds
+(`--interval`), and `--dry-run` only lists what would change.
+
+- Files deleted on one side are not destroyed on the other. The server moves them to its
+  Trash, and the client moves local files to `.ownnas-sync/deleted` for 30 days.
+- When both sides changed the same file, the client keeps both copies. Your local edit is
+  saved as `name (conflict <computer> <date>).ext` and uploaded next to the server's version.
+- `.DS_Store`, `Thumbs.db`, `desktop.ini`, and Office/LibreOffice lock files are not synced.
+- Against a `--readonly` server, the client only downloads.
+
+The client uses the `/api/sync/*` endpoints, which native apps can use as well.
+Authenticate with `POST /api/login` and `{"token": true}`, then send
+`Authorization: Bearer <token>`. Tokens stay valid while in use.
+
+## Terminals in the browser
+
+Administrators can open a shell in any folder from the right-click menu (**Open terminal
+here**), for example to run Claude Code, opencode, or other command-line agents on the
+files. It is off by default: turn it on in **Settings → Terminal**.
+
+- Terminals keep running when you close the tab or lose the connection. Reopen them from
+  the right-click menu (**Terminals**) on any device; recent output (up to 2 MB) is replayed.
+  **Pop out** opens one in its own browser tab, and phones get a row of Esc/Tab/Ctrl/arrow keys.
+- The shell runs as the account that runs OwnNAS, with its sign-ins and API keys, so sign
+  in to your agents on that machine once. Consider running OwnNAS under a dedicated account.
+- An optional terminal password is asked once per sign-in (for up to 12 hours). Changing
+  any terminal setting requires your account password, and turning terminals off ends them all.
+- Terminals are refused over plain HTTP unless you connect from this machine, your LAN,
+  or a VPN address (such as Tailscale). Use HTTPS otherwise.
+- The default shell is `$SHELL` (a login shell) on macOS and Linux and PowerShell on
+  Windows; set another one in Settings. Not available with `--readonly` or on Android.
+
 ## Run in the background
 
 OwnNAS stays in the foreground. Use the OS service manager so it survives logout and starts on boot. Pass absolute paths for the binary, `--root`, and `--data`. Create the account once interactively before installing the service.

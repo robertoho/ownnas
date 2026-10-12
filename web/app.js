@@ -237,7 +237,10 @@ async function api(url, options = {}) {
       abortErr.cancel = true;
       throw abortErr;
     }
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    error.data = data;
+    throw error;
   }
   if (!undoBusy && state.me) {
     if (method === "DELETE" && url.startsWith("/api/entry?") && data.action === "deleted" || url === "/api/trash/empty") { undoHistory.length = 0; syncUndo(); }
@@ -1077,12 +1080,19 @@ function openSelectionMenu(x, y, pasteInto) {
     buttons.push(`<button type="button" data-menu="duplicates">Find duplicates…</button>`);
     buttons.push(`<button type="button" data-menu="activity">Activity</button>`);
     buttons.push(`<button type="button" data-menu="toggleHidden">${state.hidden ? "Hide dotfiles" : "Show hidden files"}</button>`);
+    if (state.me && state.me.terminal && !inTrash) {
+      buttons.push(`<button type="button" data-menu="terminal">Open terminal here</button>`);
+      buttons.push(`<button type="button" data-menu="terminals">Terminals</button>`);
+    }
     if (write && inTrash) {
       buttons.push(`<button type="button" data-menu="emptyTrash" class="danger">Empty Trash</button>`);
     }
     if (write && clip) buttons.push(`<button type="button" data-menu="paste">Paste</button>`);
   } else {
     if (one) buttons.push(`<button type="button" data-menu="open">Open</button>`);
+    if (one && one.dir && state.me && state.me.terminal && !allInTrash) {
+      buttons.push(`<button type="button" data-menu="terminal">Open terminal here</button>`);
+    }
     if (write && entries.every(customizableFolder)) buttons.push(`<button type="button" data-menu="folderAppearance">${entries.length === 1 ? 'Customize folder…' : 'Customize folders…'}</button>`);
     if (entries.length) buttons.push(`<button type="button" data-menu="download">Download</button>`);
     if (write && allInTrash) buttons.push(`<button type="button" data-menu="restore">Restore</button>`);
@@ -1181,13 +1191,49 @@ function setSettingsTab(tab) {
   const theme = tab === "theme";
   const updates = tab === "updates";
   const users = tab === "users";
+  const terminal = tab === "terminal";
   $("settings-tab-theme").setAttribute("aria-selected", theme ? "true" : "false");
   $("settings-tab-updates").setAttribute("aria-selected", updates ? "true" : "false");
   $("settings-tab-users").setAttribute("aria-selected", users ? "true" : "false");
+  $("settings-tab-terminal").setAttribute("aria-selected", terminal ? "true" : "false");
   $("settings-theme").hidden = !theme;
   $("settings-updates").hidden = !updates;
   $("settings-users").hidden = !users;
+  $("settings-terminal").hidden = !terminal;
   if (updates) refreshUpdatePanel().catch((err) => toast(err.message, true));
+  if (terminal) {
+    terminalPanel()
+      .then((module) => module.renderSettings($("settings-terminal")))
+      .catch((err) => toast(err.message, true));
+  }
+}
+
+let terminalModule = null;
+
+/// Loads the terminal panel on first use.
+async function terminalPanel() {
+  if (!terminalModule) {
+    const module = await import("/assets/terminal-panel.js");
+    module.init({
+      api,
+      toast,
+      askText,
+      askConfirm,
+      currentPath: () => state.path,
+      rootName: () => state.me && state.me.rootName,
+      refreshMe: async () => {
+        Object.assign(state.me, await api("/api/me"));
+      },
+    });
+    terminalModule = module;
+  }
+  return terminalModule;
+}
+
+function openTerminalAt(path) {
+  terminalPanel()
+    .then((module) => module.open(path))
+    .catch((err) => toast(err.message, true));
 }
 
 function openSettings(tab) {
@@ -1195,7 +1241,8 @@ function openSettings(tab) {
   closeLibrary();
   const admin = !!(state.me && state.me.admin);
   $("settings-tab-users").hidden = !admin;
-  if (!admin && tab === "users") tab = "theme";
+  $("settings-tab-terminal").hidden = !admin;
+  if (!admin && (tab === "users" || tab === "terminal")) tab = "theme";
   if (!tab) tab = "theme";
   setSettingsTab(tab);
   renderThemeGrid();
@@ -2286,6 +2333,8 @@ function askText(title, label, value, okLabel, options = {}) {
   $("text-title").textContent = title;
   $("text-label-copy").textContent = label;
   $("text-input").value = value || "";
+  $("text-input").type = options.password ? "password" : "text";
+  $("text-input").autocomplete = options.password ? "current-password" : "off";
   $("text-ok").textContent = okLabel || "Save";
   const warning = $("text-warning");
   const originalName = options.watchExtensionFrom || "";
@@ -3519,6 +3568,10 @@ function runMenuAction(button, entries, pasteInto) {
   if (action === "activity") $("activity-btn").click();
   if (action === "bulkTag") bulkTagEntries(entries).catch((err) => toast(err.message, true));
   if (action === "emptyTrash") $("empty-trash-btn").click();
+  if (action === "terminal") openTerminalAt(one && one.dir ? one.path : state.path);
+  if (action === "terminals") {
+    terminalPanel().then((module) => module.show()).catch((err) => toast(err.message, true));
+  }
   if (action === "toggleHidden") {
     const toggle = $("hidden-toggle");
     toggle.checked = !toggle.checked;
@@ -4215,6 +4268,7 @@ $("settings-btn").addEventListener("click", () => openSettings());
 $("settings-close").addEventListener("click", closeSettings);
 $("settings-tab-theme").addEventListener("click", () => setSettingsTab("theme"));
 $("settings-tab-updates").addEventListener("click", () => setSettingsTab("updates"));
+$("settings-tab-terminal").addEventListener("click", () => setSettingsTab("terminal"));
 $("settings-tab-users").addEventListener("click", () => {
   setSettingsTab("users");
   loadUsers().catch((err) => toast(err.message, true));

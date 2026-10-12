@@ -169,6 +169,27 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>, String> {
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", params![key], |row| row.get(0))
+        .map(Some)
+        .or_else(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            _ => Err("Could not read a setting".to_string()),
+        })
+}
+
+pub fn set_setting(conn: &Connection, key: &str, value: Option<&str>) -> Result<(), String> {
+    let result = match value {
+        Some(value) => conn.execute(
+            "INSERT INTO settings(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        ),
+        None => conn.execute("DELETE FROM settings WHERE key = ?1", params![key]),
+    };
+    result.map(|_| ()).map_err(|_| "Could not save a setting".to_string())
+}
+
 pub fn count_users(conn: &Connection) -> Result<i64, String> {
     conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
         .map_err(|_| "Could not read users".to_string())
@@ -329,6 +350,11 @@ pub fn user_for_token(conn: &Connection, token: &str) -> Result<Option<User>, St
         .next()
         .map_err(|_| "Could not read the session".to_string())?
     {
+        // Sliding expiry: a session (such as a sync client's token) stays valid while in use.
+        let _ = conn.execute(
+            "UPDATE sessions SET expires_at = ?1 WHERE token_hash = ?2 AND expires_at < ?3",
+            params![now + SESSION_SECS, auth::token_hash(token), now + SESSION_SECS / 2],
+        );
         Ok(Some(User {
             id: row.get(0).map_err(|_| "Could not read the session".to_string())?,
             username: row.get(1).map_err(|_| "Could not read the session".to_string())?,
