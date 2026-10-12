@@ -2,6 +2,7 @@ package app.ownnas.android.ui
 
 import android.content.Context
 import android.content.Intent
+import android.text.format.DateUtils
 import android.text.format.Formatter
 import android.webkit.MimeTypeMap
 import androidx.compose.foundation.clickable
@@ -21,6 +22,7 @@ import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.UploadFile
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -52,6 +54,7 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
+import app.ownnas.core.Conflict
 import app.ownnas.core.Entry
 import java.io.File
 
@@ -243,4 +246,69 @@ fun shareWithAnotherApp(context: Context, file: File) {
         .putExtra(Intent.EXTRA_STREAM, file.contentUri(context))
         .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     context.startActivity(Intent.createChooser(send, null))
+}
+
+/** The web app's "File already exists" question, with the same choices. */
+@Composable
+fun ConflictDialog(prompt: ConflictPrompt) {
+    val context = LocalContext.current
+    var rest by remember(prompt) { mutableStateOf(false) }
+    val existing = prompt.existing
+    fun describe(size: Long, modified: Long) =
+        "${Formatter.formatShortFileSize(context, size)}, ${DateUtils.formatDateTime(context, modified, DateUtils.FORMAT_SHOW_DATE or DateUtils.FORMAT_SHOW_TIME or DateUtils.FORMAT_SHOW_YEAR)}"
+    val note = if (existing.dir) {
+        "A folder with this name is already here. Keep both saves the upload under a new name."
+    } else {
+        buildString {
+            append("Already here: ${describe(existing.size.toLong(), existing.modified)}.")
+            val size = prompt.incomingSize
+            val modified = prompt.incomingModified
+            if (size != null && modified != null) {
+                append(" This upload: ${describe(size, modified)}.")
+                // Compare whole seconds, as the server does.
+                val here = existing.modified / 1000
+                val incoming = modified / 1000
+                append(
+                    when {
+                        here < incoming -> " The file already here is older."
+                        here > incoming -> " This upload is older."
+                        else -> " Both have the same date."
+                    },
+                )
+            }
+        }
+    }
+    val choices = listOf(
+        Conflict.OVERWRITE to "Overwrite",
+        Conflict.KEEP_BOTH to "Keep both",
+        Conflict.ARCHIVE_OLDER to "Archive older",
+        Conflict.ARCHIVE_EXISTING to "Archive existing",
+        Conflict.IGNORE to "Ignore",
+    ).filter { (choice, _) -> prompt.allows(choice) }
+    AlertDialog(
+        onDismissRequest = {},
+        title = { Text(if (existing.dir) "Folder already exists" else "File already exists") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(if (existing.dir) "A folder named “${prompt.name}” already exists." else "“${prompt.name}” already exists.")
+                Text(note, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (prompt.more) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth().clickable { rest = !rest },
+                    ) {
+                        Checkbox(checked = rest, onCheckedChange = { rest = it })
+                        Text("Use this choice for the remaining files")
+                    }
+                }
+                Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End) {
+                    choices.forEach { (choice, label) ->
+                        TextButton(onClick = { prompt.answer(ConflictAnswer(choice, rest)) }) { Text(label) }
+                    }
+                    TextButton(onClick = { prompt.answer(null) }) { Text("Cancel") }
+                }
+            }
+        },
+        confirmButton = {},
+    )
 }

@@ -1,6 +1,6 @@
 //! Changing files on a server: new folders, renames, moving to the Trash, and uploads.
-use std::collections::HashSet;
-use std::io::{self, Read};
+//! Uploads use the same endpoint and conflict choices as the web app.
+use std::io::{self, Cursor, Read};
 
 use serde::Deserialize;
 use serde_json::json;
@@ -37,40 +37,102 @@ impl<R: Read> Read for Counted<'_, R> {
 
 const CANCELLED: &str = "Cancelled";
 
+/// What to do when an upload's name is taken: the web app's choices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Conflict {
+    Overwrite,
+    /// Save under a numbered name, such as `photo (2).jpg`.
+    KeepBoth,
+    /// Keep whichever of the two is newer here; move the older one to the archive.
+    ArchiveOlder,
+    /// Move the file that is here to the archive and save the upload.
+    ArchiveExisting,
+    /// Skip this upload.
+    Ignore,
+}
+
+impl Conflict {
+    fn param(self) -> &'static str {
+        match self {
+            Conflict::Overwrite => "overwrite",
+            Conflict::KeepBoth => "keep",
+            Conflict::ArchiveOlder => "archive-older",
+            Conflict::ArchiveExisting => "archive-existing",
+            Conflict::Ignore => "ignore",
+        }
+    }
+}
+
+/// What the server has at an upload's name.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Existing {
+    /// It is a folder; only keeping both or ignoring makes sense then.
+    pub dir: bool,
+    /// Seconds since the Unix epoch.
+    pub modified: i64,
+    pub size: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Uploaded {
+    Saved,
+    /// The server skipped it, as asked with [`Conflict::Ignore`].
+    Skipped,
+    /// The name is taken and no choice was given; ask, then upload again with one.
+    Exists(Existing),
+}
+
 #[derive(Deserialize)]
 struct PathResponse {
     path: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct UploadedEntry {
-    path: String,
+struct CheckItem {
+    exists: bool,
+    #[serde(flatten)]
+    existing: Existing,
+}
+
+#[derive(Deserialize)]
+struct CheckResponse {
+    items: Vec<CheckItem>,
 }
 
 #[derive(Deserialize)]
 struct UploadResponse {
-    entry: UploadedEntry,
+    saved: u32,
+}
+
+#[derive(Deserialize)]
+struct ConflictResponse {
+    #[serde(default)]
+    exists: bool,
+    #[serde(flatten)]
+    existing: Option<Existing>,
 }
 
 fn join(dir: &str, name: &str) -> String {
     if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") }
 }
 
-/// `name`, or `name (2).ext`, `name (3).ext`, … whichever is not in `taken`. Compares
-/// without case, since the server's disk may not tell `A.jpg` and `a.jpg` apart.
-pub fn free_name(taken: &HashSet<String>, name: &str) -> String {
-    let lower: HashSet<String> = taken.iter().map(|name| name.to_lowercase()).collect();
-    if !lower.contains(&name.to_lowercase()) {
-        return name.to_string();
-    }
-    let (stem, ext) = match name.rfind('.') {
-        Some(dot) if dot > 0 => (&name[..dot], &name[dot..]),
-        _ => (name, ""),
-    };
-    (2..)
-        .map(|n| format!("{stem} ({n}){ext}"))
-        .find(|candidate| !lower.contains(&candidate.to_lowercase()))
-        .expect("an unused name")
+/// The multipart form a browser sends for one file, around the file's bytes. Quotes and line
+/// breaks in the name are percent-encoded, as browsers do.
+fn form_parts(boundary: &str, name: &str) -> (Vec<u8>, Vec<u8>) {
+    let safe: String = name
+        .chars()
+        .map(|c| match c {
+            '"' => "%22".to_string(),
+            '\r' => "%0D".to_string(),
+            '\n' => "%0A".to_string(),
+            c => c.to_string(),
+        })
+        .collect();
+    let head = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{safe}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+    );
+    let tail = format!("\r\n--{boundary}--\r\n");
+    (head.into_bytes(), tail.into_bytes())
 }
 
 impl Api {
@@ -101,31 +163,44 @@ impl Api {
         Ok(())
     }
 
-    /// Uploads a new file into `dir` without replacing anything: a taken name gets a number,
-    /// as in `photo (2).jpg`. `size` is sent when known so the server can check the length;
-    /// `mtime` is milliseconds since the Unix epoch. Returns the file's path on the server.
-    pub fn upload_new(
+    /// What is already at `name` in `dir`, if anything. Ask before uploading, as the web app does.
+    pub fn check_upload(&self, dir: &str, name: &str) -> Result<Option<Existing>, ApiError> {
+        let response = self
+            .request("POST", "/api/upload/conflicts")
+            .send_json(json!({ "path": dir, "names": [name] }))
+            .map_err(map_err)?;
+        let body: CheckResponse = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
+        Ok(body.items.into_iter().next().filter(|item| item.exists).map(|item| item.existing))
+    }
+
+    /// Uploads one file into `dir` through the web app's upload endpoint. Without `conflict`,
+    /// a taken name comes back as [`Uploaded::Exists`]. `size` is sent when known;
+    /// `modified` (seconds) is needed for [`Conflict::ArchiveOlder`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_file(
         &self,
         dir: &str,
         name: &str,
+        conflict: Option<Conflict>,
+        modified: Option<i64>,
         size: Option<u64>,
-        mtime: Option<i64>,
         body: impl Read,
         progress: Progress,
-    ) -> Result<String, ApiError> {
-        let taken: HashSet<String> = self.list(dir)?.entries.into_iter().map(|entry| entry.name).collect();
-        let path = join(dir, &free_name(&taken, name));
+    ) -> Result<Uploaded, ApiError> {
+        let boundary = format!("----OwnNAS{}", hex::encode(rand::random::<[u8; 12]>()));
+        let (head, tail) = form_parts(&boundary, name);
         let mut request = self
-            .request("PUT", "/api/sync/file")
-            .query("path", &path)
-            // `none`: the server refuses if something appeared at this name meanwhile.
-            .query("base", "none")
-            .set("Content-Type", "application/octet-stream");
-        if let Some(mtime) = mtime {
-            request = request.query("mtime", &mtime.to_string());
+            .request("POST", "/api/upload")
+            .query("path", dir)
+            .set("Content-Type", &format!("multipart/form-data; boundary={boundary}"));
+        if let Some(conflict) = conflict {
+            request = request.query("conflict", conflict.param());
+        }
+        if let Some(modified) = modified {
+            request = request.query("modified", &modified.to_string());
         }
         if let Some(size) = size {
-            request = request.set("Content-Length", &size.to_string());
+            request = request.set("Content-Length", &(head.len() as u64 + size + tail.len() as u64).to_string());
         }
         let cancelled = std::cell::Cell::new(false);
         let watch = |done: u64| {
@@ -133,11 +208,22 @@ impl Api {
             cancelled.set(!go_on);
             go_on
         };
-        let response = request
-            .send(Counted::new(body, &watch))
-            .map_err(|err| if cancelled.get() { ApiError::Cancelled } else { map_err(err) })?;
-        let body: UploadResponse = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
-        Ok(body.entry.path)
+        let form = Cursor::new(head).chain(Counted::new(body, &watch)).chain(Cursor::new(tail));
+        match request.send(form) {
+            Ok(response) => {
+                let body: UploadResponse = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
+                Ok(if body.saved > 0 { Uploaded::Saved } else { Uploaded::Skipped })
+            }
+            Err(_) if cancelled.get() => Err(ApiError::Cancelled),
+            Err(ureq::Error::Status(409, response)) => {
+                let body: ConflictResponse = response.into_json().unwrap_or(ConflictResponse { exists: false, existing: None });
+                match body.existing.filter(|_| body.exists) {
+                    Some(existing) => Ok(Uploaded::Exists(existing)),
+                    None => Err(ApiError::Conflict),
+                }
+            }
+            Err(err) => Err(map_err(err)),
+        }
     }
 }
 
@@ -146,12 +232,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn free_names_count_up_before_the_extension() {
-        let taken: HashSet<String> = ["photo.jpg", "Photo (2).JPG", "notes", ".env"].map(String::from).into();
-        assert_eq!(free_name(&taken, "other.jpg"), "other.jpg");
-        assert_eq!(free_name(&taken, "PHOTO.jpg"), "PHOTO (3).jpg");
-        assert_eq!(free_name(&taken, "notes"), "notes (2)");
-        assert_eq!(free_name(&taken, ".env"), ".env (2)");
+    fn form_parts_wrap_the_file_like_a_browser() {
+        let (head, tail) = form_parts("B", "my \"best\".jpg");
+        assert_eq!(
+            String::from_utf8(head).unwrap(),
+            "--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"my %22best%22.jpg\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        );
+        assert_eq!(String::from_utf8(tail).unwrap(), "\r\n--B--\r\n");
+    }
+
+    #[test]
+    fn conflict_answers_parse() {
+        let body: ConflictResponse =
+            serde_json::from_str(r#"{"error":"x","exists":true,"dir":false,"modified":5,"size":9}"#).unwrap();
+        assert!(body.exists);
+        assert_eq!(body.existing, Some(Existing { dir: false, modified: 5, size: 9 }));
+        let check: CheckResponse =
+            serde_json::from_str(r#"{"items":[{"name":"a","exists":false,"dir":false,"modified":0,"size":0}]}"#).unwrap();
+        assert!(!check.items[0].exists);
     }
 
     #[test]

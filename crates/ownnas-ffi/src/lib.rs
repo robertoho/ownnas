@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ownnas_core::api::{Api, ApiError};
-use ownnas_core::browse;
+use ownnas_core::{browse, manage};
 
 uniffi::setup_scaffolding!();
 
@@ -78,6 +78,51 @@ pub struct Folder {
     pub root_name: String,
     pub entries: Vec<Entry>,
     pub truncated: bool,
+}
+
+/// What to do when an upload's name is taken; the web app's choices.
+#[derive(uniffi::Enum, Clone, Copy)]
+pub enum Conflict {
+    Overwrite,
+    KeepBoth,
+    ArchiveOlder,
+    ArchiveExisting,
+    Ignore,
+}
+
+impl From<Conflict> for manage::Conflict {
+    fn from(conflict: Conflict) -> Self {
+        match conflict {
+            Conflict::Overwrite => manage::Conflict::Overwrite,
+            Conflict::KeepBoth => manage::Conflict::KeepBoth,
+            Conflict::ArchiveOlder => manage::Conflict::ArchiveOlder,
+            Conflict::ArchiveExisting => manage::Conflict::ArchiveExisting,
+            Conflict::Ignore => manage::Conflict::Ignore,
+        }
+    }
+}
+
+/// What the server already has at an upload's name.
+#[derive(uniffi::Record)]
+pub struct Existing {
+    pub dir: bool,
+    /// Milliseconds since the Unix epoch.
+    pub modified: i64,
+    pub size: u64,
+}
+
+impl From<manage::Existing> for Existing {
+    fn from(existing: manage::Existing) -> Self {
+        Existing { dir: existing.dir, modified: existing.modified.saturating_mul(1000), size: existing.size }
+    }
+}
+
+#[derive(uniffi::Enum)]
+pub enum UploadResult {
+    Saved,
+    Skipped,
+    /// The name is taken; ask, then upload again with a [`Conflict`] choice.
+    Exists { existing: Existing },
 }
 
 /// Follows an upload or download. Called often from the transferring thread.
@@ -180,25 +225,46 @@ impl Server {
         Ok(self.api.trash(&path)?)
     }
 
-    /// Uploads from an open file descriptor, which this call takes over and closes, as a new
-    /// file in `dir`. A taken name gets a number. `size` and `mtime_ms` may be unknown.
-    /// Returns the file's path on the server.
+    /// What is already at `name` in `dir`, if anything. Check before [`Server::upload_fd`].
+    pub fn check_upload(&self, dir: String, name: String) -> Result<Option<Existing>, ClientError> {
+        Ok(self.api.check_upload(&dir, &name)?.map(Existing::from))
+    }
+
+    /// Uploads from an open file descriptor, which this call takes over and closes, through the
+    /// web app's upload endpoint. Without `conflict`, a taken name returns
+    /// [`UploadResult::Exists`] so the app can ask. `modified_secs` is needed for
+    /// [`Conflict::ArchiveOlder`].
     #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
     pub fn upload_fd(
         &self,
         dir: String,
         name: String,
         fd: i32,
         size: Option<u64>,
-        mtime_ms: Option<i64>,
+        modified_secs: Option<i64>,
+        conflict: Option<Conflict>,
         transfer: Arc<dyn Transfer>,
-    ) -> Result<String, ClientError> {
+    ) -> Result<UploadResult, ClientError> {
         use std::os::fd::{FromRawFd, OwnedFd};
         if fd < 0 {
             return Err(failed("The file could not be opened".into()));
         }
         // SAFETY: the caller hands over an open descriptor it no longer uses.
         let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-        Ok(self.api.upload_new(&dir, &name, size, mtime_ms, file, &|done| transfer.keep_going(done))?)
+        let outcome = self.api.upload_file(
+            &dir,
+            &name,
+            conflict.map(manage::Conflict::from),
+            modified_secs,
+            size,
+            file,
+            &|done| transfer.keep_going(done),
+        )?;
+        Ok(match outcome {
+            manage::Uploaded::Saved => UploadResult::Saved,
+            manage::Uploaded::Skipped => UploadResult::Skipped,
+            manage::Uploaded::Exists(existing) => UploadResult::Exists { existing: existing.into() },
+        })
     }
 }

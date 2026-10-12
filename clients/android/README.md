@@ -11,8 +11,10 @@ What works now:
 - Folders with thumbnails and pull to refresh.
 - Open a file in the app that handles its type, or share it, with download progress.
 - Upload photos and videos (the system photo picker) or any files (the system file picker).
-  Uploads stream from the picked file, show progress, can be cancelled, and never replace
-  anything: a taken name becomes `name (2).ext`. The file keeps its modification time.
+  Uploads use the web app's endpoint (`POST /api/upload`): when a name is taken the app asks
+  with the same choices (overwrite, keep both, archive older, archive existing, ignore), and
+  the activity log records them the same way. Files stream from the picker, show progress,
+  and can be cancelled.
 - New folder, rename, and move to the server's Trash (restorable from the web app).
   Servers started with `--readonly` show no write actions.
 

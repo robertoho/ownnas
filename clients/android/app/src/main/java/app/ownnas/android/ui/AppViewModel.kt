@@ -12,7 +12,9 @@ import app.ownnas.android.OwnNasApp
 import app.ownnas.android.data.SavedServer
 import app.ownnas.core.Account
 import app.ownnas.core.ClientException
+import app.ownnas.core.Conflict
 import app.ownnas.core.Entry
+import app.ownnas.core.UploadResult
 import app.ownnas.core.Folder
 import app.ownnas.core.Server
 import app.ownnas.core.normalizeAddress
@@ -64,6 +66,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private var uploader: Job? = null
     private var uploadTracker: Tracker? = null
     private var lastUploadError: String? = null
+    private val conflictState = MutableStateFlow<ConflictPrompt?>(null)
+    val conflict: StateFlow<ConflictPrompt?> = conflictState.asStateFlow()
 
     fun push(screen: Screen) {
         stack.add(screen)
@@ -138,36 +142,100 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (pending.isEmpty()) return
         synchronized(queue) { queue.addAll(pending) }
         uploadState.update { status ->
-            val base = status?.takeIf { it.active } ?: UploadStatus(0, 0, 0, null, null, 0)
+            val base = status?.takeIf { it.active } ?: UploadStatus(0, 0, 0, 0, null, null, 0)
             base.copy(total = base.total + pending.size)
         }
         if (uploader?.isActive != true) uploader = viewModelScope.launch(Dispatchers.IO) { drain() }
     }
 
+    private enum class Outcome { Saved, Skipped, Failed }
+
     private suspend fun drain() {
         lastUploadError = null
+        val rest = HashMap<Long, Conflict>()
         while (true) {
             val next = synchronized(queue) { queue.removeFirstOrNull() } ?: break
             val tracker = Tracker { done -> uploadState.update { it?.copy(currentDone = done) } }
             uploadTracker = tracker
             uploadState.update { it?.copy(current = next.name, currentSize = next.size, currentDone = 0) }
-            val ok = try {
-                call(next.serverId) {
-                    it.uploadFd(next.dir, next.name, next.file.detachFd(), next.size?.toULong(), next.modified, tracker)
-                }
-                true
+            val outcome = try {
+                uploadOne(next, tracker, rest)
             } catch (err: Exception) {
                 if (!err.isCancel()) lastUploadError = "${next.name}: ${err.userMessage()}"
-                false
+                Outcome.Failed
             } finally {
                 runCatching { next.file.close() }
             }
-            uploadState.update { it?.copy(finished = it.finished + if (ok) 1 else 0, failed = it.failed + if (ok) 0 else 1) }
-            changes.update { it + 1 }
+            uploadState.update {
+                it?.copy(
+                    finished = it.finished + if (outcome == Outcome.Saved) 1 else 0,
+                    skipped = it.skipped + if (outcome == Outcome.Skipped) 1 else 0,
+                    failed = it.failed + if (outcome == Outcome.Failed) 1 else 0,
+                )
+            }
+            if (outcome == Outcome.Saved) changes.update { it + 1 }
             if (tracker.cancelled) break
         }
         uploadTracker = null
         uploadState.update { it?.copy(current = null) }
+    }
+
+    /** Asks first when the name is taken, then uploads through the web app's endpoint. */
+    private suspend fun uploadOne(next: PendingUpload, tracker: Tracker, rest: MutableMap<Long, Conflict>): Outcome {
+        var choice: Conflict? = null
+        val existing = call(next.serverId) { it.checkUpload(next.dir, next.name) }
+        if (existing != null) {
+            val prompt = ConflictPrompt(
+                name = next.name,
+                existing = existing,
+                incomingSize = next.size,
+                incomingModified = next.modified,
+                more = synchronized(queue) { queue.any { it.batch == next.batch } },
+            )
+            choice = rest[next.batch]?.takeIf(prompt::allows) ?: run {
+                conflictState.value = prompt
+                val answer = try {
+                    prompt.reply.await()
+                } finally {
+                    conflictState.value = null
+                }
+                if (answer == null) {
+                    dropBatch(next.batch)
+                    tracker.cancelled = true
+                    return Outcome.Failed
+                }
+                if (answer.rest) rest[next.batch] = answer.choice
+                answer.choice
+            }
+        }
+        if (choice == Conflict.IGNORE) return Outcome.Skipped
+        val result = call(next.serverId) {
+            it.uploadFd(
+                next.dir,
+                next.name,
+                next.file.detachFd(),
+                next.size?.toULong(),
+                next.modified?.div(1000),
+                choice,
+                tracker,
+            )
+        }
+        return when (result) {
+            UploadResult.Saved -> Outcome.Saved
+            UploadResult.Skipped -> Outcome.Skipped
+            // Something appeared at this name after the check; the file was already read.
+            is UploadResult.Exists -> {
+                lastUploadError = "${next.name}: an item with that name appeared meanwhile. Try again."
+                Outcome.Failed
+            }
+        }
+    }
+
+    /** Drops the files still waiting from one pick, after its conflict question was cancelled. */
+    private fun dropBatch(batch: Long) {
+        val dropped = synchronized(queue) { queue.filter { it.batch == batch }.also { queue.removeAll(it) } }
+        dropped.forEach { runCatching { it.file.close() } }
+        uploadState.update { it?.copy(failed = it.failed + dropped.size) }
     }
 
     /** Stops the current upload and drops the ones still waiting. */
@@ -175,6 +243,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val dropped = synchronized(queue) { queue.toList().also { queue.clear() } }
         dropped.forEach { runCatching { it.file.close() } }
         uploadTracker?.cancelled = true
+        conflictState.value?.answer(null)
         uploadState.update { it?.copy(failed = it.failed + dropped.size) }
     }
 
@@ -182,7 +251,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun takeUploadSummary(): String? {
         val status = uploadState.value?.takeIf { !it.active } ?: return null
         uploadState.value = null
-        val uploaded = "Uploaded ${status.finished} ${if (status.finished == 1) "file" else "files"}"
+        val uploaded = "Uploaded ${status.finished} ${if (status.finished == 1) "file" else "files"}" +
+            if (status.skipped > 0) ", skipped ${status.skipped}" else ""
         return when {
             status.failed == 0 -> uploaded
             lastUploadError != null -> "$uploaded. ${status.failed} failed — $lastUploadError"
