@@ -3932,6 +3932,14 @@ window.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     // Let open dialogs handle Escape themselves (and avoid clearing selection mid-prompt).
     if (document.querySelector("dialog[open]")) return;
+    // Settings sits above everything else, so it closes before anything behind it.
+    if (!$("settings").hidden) {
+      event.preventDefault();
+      closeMenu();
+      closeSettings();
+      $("settings-btn").focus();
+      return;
+    }
     if (!$("search-panel").hidden) {
       event.preventDefault();
       clearDeepSearch();
