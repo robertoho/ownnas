@@ -63,9 +63,11 @@ function build() {
   const add = el("button", { type: "button", "data-action": "new", title: "New terminal in the same folder" }, "New");
   const popout = el("button", { type: "button", "data-action": "popout", title: "Open this terminal in its own browser tab" }, "Pop out");
   const end = el("button", { type: "button", "data-action": "end", class: "danger", title: "Stop the shell and everything running in it" }, "Close");
-  const hide = el("button", { type: "button", "data-action": "hide", title: "Hide the panel. Terminals keep running." }, "Hide");
+  const hide = el("button", { type: "button", "data-action": "hide", title: "Hide the panel (Ctrl+`). Terminals keep running." }, "Hide");
   const wide = el("button", { type: "button", "data-action": "wide", class: "terminals-wide-btn", "aria-pressed": "false" }, "Expand");
-  actions.append(add, popout, end, wide, hide);
+  // On phones the other buttons move into this menu, leaving one row for the tabs.
+  const more = el("button", { type: "button", "data-action": "more", class: "terminals-more-btn", "aria-label": "More terminal actions", "aria-haspopup": "menu" }, "⋯");
+  actions.append(add, popout, end, wide, more, hide);
   bar.append(overview, tabs, actions);
 
   const strip = el("div", { class: "terminals-agent", hidden: true });
@@ -87,6 +89,14 @@ function build() {
   });
   end.addEventListener("click", () => endTerminal(active).catch((err) => ctx.toast(err.message, true)));
   hide.addEventListener("click", hidePanel);
+  more.addEventListener("click", () => {
+    const rect = more.getBoundingClientRect();
+    openTabMenu(active, rect.right, rect.bottom + 4, { full: true });
+  });
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", fitToViewport);
+    window.visualViewport.addEventListener("scroll", fitToViewport);
+  }
   wide.addEventListener("click", () => setWide(!panel.classList.contains("is-wide")));
   setWide(storedWide());
   panel.addEventListener("click", (event) => {
@@ -102,6 +112,16 @@ function build() {
       activate(card.dataset.card);
     }
   });
+  window.addEventListener("message", (event) => {
+    if (event.origin !== location.origin || !event.data || event.data.source !== "ownnas-terminal") return;
+    if (event.data.type === "toggle-panel") togglePanel();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.ctrlKey && !event.altKey && !event.metaKey && event.code === "Backquote" && !event.repeat) {
+      event.preventDefault();
+      togglePanel();
+    }
+  }, true);
   document.addEventListener("visibilitychange", () => {
     const item = sessions.find((session) => session.id === active);
     if (panelVisible() && view === "terminal" && item && item.agent && item.agent.attention) markSeen(item.id);
@@ -145,12 +165,41 @@ function renderTabs() {
         title: `${item.path || "/"}${item.agent && item.agent.detail ? ` — ${item.agent.detail}` : ""}${attention ? `\n${attention}` : ""}`,
       });
       tab.append(el("span", { class: "agent-dot", "data-status": status, "aria-hidden": "true" }), el("span", {}, tabLabel(item)));
-      tab.addEventListener("click", () => {
+      let pressTimer = 0;
+      let pressed = false;
+      let pressStart = null;
+      // Long-press opens the tab menu on touch screens (iPhones have no context menu).
+      tab.addEventListener("pointerdown", (event) => {
+        if (event.pointerType !== "touch") return;
+        pressStart = { x: event.clientX, y: event.clientY };
+        pressTimer = setTimeout(() => {
+          pressTimer = 0;
+          pressed = true;
+          const rect = tab.getBoundingClientRect();
+          openTabMenu(item.id, rect.left, rect.bottom + 4);
+        }, 500);
+      });
+      const cancelPress = () => {
+        clearTimeout(pressTimer);
+        pressTimer = 0;
+      };
+      tab.addEventListener("pointermove", (event) => {
+        if (pressStart && Math.hypot(event.clientX - pressStart.x, event.clientY - pressStart.y) > 10) cancelPress();
+      });
+      tab.addEventListener("pointerup", cancelPress);
+      tab.addEventListener("pointercancel", cancelPress);
+      tab.addEventListener("click", (event) => {
+        if (pressed) {
+          pressed = false;
+          event.preventDefault();
+          return;
+        }
         setView("terminal");
         activate(item.id);
       });
       tab.addEventListener("contextmenu", (event) => {
         event.preventDefault();
+        if (pressed || pressTimer) return; // the long-press already handles touch
         const rect = tab.getBoundingClientRect();
         // The keyboard's menu key reports (0, 0); open under the tab instead.
         const fromKeyboard = event.clientX === 0 && event.clientY === 0;
@@ -179,6 +228,8 @@ function renderStrip() {
   const agent = item.agent || {};
   const status = statusOf(item);
   strip.hidden = false;
+  // A plain shell has nothing to report; phones hide the line to save room.
+  strip.classList.toggle("is-plain", item.running && !agent.name && !agent.attention);
   const line = el("div", { class: "terminals-agent-line" });
   line.append(el("span", { class: "agent-dot", "data-status": status, "aria-hidden": "true" }));
   if (!item.running) {
@@ -378,9 +429,9 @@ function onMenuKey(event) {
   }
 }
 
-function openTabMenu(id, x, y) {
+function openTabMenu(id, x, y, { full = false } = {}) {
   const item = sessions.find((session) => session.id === id);
-  if (!item) return;
+  if (!item && !full) return;
   if (!tabMenu) {
     tabMenu = el("div", { class: "menu terminal-tab-menu", role: "menu", hidden: true });
     document.body.append(tabMenu);
@@ -398,16 +449,25 @@ function openTabMenu(id, x, y) {
       runTabAction(button.dataset.tabAction, target).catch((err) => ctx.toast(err.message, true));
     });
   }
-  tabMenu.dataset.id = id;
+  tabMenu.dataset.id = id || "";
   const action = (name, label, extra = {}) => el("button", { type: "button", role: "menuitem", "data-tab-action": name, ...extra }, label);
-  tabMenu.replaceChildren(
-    el("div", { class: "menu-label" }, tabLabel(item)),
-    action("rename", "Rename…"),
-    action("duplicate", "Duplicate", { title: `New terminal in ${item.path || "/"}` }),
-    action("folder", "Show folder in files"),
-    action("popout", "Pop out"),
-    action("close", "Close", { class: "danger" }),
-  );
+  const items = [];
+  if (full) items.push(action("overview", view === "overview" ? "Back to the terminal" : "All terminals"));
+  if (full && !item) items.push(action("new-here", "New terminal here"));
+  if (item) {
+    items.unshift(el("div", { class: "menu-label" }, tabLabel(item)));
+    items.push(action("rename", "Rename…"));
+    items.push(action("duplicate", full ? "New terminal here" : "Duplicate", { title: `New terminal in ${item.path || "/"}` }));
+    items.push(action("folder", "Show folder in files"));
+    if (full) {
+      const edited = (item.agent && item.agent.files) || [];
+      if (edited.length) items.push(action("edited", `Edited files (${edited.length})`));
+      items.push(action("changes", "Git changes"));
+    }
+    items.push(action("popout", "Pop out"));
+    items.push(action("close", "Close", { class: "danger" }));
+  }
+  tabMenu.replaceChildren(...items);
   tabMenu.hidden = false;
   const rect = tabMenu.getBoundingClientRect();
   tabMenu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - rect.width - 8))}px`;
@@ -426,8 +486,21 @@ async function showFolder(id) {
 }
 
 async function runTabAction(action, id) {
+  if (action === "overview") {
+    setView(view === "overview" ? "terminal" : "overview");
+    return;
+  }
+  if (action === "new-here") {
+    await openTerminal(ctx.currentPath());
+    return;
+  }
   const item = sessions.find((session) => session.id === id);
   if (!item) return;
+  if (action === "edited" || action === "changes") {
+    setView("terminal");
+    if (drawer !== (action === "edited" ? "files" : "changes")) toggleDrawer(action === "edited" ? "files" : "changes");
+    return;
+  }
   if (action === "rename") {
     const name = await ctx.askText("Rename terminal", "Name (leave empty for the folder name)", item.name || "", "Rename");
     if (name === null) return;
@@ -545,17 +618,51 @@ async function withUnlock(request) {
   return request();
 }
 
+/// On phones, keep the panel inside the part of the screen the on-screen keyboard leaves
+/// (iPhones cover the page instead of resizing it).
+function fitToViewport() {
+  const viewport = window.visualViewport;
+  if (!panel || panel.hidden || !viewport || !window.matchMedia("(max-width: 820px)").matches) {
+    if (panel) {
+      panel.style.height = "";
+      panel.style.top = "";
+    }
+    return;
+  }
+  panel.style.height = `${viewport.height}px`;
+  panel.style.top = `${viewport.offsetTop}px`;
+}
+
 function showPanel() {
   panel.hidden = false;
   document.body.classList.add("terminals-open");
+  fitToViewport();
   if (view === "terminal") activate(active);
   else render();
 }
 
 function hidePanel() {
   closeTabMenu();
+  const hadFocus = panel.contains(document.activeElement);
   panel.hidden = true;
   document.body.classList.remove("terminals-open");
+  // Keep the keyboard in the page, so the shortcut can bring the panel back.
+  if (hadFocus) document.getElementById("terminals-btn")?.focus();
+}
+
+/// Ctrl+`: hide the panel, or bring it back (opening the newest terminal).
+function togglePanel() {
+  if (!panel.hidden) {
+    hidePanel();
+    return;
+  }
+  refresh()
+    .then((ok) => {
+      if (!ok) return;
+      view = "terminal";
+      showPanel();
+    })
+    .catch((err) => ctx.toast(err.message, true));
 }
 
 async function openTerminal(path) {

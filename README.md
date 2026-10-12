@@ -104,8 +104,14 @@ files. It is off by default: turn it on in **Settings → Terminal**.
 - Terminals keep running when you close the tab or lose the connection. Reopen them from
   the right-click menu (**Terminals**) on any device; recent output (up to 2 MB) is replayed.
   **Pop out** opens one in its own browser tab, and phones get a row of Esc/Tab/Ctrl/arrow keys.
-- Right-click a terminal tab to rename, duplicate, or close it, or to show its current folder
-  in the file browser (**Show folder** does the same). **Expand** makes the panel full width.
+- Right-click (or long-press) a terminal tab to rename, duplicate, or close it, or to show its
+  current folder in the file browser (**Show folder** does the same). **Expand** makes the
+  panel full width. **Ctrl+`** (the key left of 1) hides the panel and brings it back.
+- On phones the panel keeps one row of tabs, with everything else under **⋯**, and follows
+  the on-screen keyboard. The key row has Esc, Tab, Shift+Tab, sticky Ctrl and Alt (they also
+  modify arrows, Home/End, and PgUp/PgDn), Paste (images too), **Select** (the output as text
+  you can select and copy), text size, and a button that hides the keyboard. Add OwnNAS to
+  your home screen to use it full screen without the browser's address bar.
 - Paste or drop files (such as a screenshot) into a terminal to upload them and type their
   paths, as a local terminal would. They are kept in a temporary folder for that terminal and
   deleted when it closes or the server restarts.

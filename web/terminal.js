@@ -3,7 +3,25 @@ import { Terminal } from "/assets/vendor/xterm/xterm.mjs";
 import { FitAddon } from "/assets/vendor/xterm/addon-fit.mjs";
 
 const THEMES = ["ownnas", "tokyo-night", "catppuccin", "catppuccin-latte", "everforest", "gruvbox", "kanagawa", "osaka-jade", "matte-black", "rose-pine"];
-const KEYS = { esc: "\x1b", tab: "\t", up: "\x1b[A", down: "\x1b[B", right: "\x1b[C", left: "\x1b[D", "ctrl-c": "\x03" };
+const KEYS = {
+  esc: "\x1b",
+  tab: "\t",
+  "shift-tab": "\x1b[Z",
+  up: "\x1b[A",
+  down: "\x1b[B",
+  right: "\x1b[C",
+  left: "\x1b[D",
+  home: "\x1b[H",
+  end: "\x1b[F",
+  pgup: "\x1b[5~",
+  pgdn: "\x1b[6~",
+  "ctrl-c": "\x03",
+  pipe: "|",
+  slash: "/",
+  tilde: "~",
+  dash: "-",
+};
+const FONT_KEY = "ownnas-terminal-font";
 
 const id = new URLSearchParams(location.search).get("id") || "";
 const host = document.getElementById("terminal");
@@ -37,11 +55,19 @@ function applyTheme() {
   document.body.style.background = themeColors().background;
 }
 
+function storedFontSize() {
+  try {
+    const size = Number(localStorage.getItem(FONT_KEY));
+    if (size >= 8 && size <= 28) return size;
+  } catch {}
+  return window.matchMedia("(max-width: 600px)").matches ? 12 : 14;
+}
+
 applyTheme();
 const term = new Terminal({
   cursorBlink: true,
   fontFamily: getComputedStyle(document.documentElement).getPropertyValue("--mono").trim() || "ui-monospace, monospace",
-  fontSize: window.matchMedia("(max-width: 600px)").matches ? 12 : 14,
+  fontSize: storedFontSize(),
   scrollback: 10000,
   theme: themeColors(),
 });
@@ -76,8 +102,10 @@ let socket = null;
 let finished = false;
 let attempts = 0;
 let ctrlArmed = false;
+let altArmed = false;
 const encoder = new TextEncoder();
 const ctrlButton = document.querySelector('[data-key="ctrl"]');
+const altButton = document.querySelector('[data-key="alt"]');
 
 function sendBytes(bytes) {
   if (socket && socket.readyState === WebSocket.OPEN) socket.send(bytes);
@@ -98,14 +126,48 @@ function armCtrl(on) {
   ctrlButton.setAttribute("aria-pressed", on ? "true" : "false");
 }
 
+function armAlt(on) {
+  altArmed = on;
+  altButton.setAttribute("aria-pressed", on ? "true" : "false");
+}
+
+/// Applies the on-screen Ctrl and Alt keys (pressed once, they act on the next key) to a
+/// key's input, using the xterm encodings for modified arrows and similar keys.
+function withModifiers(input) {
+  if (!ctrlArmed && !altArmed) return input;
+  const modifier = 1 + (altArmed ? 2 : 0) + (ctrlArmed ? 4 : 0);
+  let output = input;
+  let match;
+  if ((match = /^\x1b\[([A-DHF])$/.exec(input))) {
+    output = `\x1b[1;${modifier}${match[1]}`;
+  } else if ((match = /^\x1b\[(\d+)~$/.exec(input))) {
+    output = `\x1b[${match[1]};${modifier}~`;
+  } else if (input.length === 1) {
+    output = ctrlArmed && /[a-z@\[\\\]^_ ?]/i.test(input)
+      ? String.fromCharCode(input === "?" ? 0x7f : input.toUpperCase().charCodeAt(0) & 0x1f)
+      : input;
+    if (altArmed) output = `\x1b${output}`;
+  }
+  armCtrl(false);
+  armAlt(false);
+  return output;
+}
+
 term.onData((data) => {
-  // The on-screen Ctrl key turns the next letter into its control character.
-  if (ctrlArmed && data.length === 1 && /[a-z@\[\\\]^_]/i.test(data)) {
-    armCtrl(false);
-    sendBytes(new Uint8Array([data.toUpperCase().charCodeAt(0) & 0x1f]));
+  // Typed text from the on-screen keyboard picks up the sticky Ctrl and Alt keys.
+  if ((ctrlArmed || altArmed) && data.length === 1) {
+    sendText(withModifiers(data));
     return;
   }
   sendText(data);
+});
+// Ctrl+` (the key left of 1, on any layout) hides the OwnNAS terminal panel, like VS Code.
+term.attachCustomKeyEventHandler((event) => {
+  if (embedded && event.ctrlKey && !event.altKey && !event.metaKey && event.code === "Backquote") {
+    if (event.type === "keydown") notifyParent({ type: "toggle-panel" });
+    return false;
+  }
+  return true;
 });
 term.onBinary((data) => sendBytes(Uint8Array.from(data, (char) => char.charCodeAt(0) & 0xff)));
 term.onResize(sendResize);
@@ -250,12 +312,79 @@ const keys = document.getElementById("terminal-keys");
 keys.hidden = !window.matchMedia("(pointer: coarse)").matches;
 if (!keys.hidden) requestAnimationFrame(() => fit.fit());
 keys.addEventListener("pointerdown", (event) => event.preventDefault()); // keep the keyboard open
+function setFontSize(size) {
+  term.options.fontSize = Math.max(8, Math.min(28, size));
+  try {
+    localStorage.setItem(FONT_KEY, String(term.options.fontSize));
+  } catch {}
+  fit.fit();
+}
+
+/// Shows the output as plain text, where the phone's own selection and copy work.
+const textView = document.getElementById("terminal-text");
+const textBody = document.getElementById("terminal-text-body");
+
+function bufferText() {
+  const buffer = term.buffer.active;
+  const lines = [];
+  for (let index = 0; index < buffer.length; index++) {
+    const line = buffer.getLine(index);
+    if (!line) continue;
+    const text = line.translateToString(true);
+    if (line.isWrapped && lines.length) lines[lines.length - 1] += text;
+    else lines.push(text);
+  }
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  return lines.join("\n");
+}
+
+function openTextView() {
+  textBody.textContent = bufferText();
+  textView.hidden = false;
+  term.blur();
+  requestAnimationFrame(() => {
+    textBody.scrollTop = textBody.scrollHeight;
+  });
+}
+
+textView.addEventListener("click", async (event) => {
+  const action = event.target.closest("[data-text]")?.dataset.text;
+  if (action === "close") {
+    textView.hidden = true;
+    term.focus();
+  } else if (action === "copy") {
+    try {
+      await navigator.clipboard.writeText(textBody.textContent);
+      flash("Copied");
+    } catch {
+      const range = document.createRange();
+      range.selectNodeContents(textBody);
+      getSelection().removeAllRanges();
+      getSelection().addRange(range);
+      flash(document.execCommand("copy") ? "Copied" : "Select the text and use your phone's Copy.");
+    }
+  }
+});
+
 keys.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-key]");
   if (!button) return;
   const key = button.dataset.key;
-  if (key === "ctrl") {
+  if (key === "keyboard") {
+    // Hiding the keyboard leaves the whole screen for reading the output.
+    if (document.activeElement === term.textarea) term.blur();
+    else term.focus();
+    return;
+  } else if (key === "select") {
+    openTextView();
+    return;
+  } else if (key === "smaller" || key === "larger") {
+    setFontSize(term.options.fontSize + (key === "larger" ? 1 : -1));
+    return;
+  } else if (key === "ctrl") {
     armCtrl(!ctrlArmed);
+  } else if (key === "alt") {
+    armAlt(!altArmed);
   } else if (key === "paste") {
     try {
       // An image on the clipboard (such as a screenshot) is uploaded like a pasted file.
@@ -276,10 +405,20 @@ keys.addEventListener("click", async (event) => {
       flash("The browser did not allow pasting here. Use the keyboard's paste instead.");
     }
   } else if (KEYS[key]) {
-    sendText(KEYS[key]);
+    sendText(withModifiers(KEYS[key]));
   }
   term.focus();
 });
+
+// On its own tab, follow the on-screen keyboard: iPhones cover the page instead of resizing it.
+if (!embedded && window.visualViewport) {
+  const fitViewport = () => {
+    document.body.style.height = `${window.visualViewport.height}px`;
+    window.scrollTo(0, 0);
+  };
+  window.visualViewport.addEventListener("resize", fitViewport);
+  fitViewport();
+}
 
 if (id) {
   connect();

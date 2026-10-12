@@ -40,17 +40,56 @@ body.terminal-page {
 .terminal-keys {
   display: flex;
   gap: 4px;
-  padding: 6px;
+  padding: 6px 6px calc(6px + env(safe-area-inset-bottom));
   overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
   border-top: 1px solid var(--line);
   background: var(--bg-2);
 }
+.terminal-keys::-webkit-scrollbar { display: none; }
 .terminal-keys[hidden] { display: none; }
 .terminal-keys button {
   flex: 0 0 auto;
-  min-width: 2.6rem;
-  padding: 0.45rem 0.6rem;
+  min-width: 2.4rem;
+  min-height: 2.6rem;
+  padding: 0.35rem 0.5rem;
+  border-radius: 8px;
   font: 0.9rem var(--mono);
+  touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.terminal-text {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel-deep);
+}
+.terminal-text[hidden] { display: none; }
+.terminal-text-bar {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.5rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-2);
+  font: 0.9rem var(--sans);
+}
+.terminal-text-bar span { flex: 1; color: var(--muted); }
+.terminal-text-body {
+  flex: 1;
+  margin: 0;
+  padding: 0.6rem 0.75rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 0.85rem/1.35 var(--mono);
+  color: var(--text);
+  -webkit-user-select: text;
+  user-select: text;
 }
 .terminal-keys button[aria-pressed="true"] {
   background: var(--accent);

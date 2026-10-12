@@ -54,6 +54,10 @@ const TERMINAL_CSS: &str = include_str!("../web/terminal.css");
 const XTERM_JS: &str = include_str!("../web/vendor/xterm/xterm.mjs");
 const XTERM_FIT_JS: &str = include_str!("../web/vendor/xterm/addon-fit.mjs");
 const XTERM_CSS: &str = include_str!("../web/vendor/xterm/xterm.css");
+const MANIFEST: &str = include_str!("../web/manifest.webmanifest");
+const ICON_192: &[u8] = include_bytes!("../web/icons/icon-192.png");
+const ICON_512: &[u8] = include_bytes!("../web/icons/icon-512.png");
+const ICON_180: &[u8] = include_bytes!("../web/icons/icon-180.png");
 
 pub struct AppState {
     pub db: Mutex<rusqlite::Connection>,
@@ -243,6 +247,10 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/tags", post(add_tag).delete(remove_tag))
         .route("/api/tags/bulk", post(bulk_tags))
         .route("/api/comments", post(add_comment).delete(remove_comment))
+        .route("/manifest.webmanifest", get(manifest))
+        .route("/assets/icons/icon-192.png", get(|| async { png(ICON_192) }))
+        .route("/assets/icons/icon-512.png", get(|| async { png(ICON_512) }))
+        .route("/assets/icons/icon-180.png", get(|| async { png(ICON_180) }))
         .route("/terminal", get(terminal_page))
         .route("/assets/terminal.js", get(terminal_javascript))
         .route("/assets/terminal-panel.js", get(terminal_panel_javascript))
@@ -2729,6 +2737,15 @@ async fn terminal_pump(mut socket: axum::extract::ws::WebSocket, session: std::s
             },
         }
     }
+}
+
+/// Lets phones install OwnNAS as a home-screen app.
+async fn manifest() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "application/manifest+json"), (header::CACHE_CONTROL, "no-cache")], MANIFEST)
+}
+
+fn png(bytes: &'static [u8]) -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "public, max-age=86400")], bytes)
 }
 
 async fn terminal_page() -> impl IntoResponse {

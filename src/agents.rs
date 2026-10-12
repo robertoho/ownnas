@@ -73,6 +73,9 @@ pub struct Agent {
     pub last_message: Option<String>,
     /// Milliseconds since the Unix epoch.
     pub updated: i64,
+    /// Detection has seen this agent in the terminal's foreground.
+    #[serde(skip)]
+    pub seen_running: bool,
 }
 
 fn now_ms() -> i64 {
@@ -274,6 +277,9 @@ impl Agent {
     pub fn detected(&mut self, name: Option<&str>, recently_active: bool) -> bool {
         let before = self.clone();
         match name {
+            // Hooks reported an agent that detection never saw running (for example because
+            // it was started through a wrapper): trust the hooks until SessionEnd.
+            None if self.hooked && !self.seen_running => {}
             None if self.name.is_some() => {
                 // The agent exited (possibly without a SessionEnd hook).
                 let attention = self.attention.take();
@@ -284,6 +290,7 @@ impl Agent {
                 if self.name.as_deref() != Some(name) {
                     *self = Agent { name: Some(name.to_string()), label: Some(display_name(name).to_string()), ..Agent::default() };
                 }
+                self.seen_running = true;
                 if !self.hooked && self.status.as_deref() != Some("waiting") {
                     self.status = Some(if recently_active { "working" } else { "idle" }.into());
                 }
@@ -699,6 +706,15 @@ mod tests {
         assert!(agent.detected(None, false));
         assert!(agent.name.is_none());
         assert!(agent.attention.is_some(), "attention survives the agent exiting");
+
+        // Hook-reported agents are only cleared once detection has seen them run.
+        let mut hooked = Agent::default();
+        hooked.apply_claude(&json!({"hook_event_name": "SessionStart"}), &rel);
+        assert!(!hooked.detected(None, false), "never seen running: keep the hook state");
+        assert_eq!(hooked.name.as_deref(), Some("claude"));
+        hooked.detected(Some("claude"), false);
+        assert!(hooked.detected(None, false));
+        assert!(hooked.name.is_none(), "seen running, then gone: the agent exited");
     }
 
     #[test]

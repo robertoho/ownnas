@@ -4,6 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
   <meta name="robots" content="noindex, nofollow">
+  <meta name="theme-color" content="#12140f">
+  <link rel="icon" type="image/png" sizes="192x192" href="/assets/icons/icon-192.png">
   <title>Terminal · OwnNAS</title>
   <link rel="stylesheet" href="/assets/app.css">
   <link rel="stylesheet" href="/assets/vendor/xterm/xterm.css">
@@ -12,7 +14,16 @@
 <body class="terminal-page">
   <div id="terminal" class="terminal-host"></div>
   <p id="terminal-status" class="terminal-status" role="status" hidden></p>
-  <div id="terminal-keys" class="terminal-keys" hidden>
+  <div id="terminal-text" class="terminal-text" hidden>
+    <div class="terminal-text-bar">
+      <span>Select text to copy it</span>
+      <button type="button" data-text="copy">Copy all</button>
+      <button type="button" data-text="close">Done</button>
+    </div>
+    <pre id="terminal-text-body" class="terminal-text-body" tabindex="0"></pre>
+  </div>
+  <div id="terminal-keys" class="terminal-keys" role="toolbar" aria-label="Terminal keys" hidden>
+    <button type="button" data-key="keyboard" aria-label="Show or hide the keyboard" title="Keyboard">⌨</button>
     <button type="button" data-key="esc">Esc</button>
     <button type="button" data-key="tab">Tab</button>
     <button type="button" data-key="ctrl" aria-pressed="false">Ctrl</button>
@@ -20,8 +31,21 @@
     <button type="button" data-key="down" aria-label="Down">↓</button>
     <button type="button" data-key="left" aria-label="Left">←</button>
     <button type="button" data-key="right" aria-label="Right">→</button>
-    <button type="button" data-key="ctrl-c">^C</button>
+    <button type="button" data-key="ctrl-c" aria-label="Control C">^C</button>
+    <button type="button" data-key="shift-tab" aria-label="Shift Tab">⇧Tab</button>
+    <button type="button" data-key="alt" aria-pressed="false">Alt</button>
     <button type="button" data-key="paste">Paste</button>
+    <button type="button" data-key="select" title="Show the output as text you can select and copy">Select</button>
+    <button type="button" data-key="pipe">|</button>
+    <button type="button" data-key="slash">/</button>
+    <button type="button" data-key="tilde">~</button>
+    <button type="button" data-key="dash">-</button>
+    <button type="button" data-key="home">Home</button>
+    <button type="button" data-key="end">End</button>
+    <button type="button" data-key="pgup" aria-label="Page up">PgUp</button>
+    <button type="button" data-key="pgdn" aria-label="Page down">PgDn</button>
+    <button type="button" data-key="smaller" aria-label="Smaller text">A−</button>
+    <button type="button" data-key="larger" aria-label="Larger text">A+</button>
   </div>
   <script type="module" src="/assets/terminal.js"></script>
 </body>
