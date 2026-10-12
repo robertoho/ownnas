@@ -386,6 +386,26 @@ pub fn command_line(pid: u32) -> Option<Vec<String>> {
     }
 }
 
+/// Current folder of a process, if this platform can read it.
+pub fn process_dir(pid: u32) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("lsof").args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"]).output().ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix('n').map(PathBuf::from))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Installing the integrations
 // ---------------------------------------------------------------------------

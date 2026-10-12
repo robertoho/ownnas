@@ -1231,6 +1231,10 @@ async function terminalPanel() {
         openFileByPath(path).catch((err) => toast(err.message, true));
       },
       openSettings: (tab) => openSettings(tab),
+      goToFolder: (path) => {
+        closeSettings();
+        go(path).catch((err) => toast(err.message, true));
+      },
       setBadge: (count) => {
         $("terminals-badge").hidden = !count;
         $("terminals-badge").textContent = count > 9 ? "9+" : String(count);

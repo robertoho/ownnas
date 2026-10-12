@@ -49,7 +49,13 @@ const fit = new FitAddon();
 term.loadAddon(fit);
 term.open(host);
 fit.fit();
-term.focus();
+// In the OwnNAS panel, take focus only if the panel gave it to this terminal (it may have
+// moved on, for example to a menu, while this page was loading).
+let focusOnLoad = true;
+try {
+  focusOnLoad = !embedded || window.parent.document.activeElement === window.frameElement;
+} catch {}
+if (focusOnLoad) term.focus();
 
 window.addEventListener("storage", (event) => {
   if (event.key !== "ownnas-theme") return;
@@ -174,6 +180,72 @@ function connect() {
   });
 }
 
+/// Types a path the way local terminals do for pasted or dropped files.
+function shellQuote(path) {
+  return /^[\w@%+=:,./\\-]+$/.test(path) ? path : `'${path.replace(/'/g, "'\\''")}'`;
+}
+
+function flash(text) {
+  setStatus(text);
+  setTimeout(() => setStatus(""), 5000);
+}
+
+/// Uploads files to this terminal's temporary folder on the server and pastes their paths.
+async function pasteFiles(files) {
+  if (!files.length || finished) return;
+  setStatus(files.length === 1 ? `Uploading ${files[0].name || "the file"}…` : `Uploading ${files.length} files…`);
+  const paths = [];
+  try {
+    for (const file of files) {
+      const extension = (file.type.split("/")[1] || "bin").replace(/[^a-z0-9]/gi, "");
+      const name = file.name || `pasted.${extension}`;
+      const response = await fetch(`/api/terminals/upload?id=${encodeURIComponent(id)}&name=${encodeURIComponent(name)}`, {
+        method: "POST",
+        headers: { "X-OwnNAS": "1", "Content-Type": "application/octet-stream" },
+        body: file,
+        credentials: "same-origin",
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || "Could not upload the file");
+      paths.push(shellQuote(data.path));
+    }
+  } catch (err) {
+    flash(err.message);
+    return;
+  }
+  setStatus("");
+  term.paste(`${paths.join(" ")} `);
+  term.focus();
+}
+
+// Pasting files (a screenshot, files copied in a file manager) uploads them; text pastes as usual.
+document.addEventListener("paste", (event) => {
+  const data = event.clipboardData;
+  let files = [...((data && data.files) || [])];
+  // Some browsers list pasted screenshots only as items.
+  if (!files.length && data) {
+    files = [...(data.items || [])].filter((item) => item.kind === "file").map((item) => item.getAsFile()).filter(Boolean);
+  }
+  if (!files.length) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  pasteFiles(files);
+}, true);
+host.addEventListener("dragover", (event) => {
+  if (![...(event.dataTransfer?.types || [])].includes("Files")) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = "copy";
+  host.classList.add("is-drop-target");
+});
+host.addEventListener("dragleave", () => host.classList.remove("is-drop-target"));
+host.addEventListener("drop", (event) => {
+  host.classList.remove("is-drop-target");
+  const files = [...(event.dataTransfer?.files || [])];
+  if (!files.length) return;
+  event.preventDefault();
+  pasteFiles(files);
+});
+
 const keys = document.getElementById("terminal-keys");
 keys.hidden = !window.matchMedia("(pointer: coarse)").matches;
 if (!keys.hidden) requestAnimationFrame(() => fit.fit());
@@ -186,11 +258,22 @@ keys.addEventListener("click", async (event) => {
     armCtrl(!ctrlArmed);
   } else if (key === "paste") {
     try {
+      // An image on the clipboard (such as a screenshot) is uploaded like a pasted file.
+      if (navigator.clipboard.read) {
+        for (const item of await navigator.clipboard.read()) {
+          const type = item.types.find((kind) => kind.startsWith("image/"));
+          if (type) {
+            const blob = await item.getType(type);
+            await pasteFiles([new File([blob], `pasted.${type.split("/")[1]}`, { type })]);
+            term.focus();
+            return;
+          }
+        }
+      }
       const text = await navigator.clipboard.readText();
       if (text) term.paste(text);
     } catch {
-      setStatus("The browser did not allow pasting here. Use the keyboard's paste instead.");
-      setTimeout(() => setStatus(""), 4000);
+      flash("The browser did not allow pasting here. Use the keyboard's paste instead.");
     }
   } else if (KEYS[key]) {
     sendText(KEYS[key]);

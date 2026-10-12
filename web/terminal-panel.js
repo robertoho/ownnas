@@ -38,7 +38,7 @@ function folderLabel(path) {
 }
 
 function tabLabel(item) {
-  const folder = folderLabel(item.path);
+  const folder = item.name || folderLabel(item.path);
   if (item.agent && item.agent.label) return `${folder} · ${item.agent.label}`;
   // Shell prompts set titles like "user@host: ~/path"; other programs set their name.
   if (item.title && !item.title.includes("@")) return `${folder} · ${item.title}`;
@@ -62,9 +62,10 @@ function build() {
   const actions = el("div", { class: "terminals-actions" });
   const add = el("button", { type: "button", "data-action": "new", title: "New terminal in the same folder" }, "New");
   const popout = el("button", { type: "button", "data-action": "popout", title: "Open this terminal in its own browser tab" }, "Pop out");
-  const end = el("button", { type: "button", "data-action": "end", class: "danger", title: "Stop the shell and everything running in it" }, "End");
+  const end = el("button", { type: "button", "data-action": "end", class: "danger", title: "Stop the shell and everything running in it" }, "Close");
   const hide = el("button", { type: "button", "data-action": "hide", title: "Hide the panel. Terminals keep running." }, "Hide");
-  actions.append(add, popout, end, hide);
+  const wide = el("button", { type: "button", "data-action": "wide", class: "terminals-wide-btn", "aria-pressed": "false" }, "Expand");
+  actions.append(add, popout, end, wide, hide);
   bar.append(overview, tabs, actions);
 
   const strip = el("div", { class: "terminals-agent", hidden: true });
@@ -86,6 +87,8 @@ function build() {
   });
   end.addEventListener("click", () => endTerminal(active).catch((err) => ctx.toast(err.message, true)));
   hide.addEventListener("click", hidePanel);
+  wide.addEventListener("click", () => setWide(!panel.classList.contains("is-wide")));
+  setWide(storedWide());
   panel.addEventListener("click", (event) => {
     const file = event.target.closest("[data-open-file]");
     if (file) {
@@ -105,6 +108,28 @@ function build() {
   });
 }
 
+const WIDE_KEY = "ownnas-terminals-wide";
+
+function storedWide() {
+  try {
+    return localStorage.getItem(WIDE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+/// Full-width panel, or the default side panel. Remembered in this browser.
+function setWide(on) {
+  panel.classList.toggle("is-wide", on);
+  const button = panel.querySelector('[data-action="wide"]');
+  button.textContent = on ? "Collapse" : "Expand";
+  button.title = on ? "Make the panel narrower so the files show beside it" : "Make the panel full width";
+  button.setAttribute("aria-pressed", on ? "true" : "false");
+  try {
+    localStorage.setItem(WIDE_KEY, on ? "1" : "0");
+  } catch {}
+}
+
 function renderTabs() {
   const tabs = panel.querySelector(".terminals-tabs");
   tabs.replaceChildren(
@@ -115,6 +140,7 @@ function renderTabs() {
         type: "button",
         role: "tab",
         "aria-selected": view === "terminal" && item.id === active ? "true" : "false",
+        "data-tab": item.id,
         class: [item.running ? "" : "ended", attention ? "has-attention" : ""].join(" ").trim() || null,
         title: `${item.path || "/"}${item.agent && item.agent.detail ? ` — ${item.agent.detail}` : ""}${attention ? `\n${attention}` : ""}`,
       });
@@ -122,6 +148,13 @@ function renderTabs() {
       tab.addEventListener("click", () => {
         setView("terminal");
         activate(item.id);
+      });
+      tab.addEventListener("contextmenu", (event) => {
+        event.preventDefault();
+        const rect = tab.getBoundingClientRect();
+        // The keyboard's menu key reports (0, 0); open under the tab instead.
+        const fromKeyboard = event.clientX === 0 && event.clientY === 0;
+        openTabMenu(item.id, fromKeyboard ? rect.left : event.clientX, fromKeyboard ? rect.bottom + 4 : event.clientY);
       });
       return tab;
     }),
@@ -164,9 +197,11 @@ function renderStrip() {
   const tools = el("div", { class: "terminals-agent-tools" });
   const files = el("button", { type: "button", "aria-pressed": drawer === "files" ? "true" : "false", hidden: !(agent.files && agent.files.length) }, `Edited (${(agent.files || []).length})`);
   const changes = el("button", { type: "button", "aria-pressed": drawer === "changes" ? "true" : "false", title: "Uncommitted changes in this folder's Git repository" }, "Changes");
+  const folder = el("button", { type: "button", title: "Show the terminal's current folder in the file browser" }, "Show folder");
+  folder.addEventListener("click", () => showFolder(item.id).catch((err) => ctx.toast(err.message, true)));
   files.addEventListener("click", () => toggleDrawer("files"));
   changes.addEventListener("click", () => toggleDrawer("changes"));
-  tools.append(files, changes);
+  tools.append(files, changes, folder);
   const rows = [line];
   if (agent.attention) rows.push(el("p", { class: "agent-attention" }, agent.attention));
   else if (agent.status === "done" && agent.lastMessage) rows.push(el("p", { class: "agent-message muted" }, agent.lastMessage));
@@ -292,7 +327,9 @@ function activate(id) {
   active = id;
   for (const [frameId, frame] of frames) frame.hidden = frameId !== id || view !== "terminal";
   if (id && !frames.has(id)) {
-    const frame = el("iframe", { src: `/terminal?id=${encodeURIComponent(id)}`, title: "Terminal", class: "terminals-frame", "data-id": id });
+    const frame = el("iframe", { src: `/terminal?id=${encodeURIComponent(id)}`, title: "Terminal", class: "terminals-frame is-loading", "data-id": id });
+    // A page is white until its styles load; show the panel's background meanwhile.
+    frame.addEventListener("load", () => frame.classList.remove("is-loading"), { once: true });
     frames.set(id, frame);
     panel.querySelector(".terminals-body").append(frame);
   }
@@ -306,6 +343,104 @@ function activate(id) {
       frame.focus();
       frame.contentWindow?.postMessage({ type: "ownnas-terminal-focus" }, location.origin);
     });
+  }
+}
+
+let tabMenu = null;
+
+function closeTabMenu() {
+  if (!tabMenu || tabMenu.hidden) return;
+  tabMenu.hidden = true;
+  document.removeEventListener("pointerdown", onPointerOutside, true);
+  document.removeEventListener("keydown", onMenuKey, true);
+}
+
+function onPointerOutside(event) {
+  if (!tabMenu.contains(event.target)) closeTabMenu();
+}
+
+function onMenuKey(event) {
+  if (event.key === "Escape") {
+    // Only the menu closes, not Settings or anything else behind it.
+    event.preventDefault();
+    event.stopPropagation();
+    const id = tabMenu.dataset.id;
+    closeTabMenu();
+    panel.querySelector(`.terminals-tabs [data-tab="${CSS.escape(id)}"]`)?.focus();
+    return;
+  }
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    const buttons = [...tabMenu.querySelectorAll("button:not([disabled])")];
+    const index = buttons.indexOf(document.activeElement);
+    const next = event.key === "ArrowDown" ? index + 1 : index - 1;
+    buttons[(next + buttons.length) % buttons.length]?.focus();
+  }
+}
+
+function openTabMenu(id, x, y) {
+  const item = sessions.find((session) => session.id === id);
+  if (!item) return;
+  if (!tabMenu) {
+    tabMenu = el("div", { class: "menu terminal-tab-menu", role: "menu", hidden: true });
+    document.body.append(tabMenu);
+    // Like other menus, close when focus moves elsewhere (including into a terminal).
+    tabMenu.addEventListener("focusout", () => {
+      setTimeout(() => {
+        if (!tabMenu.contains(document.activeElement) || !document.hasFocus()) closeTabMenu();
+      }, 0);
+    });
+    tabMenu.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-tab-action]");
+      if (!button) return;
+      const target = tabMenu.dataset.id;
+      closeTabMenu();
+      runTabAction(button.dataset.tabAction, target).catch((err) => ctx.toast(err.message, true));
+    });
+  }
+  tabMenu.dataset.id = id;
+  const action = (name, label, extra = {}) => el("button", { type: "button", role: "menuitem", "data-tab-action": name, ...extra }, label);
+  tabMenu.replaceChildren(
+    el("div", { class: "menu-label" }, tabLabel(item)),
+    action("rename", "Rename…"),
+    action("duplicate", "Duplicate", { title: `New terminal in ${item.path || "/"}` }),
+    action("folder", "Show folder in files"),
+    action("popout", "Pop out"),
+    action("close", "Close", { class: "danger" }),
+  );
+  tabMenu.hidden = false;
+  const rect = tabMenu.getBoundingClientRect();
+  tabMenu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - rect.width - 8))}px`;
+  tabMenu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - rect.height - 8))}px`;
+  document.addEventListener("pointerdown", onPointerOutside, true);
+  document.addEventListener("keydown", onMenuKey, true);
+  tabMenu.querySelector("button")?.focus();
+}
+
+/// Shows the folder the terminal is in now (it may have changed with `cd`) in the file browser.
+async function showFolder(id) {
+  const data = await ctx.api(`/api/terminals/cwd?id=${encodeURIComponent(id)}`);
+  if (data.outside) ctx.toast(`The terminal is in ${data.current}, outside the library. Showing the folder it started in.`);
+  hidePanel();
+  ctx.goToFolder(data.path);
+}
+
+async function runTabAction(action, id) {
+  const item = sessions.find((session) => session.id === id);
+  if (!item) return;
+  if (action === "rename") {
+    const name = await ctx.askText("Rename terminal", "Name (leave empty for the folder name)", item.name || "", "Rename");
+    if (name === null) return;
+    const data = await ctx.api("/api/terminals/rename", { method: "POST", json: { id, name } });
+    applyList(sessions.map((session) => (session.id === id ? data.terminal : session)));
+  } else if (action === "duplicate") {
+    await openTerminal(item.path);
+  } else if (action === "folder") {
+    await showFolder(id);
+  } else if (action === "popout") {
+    window.open(`/terminal?id=${encodeURIComponent(id)}`, "_blank", "noopener");
+  } else if (action === "close") {
+    await endTerminal(id);
   }
 }
 
@@ -418,6 +553,7 @@ function showPanel() {
 }
 
 function hidePanel() {
+  closeTabMenu();
   panel.hidden = true;
   document.body.classList.remove("terminals-open");
 }
@@ -434,7 +570,7 @@ async function openTerminal(path) {
 async function endTerminal(id) {
   const item = sessions.find((session) => session.id === id);
   if (!item) return;
-  if (item.running && !(await ctx.askConfirm(`End the terminal in ${item.path || "/"}? Programs running in it are stopped.`, "End terminal"))) return;
+  if (item.running && !(await ctx.askConfirm(`Close “${tabLabel(item)}”? The shell and anything running in it will stop.`, "Close terminal"))) return;
   await ctx.api(`/api/terminals?id=${encodeURIComponent(id)}`, { method: "DELETE" });
   await refresh();
   if (!sessions.length) hidePanel();

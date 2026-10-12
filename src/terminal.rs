@@ -41,6 +41,9 @@ pub struct Info {
     /// Window title set by the program in the terminal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Name the user gave the terminal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub agent: Agent,
 }
 
@@ -139,6 +142,9 @@ pub struct Session {
     hook_token: String,
     cwd: PathBuf,
     shell_pid: Option<u32>,
+    name: Mutex<Option<String>>,
+    /// Folder holding files pasted into this terminal; deleted with the terminal.
+    uploads: Mutex<Option<PathBuf>>,
     agent: Mutex<Agent>,
     changes: broadcast::Sender<()>,
     screen: Mutex<Screen>,
@@ -160,12 +166,50 @@ impl Session {
         }
         info.title = screen.title.clone();
         drop(screen);
+        info.name = self.name.lock().unwrap_or_else(|err| err.into_inner()).clone();
         info.agent = self.agent.lock().unwrap_or_else(|err| err.into_inner()).clone();
         info
     }
 
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    /// Remembers the folder of files pasted into this terminal, for cleanup.
+    pub fn track_uploads(&self, dir: &Path) {
+        *self.uploads.lock().unwrap_or_else(|err| err.into_inner()) = Some(dir.to_path_buf());
+    }
+
+    fn remove_uploads(&self) {
+        if let Some(dir) = self.uploads.lock().unwrap_or_else(|err| err.into_inner()).take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// The folder the terminal's foreground program (or its shell) is in now.
+    pub fn current_dir(&self) -> PathBuf {
+        #[cfg(all(unix, not(target_os = "android")))]
+        {
+            let foreground = self
+                .master
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .process_group_leader()
+                .and_then(|pid| u32::try_from(pid).ok());
+            for pid in foreground.into_iter().chain(self.shell_pid) {
+                if let Some(dir) = agents::process_dir(pid) {
+                    return dir;
+                }
+            }
+        }
+        self.cwd.clone()
+    }
+
+    /// Names the terminal; an empty name restores the default label.
+    pub fn rename(&self, name: &str) {
+        let name: String = name.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(60).collect();
+        *self.name.lock().unwrap_or_else(|err| err.into_inner()) = (!name.is_empty()).then_some(name);
+        self.notify();
     }
 
     fn notify(&self) {
@@ -293,6 +337,13 @@ impl Session {
     }
 }
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Also covers terminals that end without being closed through `Terminals::remove`.
+        self.remove_uploads();
+    }
+}
+
 pub struct Terminals {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     /// Sign-in token hash -> when the terminal password unlock expires.
@@ -351,6 +402,7 @@ impl Terminals {
     pub fn remove(&self, id: &str) -> Option<Arc<Session>> {
         let session = self.sessions.lock().unwrap_or_else(|err| err.into_inner()).remove(id)?;
         session.kill();
+        session.remove_uploads();
         let _ = self.changes.send(());
         Some(session)
     }
@@ -359,6 +411,7 @@ impl Terminals {
         let sessions: Vec<_> = self.sessions.lock().unwrap_or_else(|err| err.into_inner()).drain().collect();
         for (_, session) in sessions {
             session.kill();
+            session.remove_uploads();
         }
         let _ = self.changes.send(());
     }
@@ -543,11 +596,14 @@ fn spawn_session(
             running: true,
             exit_code: None,
             title: None,
+            name: None,
             agent: Agent::default(),
         },
         hook_token,
         cwd: cwd.to_path_buf(),
         shell_pid,
+        name: Mutex::new(None),
+        uploads: Mutex::new(None),
         agent: Mutex::new(Agent::default()),
         changes,
         screen: Mutex::new(Screen {

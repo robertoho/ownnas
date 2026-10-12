@@ -60,6 +60,8 @@ pub struct AppState {
     pub root: PathBuf,
     pub thumbs: PathBuf,
     pub text_cache: PathBuf,
+    /// Files pasted into terminals, one folder per terminal.
+    pub terminal_uploads: PathBuf,
     pub readonly: bool,
     pub secure_cookie: bool,
     pub ffmpeg: bool,
@@ -105,11 +107,15 @@ pub fn new_state(
     let thumbs = data_dir.join("thumbs");
     std::fs::create_dir_all(&thumbs).map_err(|_| "Could not create the thumbnail cache".to_string())?;
     let text_cache = crate::content_index::ensure_cache_dir(&data_dir)?;
+    // Pasted files belong to terminals, which do not survive a restart.
+    let terminal_uploads = data_dir.join("terminal-uploads");
+    let _ = std::fs::remove_dir_all(&terminal_uploads);
     Ok(AppState {
         db: Mutex::new(conn),
         root,
         thumbs,
         text_cache,
+        terminal_uploads,
         readonly,
         secure_cookie,
         ffmpeg,
@@ -250,6 +256,12 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/terminals", get(list_terminals).post(open_terminal).delete(close_terminal))
         .route("/api/terminals/ws", get(terminal_socket))
         .route("/api/terminals/seen", post(terminal_seen))
+        .route("/api/terminals/rename", post(rename_terminal))
+        .route("/api/terminals/cwd", get(terminal_cwd))
+        .route(
+            "/api/terminals/upload",
+            post(terminal_upload).layer(DefaultBodyLimit::disable()),
+        )
         .route("/api/terminals/changes", get(terminal_changes))
         .route("/api/agents/stream", get(agent_stream))
         .route("/api/agents/integrations", get(agent_integrations).post(set_agent_integration))
@@ -2886,6 +2898,139 @@ async fn terminal_seen(
         session.seen();
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct TerminalRenameBody {
+    id: String,
+    name: String,
+}
+
+async fn rename_terminal(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    peer: Peer,
+    Json(body): Json<TerminalRenameBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    terminal_access(&state, &headers, &peer)?;
+    let session = state
+        .terminals
+        .get(&body.id)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That terminal is closed"))?;
+    session.rename(&body.name);
+    Ok(Json(json!({ "terminal": session.info() })))
+}
+
+/// The library folder a terminal is in now, for showing it in the file browser.
+async fn terminal_cwd(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    peer: Peer,
+    Query(query): Query<TerminalIdQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    terminal_access(&state, &headers, &peer)?;
+    let session = state
+        .terminals
+        .get(&query.id)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That terminal is closed"))?;
+    let root = state.root.clone();
+    let (current, start) = tokio::task::spawn_blocking(move || {
+        let current = session.current_dir();
+        (current, session.cwd().to_path_buf())
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the folder"))?;
+    let inside = |dir: &std::path::Path| {
+        let root_canon = root.canonicalize().ok()?;
+        let dir = dir.canonicalize().ok()?;
+        if dir == root_canon {
+            return Some(String::new());
+        }
+        library_path(&root, &dir, &dir.to_string_lossy())
+    };
+    match inside(&current) {
+        Some(path) => Ok(Json(json!({ "path": path, "outside": false }))),
+        None => Ok(Json(json!({
+            "path": inside(&start).unwrap_or_default(),
+            "outside": true,
+            "current": current.display().to_string(),
+        }))),
+    }
+}
+
+#[derive(Deserialize)]
+struct TerminalUploadQuery {
+    id: String,
+    name: Option<String>,
+}
+
+/// File name safe to type into any shell without quoting.
+fn pasted_file_name(name: &str) -> String {
+    let name = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let clean: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect();
+    let clean = clean.trim_matches('.').chars().take(120).collect::<String>();
+    if clean.trim_matches('_').is_empty() { "pasted-file".to_string() } else { clean }
+}
+
+/// Stores a file pasted or dropped into a terminal and returns its path on the server.
+async fn terminal_upload(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    peer: Peer,
+    Query(query): Query<TerminalUploadQuery>,
+    body: Body,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    terminal_access(&state, &headers, &peer)?;
+    let session = state
+        .terminals
+        .get(&query.id)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That terminal is closed"))?;
+    let dir = state.terminal_uploads.join(&query.id);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the pasted file"))?;
+    session.track_uploads(&dir);
+    let name = pasted_file_name(query.name.as_deref().unwrap_or(""));
+    let (stem, ext) = match name.rfind('.') {
+        Some(index) if index > 0 => (&name[..index], &name[index..]),
+        _ => (name.as_str(), ""),
+    };
+    let mut dest = dir.join(&name);
+    let mut counter = 2;
+    while tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+        dest = dir.join(format!("{stem}-{counter}{ext}"));
+        counter += 1;
+    }
+    const MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    let stored = async {
+        let mut out = tokio::fs::File::create(&dest).await?;
+        let mut written = 0u64;
+        let mut stream = body.into_data_stream();
+        while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+            let chunk = chunk.map_err(|err| io::Error::new(io::ErrorKind::ConnectionAborted, err))?;
+            written += chunk.len() as u64;
+            if written > MAX_BYTES {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "too large"));
+            }
+            tokio::io::AsyncWriteExt::write_all(&mut out, &chunk).await?;
+        }
+        tokio::io::AsyncWriteExt::flush(&mut out).await
+    }
+    .await;
+    if let Err(err) = stored {
+        let _ = tokio::fs::remove_file(&dest).await;
+        return Err(match err.kind() {
+            io::ErrorKind::InvalidData => ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "Files pasted into a terminal can be up to 2 GB"),
+            io::ErrorKind::ConnectionAborted => ApiError::new(StatusCode::BAD_REQUEST, "The upload was interrupted"),
+            _ => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the pasted file"),
+        });
+    }
+    Ok(Json(json!({ "path": dest.display().to_string() })))
 }
 
 /// `git status` for the repository a terminal's folder belongs to.

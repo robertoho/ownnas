@@ -2720,6 +2720,7 @@ dialog { color: var(--text); }
   box-shadow: var(--shadow);
 }
 .terminals[hidden] { display: none; }
+.terminals.is-wide { width: 100vw; border-left: 0; }
 .terminals-bar {
   display: flex;
   gap: 0.5rem;
@@ -2856,6 +2857,7 @@ button.linkish {
 }
 .terminals-badge[hidden] { display: none; }
 .terminals-actions { display: flex; gap: 0.35rem; flex: 0 0 auto; }
+.terminal-tab-menu { z-index: 30; }
 .terminals-body { position: relative; flex: 1; min-height: 0; }
 .terminals-frame {
   position: absolute;
@@ -2865,11 +2867,13 @@ button.linkish {
   border: 0;
 }
 .terminals-frame[hidden] { display: none; }
+.terminals-frame.is-loading { visibility: hidden; }
 .terminals-empty { margin: 1.5rem; }
 .terminal-settings label:not(.check) { display: grid; gap: 0.3rem; }
 .terminal-settings p { margin: 0; }
 @media (max-width: 820px) {
   .terminals { width: 100vw; border-left: 0; }
+  .terminals-wide-btn { display: none; }
   .terminals-bar { flex-wrap: wrap; }
   .terminals-tabs { flex-basis: 100%; order: 2; }
 }

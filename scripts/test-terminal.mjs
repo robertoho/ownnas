@@ -130,6 +130,11 @@ try {
   assert.equal(response.status, 200, JSON.stringify(response.data));
   const id = response.data.terminal.id;
   assert.equal(response.data.terminal.path, 'proj');
+  response = await call('POST', '/api/terminals/rename', { id, name: '  API   server  ' });
+  assert.equal(response.data.terminal.name, 'API server', 'names are trimmed');
+  assert.equal((await call('GET', '/api/terminals')).data.terminals[0].name, 'API server');
+  response = await call('POST', '/api/terminals/rename', { id, name: '' });
+  assert.equal(response.data.terminal.name, undefined, 'an empty name restores the default');
   assert.equal(response.data.terminal.running, true);
 
   // Cross-site WebSocket connections are refused.
@@ -252,6 +257,29 @@ try {
     assert.equal(agent.name, null, 'the agent is forgotten when it exits');
   }
 
+  // Files pasted into a terminal go to its own temporary folder, removed with the terminal.
+  const upload = (name, body, headers = { 'x-ownnas': '1' }) => fetch(`${base}/api/terminals/upload?id=${agentTerminal}&name=${encodeURIComponent(name)}`, { method: 'POST', headers: { cookie, ...headers }, body });
+  let pasted = await upload('my screen shot.png', 'png-bytes');
+  assert.equal(pasted.status, 200);
+  const firstPath = (await pasted.json()).path;
+  assert.ok(firstPath.startsWith(path.join(tmp, 'data', 'terminal-uploads', agentTerminal)), firstPath);
+  assert.ok(firstPath.endsWith(`${path.sep}my_screen_shot.png`), 'names are made safe to type');
+  assert.equal(await fs.readFile(firstPath, 'utf8'), 'png-bytes');
+  const secondPath = (await (await upload('my screen shot.png', 'again')).json()).path;
+  assert.ok(secondPath.endsWith('my_screen_shot-2.png'), 'same names do not overwrite');
+  assert.ok((await (await upload('../../escape', 'x')).json()).path.endsWith(`${path.sep}escape`));
+  assert.equal((await upload('x.txt', 'x', {})).status, 403, 'needs the request header');
+
+  // The current folder follows `cd` inside the library.
+  type('mkdir -p sub && cd sub\r');
+  let cwd;
+  for (let i = 0; i < 100 && (cwd = (await call('GET', `/api/terminals/cwd?id=${agentTerminal}`)).data).path !== 'proj/sub'; i++) await sleep(50);
+  assert.deepEqual(cwd, { path: 'proj/sub', outside: false });
+  type(`cd ${os.tmpdir()}\r`);
+  for (let i = 0; i < 100 && !(cwd = (await call('GET', `/api/terminals/cwd?id=${agentTerminal}`)).data).outside; i++) await sleep(50);
+  assert.equal(cwd.path, 'proj', 'outside the library, the start folder is shown');
+  type(`cd ${path.join(library, 'proj')}\r`);
+
   // Git changes for the terminal's folder.
   type('git init -q . && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init && echo hi > b.txt && echo y > a.txt && echo git-ready\r');
   await until(() => shell.text.includes('git-ready\r\n') || shell.text.split('git-ready').length > 2, 'git setup');
@@ -279,6 +307,7 @@ try {
   await assert.rejects(fs.access(path.join(home, '.config', 'opencode', 'plugins', 'ownnas.js')));
   shell.socket.close();
   await call('DELETE', `/api/terminals?id=${agentTerminal}`);
+  await assert.rejects(fs.access(path.dirname(firstPath)), 'pasted files are deleted with the terminal');
 
   // Signing out locks terminals again.
   const running = (await call('POST', '/api/terminals', { path: '' })).data.terminal.id;

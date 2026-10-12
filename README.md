@@ -104,6 +104,11 @@ files. It is off by default: turn it on in **Settings → Terminal**.
 - Terminals keep running when you close the tab or lose the connection. Reopen them from
   the right-click menu (**Terminals**) on any device; recent output (up to 2 MB) is replayed.
   **Pop out** opens one in its own browser tab, and phones get a row of Esc/Tab/Ctrl/arrow keys.
+- Right-click a terminal tab to rename, duplicate, or close it, or to show its current folder
+  in the file browser (**Show folder** does the same). **Expand** makes the panel full width.
+- Paste or drop files (such as a screenshot) into a terminal to upload them and type their
+  paths, as a local terminal would. They are kept in a temporary folder for that terminal and
+  deleted when it closes or the server restarts.
 - The shell runs as the account that runs OwnNAS, with its sign-ins and API keys, so sign
   in to your agents on that machine once. Consider running OwnNAS under a dedicated account.
 - An optional terminal password is asked once per sign-in (for up to 12 hours). Changing

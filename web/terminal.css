@@ -17,6 +17,7 @@ body.terminal-page {
   padding: 6px 0 0 8px;
 }
 .terminal-host .xterm { height: 100%; }
+.terminal-host.is-drop-target { outline: 2px dashed var(--accent); outline-offset: -4px; }
 /* xterm draws its own scrollbar; hide the native one and xterm's black default in the
    few pixels left below the last row. */
 .terminal-host .xterm .xterm-viewport {
