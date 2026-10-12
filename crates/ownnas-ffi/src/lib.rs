@@ -367,6 +367,27 @@ impl Server {
         Ok(self.api.unlock_terminals(&password)?)
     }
 
+    /// Uploads a pasted or attached file (an open descriptor this call takes over) into the
+    /// terminal's temporary folder on the server; returns its path there for
+    /// [`TerminalSession::paste_paths`].
+    #[cfg(unix)]
+    pub fn upload_to_terminal(
+        &self,
+        id: String,
+        name: String,
+        fd: i32,
+        size: Option<u64>,
+        transfer: Arc<dyn Transfer>,
+    ) -> Result<String, ClientError> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        if fd < 0 {
+            return Err(failed("The file could not be opened".into()));
+        }
+        // SAFETY: the caller hands over an open descriptor it no longer uses.
+        let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        Ok(self.api.upload_to_terminal(&id, &name, size, file, &|done| transfer.keep_going(done))?)
+    }
+
     pub fn mark_terminal_seen(&self, id: String) -> Result<(), ClientError> {
         Ok(self.api.mark_terminal_seen(&id)?)
     }
@@ -502,6 +523,11 @@ impl TerminalSession {
 
     pub fn paste(&self, text: String) {
         self.session.paste(&text);
+    }
+
+    /// Pastes uploaded files' paths, shell-quoted and separated by spaces, as the web terminal does.
+    pub fn paste_paths(&self, paths: Vec<String>) {
+        self.session.paste_paths(&paths);
     }
 
     pub fn resize(&self, rows: u16, cols: u16) {

@@ -20,6 +20,7 @@ import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.DriveFileRenameOutline
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.Share
+import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material.icons.outlined.UploadFile
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
@@ -58,18 +59,29 @@ import app.ownnas.core.Conflict
 import app.ownnas.core.Entry
 import java.io.File
 
-enum class EntryAction { Share, Rename, Trash }
+enum class EntryAction { Share, Rename, Trash, OpenTerminal }
 
 @Composable
-fun EntryMenu(entry: Entry, writable: Boolean, expanded: Boolean, onDismiss: () -> Unit, onPick: (EntryAction) -> Unit) {
+fun EntryMenu(
+    entry: Entry,
+    writable: Boolean,
+    terminals: Boolean,
+    expanded: Boolean,
+    onDismiss: () -> Unit,
+    onPick: (EntryAction) -> Unit,
+) {
     DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
         val pick = { action: EntryAction -> onDismiss(); onPick(action) }
         if (!entry.dir) MenuItem("Share", Icons.Outlined.Share) { pick(EntryAction.Share) }
+        // As in the web app's folder menu.
+        if (entry.dir && terminals && !inTrash(entry.path)) {
+            MenuItem("Open terminal here", Icons.Outlined.Terminal) { pick(EntryAction.OpenTerminal) }
+        }
         if (writable) {
             MenuItem("Rename", Icons.Outlined.DriveFileRenameOutline) { pick(EntryAction.Rename) }
             MenuItem(if (inTrash(entry.path)) "Delete permanently" else "Move to Trash", Icons.Outlined.Delete) { pick(EntryAction.Trash) }
         }
-        if (entry.dir && !writable) {
+        if (entry.dir && !writable && !terminals) {
             DropdownMenuItem(text = { Text("This server is read-only") }, enabled = false, onClick = {})
         }
     }

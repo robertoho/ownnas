@@ -17,6 +17,9 @@ import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
+import android.net.Uri
+import androidx.core.view.inputmethod.EditorInfoCompat
+import androidx.core.view.inputmethod.InputConnectionCompat
 import app.ownnas.core.TerminalScreen
 import app.ownnas.core.TerminalSession
 import kotlin.math.abs
@@ -39,6 +42,9 @@ class TerminalView(context: Context, private val onSize: (rows: Int, cols: Int) 
     var ctrlArmed = false
     var altArmed = false
     var onModifiersUsed: () -> Unit = {}
+
+    /** An image or file the keyboard inserted (Gboard's clipboard, image suggestions, …). */
+    var onContent: (Uri) -> Unit = {}
 
     private val background = Color.parseColor("#151810")
     private val foreground = Color.parseColor("#F4F2E8")
@@ -146,7 +152,9 @@ class TerminalView(context: Context, private val onSize: (rows: Int, cols: Int) 
         outAttrs.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD or
             InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN or EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_ACTION_NONE
-        return object : BaseInputConnection(this, false) {
+        // Keyboards may insert images; they are uploaded and their paths typed, as pastes are.
+        EditorInfoCompat.setContentMimeTypes(outAttrs, arrayOf("image/*", "video/*", "application/pdf"))
+        val connection = object : BaseInputConnection(this, false) {
             override fun commitText(text: CharSequence, newCursorPosition: Int): Boolean {
                 typed(text.toString().replace('\n', '\r'))
                 return true
@@ -161,6 +169,14 @@ class TerminalView(context: Context, private val onSize: (rows: Int, cols: Int) 
                 if (event.action == KeyEvent.ACTION_DOWN) onKeyDown(event.keyCode, event)
                 return true
             }
+        }
+        @Suppress("DEPRECATION")
+        return InputConnectionCompat.createWrapper(connection, outAttrs) { content, flags, _ ->
+            if (flags and InputConnectionCompat.INPUT_CONTENT_GRANT_READ_URI_PERMISSION != 0) {
+                runCatching { content.requestPermission() }
+            }
+            onContent(content.contentUri)
+            true
         }
     }
 

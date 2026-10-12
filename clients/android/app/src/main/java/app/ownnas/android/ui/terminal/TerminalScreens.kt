@@ -1,6 +1,10 @@
 package app.ownnas.android.ui.terminal
 
 import android.content.ClipboardManager
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import android.os.Handler
 import android.os.Looper
 import androidx.compose.foundation.background
@@ -26,6 +30,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.outlined.AttachFile
 import androidx.compose.material.icons.outlined.ContentPaste
 import androidx.compose.material.icons.outlined.Keyboard
 import androidx.compose.material.icons.outlined.Terminal
@@ -82,10 +87,12 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /** How an agent's status reads and looks, as in the web app's terminal tabs. */
-private fun agentStatus(info: TerminalInfo): Pair<String, Color>? {
+internal fun agentStatus(info: TerminalInfo): Pair<String, Color>? {
     val agent = info.agent
     if (agent.name == null) return null
     val label = agent.label ?: agent.name!!
+    // Attention outlasts the status that caused it (an agent can go idle after asking).
+    if (agent.attention != null) return "$label · needs you" to Color(0xFFF59E0B)
     return when (agent.status) {
         "working" -> "$label · working" to Color(0xFF3B82F6)
         "waiting" -> "$label · needs you" to Color(0xFFF59E0B)
@@ -95,7 +102,7 @@ private fun agentStatus(info: TerminalInfo): Pair<String, Color>? {
     }
 }
 
-private fun titleOf(info: TerminalInfo) =
+internal fun titleOf(info: TerminalInfo) =
     info.name?.takeIf { it.isNotBlank() } ?: info.title?.takeIf { it.isNotBlank() } ?: info.path.ifEmpty { "/" }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -315,6 +322,27 @@ fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String) {
     var alt by remember { mutableStateOf(false) }
     var ending by remember { mutableStateOf(false) }
     var view by remember { mutableStateOf<TerminalView?>(null) }
+    var uploading by remember { mutableStateOf<String?>(null) }
+    val snackbar = remember { SnackbarHostState() }
+
+    // Paste → upload to the terminal's temporary folder → paste the paths, as the web terminal does.
+    fun pasteFiles(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        uploading = if (uris.size == 1) "Uploading the file…" else "Uploading ${uris.size} files…"
+        scope.launch {
+            try {
+                val paths = vm.uploadToTerminal(serverId, terminalId, uris)
+                session?.pastePaths(paths)
+                view?.showKeyboard()
+            } catch (err: Exception) {
+                snackbar.showSnackbar(err.userMessage())
+            } finally {
+                uploading = null
+            }
+        }
+    }
+    val pickMedia = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { pasteFiles(it) }
+    val pickFiles = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { pasteFiles(it) }
 
     DisposableEffect(serverId, terminalId) {
         val main = Handler(Looper.getMainLooper())
@@ -355,6 +383,7 @@ fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String) {
     }
 
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbar) },
         topBar = {
             TopAppBar(
                 title = {
@@ -367,7 +396,8 @@ fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String) {
                             is TerminalConnection.Exited -> "Ended${c.code?.let { " with code $it" } ?: ""}"
                             TerminalConnection.Closed -> state.second ?: "Disconnected"
                         }
-                        if (status != null) Text(status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+                        val shown = uploading ?: status
+                        if (shown != null) Text(shown, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
                     }
                 },
                 navigationIcon = {
@@ -376,10 +406,28 @@ fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String) {
                 actions = {
                     IconButton(onClick = { view?.showKeyboard() }) { Icon(Icons.Outlined.Keyboard, contentDescription = "Keyboard") }
                     IconButton(onClick = {
+                        // Copied files and images (a screenshot's "Copy") are uploaded; text pastes as usual.
                         val clip = context.getSystemService(ClipboardManager::class.java)?.primaryClip
-                        val text = clip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(context)?.toString()
-                        if (!text.isNullOrEmpty()) session?.paste(text)
+                        val items = clip?.let { c -> (0 until c.itemCount).map(c::getItemAt) }.orEmpty()
+                        val files = items.mapNotNull { it.uri }.filter { it.scheme == "content" || it.scheme == "file" }
+                        if (files.isNotEmpty()) {
+                            pasteFiles(files)
+                        } else {
+                            val text = items.firstOrNull()?.coerceToText(context)?.toString()
+                            if (!text.isNullOrEmpty()) session?.paste(text)
+                        }
                     }) { Icon(Icons.Outlined.ContentPaste, contentDescription = "Paste") }
+                    var attach by remember { mutableStateOf(false) }
+                    Box {
+                        IconButton(onClick = { attach = true }) { Icon(Icons.Outlined.AttachFile, contentDescription = "Attach a file") }
+                        DropdownMenu(expanded = attach, onDismissRequest = { attach = false }) {
+                            DropdownMenuItem(text = { Text("Photos and videos") }, onClick = {
+                                attach = false
+                                pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
+                            })
+                            DropdownMenuItem(text = { Text("Files") }, onClick = { attach = false; pickFiles.launch(arrayOf("*/*")) })
+                        }
+                    }
                     var menu by remember { mutableStateOf(false) }
                     Box {
                         IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "More") }
@@ -398,6 +446,7 @@ fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String) {
                     TerminalView(ctx) { _, _ -> }.also {
                         view = it
                         it.onModifiersUsed = { ctrl = false; alt = false }
+                        it.onContent = { uri -> pasteFiles(listOf(uri)) }
                         // Ready to type as soon as the terminal opens.
                         it.post { it.showKeyboard() }
                     }

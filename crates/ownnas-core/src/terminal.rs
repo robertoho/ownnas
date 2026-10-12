@@ -17,7 +17,7 @@ use serde_json::json;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::Message;
 
-use crate::api::{Api, ApiError, Fetch};
+use crate::api::{map_err, Api, ApiError, Fetch};
 
 /// Lines kept above the screen for scrolling back.
 const SCROLLBACK: usize = 5000;
@@ -92,6 +92,37 @@ impl Api {
     pub fn unlock_terminals(&self, password: &str) -> Result<(), ApiError> {
         self.post_json("/api/terminal/unlock", json!({ "password": password }))?;
         Ok(())
+    }
+
+    /// Stores a pasted or attached file in the terminal's own temporary folder on the server
+    /// (removed with the terminal) and returns its path there, to type into the terminal.
+    pub fn upload_to_terminal(
+        &self,
+        id: &str,
+        name: &str,
+        size: Option<u64>,
+        body: impl Read,
+        progress: crate::manage::Progress,
+    ) -> Result<String, ApiError> {
+        let mut request = self
+            .request("POST", "/api/terminals/upload")
+            .query("id", id)
+            .query("name", name)
+            .set("Content-Type", "application/octet-stream");
+        if let Some(size) = size {
+            request = request.set("Content-Length", &size.to_string());
+        }
+        let cancelled = std::cell::Cell::new(false);
+        let watch = |done: u64| {
+            let go_on = progress(done);
+            cancelled.set(!go_on);
+            go_on
+        };
+        let response = request
+            .send(crate::manage::Counted::new(body, &watch))
+            .map_err(|err| if cancelled.get() { ApiError::Cancelled } else { map_err(err) })?;
+        let body: serde_json::Value = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
+        body["path"].as_str().map(str::to_string).ok_or_else(|| ApiError::Other("The server did not say where the file went".into()))
     }
 
     /// Clears the "wants attention" mark once someone has looked at the terminal.
@@ -211,6 +242,16 @@ impl Session {
         let text = text.replace("\r\n", "\r").replace('\n', "\r");
         let bytes = if bracketed { format!("\x1b[200~{text}\x1b[201~") } else { text };
         self.type_text(&bytes);
+    }
+
+    /// Pastes file paths the way local terminals do for dropped files: quoted for the shell,
+    /// separated by spaces, with a space after the last.
+    pub fn paste_paths(&self, paths: &[String]) {
+        if paths.is_empty() {
+            return;
+        }
+        let quoted: Vec<String> = paths.iter().map(|path| shell_quote(path)).collect();
+        self.paste(&format!("{} ", quoted.join(" ")));
     }
 
     /// The view now fits `rows` × `cols` cells.
@@ -510,6 +551,13 @@ impl Worker {
     }
 }
 
+/// Quotes a path for a POSIX shell only when it needs it, as the web terminal does.
+pub fn shell_quote(path: &str) -> String {
+    let plain = !path.is_empty()
+        && path.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || "@%+=:,./\\-".contains(c));
+    if plain { path.to_string() } else { format!("'{}'", path.replace('\'', "'\\''")) }
+}
+
 /// Clears the emulator, keeping its size and the program's title.
 fn reset(parser: &mut vt100::Parser<Titles>) {
     let (rows, cols) = parser.screen().size();
@@ -650,6 +698,13 @@ mod tests {
         assert_eq!((line[2].text.as_str(), line[2].col, line[2].width), ("你", 4, 2));
         assert_eq!((line[3].text.as_str(), line[3].col), ("e   ", 6));
         assert_eq!((snapshot.cursor_row, snapshot.cursor_col), (0, 7));
+    }
+
+    #[test]
+    fn paths_are_quoted_like_the_web_terminal() {
+        assert_eq!(shell_quote("/tmp/up/shot.png"), "/tmp/up/shot.png");
+        assert_eq!(shell_quote("/tmp/my shot.png"), "'/tmp/my shot.png'");
+        assert_eq!(shell_quote("/tmp/it's.png"), "'/tmp/it'\\''s.png'");
     }
 
     #[test]

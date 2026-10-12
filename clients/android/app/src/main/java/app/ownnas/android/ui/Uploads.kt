@@ -39,6 +39,8 @@ class PendingUpload(
     val size: Long?,
     val modified: Long?,
     val file: ParcelFileDescriptor,
+    /** The provider's MIME type, for naming things like pasted screenshots that have no name. */
+    val type: String? = null,
 )
 
 /** What the upload bar shows. */
@@ -80,7 +82,16 @@ fun ContentResolver.pendingUploads(serverId: String, dir: String, uris: List<Uri
             }
         }
         val fallbackName = uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() } ?: "upload"
-        PendingUpload(batch, serverId, dir, name?.takeIf { it.isNotBlank() } ?: fallbackName, size?.takeIf { it >= 0 }, modified?.takeIf { it > 0 }, file)
+        PendingUpload(
+            batch,
+            serverId,
+            dir,
+            name?.takeIf { it.isNotBlank() } ?: fallbackName,
+            size?.takeIf { it >= 0 },
+            modified?.takeIf { it > 0 },
+            file,
+            runCatching { getType(uri) }.getOrNull(),
+        )
     }
     return uploads to unreadable
 }

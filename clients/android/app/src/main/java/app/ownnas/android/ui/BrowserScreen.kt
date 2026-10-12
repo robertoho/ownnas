@@ -73,6 +73,16 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
+import androidx.compose.material3.Surface
+import androidx.compose.ui.graphics.Color
+import app.ownnas.android.ui.terminal.agentStatus
+import app.ownnas.core.TerminalInfo
+import kotlinx.coroutines.delay
 import app.ownnas.core.ClientException
 import app.ownnas.core.Entry
 import app.ownnas.core.Folder
@@ -111,6 +121,20 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
         value = runCatching { vm.account(serverId) }.getOrNull()
     }
     val writable = account?.readonly == false
+    val terminalsOn = account?.terminal == true
+
+    // Follow the server's terminals for badges, as the web app does in the background.
+    var terminals by remember { mutableStateOf<List<TerminalInfo>>(emptyList()) }
+    LaunchedEffect(serverId, terminalsOn) {
+        while (terminalsOn) {
+            runCatching { vm.terminals(serverId) }.onSuccess { terminals = it }
+            delay(3000)
+        }
+    }
+    // Like the web app's badge: terminals whose agent wants attention (waiting, finished,
+    // stopped) until someone opens them.
+    val attention = terminals.count { it.agent.attention != null }
+    val terminalsByPath = remember(terminals) { terminals.filter { it.running }.groupBy { it.path } }
 
     LaunchedEffect(reload, revision) {
         refreshing = true
@@ -203,9 +227,16 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
                 },
                 actions = {
                     // Shown to administrators when terminals are turned on, as in the web app.
-                    if (account?.terminal == true) {
+                    if (terminalsOn) {
                         IconButton(onClick = { vm.push(Screen.Terminals(serverId, path)) }) {
-                            Icon(Icons.Outlined.Terminal, contentDescription = "Terminals")
+                            BadgedBox(badge = {
+                                if (attention > 0) Badge { Text(if (attention > 9) "9+" else attention.toString()) }
+                            }) {
+                                Icon(
+                                    Icons.Outlined.Terminal,
+                                    contentDescription = if (attention > 0) "Terminals, $attention need attention" else "Terminals",
+                                )
+                            }
                         }
                     }
                     var menu by remember { mutableStateOf(false) }
@@ -246,12 +277,25 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
                     serverId = serverId,
                     folder = shown,
                     writable = writable,
+                    terminalsOn = terminalsOn,
+                    terminalsByPath = terminalsByPath,
                     onOpen = ::open,
                     onAction = { action, entry ->
                         when (action) {
                             EntryAction.Share -> fetch(entry, share = true)
                             EntryAction.Rename -> dialog = Dialog.Rename(entry)
                             EntryAction.Trash -> dialog = Dialog.Trash(entry)
+                            EntryAction.OpenTerminal -> scope.launch {
+                                try {
+                                    val info = vm.openTerminal(serverId, entry.path)
+                                    vm.push(Screen.Terminal(serverId, info.id))
+                                } catch (err: ClientException.Locked) {
+                                    // The terminals screen asks for the terminal password.
+                                    vm.push(Screen.Terminals(serverId, entry.path))
+                                } catch (err: Exception) {
+                                    snackbar.showSnackbar(err.userMessage())
+                                }
+                            }
                         }
                     },
                 )
@@ -334,6 +378,8 @@ private fun Listing(
     serverId: String,
     folder: Folder,
     writable: Boolean,
+    terminalsOn: Boolean,
+    terminalsByPath: Map<String, List<TerminalInfo>>,
     onOpen: (Entry) -> Unit,
     onAction: (EntryAction, Entry) -> Unit,
 ) {
@@ -345,15 +391,30 @@ private fun Listing(
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 88.dp)) {
         items(entries, key = { it.path }) { entry ->
             var menu by remember { mutableStateOf(false) }
+            val here = if (entry.dir) terminalsByPath[entry.path].orEmpty() else emptyList()
             ListItem(
                 modifier = Modifier.combinedClickable(onClick = { onOpen(entry) }, onLongClick = { menu = true }),
-                leadingContent = { Thumbnail(vm, serverId, entry) },
+                leadingContent = {
+                    Box {
+                        Thumbnail(vm, serverId, entry)
+                        if (here.isNotEmpty()) TerminalMark(here, Modifier.align(Alignment.BottomEnd).offset(x = 4.dp, y = 4.dp))
+                    }
+                },
                 headlineContent = { Text(specialFolderLabel(entry.name), maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                supportingContent = { Text(details(context, entry), maxLines = 1) },
+                supportingContent = {
+                    val status = here.firstNotNullOfOrNull { info -> agentStatus(info)?.first }
+                    val terminalNote = when {
+                        status != null -> " · $status"
+                        here.size == 1 -> " · terminal open"
+                        here.size > 1 -> " · ${here.size} terminals open"
+                        else -> ""
+                    }
+                    Text(details(context, entry) + terminalNote, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                },
                 trailingContent = {
                     Box {
                         IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "Actions for ${entry.name}") }
-                        EntryMenu(entry, writable, expanded = menu, onDismiss = { menu = false }) { onAction(it, entry) }
+                        EntryMenu(entry, writable, terminalsOn, expanded = menu, onDismiss = { menu = false }) { onAction(it, entry) }
                     }
                 },
             )
@@ -361,6 +422,26 @@ private fun Listing(
         if (folder.truncated) {
             item { Message("Showing the first ${folder.entries.size} items. Open this folder in the browser to see the rest.") }
         }
+    }
+}
+
+/**
+ * A small terminal badge on a folder with open terminals. Amber when an agent wants attention,
+ * otherwise the agent's status color, or neutral for a plain shell.
+ */
+@Composable
+private fun TerminalMark(terminals: List<TerminalInfo>, modifier: Modifier) {
+    val color = when {
+        terminals.any { it.agent.attention != null } -> Color(0xFFF59E0B)
+        else -> terminals.firstNotNullOfOrNull { agentStatus(it)?.second } ?: MaterialTheme.colorScheme.secondary
+    }
+    Surface(
+        shape = CircleShape,
+        color = color,
+        border = BorderStroke(2.dp, MaterialTheme.colorScheme.surface),
+        modifier = modifier.size(20.dp),
+    ) {
+        Icon(Icons.Outlined.Terminal, contentDescription = "Terminal open", tint = Color.White, modifier = Modifier.padding(3.dp))
     }
 }
 

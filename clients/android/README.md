@@ -24,6 +24,10 @@ What works now:
 - Terminals, for administrators when the server has them turned on: the list shows each
   terminal's coding-agent status, and a terminal opens in a native view with the web app's
   extra keys (Esc, Tab, Ctrl, Alt, arrows, …). Drag to scroll back, pinch to resize the text.
+  Pasting a copied image or file, inserting one from the keyboard, or attaching one uploads
+  it to the terminal's temporary folder and pastes its path, as the web terminal does. The
+  terminal button shows how many terminals want attention, and folders with open terminals
+  carry a badge in their agent's status color.
   The emulator and the WebSocket run in Rust (`crates/ownnas-core/src/terminal.rs`, using
   the `vt100` crate), so the iOS app can share them.
 

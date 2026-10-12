@@ -1,6 +1,8 @@
 package app.ownnas.android.ui
 
 import android.app.Application
+import android.net.Uri
+import android.webkit.MimeTypeMap
 import android.graphics.BitmapFactory
 import android.util.LruCache
 import androidx.compose.runtime.mutableStateListOf
@@ -261,6 +263,30 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     suspend fun unlockTerminals(id: String, password: String) {
         call(id) { it.unlockTerminals(password) }
+    }
+
+    /**
+     * Uploads pasted or attached files into a terminal's temporary folder on the server and
+     * returns their paths there, as the web terminal does with pasted screenshots.
+     */
+    suspend fun uploadToTerminal(id: String, terminalId: String, uris: List<Uri>): List<String> = withContext(Dispatchers.IO) {
+        val resolver = getApplication<Application>().contentResolver
+        val (pending, _) = resolver.pendingUploads(id, "", uris)
+        if (pending.isEmpty()) throw ClientException.Failed("That could not be read")
+        pending.map { item ->
+            // Clipboard images often have a bare name like "image"; give them an extension.
+            val name = if ('.' in item.name) {
+                item.name
+            } else {
+                val extension = item.type?.let { MimeTypeMap.getSingleton().getExtensionFromMimeType(it) }
+                if (extension != null) "${item.name}.$extension" else item.name
+            }
+            try {
+                call(id) { it.uploadToTerminal(terminalId, name, item.file.detachFd(), item.size?.toULong(), Tracker {}) }
+            } finally {
+                runCatching { item.file.close() }
+            }
+        }
     }
 
     suspend fun markTerminalSeen(id: String, terminalId: String) {
