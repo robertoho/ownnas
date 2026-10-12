@@ -535,7 +535,17 @@ impl Worker {
                             reset(&mut self.parser.lock().unwrap_or_else(|err| err.into_inner()));
                             self.listener.screen_changed();
                         }
-                        Some("exit") => return Ended::Exited(message["code"].as_u64().map(|code| code as u32)),
+                        Some("exit") => {
+                            let code = message["code"].as_u64().map(|code| code as u32);
+                            // Said in the terminal itself, as the web terminal does.
+                            let note = match code {
+                                Some(code) => format!("\r\n\x1b[2m[Process exited with code {code}]\x1b[0m\r\n"),
+                                None => "\r\n\x1b[2m[Process exited]\x1b[0m\r\n".to_string(),
+                            };
+                            self.parser.lock().unwrap_or_else(|err| err.into_inner()).process(note.as_bytes());
+                            self.listener.screen_changed();
+                            return Ended::Exited(code);
+                        }
                         _ => {}
                     }
                 }

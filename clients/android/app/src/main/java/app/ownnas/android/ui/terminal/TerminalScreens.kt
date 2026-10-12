@@ -7,6 +7,8 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import android.os.Handler
 import android.os.Looper
+import android.view.inputmethod.InputMethodManager
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -323,6 +325,7 @@ fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String) {
     var ending by remember { mutableStateOf(false) }
     var view by remember { mutableStateOf<TerminalView?>(null) }
     var uploading by remember { mutableStateOf<String?>(null) }
+    var info by remember { mutableStateOf<TerminalInfo?>(null) }
     val snackbar = remember { SnackbarHostState() }
 
     // Paste → upload to the terminal's temporary folder → paste the paths, as the web terminal does.
@@ -371,9 +374,25 @@ fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String) {
         }
     }
 
+    // When the shell ends: after a clean `exit` the terminal is done, so close it and go back;
+    // after a failure, keep the screen so what happened can be read.
+    val exited = state.first as? TerminalConnection.Exited
+    LaunchedEffect(exited) {
+        if (exited == null) return@LaunchedEffect
+        view?.let { terminal ->
+            terminal.clearFocus()
+            context.getSystemService(InputMethodManager::class.java)?.hideSoftInputFromWindow(terminal.windowToken, 0)
+        }
+        if (exited.code == 0u) {
+            delay(700)
+            runCatching { vm.closeTerminal(serverId, terminalId) }
+            Toast.makeText(context, "Terminal closed", Toast.LENGTH_SHORT).show()
+            if (vm.stack.lastOrNull() == Screen.Terminal(serverId, terminalId)) vm.pop()
+        }
+    }
+
     // The program's title wins; otherwise the terminal's name or folder, as in the web tabs.
     // The agent's status is refreshed with it.
-    var info by remember { mutableStateOf<TerminalInfo?>(null) }
     LaunchedEffect(serverId, terminalId) {
         while (true) {
             runCatching { vm.terminals(serverId).firstOrNull { it.id == terminalId } }.getOrNull()?.let { info = it }
@@ -454,7 +473,38 @@ fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String) {
                 update = { it.session = session },
                 modifier = Modifier.weight(1f).fillMaxWidth().background(Color(0xFF151810)),
             )
-            Surface(color = MaterialTheme.colorScheme.surfaceContainer) {
+            if (exited != null && exited.code != 0u) {
+                Surface(color = MaterialTheme.colorScheme.surfaceContainer) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "This terminal has ended${exited.code?.let { " (exit code $it)" } ?: ""}.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = {
+                            scope.launch {
+                                try {
+                                    val fresh = vm.openTerminal(serverId, info?.path ?: "")
+                                    runCatching { vm.closeTerminal(serverId, terminalId) }
+                                    vm.pop()
+                                    vm.push(Screen.Terminal(serverId, fresh.id))
+                                } catch (err: Exception) {
+                                    snackbar.showSnackbar(err.userMessage())
+                                }
+                            }
+                        }) { Text("New terminal") }
+                        TextButton(onClick = {
+                            scope.launch {
+                                runCatching { vm.closeTerminal(serverId, terminalId) }
+                                vm.pop()
+                            }
+                        }) { Text("Close") }
+                    }
+                }
+            } else Surface(color = MaterialTheme.colorScheme.surfaceContainer) {
                 Row(
                     Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 4.dp, vertical = 2.dp),
                     horizontalArrangement = Arrangement.spacedBy(4.dp),
