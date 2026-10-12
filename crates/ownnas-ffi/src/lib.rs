@@ -15,6 +15,8 @@ pub enum ClientError {
     NotFound,
     /// The file changed on the server since it was read.
     Conflict,
+    /// [`Transfer::keep_going`] returned false.
+    Cancelled,
     Failed { reason: String },
 }
 
@@ -24,6 +26,7 @@ impl std::fmt::Display for ClientError {
             ClientError::Unauthorized => write!(f, "Sign in again"),
             ClientError::NotFound => write!(f, "Not found on the server"),
             ClientError::Conflict => write!(f, "Changed on the server"),
+            ClientError::Cancelled => write!(f, "Cancelled"),
             ClientError::Failed { reason } => write!(f, "{reason}"),
         }
     }
@@ -35,6 +38,7 @@ impl From<ApiError> for ClientError {
             ApiError::Unauthorized => ClientError::Unauthorized,
             ApiError::NotFound => ClientError::NotFound,
             ApiError::Conflict => ClientError::Conflict,
+            ApiError::Cancelled => ClientError::Cancelled,
             ApiError::Other(reason) => ClientError::Failed { reason },
         }
     }
@@ -74,6 +78,13 @@ pub struct Folder {
     pub root_name: String,
     pub entries: Vec<Entry>,
     pub truncated: bool,
+}
+
+/// Follows an upload or download. Called often from the transferring thread.
+#[uniffi::export(with_foreign)]
+pub trait Transfer: Send + Sync {
+    /// `done` bytes have moved so far. Return false to cancel.
+    fn keep_going(&self, done: u64) -> bool;
 }
 
 /// Checks and normalizes a typed server address, adding `http://` when there is no scheme.
@@ -150,7 +161,44 @@ impl Server {
     }
 
     /// Downloads a file to the local path `destination`; returns its size.
-    pub fn download(&self, path: String, destination: String) -> Result<u64, ClientError> {
-        Ok(self.api.download_to(&path, Path::new(&destination))?)
+    pub fn download(&self, path: String, destination: String, transfer: Arc<dyn Transfer>) -> Result<u64, ClientError> {
+        Ok(self.api.download_to(&path, Path::new(&destination), &|done| transfer.keep_going(done))?)
+    }
+
+    /// Creates the folder `name` inside `parent`; returns its path.
+    pub fn create_folder(&self, parent: String, name: String) -> Result<String, ClientError> {
+        Ok(self.api.create_folder(&parent, &name)?)
+    }
+
+    /// Renames in place; returns the new path.
+    pub fn rename(&self, path: String, name: String) -> Result<String, ClientError> {
+        Ok(self.api.rename(&path, &name)?)
+    }
+
+    /// Moves to the server's Trash (or deletes, inside the Trash).
+    pub fn trash(&self, path: String) -> Result<(), ClientError> {
+        Ok(self.api.trash(&path)?)
+    }
+
+    /// Uploads from an open file descriptor, which this call takes over and closes, as a new
+    /// file in `dir`. A taken name gets a number. `size` and `mtime_ms` may be unknown.
+    /// Returns the file's path on the server.
+    #[cfg(unix)]
+    pub fn upload_fd(
+        &self,
+        dir: String,
+        name: String,
+        fd: i32,
+        size: Option<u64>,
+        mtime_ms: Option<i64>,
+        transfer: Arc<dyn Transfer>,
+    ) -> Result<String, ClientError> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        if fd < 0 {
+            return Err(failed("The file could not be opened".into()));
+        }
+        // SAFETY: the caller hands over an open descriptor it no longer uses.
+        let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        Ok(self.api.upload_new(&dir, &name, size, mtime_ms, file, &|done| transfer.keep_going(done))?)
     }
 }

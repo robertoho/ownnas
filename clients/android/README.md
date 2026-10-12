@@ -5,9 +5,19 @@ and, later, sync run in Rust: `crates/ownnas-core` is the client library shared 
 `ownnas-sync` CLI, and `crates/ownnas-ffi` exposes it to Kotlin through
 [UniFFI](https://mozilla.github.io/uniffi-rs/).
 
-What works now: add several servers, sign in (tokens are encrypted with an Android Keystore
-key), browse folders with thumbnails, pull to refresh, and open a file in the app that handles
-its type. Sync, uploads, a file picker provider, and terminals come next.
+What works now:
+
+- Several servers, each signed in with a token encrypted by an Android Keystore key.
+- Folders with thumbnails and pull to refresh.
+- Open a file in the app that handles its type, or share it, with download progress.
+- Upload photos and videos (the system photo picker) or any files (the system file picker).
+  Uploads stream from the picked file, show progress, can be cancelled, and never replace
+  anything: a taken name becomes `name (2).ext`. The file keeps its modification time.
+- New folder, rename, and move to the server's Trash (restorable from the web app).
+  Servers started with `--readonly` show no write actions.
+
+Uploads run while the app is open; background transfers come with sync. A file picker
+provider and terminals come after that.
 
 ## Build
 

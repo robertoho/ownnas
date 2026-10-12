@@ -10,6 +10,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import app.ownnas.android.OwnNasApp
 import app.ownnas.android.data.SavedServer
+import app.ownnas.core.Account
 import app.ownnas.core.ClientException
 import app.ownnas.core.Entry
 import app.ownnas.core.Folder
@@ -17,6 +18,11 @@ import app.ownnas.core.Server
 import app.ownnas.core.normalizeAddress
 import app.ownnas.core.signIn
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -46,6 +52,18 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         override fun sizeOf(key: String, value: ImageBitmap) = value.width * value.height * 4
     }
     private val thumbnailSlots = Semaphore(4)
+    private val accounts = ConcurrentHashMap<String, Account>()
+
+    /** Bumped after every change the app makes on a server, so open folders reload. */
+    private val changes = MutableStateFlow(0)
+    val revision: StateFlow<Int> = changes.asStateFlow()
+
+    private val queue = ArrayDeque<PendingUpload>()
+    private val uploadState = MutableStateFlow<UploadStatus?>(null)
+    val uploads: StateFlow<UploadStatus?> = uploadState.asStateFlow()
+    private var uploader: Job? = null
+    private var uploadTracker: Tracker? = null
+    private var lastUploadError: String? = null
 
     fun push(screen: Screen) {
         stack.add(screen)
@@ -88,12 +106,87 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun remove(id: String) {
+        accounts.remove(id)
         val server = connections.remove(id)
         store.remove(id)
         folders.keys.removeAll { it.first == id }
         // Ending the session on the server is best effort: the token is already gone here.
         viewModelScope.launch(Dispatchers.IO) {
             server?.let { runCatching { it.signOut() }; it.close() }
+        }
+    }
+
+    /** Who is signed in, and whether the server takes changes. Fetched once per app run. */
+    suspend fun account(id: String): Account =
+        accounts[id] ?: call(id) { it.account() }.also { accounts[id] = it }
+
+    private suspend fun <T> change(id: String, block: (Server) -> T): T =
+        call(id, block).also { changes.update { it + 1 } }
+
+    suspend fun createFolder(id: String, parent: String, name: String): String =
+        change(id) { it.createFolder(parent, name.trim()) }
+
+    suspend fun rename(id: String, entry: Entry, name: String): String =
+        change(id) { it.rename(entry.path, name.trim()) }
+
+    suspend fun trash(id: String, entry: Entry) {
+        change(id) { it.trash(entry.path) }
+    }
+
+    /** Queues picked files; they upload one at a time, in order, while the app is open. */
+    fun upload(pending: List<PendingUpload>) {
+        if (pending.isEmpty()) return
+        synchronized(queue) { queue.addAll(pending) }
+        uploadState.update { status ->
+            val base = status?.takeIf { it.active } ?: UploadStatus(0, 0, 0, null, null, 0)
+            base.copy(total = base.total + pending.size)
+        }
+        if (uploader?.isActive != true) uploader = viewModelScope.launch(Dispatchers.IO) { drain() }
+    }
+
+    private suspend fun drain() {
+        lastUploadError = null
+        while (true) {
+            val next = synchronized(queue) { queue.removeFirstOrNull() } ?: break
+            val tracker = Tracker { done -> uploadState.update { it?.copy(currentDone = done) } }
+            uploadTracker = tracker
+            uploadState.update { it?.copy(current = next.name, currentSize = next.size, currentDone = 0) }
+            val ok = try {
+                call(next.serverId) {
+                    it.uploadFd(next.dir, next.name, next.file.detachFd(), next.size?.toULong(), next.modified, tracker)
+                }
+                true
+            } catch (err: Exception) {
+                if (!err.isCancel()) lastUploadError = "${next.name}: ${err.userMessage()}"
+                false
+            } finally {
+                runCatching { next.file.close() }
+            }
+            uploadState.update { it?.copy(finished = it.finished + if (ok) 1 else 0, failed = it.failed + if (ok) 0 else 1) }
+            changes.update { it + 1 }
+            if (tracker.cancelled) break
+        }
+        uploadTracker = null
+        uploadState.update { it?.copy(current = null) }
+    }
+
+    /** Stops the current upload and drops the ones still waiting. */
+    fun cancelUploads() {
+        val dropped = synchronized(queue) { queue.toList().also { queue.clear() } }
+        dropped.forEach { runCatching { it.file.close() } }
+        uploadTracker?.cancelled = true
+        uploadState.update { it?.copy(failed = it.failed + dropped.size) }
+    }
+
+    /** The summary to show once uploads finish, then forgets them. */
+    fun takeUploadSummary(): String? {
+        val status = uploadState.value?.takeIf { !it.active } ?: return null
+        uploadState.value = null
+        val uploaded = "Uploaded ${status.finished} ${if (status.finished == 1) "file" else "files"}"
+        return when {
+            status.failed == 0 -> uploaded
+            lastUploadError != null -> "$uploaded. ${status.failed} failed — $lastUploadError"
+            else -> "$uploaded. ${status.failed} cancelled"
         }
     }
 
@@ -114,16 +207,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** Downloads a file into the cache for other apps to open, reusing an unchanged copy. */
-    suspend fun download(id: String, entry: Entry): File {
+    suspend fun download(id: String, entry: Entry, tracker: Tracker): File {
         val file = File(getApplication<Application>().cacheDir, "opened/$id/${entry.path}")
         if (file.isFile && file.length() == entry.size.toLong() && file.lastModified() == entry.modified) return file
         file.parentFile?.mkdirs()
-        call(id) { it.download(entry.path, file.absolutePath) }
+        call(id) { it.download(entry.path, file.absolutePath, tracker) }
         file.setLastModified(entry.modified)
         return file
     }
 
     override fun onCleared() {
+        cancelUploads()
         connections.values.forEach(Server::close)
         connections.clear()
     }
@@ -138,6 +232,7 @@ fun Throwable.userMessage(): String = when (this) {
     is ClientException.Unauthorized -> "Your session ended. Sign in again."
     is ClientException.NotFound -> "This is no longer on the server."
     is ClientException.Conflict -> "This changed on the server. Try again."
+    is ClientException.Cancelled -> "Cancelled"
     is ClientException.Failed -> reason
     else -> message ?: "Something went wrong"
 }

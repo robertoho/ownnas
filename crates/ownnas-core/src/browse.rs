@@ -6,6 +6,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::api::{map_err, Api, ApiError};
+use crate::manage::{Counted, Progress};
 
 /// Thumbnails are small PNGs; anything bigger than this is not one.
 const THUMBNAIL_LIMIT: u64 = 8 * 1024 * 1024;
@@ -88,18 +89,24 @@ impl Api {
 
     /// Downloads a file to `destination`, replacing it only once every byte has arrived.
     /// Returns the number of bytes written.
-    pub fn download_to(&self, path: &str, destination: &Path) -> Result<u64, ApiError> {
-        let (mut reader, stamp) = self.download(path)?;
+    pub fn download_to(&self, path: &str, destination: &Path, progress: Progress) -> Result<u64, ApiError> {
+        let (reader, stamp) = self.download(path)?;
         let temp = destination.with_extension("part");
+        let cancelled = std::cell::Cell::new(false);
+        let watch = |done: u64| {
+            let go_on = progress(done);
+            cancelled.set(!go_on);
+            go_on
+        };
         let written = (|| {
             let mut file = fs::File::create(&temp)?;
-            let written = std::io::copy(&mut reader, &mut file)?;
+            let written = std::io::copy(&mut Counted::new(reader, &watch), &mut file)?;
             file.flush()?;
             Ok::<u64, std::io::Error>(written)
         })()
         .map_err(|err| {
             let _ = fs::remove_file(&temp);
-            ApiError::Other(format!("Could not save the file: {err}"))
+            if cancelled.get() { ApiError::Cancelled } else { ApiError::Other(format!("Could not save the file: {err}")) }
         })?;
         if written != stamp.size {
             let _ = fs::remove_file(&temp);

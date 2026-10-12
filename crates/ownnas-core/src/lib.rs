@@ -3,5 +3,6 @@ pub mod api;
 pub mod browse;
 pub mod engine;
 pub mod local;
+pub mod manage;
 pub mod model;
 pub mod plan;

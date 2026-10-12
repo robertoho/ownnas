@@ -45,6 +45,8 @@ pub enum ApiError {
     Conflict,
     Unauthorized,
     NotFound,
+    /// The caller stopped the transfer.
+    Cancelled,
     Other(String),
 }
 
@@ -54,6 +56,7 @@ impl std::fmt::Display for ApiError {
             ApiError::Conflict => write!(f, "changed on the server"),
             ApiError::Unauthorized => write!(f, "the server rejected the sign-in token; run `ownnas-sync setup` again"),
             ApiError::NotFound => write!(f, "not found on the server"),
+            ApiError::Cancelled => write!(f, "cancelled"),
             ApiError::Other(message) => write!(f, "{message}"),
         }
     }
