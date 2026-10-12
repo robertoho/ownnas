@@ -37,6 +37,9 @@ import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.PictureAsPdf
 import androidx.compose.material.icons.outlined.Terminal
+import androidx.compose.material.icons.outlined.Sync
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -138,6 +141,8 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
         if (unreadable > 0) report("$unreadable could not be read and were skipped")
     }
 
+    val setUpSync = rememberSyncSetup(vm, serverId, path)
+
     val pickMedia = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(), ::upload)
     val pickFiles = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments(), ::upload)
 
@@ -201,6 +206,17 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
                     if (account?.terminal == true) {
                         IconButton(onClick = { vm.push(Screen.Terminals(serverId, path)) }) {
                             Icon(Icons.Outlined.Terminal, contentDescription = "Terminals")
+                        }
+                    }
+                    var menu by remember { mutableStateOf(false) }
+                    Box {
+                        IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "Folder actions") }
+                        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                            DropdownMenuItem(
+                                text = { Text("Sync with this phone…") },
+                                leadingIcon = { Icon(Icons.Outlined.Sync, contentDescription = null) },
+                                onClick = { menu = false; setUpSync() },
+                            )
                         }
                     }
                 },

@@ -5,7 +5,7 @@ use std::io::{self, Cursor, Read};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::api::{map_err, Api, ApiError};
+use crate::api::{map_err, Api, ApiError, Fetch};
 
 /// Called with the bytes moved so far. Returning `false` cancels the transfer.
 pub type Progress<'a> = &'a dyn Fn(u64) -> bool;
@@ -153,8 +153,7 @@ impl Api {
     pub fn trash(&self, path: &str) -> Result<(), ApiError> {
         self.request("DELETE", "/api/entry")
             .query("path", path)
-            .call()
-            .map_err(map_err)?;
+            .fetch()?;
         Ok(())
     }
 

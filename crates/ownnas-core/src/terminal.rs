@@ -17,7 +17,7 @@ use serde_json::json;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::Message;
 
-use crate::api::{map_err, Api, ApiError};
+use crate::api::{Api, ApiError, Fetch};
 
 /// Lines kept above the screen for scrolling back.
 const SCROLLBACK: usize = 5000;
@@ -71,7 +71,7 @@ struct Opened {
 impl Api {
     /// Every open terminal. [`ApiError::Locked`] means: ask for the terminal password and [`Api::unlock_terminals`].
     pub fn terminals(&self) -> Result<Vec<TerminalInfo>, ApiError> {
-        let response = self.request("GET", "/api/terminals").call().map_err(map_err)?;
+        let response = self.request("GET", "/api/terminals").fetch()?;
         let body: TerminalList = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
         Ok(body.terminals)
     }
@@ -85,7 +85,7 @@ impl Api {
 
     /// Ends a terminal and its programs.
     pub fn close_terminal(&self, id: &str) -> Result<(), ApiError> {
-        self.request("DELETE", "/api/terminals").query("id", id).call().map_err(map_err)?;
+        self.request("DELETE", "/api/terminals").query("id", id).fetch()?;
         Ok(())
     }
 

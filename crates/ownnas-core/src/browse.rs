@@ -5,7 +5,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::api::{map_err, Api, ApiError};
+use crate::api::{Api, ApiError, Fetch};
 use crate::manage::{Counted, Progress};
 
 /// Thumbnails are small PNGs; anything bigger than this is not one.
@@ -57,7 +57,7 @@ fn io_err(err: std::io::Error) -> ApiError {
 
 impl Api {
     pub fn account(&self) -> Result<Account, ApiError> {
-        let response = self.request("GET", "/api/me").call().map_err(map_err)?;
+        let response = self.request("GET", "/api/me").fetch()?;
         response.into_json().map_err(io_err)
     }
 
@@ -66,8 +66,7 @@ impl Api {
         let response = self
             .request("GET", "/api/list")
             .query("path", path)
-            .call()
-            .map_err(map_err)?;
+            .fetch()?;
         response.into_json().map_err(io_err)
     }
 
@@ -76,8 +75,7 @@ impl Api {
         let response = self
             .request("GET", "/api/thumb")
             .query("path", path)
-            .call()
-            .map_err(map_err)?;
+            .fetch()?;
         let mut bytes = Vec::new();
         response
             .into_reader()

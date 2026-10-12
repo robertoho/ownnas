@@ -13,6 +13,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.outlined.Dns
+import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
@@ -49,7 +50,17 @@ fun ServersScreen(vm: AppViewModel) {
     val scroll = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
     Scaffold(
         modifier = Modifier.nestedScroll(scroll.nestedScrollConnection),
-        topBar = { LargeTopAppBar(title = { Text("OwnNAS") }, scrollBehavior = scroll) },
+        topBar = {
+            LargeTopAppBar(
+                title = { Text("OwnNAS") },
+                actions = {
+                    if (servers.isNotEmpty()) {
+                        IconButton(onClick = { vm.push(Screen.Sync) }) { Icon(Icons.Outlined.Sync, contentDescription = "Sync") }
+                    }
+                },
+                scrollBehavior = scroll,
+            )
+        },
         floatingActionButton = {
             if (servers.isNotEmpty()) {
                 ExtendedFloatingActionButton(

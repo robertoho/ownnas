@@ -96,6 +96,21 @@ fn base_param(base: Option<Stamp>) -> String {
     }
 }
 
+/// Sends a request without a body, once more on a fresh connection when a pooled one turns
+/// out to be dead: phones and NATs drop idle connections, and ureq does not always notice.
+pub(crate) trait Fetch {
+    fn fetch(self) -> Result<ureq::Response, ApiError>;
+}
+
+impl Fetch for ureq::Request {
+    fn fetch(self) -> Result<ureq::Response, ApiError> {
+        match self.clone().call() {
+            Err(ureq::Error::Transport(transport)) if transport.kind() == ureq::ErrorKind::Io => self.call().map_err(map_err),
+            other => other.map_err(map_err),
+        }
+    }
+}
+
 impl Api {
     /// `ca_pem` adds a private CA (such as the one `ownnas tls` generates) to the public roots.
     pub fn new(server: &str, token: Option<String>, ca_pem: Option<&[u8]>) -> Result<Self, String> {
@@ -161,8 +176,7 @@ impl Api {
         let response = self
             .request("GET", "/api/sync/tree")
             .query("path", remote_root)
-            .call()
-            .map_err(map_err)?;
+            .fetch()?;
         let body: TreeResponse = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
         let prefix = if remote_root.is_empty() { String::new() } else { format!("{remote_root}/") };
         let nodes = body
@@ -181,8 +195,7 @@ impl Api {
         let response = self
             .request("GET", "/api/sync/file")
             .query("path", path)
-            .call()
-            .map_err(map_err)?;
+            .fetch()?;
         let header = |name: &str| response.header(name).and_then(|value| value.parse::<i64>().ok());
         let stamp = match (header("x-ownnas-size"), header("x-ownnas-mtime")) {
             (Some(size), Some(mtime)) => Stamp { size: size as u64, mtime },
@@ -232,8 +245,7 @@ impl Api {
         let response = self
             .request("GET", "/api/hash")
             .query("path", path)
-            .call()
-            .map_err(map_err)?;
+            .fetch()?;
         let body: serde_json::Value = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
         body["sha256"]
             .as_str()

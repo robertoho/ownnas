@@ -49,10 +49,13 @@ sealed interface Screen {
     data class Terminals(val serverId: String, val path: String) : Screen
 
     data class Terminal(val serverId: String, val terminalId: String) : Screen
+
+    data object Sync : Screen
 }
 
 class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val hub = (application as OwnNasApp).servers
+    val syncs = (application as OwnNasApp).syncs
     private val store = hub.store
     val servers = store.servers
 
@@ -99,8 +102,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     suspend fun fingerprint(address: String): String =
         withContext(Dispatchers.IO) { serverFingerprint(normalizeAddress(address)) }
 
+    fun syncNow(pairId: String? = null) {
+        viewModelScope.launch { syncs.run(pairId) }
+    }
+
     fun remove(id: String) {
         folders.keys.removeAll { it.first == id }
+        syncs.pairs.value.filter { it.serverId == id }.forEach { syncs.remove(it.id) }
         viewModelScope.launch(Dispatchers.IO) { hub.remove(id) }
     }
 

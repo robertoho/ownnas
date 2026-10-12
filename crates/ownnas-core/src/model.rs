@@ -126,5 +126,8 @@ pub fn load_state(root: &Path) -> Result<State, String> {
 
 pub fn save_state(root: &Path, state: &State) -> Result<(), String> {
     let bytes = serde_json::to_vec(state).map_err(|err| err.to_string())?;
-    write_atomic(&meta_dir(root).join("state.json"), &bytes, false)
+    // Apps sync without a saved config, so the folder may not exist yet.
+    let dir = meta_dir(root);
+    fs::create_dir_all(&dir).map_err(|err| format!("Could not create {}: {err}", dir.display()))?;
+    write_atomic(&dir.join("state.json"), &bytes, false)
 }

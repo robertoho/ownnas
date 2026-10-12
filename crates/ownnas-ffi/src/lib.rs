@@ -518,3 +518,66 @@ impl TerminalSession {
         self.session.close();
     }
 }
+
+#[derive(uniffi::Record)]
+pub struct SyncSummary {
+    pub uploaded: u32,
+    pub downloaded: u32,
+    pub deleted_on_server: u32,
+    pub deleted_here: u32,
+    pub folders: u32,
+    pub conflicts: u32,
+    pub skipped: u32,
+    pub failed: u32,
+    /// Local changes not sent because the server is read-only.
+    pub held: u32,
+    /// Conflicts, skips, and errors worth showing, one per line.
+    pub notices: Vec<String>,
+}
+
+#[uniffi::export]
+impl Server {
+    /// Two-way sync of the local folder `local_root` with the server folder `remote`, as
+    /// `ownnas-sync run` does: deletions go to the server's Trash or to `.ownnas-sync/deleted`
+    /// here (kept 30 days), and edits on both sides keep both copies. `device` names this phone
+    /// in conflict copies. State lives in `local_root/.ownnas-sync`, so syncs resume.
+    pub fn sync_folder(&self, local_root: String, remote: String, device: String) -> Result<SyncSummary, ClientError> {
+        let root = Path::new(&local_root);
+        std::fs::create_dir_all(root).map_err(|err| failed(format!("Could not open {local_root}: {err}")))?;
+        ownnas_core::local::prune_deleted(root, 30);
+        let config = ownnas_core::model::Config {
+            server: String::new(),
+            remote: remote.trim_matches('/').to_string(),
+            username: String::new(),
+            token: String::new(),
+            ca_cert: None,
+        };
+        let notices = std::sync::Mutex::new(Vec::new());
+        let collect = |message: String| notices.lock().unwrap_or_else(|err| err.into_inner()).push(message);
+        let syncer = ownnas_core::engine::Syncer {
+            root,
+            config: &config,
+            api: &self.api,
+            host: device,
+            dry_run: false,
+            verbose: false,
+            notices: Some(&collect),
+        };
+        let summary = syncer.run().map_err(|err| {
+            if err == ApiError::Unauthorized.to_string() { ClientError::Unauthorized } else { failed(err) }
+        })?;
+        let count = |n: usize| n.min(u32::MAX as usize) as u32;
+        Ok(SyncSummary {
+            uploaded: count(summary.uploaded),
+            downloaded: count(summary.downloaded),
+            deleted_on_server: count(summary.deleted_remote),
+            deleted_here: count(summary.deleted_local),
+            folders: count(summary.folders),
+            conflicts: count(summary.conflicts),
+            skipped: count(summary.skipped),
+            failed: count(summary.failed),
+            held: count(summary.held),
+            notices: notices.into_inner().unwrap_or_default(),
+        })
+    }
+}

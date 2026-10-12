@@ -145,6 +145,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.androidx.work.runtime.ktx)
     implementation("${libs.jna.get()}@aar")
     debugImplementation(libs.androidx.compose.ui.tooling)
 }

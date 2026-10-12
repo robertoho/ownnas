@@ -107,7 +107,7 @@ fn run(dir: &Path, watch: bool, interval: u64, dry_run: bool, verbose: bool) -> 
     let dir = dir.canonicalize().map_err(|err| format!("Could not open {}: {err}", dir.display()))?;
     let config = model::load_config(&dir)?;
     let api = api_for(&config, Some(config.token.clone()))?;
-    let syncer = engine::Syncer { root: &dir, config: &config, api: &api, host: engine::host_name(), dry_run, verbose };
+    let syncer = engine::Syncer { root: &dir, config: &config, api: &api, host: engine::host_name(), dry_run, verbose, notices: None };
     loop {
         local::prune_deleted(&dir, 30);
         match syncer.run() {

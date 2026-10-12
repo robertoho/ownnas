@@ -33,7 +33,14 @@ What works now:
   certificate renewals). Trust is stored per server and also covers terminals and the
   file picker.
 
-Uploads run while the app is open; background transfers come with sync.
+- Two-way folder sync: from a server folder's menu, “Sync with this phone…” pairs it with a
+  folder on the phone (DCIM, Documents, an SD card…). It runs the same Rust engine as
+  `ownnas-sync`: deletions go to the server's Trash or to `.ownnas-sync/deleted` on the phone
+  for 30 days, and edits on both sides keep both copies. Syncs run every 15 minutes with
+  WorkManager while there is a network, and on demand from the Sync screen. Sync needs
+  “All files access”, which the app asks for when you set one up.
+
+Uploads from the + button run while the app is open.
 
 ## Build
 

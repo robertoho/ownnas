@@ -68,9 +68,16 @@ pub struct Syncer<'a> {
     pub host: String,
     pub dry_run: bool,
     pub verbose: bool,
+    /// Where notices (conflicts, skips, errors) go. `None` prints them, as the CLI wants.
+    pub notices: Option<&'a (dyn Fn(String) + Sync)>,
 }
 
 impl Syncer<'_> {
+    /// What to call this machine in messages.
+    fn device(&self) -> &'static str {
+        if cfg!(any(target_os = "android", target_os = "ios")) { "phone" } else { "computer" }
+    }
+
     fn remote_path(&self, rel: &str) -> String {
         if self.config.remote.is_empty() {
             rel.to_string()
@@ -127,7 +134,7 @@ impl Syncer<'_> {
                 }
                 Err(err) => {
                     summary.failed += 1;
-                    eprintln!("error: {}: {err}", action_path(&action));
+                    self.notice(format!("error: {}: {err}", action_path(&action)), true);
                 }
             }
             since_save += 1;
@@ -148,6 +155,15 @@ impl Syncer<'_> {
         }
     }
 
+    /// Something the user should hear about even without `verbose`.
+    fn notice(&self, message: String, error: bool) {
+        match self.notices {
+            Some(notices) => notices(message),
+            None if error => eprintln!("{message}"),
+            None => println!("{message}"),
+        }
+    }
+
     fn apply(&self, action: &Action, state: &mut State, session: &str, summary: &mut Summary) -> Result<(), ApiError> {
         let io = |err: std::io::Error| ApiError::Other(err.to_string());
         let entries = &mut state.entries;
@@ -160,7 +176,7 @@ impl Syncer<'_> {
             }
             Action::Skip { path, reason } => {
                 summary.skipped += 1;
-                eprintln!("skip: {path} {reason}");
+                self.notice(format!("skip: {path} {reason}"), true);
             }
             Action::MkdirRemote(path) => {
                 self.api.mkdir(&self.remote_path(path))?;
@@ -245,7 +261,7 @@ impl Syncer<'_> {
                 fs::rename(&full, local::full_path(self.root, &copy)).map_err(io)?;
                 entries.remove(path);
                 summary.conflicts += 1;
-                println!("conflict: {path} changed on both sides; kept this computer's version as {copy}");
+                self.notice(format!("conflict: {path} changed on both sides; kept this {}'s version as {copy}", self.device()), false);
                 self.download(path, None, entries)?;
             }
         }
