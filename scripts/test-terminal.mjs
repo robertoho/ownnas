@@ -57,8 +57,10 @@ async function login() {
 }
 
 /// Opens a terminal socket and collects its output as text.
-function attach(id, origin = base) {
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/api/terminals/ws?id=${id}`, { headers: { cookie, origin } });
+function attach(id, origin = base, { token } = {}) {
+  // Native apps send a bearer token on the handshake instead of a cookie.
+  const headers = token ? { authorization: `Bearer ${token}` } : { cookie, origin };
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/api/terminals/ws?id=${id}`, { headers });
   socket.binaryType = 'arraybuffer';
   const state = { socket, text: '', messages: [], opened: false, closed: false };
   socket.addEventListener('open', () => { state.opened = true; });
@@ -141,6 +143,22 @@ try {
   const foreign = attach(id, 'http://evil.example');
   await until(() => foreign.closed, 'cross-site socket to close');
   assert.equal(foreign.opened, false);
+
+  // A native app signs in for a token and connects with it and no Origin header.
+  const tokenLogin = await fetch(`${base}/api/login`, {
+    method: 'POST',
+    headers: { 'x-ownnas': '1', 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'admin', password: PASSWORD, token: true }),
+  });
+  const { token } = await tokenLogin.json();
+  await call('POST', '/api/terminal/unlock', { password: TERMINAL_PASSWORD }, { cookie: '', authorization: `Bearer ${token}` });
+  const app = attach(id, undefined, { token });
+  await until(() => app.opened, 'app socket to open');
+  app.socket.close();
+  await until(() => app.closed, 'app socket to close');
+  const badToken = attach(id, undefined, { token: 'not-a-session' });
+  await until(() => badToken.closed, 'socket with a bad token to close');
+  assert.equal(badToken.opened, false);
 
   const first = attach(id);
   await until(() => first.opened, 'socket to open');

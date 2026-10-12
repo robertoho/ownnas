@@ -253,6 +253,7 @@ Paths never escape `--root` (traversal, absolute paths, and drive letters are re
 ## Security notes
 
 - Session cookie after login; mutating requests require the `X-OwnNAS: 1` header (CSRF-style guard).
+- Native apps sign in with `{"token": true}` and send `Authorization: Bearer <token>`, which also satisfies the CSRF guard and works on the terminal WebSocket handshake. Sockets that sign in with the cookie must come from the server's own origin.
 - Passwords hashed with argon2.
 - Active content (SVG/HTML/JS, …) is served carefully for preview (e.g. text/plain where needed) to reduce script execution risk.
 - Prefer VPN + HTTPS in any exposure beyond localhost.

@@ -2662,7 +2662,9 @@ async fn terminal_socket(
     Query(query): Query<TerminalIdQuery>,
     upgrade: axum::extract::ws::WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    if !same_origin(&headers) {
+    // A browser never attaches a bearer token by itself, so only cookie sign-ins need the Origin
+    // check. Native apps send `Authorization: Bearer` on the handshake.
+    if bearer_token(&headers).is_none() && !same_origin(&headers) {
         return Err(ApiError::new(StatusCode::FORBIDDEN, "Cross-site terminal connections are not allowed"));
     }
     terminal_access(&state, &headers, &peer)?;
