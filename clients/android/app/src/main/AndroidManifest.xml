@@ -21,6 +21,18 @@
             </intent-filter>
         </activity>
 
+        <!-- Shows signed-in servers in the system file picker and Files app. -->
+        <provider
+            android:name=".data.OwnNasDocuments"
+            android:authorities="${applicationId}.documents"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
+        </provider>
+
         <!-- Hands downloaded files to other apps for viewing and sharing. -->
         <provider
             android:name="androidx.core.content.FileProvider"

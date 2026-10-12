@@ -18,8 +18,10 @@ What works now:
 - New folder, rename, and move to the server's Trash (restorable from the web app).
   Servers started with `--readonly` show no write actions.
 
-Uploads run while the app is open; background transfers come with sync. A file picker
-provider and terminals come after that.
+- Each signed-in server appears in the system file picker and the Files app, so any app can
+  open, attach, save into, rename, and delete files there (`data/OwnNasDocuments.kt`).
+
+Uploads run while the app is open; background transfers come with sync.
 
 ## Build
 

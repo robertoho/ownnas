@@ -138,18 +138,13 @@ fn form_parts(boundary: &str, name: &str) -> (Vec<u8>, Vec<u8>) {
 impl Api {
     /// Creates `name` inside `parent` and returns its path.
     pub fn create_folder(&self, parent: &str, name: &str) -> Result<String, ApiError> {
-        self.request("POST", "/api/mkdir")
-            .send_json(json!({ "path": parent, "name": name }))
-            .map_err(map_err)?;
+        self.post_json("/api/mkdir", json!({ "path": parent, "name": name }))?;
         Ok(join(parent, name))
     }
 
     /// Renames a file or folder in place and returns its new path.
     pub fn rename(&self, path: &str, name: &str) -> Result<String, ApiError> {
-        let response = self
-            .request("POST", "/api/rename")
-            .send_json(json!({ "path": path, "name": name }))
-            .map_err(map_err)?;
+        let response = self.post_json("/api/rename", json!({ "path": path, "name": name }))?;
         let body: PathResponse = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
         body.path.ok_or_else(|| ApiError::Other("The server did not say where the item went".into()))
     }
@@ -165,10 +160,7 @@ impl Api {
 
     /// What is already at `name` in `dir`, if anything. Ask before uploading, as the web app does.
     pub fn check_upload(&self, dir: &str, name: &str) -> Result<Option<Existing>, ApiError> {
-        let response = self
-            .request("POST", "/api/upload/conflicts")
-            .send_json(json!({ "path": dir, "names": [name] }))
-            .map_err(map_err)?;
+        let response = self.post_json("/api/upload/conflicts", json!({ "path": dir, "names": [name] }))?;
         let body: CheckResponse = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
         Ok(body.items.into_iter().next().filter(|item| item.exists).map(|item| item.existing))
     }

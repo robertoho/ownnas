@@ -126,6 +126,18 @@ impl Api {
         format!("{}{}", self.server, path)
     }
 
+    /// Sends a JSON POST. ureq retries GET and DELETE when a pooled connection turns out to be
+    /// dead (phones and NATs drop idle ones), but not POST, so this does it here: the request
+    /// never reached the server in that case, so sending it again is safe.
+    pub(crate) fn post_json(&self, path: &str, body: serde_json::Value) -> Result<ureq::Response, ApiError> {
+        match self.request("POST", path).send_json(&body) {
+            Err(ureq::Error::Transport(transport)) if transport.kind() == ureq::ErrorKind::Io => {
+                self.request("POST", path).send_json(&body).map_err(map_err)
+            }
+            other => other.map_err(map_err),
+        }
+    }
+
     pub(crate) fn request(&self, method: &str, path: &str) -> ureq::Request {
         let request = self.agent.request(method, &self.url(path));
         match &self.token {
@@ -135,10 +147,7 @@ impl Api {
     }
 
     pub fn login(&self, username: &str, password: &str) -> Result<String, ApiError> {
-        let response = self
-            .request("POST", "/api/login")
-            .send_json(json!({ "username": username, "password": password, "token": true }))
-            .map_err(map_err)?;
+        let response = self.post_json("/api/login", json!({ "username": username, "password": password, "token": true }))?;
         let body: serde_json::Value = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
         body["token"]
             .as_str()
@@ -147,7 +156,7 @@ impl Api {
     }
 
     pub fn logout(&self) -> Result<(), ApiError> {
-        self.request("POST", "/api/logout").call().map_err(map_err)?;
+        self.post_json("/api/logout", json!({}))?;
         Ok(())
     }
 
@@ -209,9 +218,7 @@ impl Api {
     }
 
     pub fn mkdir(&self, path: &str) -> Result<(), ApiError> {
-        self.request("POST", "/api/sync/mkdir")
-            .send_json(json!({ "path": path }))
-            .map_err(map_err)?;
+        self.post_json("/api/sync/mkdir", json!({ "path": path }))?;
         Ok(())
     }
 
@@ -221,9 +228,7 @@ impl Api {
             Some(stamp) => base_param(Some(stamp)),
             None => "dir".to_string(),
         };
-        self.request("POST", "/api/sync/delete")
-            .send_json(json!({ "path": path, "base": base }))
-            .map_err(map_err)?;
+        self.post_json("/api/sync/delete", json!({ "path": path, "base": base }))?;
         Ok(())
     }
 

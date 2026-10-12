@@ -42,23 +42,21 @@ sealed interface Screen {
 }
 
 class AppViewModel(application: Application) : AndroidViewModel(application) {
-    private val store = (application as OwnNasApp).store
+    private val hub = (application as OwnNasApp).servers
+    private val store = hub.store
     val servers = store.servers
 
     /** The back stack; the last screen is showing. */
     val stack = mutableStateListOf<Screen>(Screen.Servers)
 
-    private val connections = ConcurrentHashMap<String, Server>()
     private val folders = ConcurrentHashMap<Pair<String, String>, Folder>()
     private val thumbnails = object : LruCache<String, ImageBitmap>(THUMBNAIL_CACHE_BYTES) {
         override fun sizeOf(key: String, value: ImageBitmap) = value.width * value.height * 4
     }
     private val thumbnailSlots = Semaphore(4)
-    private val accounts = ConcurrentHashMap<String, Account>()
 
-    /** Bumped after every change the app makes on a server, so open folders reload. */
-    private val changes = MutableStateFlow(0)
-    val revision: StateFlow<Int> = changes.asStateFlow()
+    /** Bumped after every change made on a server from this phone, so open folders reload. */
+    val revision: StateFlow<Int> = hub.revision
 
     private val queue = ArrayDeque<PendingUpload>()
     private val uploadState = MutableStateFlow<UploadStatus?>(null)
@@ -82,59 +80,30 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun server(id: String): SavedServer? = store.find(id)
 
-    private fun connection(id: String): Server = connections.getOrPut(id) {
-        val saved = store.find(id) ?: throw ClientException.NotFound()
-        val token = store.token(id) ?: throw ClientException.Unauthorized()
-        Server(saved.address, token, null)
-    }
+    private suspend fun <T> call(id: String, block: (Server) -> T): T = hub.call(id, block)
 
-    /** Runs a server call off the main thread; a rejected token is forgotten so the app asks to sign in. */
-    private suspend fun <T> call(id: String, block: (Server) -> T): T = withContext(Dispatchers.IO) {
-        try {
-            block(connection(id))
-        } catch (err: ClientException.Unauthorized) {
-            connections.remove(id)?.close()
-            store.forgetToken(id)
-            throw err
-        }
-    }
-
-    suspend fun signIn(address: String, username: String, password: String): SavedServer = withContext(Dispatchers.IO) {
-        val normalized = normalizeAddress(address)
-        val token = signIn(normalized, username.trim(), password, null)
-        val server = Server(normalized, token, null)
-        val account = server.account()
-        val saved = store.save(normalized, account.username, account.rootName, token)
-        connections.put(saved.id, server)?.close()
-        saved
-    }
+    suspend fun signIn(address: String, username: String, password: String): SavedServer =
+        withContext(Dispatchers.IO) { hub.signIn(address, username, password) }
 
     fun remove(id: String) {
-        accounts.remove(id)
-        val server = connections.remove(id)
-        store.remove(id)
         folders.keys.removeAll { it.first == id }
-        // Ending the session on the server is best effort: the token is already gone here.
-        viewModelScope.launch(Dispatchers.IO) {
-            server?.let { runCatching { it.signOut() }; it.close() }
-        }
+        viewModelScope.launch(Dispatchers.IO) { hub.remove(id) }
     }
 
     /** Who is signed in, and whether the server takes changes. Fetched once per app run. */
-    suspend fun account(id: String): Account =
-        accounts[id] ?: call(id) { it.account() }.also { accounts[id] = it }
+    suspend fun account(id: String): Account = withContext(Dispatchers.IO) { hub.account(id) }
 
-    private suspend fun <T> change(id: String, block: (Server) -> T): T =
-        call(id, block).also { changes.update { it + 1 } }
+    private suspend fun <T> change(id: String, dir: String, block: (Server) -> T): T =
+        call(id, block).also { hub.changed(id, dir) }
 
     suspend fun createFolder(id: String, parent: String, name: String): String =
-        change(id) { it.createFolder(parent, name.trim()) }
+        change(id, parent) { it.createFolder(parent, name.trim()) }
 
     suspend fun rename(id: String, entry: Entry, name: String): String =
-        change(id) { it.rename(entry.path, name.trim()) }
+        change(id, entry.path.parentPath()) { it.rename(entry.path, name.trim()) }
 
     suspend fun trash(id: String, entry: Entry) {
-        change(id) { it.trash(entry.path) }
+        change(id, entry.path.parentPath()) { it.trash(entry.path) }
     }
 
     /** Queues picked files; they upload one at a time, in order, while the app is open. */
@@ -173,7 +142,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     failed = it.failed + if (outcome == Outcome.Failed) 1 else 0,
                 )
             }
-            if (outcome == Outcome.Saved) changes.update { it + 1 }
+            if (outcome == Outcome.Saved) hub.changed(next.serverId, next.dir)
             if (tracker.cancelled) break
         }
         uploadTracker = null
@@ -277,25 +246,20 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** Downloads a file into the cache for other apps to open, reusing an unchanged copy. */
-    suspend fun download(id: String, entry: Entry, tracker: Tracker): File {
-        val file = File(getApplication<Application>().cacheDir, "opened/$id/${entry.path}")
-        if (file.isFile && file.length() == entry.size.toLong() && file.lastModified() == entry.modified) return file
-        file.parentFile?.mkdirs()
-        call(id) { it.download(entry.path, file.absolutePath, tracker) }
-        file.setLastModified(entry.modified)
-        return file
-    }
+    suspend fun download(id: String, entry: Entry, tracker: Tracker): File =
+        withContext(Dispatchers.IO) { hub.cachedCopy(id, entry.path, entry.size.toLong(), entry.modified, tracker) }
 
     override fun onCleared() {
         cancelUploads()
-        connections.values.forEach(Server::close)
-        connections.clear()
     }
 
     private companion object {
         const val THUMBNAIL_CACHE_BYTES = 32 * 1024 * 1024
     }
 }
+
+/** The folder that holds `path` ("" at the top). */
+fun String.parentPath() = substringBeforeLast('/', "")
 
 /** Text to show for a failed server call. */
 fun Throwable.userMessage(): String = when (this) {
