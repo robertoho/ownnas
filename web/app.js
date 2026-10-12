@@ -291,6 +291,7 @@ function showApp() {
   $("preview-duplicate").hidden = !write;
   $("preview-move").hidden = !write;
   $("empty-trash-btn").hidden = true;
+  syncTerminalButton();
   refreshLibrary().catch((err) => toast(err.message, true));
 }
 
@@ -1223,11 +1224,33 @@ async function terminalPanel() {
       rootName: () => state.me && state.me.rootName,
       refreshMe: async () => {
         Object.assign(state.me, await api("/api/me"));
+        syncTerminalButton();
+      },
+      openFile: (path) => {
+        closeSettings();
+        openFileByPath(path).catch((err) => toast(err.message, true));
+      },
+      openSettings: (tab) => openSettings(tab),
+      setBadge: (count) => {
+        $("terminals-badge").hidden = !count;
+        $("terminals-badge").textContent = count > 9 ? "9+" : String(count);
+        document.title = count ? `(${count}) OwnNAS` : "OwnNAS";
       },
     });
     terminalModule = module;
   }
   return terminalModule;
+}
+
+function syncTerminalButton() {
+  const on = !!(state.me && state.me.terminal);
+  $("terminals-btn").hidden = !on;
+  if (on) {
+    terminalPanel().then((module) => module.background()).catch(() => {});
+  } else {
+    $("terminals-badge").hidden = true;
+    document.title = "OwnNAS";
+  }
 }
 
 function openTerminalAt(path) {
@@ -4265,6 +4288,9 @@ $("fab-menu").addEventListener("click", (event) => {
   menu.style.top = `${Math.max(8, fab.top - rect.height - 10)}px`;
 });
 $("settings-btn").addEventListener("click", () => openSettings());
+$("terminals-btn").addEventListener("click", () => {
+  terminalPanel().then((module) => module.show()).catch((err) => toast(err.message, true));
+});
 $("settings-close").addEventListener("click", closeSettings);
 $("settings-tab-theme").addEventListener("click", () => setSettingsTab("theme"));
 $("settings-tab-updates").addEventListener("click", () => setSettingsTab("updates"));
@@ -5367,17 +5393,21 @@ $("bookmarks").addEventListener("click", (event) => {
   closeLibrary();
   go(button.dataset.go).catch((err) => toast(err.message, true));
 });
+/// Goes to a file's folder and opens it.
+async function openFileByPath(path) {
+  const parent = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+  if (state.path !== parent) await go(parent);
+  const entry = findEntry(path);
+  if (entry) await openEntry(entry);
+  else await openEntry({ path, name: path.split("/").pop(), dir: false, size: 0, modified: 0, kind: "file" });
+}
+
 $("recents").addEventListener("click", async (event) => {
   const button = event.target.closest("[data-open]");
   if (!button) return;
-  const path = button.dataset.open;
-  const parent = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
   try {
     closeLibrary();
-    if (state.path !== parent) await go(parent);
-    const entry = findEntry(path);
-    if (entry) await openEntry(entry);
-    else await openEntry({ path, name: path.split("/").pop(), dir: false, size: 0, modified: 0, kind: "file" });
+    await openFileByPath(button.dataset.open);
   } catch (err) {
     toast(err.message, true);
   }

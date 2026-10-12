@@ -113,6 +113,24 @@ files. It is off by default: turn it on in **Settings → Terminal**.
 - The default shell is `$SHELL` (a login shell) on macOS and Linux and PowerShell on
   Windows; set another one in Settings. Not available with `--readonly` or on Android.
 
+### Coding agents
+
+Each terminal tab shows the agent running in it and what it is doing; **Overview** lists
+all of them. The terminals button in the header shows a badge, the page title a count, and
+(after **Notify me when an agent needs me**) the browser a notification when an agent needs
+permission, asks a question, or finishes. **Edited** lists the files the agent changed and
+**Changes** shows `git status` for the folder; both open files in OwnNAS.
+
+- Without setup, OwnNAS recognizes Claude Code, opencode, Codex, Gemini CLI, Aider, and
+  other agents from the terminal's foreground process (macOS and Linux), and treats the
+  terminal bell and desktop-notification escape codes (OSC 9, 99, 777) as requests for
+  attention.
+- **Settings → Terminal → Agent integrations** installs a Claude Code hook (in
+  `~/.claude/settings.json`, backed up first) or an opencode plugin
+  (`~/.config/opencode/plugins/ownnas.js`) for step-by-step status. They report only from
+  inside OwnNAS terminals, through a per-terminal token to a listener on `127.0.0.1`, and do
+  nothing elsewhere. **Remove** takes them out again.
+
 ## Run in the background
 
 OwnNAS stays in the foreground. Use the OS service manager so it survives logout and starts on boot. Pass absolute paths for the binary, `--root`, and `--data`. Create the account once interactively before installing the service.

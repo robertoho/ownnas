@@ -73,6 +73,8 @@ pub struct AppState {
     /// Served over native HTTPS (`--tls-cert`).
     pub https: bool,
     pub terminals: crate::terminal::Terminals,
+    /// Loopback URL that agent hooks inside terminals report to.
+    pub agent_url: std::sync::OnceLock<String>,
 }
 
 pub struct AttemptGate {
@@ -120,6 +122,7 @@ pub fn new_state(
         attempts: Mutex::new(AttemptGate::new()),
         https: false,
         terminals: crate::terminal::Terminals::default(),
+        agent_url: std::sync::OnceLock::new(),
     })
 }
 
@@ -246,6 +249,10 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/terminal/lock", post(terminal_lock))
         .route("/api/terminals", get(list_terminals).post(open_terminal).delete(close_terminal))
         .route("/api/terminals/ws", get(terminal_socket))
+        .route("/api/terminals/seen", post(terminal_seen))
+        .route("/api/terminals/changes", get(terminal_changes))
+        .route("/api/agents/stream", get(agent_stream))
+        .route("/api/agents/integrations", get(agent_integrations).post(set_agent_integration))
         .route("/api/sync/tree", get(sync_tree))
         .route(
             "/api/sync/file",
@@ -283,6 +290,7 @@ pub async fn serve_https(
     if open_browser {
         open_url(&format!("https://127.0.0.1:{}", bound.port()));
     }
+    start_agent_services(state.clone()).await;
     let handle = axum_server::Handle::new();
     let shutdown_handle = handle.clone();
     let shutdown_state = state.clone();
@@ -340,6 +348,7 @@ where
         let _ = sender.send(Ok(bound));
     }
     print_banner(&state, bound, "http");
+    start_agent_services(state.clone()).await;
     if open_browser {
         let url = format!("http://127.0.0.1:{}", bound.port());
         open_url(&url);
@@ -2573,6 +2582,7 @@ async fn open_terminal(
         return Err(FileError::NotADirectory.into());
     }
     let shell = setting(&state, crate::terminal::SETTING_SHELL);
+    let agent_url = state.agent_url.get().cloned();
     let label = resolved.rel.clone();
     let username = user.username.clone();
     let worker = state.clone();
@@ -2584,6 +2594,7 @@ async fn open_terminal(
             &username,
             body.cols.unwrap_or(100),
             body.rows.unwrap_or(30),
+            agent_url.as_deref(),
         )
     })
     .await
@@ -2755,6 +2766,251 @@ async fn xterm_fit_module() -> impl IntoResponse {
 
 async fn xterm_css() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/css; charset=utf-8"), (header::CACHE_CONTROL, "public, max-age=86400")], XTERM_CSS)
+}
+
+// ---------------------------------------------------------------------------
+// Coding agents in terminals
+// ---------------------------------------------------------------------------
+
+/// Starts the loopback-only listener that agent hooks report to, and the poller that
+/// detects agents running in terminals. Hooks never see HTTPS or the network this way.
+pub async fn start_agent_services(state: std::sync::Arc<AppState>) {
+    if !crate::terminal::available() || state.agent_url.get().is_some() {
+        return;
+    }
+    match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => {
+            if let Ok(addr) = listener.local_addr() {
+                let _ = state.agent_url.set(format!("http://{addr}/agent-events"));
+            }
+            let app = Router::new()
+                .route("/agent-events", post(agent_event))
+                .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
+                .with_state(state.clone());
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+        }
+        Err(err) => eprintln!("Agent status in terminals is unavailable: {err}"),
+    }
+    let poller = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            tick.tick().await;
+            let state = poller.clone();
+            let _ = tokio::task::spawn_blocking(move || state.terminals.poll_agents()).await;
+        }
+    });
+}
+
+/// Maps a path an agent reported to a path in the library, if it is inside it.
+fn library_path(root: &std::path::Path, cwd: &std::path::Path, path: &str) -> Option<String> {
+    let path = std::path::Path::new(path);
+    let full = if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) };
+    // A deleted file cannot be canonicalized, but its folder usually can.
+    let full = full.canonicalize().ok().or_else(|| {
+        let parent = full.parent()?.canonicalize().ok()?;
+        Some(parent.join(full.file_name()?))
+    })?;
+    let root = root.canonicalize().ok()?;
+    let rel = full.strip_prefix(&root).ok()?;
+    let parts: Vec<String> = rel.components().map(|part| part.as_os_str().to_string_lossy().to_string()).collect();
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+async fn agent_event(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> StatusCode {
+    let Some(token) = headers.get("x-ownnas-agent-token").and_then(|value| value.to_str().ok()) else {
+        return StatusCode::UNAUTHORIZED;
+    };
+    let Some(session) = state.terminals.by_hook_token(token) else {
+        return StatusCode::UNAUTHORIZED;
+    };
+    let root = state.root.clone();
+    let rel = |path: &str| library_path(&root, session.cwd(), path);
+    let event = &body["event"];
+    match body["agent"].as_str() {
+        Some("claude") => session.update_agent(|agent| agent.apply_claude(event, &rel)),
+        Some("opencode") => session.update_agent(|agent| agent.apply_opencode(event, &rel)),
+        _ => return StatusCode::BAD_REQUEST,
+    }
+    StatusCode::NO_CONTENT
+}
+
+/// Server-sent events with the full terminal list whenever a terminal or its agent changes.
+async fn agent_stream(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    peer: Peer,
+) -> Result<impl IntoResponse, ApiError> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    terminal_access(&state, &headers, &peer)?;
+    let changes = state.terminals.subscribe();
+    let stream = futures_util::stream::unfold((state, changes, true), |(state, mut changes, first)| async move {
+        if !first {
+            match changes.recv().await {
+                Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+            // Coalesce bursts (a tool call fires several hooks at once).
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            while changes.try_recv().is_ok() {}
+        }
+        if !terminal_enabled(&state) {
+            return None;
+        }
+        let payload = json!({ "terminals": state.terminals.list() }).to_string();
+        Some((Ok::<_, std::convert::Infallible>(Event::default().event("terminals").data(payload)), (state, changes, false)))
+    });
+    Ok(([(header::CACHE_CONTROL, "no-store")], Sse::new(stream).keep_alive(KeepAlive::default())))
+}
+
+#[derive(Deserialize)]
+struct TerminalIdBody {
+    id: String,
+}
+
+async fn terminal_seen(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    peer: Peer,
+    Json(body): Json<TerminalIdBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    terminal_access(&state, &headers, &peer)?;
+    if let Some(session) = state.terminals.get(&body.id) {
+        session.seen();
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// `git status` for the repository a terminal's folder belongs to.
+async fn terminal_changes(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    peer: Peer,
+    Query(query): Query<TerminalIdQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    terminal_access(&state, &headers, &peer)?;
+    let session = state
+        .terminals
+        .get(&query.id)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That terminal is closed"))?;
+    let cwd = session.cwd().to_path_buf();
+    let root = state.root.clone();
+    let changes = tokio::task::spawn_blocking(move || git_changes(&root, &cwd))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the changes"))?
+        .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    Ok(Json(changes))
+}
+
+fn git_changes(root: &std::path::Path, cwd: &std::path::Path) -> Result<serde_json::Value, String> {
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .output()
+            .map_err(|_| "Git is not installed on the server".to_string())
+    };
+    let top = git(cwd, &["rev-parse", "--show-toplevel"])?;
+    if !top.status.success() {
+        return Ok(json!({ "repo": false }));
+    }
+    let top = std::path::PathBuf::from(String::from_utf8_lossy(&top.stdout).trim().to_string());
+    let branch = git(&top, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+    let summary = git(&top, &["diff", "--shortstat", "HEAD"])
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|text| !text.is_empty());
+    let status = git(&top, &["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
+    if !status.status.success() {
+        return Err("Git could not read this repository".into());
+    }
+    let raw = String::from_utf8_lossy(&status.stdout).to_string();
+    let mut parts = raw.split('\0').filter(|part| !part.is_empty());
+    let mut files = Vec::new();
+    let mut total = 0usize;
+    while let Some(entry) = parts.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let code = entry[..2].trim().to_string();
+        let path = entry[3..].to_string();
+        if code.starts_with('R') || code.starts_with('C') {
+            parts.next(); // the original name
+        }
+        total += 1;
+        if files.len() < 300 {
+            let full = top.join(&path);
+            files.push(json!({
+                "status": if code == "??" { "new".to_string() } else { code },
+                "name": path,
+                "path": library_path(root, &top, &full.to_string_lossy()),
+            }));
+        }
+    }
+    Ok(json!({
+        "repo": true,
+        "branch": branch,
+        "summary": summary,
+        "total": total,
+        "files": files,
+    }))
+}
+
+#[derive(Deserialize)]
+struct IntegrationBody {
+    agent: String,
+    installed: bool,
+}
+
+async fn agent_integrations(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    peer: Peer,
+) -> Result<impl IntoResponse, ApiError> {
+    terminal_access(&state, &headers, &peer)?;
+    let list = tokio::task::spawn_blocking(crate::agents::integrations)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the agent settings"))?;
+    Ok(Json(json!({ "integrations": list })))
+}
+
+async fn set_agent_integration(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    peer: Peer,
+    Json(body): Json<IntegrationBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = terminal_access(&state, &headers, &peer)?;
+    let exe = std::env::current_exe()
+        .and_then(|exe| exe.canonicalize())
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not find the OwnNAS program"))?;
+    let agent = body.agent.clone();
+    tokio::task::spawn_blocking(move || {
+        if body.installed {
+            crate::agents::install(&body.agent, &exe)
+        } else {
+            crate::agents::uninstall(&body.agent)
+        }
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not change the agent settings"))?
+    .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    record(&state, &user, if body.installed { "agent-integration-on" } else { "agent-integration-off" }, &agent);
+    Ok(Json(json!({ "ok": true })))
 }
 
 fn record(state: &AppState, user: &User, action: &str, detail: &str) {

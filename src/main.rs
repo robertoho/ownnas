@@ -1,3 +1,4 @@
+mod agents;
 mod auth;
 mod content_index;
 mod db;
@@ -48,6 +49,9 @@ enum Command {
         #[command(subcommand)]
         command: UpdateCommand,
     },
+    /// Forward a coding-agent hook event to the OwnNAS terminal it runs in (used by hooks)
+    #[command(hide = true)]
+    AgentHook { agent: String },
 }
 
 const SERVE_AFTER_HELP: &str = "\
@@ -210,6 +214,10 @@ fn main() {
 fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Serve(args) => serve(args),
+        Command::AgentHook { agent } => {
+            agents::run_hook(&agent);
+            Ok(())
+        }
         Command::Tls { command } => match command {
             TlsCommand::Generate { out, host } => tls::generate(&out, host),
         },

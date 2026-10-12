@@ -4,6 +4,7 @@
 //! modules for tests and provides the Android JNI entry points when compiled
 //! for Android.
 
+pub mod agents;
 pub mod auth;
 pub mod content_index;
 pub mod db;

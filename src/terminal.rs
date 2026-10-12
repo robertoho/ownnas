@@ -2,12 +2,14 @@
 //! (with a scrollback buffer) while no browser is attached, so long agent sessions survive a
 //! closed tab or a dropped connection.
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio::sync::broadcast;
+
+use crate::agents::{self, Agent};
 
 /// Output kept for replay when a browser (re)attaches.
 const SCROLLBACK_BYTES: usize = 2 * 1024 * 1024;
@@ -36,15 +38,109 @@ pub struct Info {
     pub running: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<u32>,
+    /// Window title set by the program in the terminal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub agent: Agent,
 }
 
 struct Screen {
     scrollback: VecDeque<u8>,
     exit: Option<Option<u32>>,
+    escapes: Escapes,
+    title: Option<String>,
+    last_output: Option<Instant>,
+}
+
+/// Something worth surfacing that a program wrote to the terminal.
+#[derive(Debug, PartialEq)]
+enum Signal {
+    Bell,
+    Notify(String),
+    Title(String),
+}
+
+/// Finds BEL and OSC sequences (titles; OSC 9, 99, and 777 desktop notifications) in output
+/// that may be split across reads.
+#[derive(Default)]
+struct Escapes {
+    state: u8,
+    osc: Vec<u8>,
+}
+
+impl Escapes {
+    const TEXT: u8 = 0;
+    const ESC: u8 = 1;
+    const OSC: u8 = 2;
+    const OSC_ESC: u8 = 3;
+
+    fn feed(&mut self, bytes: &[u8], out: &mut Vec<Signal>) {
+        for &byte in bytes {
+            self.state = match (self.state, byte) {
+                (Self::TEXT, 0x07) => {
+                    out.push(Signal::Bell);
+                    Self::TEXT
+                }
+                (Self::TEXT, 0x1b) | (Self::ESC, 0x1b) => Self::ESC,
+                (Self::TEXT, _) => Self::TEXT,
+                (Self::ESC, b']') => {
+                    self.osc.clear();
+                    Self::OSC
+                }
+                (Self::ESC, _) => Self::TEXT,
+                (Self::OSC, 0x07) | (Self::OSC_ESC, b'\\') => {
+                    if let Some(signal) = Self::parse(&self.osc) {
+                        out.push(signal);
+                    }
+                    Self::TEXT
+                }
+                (Self::OSC, 0x1b) => Self::OSC_ESC,
+                (Self::OSC, _) => {
+                    if self.osc.len() < 4096 {
+                        self.osc.push(byte);
+                    }
+                    Self::OSC
+                }
+                (Self::OSC_ESC, _) => Self::TEXT,
+                _ => Self::TEXT,
+            };
+        }
+    }
+
+    fn parse(osc: &[u8]) -> Option<Signal> {
+        let text = String::from_utf8_lossy(osc);
+        let (code, rest) = text.split_once(';')?;
+        let rest = rest.trim();
+        match code {
+            "0" | "2" => Some(Signal::Title(rest.to_string())),
+            // OSC 9;4 is a progress report (ConEmu, Windows Terminal), not a notification.
+            "9" if !rest.starts_with("4;") && !rest.is_empty() => Some(Signal::Notify(rest.to_string())),
+            "777" => {
+                let mut parts = rest.splitn(3, ';');
+                (parts.next() == Some("notify")).then(|| {
+                    let title = parts.next().unwrap_or("").trim();
+                    let body = parts.next().unwrap_or("").trim();
+                    Signal::Notify(match (title.is_empty(), body.is_empty()) {
+                        (false, false) => format!("{title}: {body}"),
+                        (true, _) => body.to_string(),
+                        (_, true) => title.to_string(),
+                    })
+                })
+            }
+            "99" => rest.split_once(';').map(|(_, body)| body.trim()).filter(|body| !body.is_empty()).map(|body| Signal::Notify(body.to_string())),
+            _ => None,
+        }
+    }
 }
 
 pub struct Session {
     info: Info,
+    /// Secret that hooks inside this terminal use to report agent events.
+    hook_token: String,
+    cwd: PathBuf,
+    shell_pid: Option<u32>,
+    agent: Mutex<Agent>,
+    changes: broadcast::Sender<()>,
     screen: Mutex<Screen>,
     events: broadcast::Sender<Event>,
     input: std::sync::mpsc::Sender<Vec<u8>>,
@@ -62,7 +158,36 @@ impl Session {
             info.running = false;
             info.exit_code = code;
         }
+        info.title = screen.title.clone();
+        drop(screen);
+        info.agent = self.agent.lock().unwrap_or_else(|err| err.into_inner()).clone();
         info
+    }
+
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    fn notify(&self) {
+        let _ = self.changes.send(());
+    }
+
+    /// Changes the agent state and tells listeners if anything changed.
+    pub fn update_agent(&self, change: impl FnOnce(&mut Agent)) {
+        let changed = {
+            let mut agent = self.agent.lock().unwrap_or_else(|err| err.into_inner());
+            let before = agent.clone();
+            change(&mut agent);
+            *agent != before
+        };
+        if changed {
+            self.notify();
+        }
+    }
+
+    /// The user looked at this terminal.
+    pub fn seen(&self) {
+        self.update_agent(|agent| agent.attention = None);
     }
 
     /// Returns the scrollback, whether the shell already exited, and a receiver for everything
@@ -75,6 +200,10 @@ impl Session {
 
     pub fn write(&self, bytes: Vec<u8>) {
         let _ = self.input.send(bytes);
+        // Typing in a terminal means the user has seen whatever it wanted.
+        if self.agent.lock().unwrap_or_else(|err| err.into_inner()).attention.is_some() {
+            self.seen();
+        }
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
@@ -98,8 +227,11 @@ impl Session {
 
     fn record(&self, event: Event) {
         let mut screen = self.screen.lock().unwrap_or_else(|err| err.into_inner());
+        let mut signals = Vec::new();
         match &event {
             Event::Output(bytes) => {
+                screen.last_output = Some(Instant::now());
+                screen.escapes.feed(bytes, &mut signals);
                 screen.scrollback.extend(bytes.iter());
                 if screen.scrollback.len() > SCROLLBACK_BYTES {
                     // Trim to a line start so replay does not begin mid escape sequence.
@@ -116,18 +248,95 @@ impl Session {
             }
             Event::Exit(code) => screen.exit = Some(*code),
         }
+        let mut title_changed = false;
+        for signal in &signals {
+            if let Signal::Title(title) = signal {
+                title_changed |= screen.title.as_deref() != Some(title.as_str());
+                screen.title = Some(title.clone());
+            }
+        }
+        let exited = matches!(event, Event::Exit(_));
         let _ = self.events.send(event);
+        drop(screen);
+        for signal in signals {
+            match signal {
+                Signal::Bell => self.update_agent(|agent| agent.notified(None)),
+                Signal::Notify(message) => self.update_agent(|agent| agent.notified(Some(message))),
+                Signal::Title(_) => {}
+            }
+        }
+        if title_changed || exited {
+            self.notify();
+        }
+    }
+
+    fn recently_active(&self, within: Duration) -> bool {
+        let screen = self.screen.lock().unwrap_or_else(|err| err.into_inner());
+        screen.last_output.is_some_and(|at| at.elapsed() < within)
+    }
+
+    /// The program in the foreground of this terminal, if it is a known agent.
+    fn foreground_agent(&self) -> Option<Option<&'static str>> {
+        #[cfg(all(unix, not(target_os = "android")))]
+        {
+            let pid = self.master.lock().unwrap_or_else(|err| err.into_inner()).process_group_leader()?;
+            let pid = u32::try_from(pid).ok()?;
+            if Some(pid) == self.shell_pid {
+                return Some(None);
+            }
+            Some(agents::command_line(pid).and_then(|args| agents::agent_from_command(&args)))
+        }
+        #[cfg(not(all(unix, not(target_os = "android"))))]
+        {
+            None
+        }
     }
 }
 
-#[derive(Default)]
 pub struct Terminals {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     /// Sign-in token hash -> when the terminal password unlock expires.
     unlocked: Mutex<HashMap<String, Instant>>,
+    /// Fires when a terminal opens, closes, or its agent state changes.
+    changes: broadcast::Sender<()>,
+}
+
+impl Default for Terminals {
+    fn default() -> Self {
+        Self {
+            sessions: Mutex::default(),
+            unlocked: Mutex::default(),
+            changes: broadcast::channel(64).0,
+        }
+    }
 }
 
 impl Terminals {
+    pub fn subscribe(&self) -> broadcast::Receiver<()> {
+        self.changes.subscribe()
+    }
+
+    /// Finds the terminal a hook token belongs to.
+    pub fn by_hook_token(&self, token: &str) -> Option<Arc<Session>> {
+        use sha2::{Digest, Sha256};
+        // Compare digests so the lookup time does not depend on how much of a token matches.
+        let wanted = Sha256::digest(token.as_bytes());
+        let sessions = self.sessions.lock().unwrap_or_else(|err| err.into_inner());
+        sessions.values().find(|session| Sha256::digest(session.hook_token.as_bytes()) == wanted).cloned()
+    }
+
+    /// Refreshes agent detection and activity for every terminal.
+    pub fn poll_agents(&self) {
+        let sessions: Vec<_> = self.sessions.lock().unwrap_or_else(|err| err.into_inner()).values().cloned().collect();
+        for session in sessions {
+            let Some(name) = session.foreground_agent() else { continue };
+            let active = session.recently_active(Duration::from_millis(2500));
+            session.update_agent(|agent| {
+                agent.detected(name, active);
+            });
+        }
+    }
+
     pub fn list(&self) -> Vec<Info> {
         let sessions = self.sessions.lock().unwrap_or_else(|err| err.into_inner());
         let mut list: Vec<Info> = sessions.values().map(|session| session.info()).collect();
@@ -142,6 +351,7 @@ impl Terminals {
     pub fn remove(&self, id: &str) -> Option<Arc<Session>> {
         let session = self.sessions.lock().unwrap_or_else(|err| err.into_inner()).remove(id)?;
         session.kill();
+        let _ = self.changes.send(());
         Some(session)
     }
 
@@ -150,6 +360,7 @@ impl Terminals {
         for (_, session) in sessions {
             session.kill();
         }
+        let _ = self.changes.send(());
     }
 
     pub fn unlock(&self, token_hash: &str) {
@@ -177,17 +388,19 @@ impl Terminals {
             .is_some_and(|until| *until > Instant::now())
     }
 
-    /// Starts `shell` (or the platform default) in `cwd`.
-    pub fn spawn(&self, cwd: &Path, rel: &str, shell: Option<&str>, owner: &str, cols: u16, rows: u16) -> Result<Info, String> {
+    /// Starts `shell` (or the platform default) in `cwd`. `agent_url` is where hooks inside
+    /// the terminal report agent events.
+    pub fn spawn(&self, cwd: &Path, rel: &str, shell: Option<&str>, owner: &str, cols: u16, rows: u16, agent_url: Option<&str>) -> Result<Info, String> {
         if self.sessions.lock().unwrap_or_else(|err| err.into_inner()).len() >= MAX_SESSIONS {
             return Err(format!("Close a terminal first (at most {MAX_SESSIONS} can run at once)"));
         }
-        let session = spawn_session(cwd, rel, shell, owner, cols, rows)?;
+        let session = spawn_session(cwd, rel, shell, owner, cols, rows, agent_url, self.changes.clone())?;
         let info = session.info();
         self.sessions
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .insert(info.id.clone(), session);
+        let _ = self.changes.send(());
         Ok(info)
     }
 }
@@ -239,12 +452,23 @@ fn pty_size(cols: u16, rows: u16) -> portable_pty::PtySize {
 }
 
 #[cfg(target_os = "android")]
-fn spawn_session(_: &Path, _: &str, _: Option<&str>, _: &str, _: u16, _: u16) -> Result<Arc<Session>, String> {
+#[allow(clippy::too_many_arguments)]
+fn spawn_session(_: &Path, _: &str, _: Option<&str>, _: &str, _: u16, _: u16, _: Option<&str>, _: broadcast::Sender<()>) -> Result<Arc<Session>, String> {
     Err("Terminals are not available on Android".into())
 }
 
 #[cfg(not(target_os = "android"))]
-fn spawn_session(cwd: &Path, rel: &str, shell: Option<&str>, owner: &str, cols: u16, rows: u16) -> Result<Arc<Session>, String> {
+#[allow(clippy::too_many_arguments)]
+fn spawn_session(
+    cwd: &Path,
+    rel: &str,
+    shell: Option<&str>,
+    owner: &str,
+    cols: u16,
+    rows: u16,
+    agent_url: Option<&str>,
+    changes: broadcast::Sender<()>,
+) -> Result<Arc<Session>, String> {
     use portable_pty::{native_pty_system, CommandBuilder};
     use std::io::{Read, Write};
 
@@ -275,6 +499,15 @@ fn spawn_session(cwd: &Path, rel: &str, shell: Option<&str>, owner: &str, cols: 
             command.env_remove(&key);
         }
     }
+    let mut id_bytes = [0u8; 12];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut id_bytes);
+    let id = hex::encode(id_bytes);
+    let hook_token = crate::auth::new_token();
+    if let Some(url) = agent_url {
+        command.env(agents::ENV_URL, url);
+        command.env(agents::ENV_TOKEN, &hook_token);
+        command.env(agents::ENV_TERMINAL, &id);
+    }
     let mut child = pair
         .slave
         .spawn_command(command)
@@ -289,18 +522,17 @@ fn spawn_session(cwd: &Path, rel: &str, shell: Option<&str>, owner: &str, cols: 
         .take_writer()
         .map_err(|err| format!("Could not write to the terminal: {err}"))?;
     let killer = child.clone_killer();
+    let shell_pid = child.process_id();
 
     let (input, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let (events, _) = broadcast::channel(1024);
-    let mut id_bytes = [0u8; 12];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut id_bytes);
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     let session = Arc::new(Session {
         info: Info {
-            id: hex::encode(id_bytes),
+            id,
             path: rel.to_string(),
             shell: Path::new(&shell)
                 .file_name()
@@ -310,8 +542,21 @@ fn spawn_session(cwd: &Path, rel: &str, shell: Option<&str>, owner: &str, cols: 
             created,
             running: true,
             exit_code: None,
+            title: None,
+            agent: Agent::default(),
         },
-        screen: Mutex::new(Screen { scrollback: VecDeque::new(), exit: None }),
+        hook_token,
+        cwd: cwd.to_path_buf(),
+        shell_pid,
+        agent: Mutex::new(Agent::default()),
+        changes,
+        screen: Mutex::new(Screen {
+            scrollback: VecDeque::new(),
+            exit: None,
+            escapes: Escapes::default(),
+            title: None,
+            last_output: None,
+        }),
         events,
         input,
         master: Mutex::new(pair.master),
@@ -347,6 +592,30 @@ fn spawn_session(cwd: &Path, rel: &str, shell: Option<&str>, owner: &str, cols: 
     Ok(session)
 }
 
+#[cfg(test)]
+mod escape_tests {
+    use super::*;
+
+    #[test]
+    fn finds_bells_notifications_and_titles_across_reads() {
+        let mut escapes = Escapes::default();
+        let mut out = Vec::new();
+        escapes.feed(b"hi\x07 \x1b]0;claude: fixing\x07\x1b]9;Claude needs ", &mut out);
+        escapes.feed(b"your permission\x1b\\\x1b]9;4;3;50\x07\x1b[31mred\x1b]777;notify;Codex;Turn complete\x07", &mut out);
+        escapes.feed(b"\x1b]99;i=1;Done here\x1b\\", &mut out);
+        assert_eq!(
+            out,
+            vec![
+                Signal::Bell,
+                Signal::Title("claude: fixing".into()),
+                Signal::Notify("Claude needs your permission".into()),
+                Signal::Notify("Codex: Turn complete".into()),
+                Signal::Notify("Done here".into()),
+            ]
+        );
+    }
+}
+
 #[cfg(all(test, not(target_os = "android"), unix))]
 mod tests {
     use super::*;
@@ -357,16 +626,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("OWNNAS_PASSWORD", "must-not-leak");
         let terminals = Terminals::default();
-        let info = terminals.spawn(&dir, "work", Some("/bin/sh"), "admin", 80, 24).unwrap();
+        let info = terminals.spawn(&dir, "work", Some("/bin/sh"), "admin", 80, 24, Some("http://127.0.0.1:9/agent-events")).unwrap();
         let session = terminals.get(&info.id).unwrap();
-        session.write(b"pwd; echo \"secret=$OWNNAS_PASSWORD.\"; exit 3\n".to_vec());
+        session.write(b"pwd; echo \"secret=$OWNNAS_PASSWORD. url=$OWNNAS_AGENT_URL\"; printf '\\033]777;notify;Build;done\\007'; exit 3\n".to_vec());
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let (scrollback, exit, _) = session.attach();
             if exit.is_some() {
                 let text = String::from_utf8_lossy(&scrollback).to_string();
                 assert!(text.contains(dir.file_name().unwrap().to_str().unwrap()), "{text}");
-                assert!(text.contains("secret=."), "{text}");
+                assert!(text.contains("secret=. url=http://127.0.0.1:9/agent-events"), "{text}");
+                assert_eq!(session.info().agent.attention.as_deref(), Some("Build: done"));
+                assert!(terminals.by_hook_token(&session.hook_token).is_some());
+                assert!(terminals.by_hook_token("wrong").is_none());
                 assert_eq!(exit, Some(Some(3)));
                 break;
             }

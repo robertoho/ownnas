@@ -1,12 +1,26 @@
-// Terminal panel for the OwnNAS page: tabs of running terminals (each an iframe of /terminal)
-// plus the Terminal tab in Settings. Loaded on demand by app.js.
+// Terminal panel for the OwnNAS page: tabs of running terminals (each an iframe of /terminal),
+// what the coding agent in each one is doing, an overview of all of them, notifications,
+// and the Terminal tab in Settings. Loaded on demand by app.js.
 
 let ctx = null;
 let panel = null;
 let active = "";
-const frames = new Map(); // id -> iframe
-const titles = new Map(); // id -> title reported by the shell
+let view = "terminal"; // or "overview"
+let drawer = ""; // "", "changes", or "files"
 let sessions = [];
+let stream = null;
+let streamRetry = 0;
+let streamTimer = 0;
+const frames = new Map(); // id -> iframe
+const shownAttention = new Map(); // id -> attention text already announced
+
+const STATUS_WORDS = {
+  working: "Working",
+  waiting: "Needs you",
+  idle: "Idle",
+  done: "Finished",
+  error: "Stopped",
+};
 
 function el(tag, attrs = {}, text = "") {
   const node = document.createElement(tag);
@@ -23,23 +37,46 @@ function folderLabel(path) {
   return path.split("/").pop();
 }
 
+function tabLabel(item) {
+  const folder = folderLabel(item.path);
+  if (item.agent && item.agent.label) return `${folder} · ${item.agent.label}`;
+  // Shell prompts set titles like "user@host: ~/path"; other programs set their name.
+  if (item.title && !item.title.includes("@")) return `${folder} · ${item.title}`;
+  return folder;
+}
+
+function statusOf(item) {
+  if (!item.running) return "ended";
+  return (item.agent && item.agent.status) || "shell";
+}
+
+function panelVisible() {
+  return panel && !panel.hidden && !document.hidden;
+}
+
 function build() {
   panel = el("aside", { id: "terminals", class: "terminals", hidden: true, "aria-label": "Terminals" });
   const bar = el("div", { class: "terminals-bar" });
+  const overview = el("button", { type: "button", class: "terminals-overview-btn", "aria-pressed": "false", title: "All terminals and their agents" }, "Overview");
   const tabs = el("div", { class: "terminals-tabs", role: "tablist", "aria-label": "Open terminals" });
   const actions = el("div", { class: "terminals-actions" });
-  const add = el("button", { type: "button", title: "New terminal in the same folder" }, "New");
-  const popout = el("button", { type: "button", title: "Open this terminal in its own browser tab" }, "Pop out");
-  const end = el("button", { type: "button", class: "danger", title: "Stop the shell and everything running in it" }, "End");
-  const hide = el("button", { type: "button", title: "Hide the panel. Terminals keep running." }, "Hide");
+  const add = el("button", { type: "button", "data-action": "new", title: "New terminal in the same folder" }, "New");
+  const popout = el("button", { type: "button", "data-action": "popout", title: "Open this terminal in its own browser tab" }, "Pop out");
+  const end = el("button", { type: "button", "data-action": "end", class: "danger", title: "Stop the shell and everything running in it" }, "End");
+  const hide = el("button", { type: "button", "data-action": "hide", title: "Hide the panel. Terminals keep running." }, "Hide");
   actions.append(add, popout, end, hide);
-  bar.append(tabs, actions);
+  bar.append(overview, tabs, actions);
+
+  const strip = el("div", { class: "terminals-agent", hidden: true });
+  const drawerBox = el("div", { class: "terminals-drawer", hidden: true });
   const body = el("div", { class: "terminals-body" });
   const empty = el("p", { class: "terminals-empty muted" }, "No terminals are running. Right-click a folder and choose Open terminal here.");
-  body.append(empty);
-  panel.append(bar, body);
+  const grid = el("div", { class: "terminals-overview", hidden: true });
+  body.append(empty, grid);
+  panel.append(bar, strip, drawerBox, body);
   document.body.append(panel);
 
+  overview.addEventListener("click", () => setView(view === "overview" ? "terminal" : "overview"));
   add.addEventListener("click", () => {
     const current = sessions.find((item) => item.id === active);
     openTerminal(current ? current.path : ctx.currentPath()).catch((err) => ctx.toast(err.message, true));
@@ -49,18 +86,22 @@ function build() {
   });
   end.addEventListener("click", () => endTerminal(active).catch((err) => ctx.toast(err.message, true)));
   hide.addEventListener("click", hidePanel);
-  panel.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && event.target === panel) hidePanel();
-  });
-  window.addEventListener("message", (event) => {
-    const data = event.data;
-    if (event.origin !== location.origin || !data || data.source !== "ownnas-terminal") return;
-    if (data.type === "title") titles.set(data.id, data.title);
-    if (data.type === "exit") {
-      const item = sessions.find((session) => session.id === data.id);
-      if (item) item.running = false;
+  panel.addEventListener("click", (event) => {
+    const file = event.target.closest("[data-open-file]");
+    if (file) {
+      hidePanel();
+      ctx.openFile(file.dataset.openFile);
+      return;
     }
-    renderTabs();
+    const card = event.target.closest("[data-card]");
+    if (card) {
+      setView("terminal");
+      activate(card.dataset.card);
+    }
+  });
+  document.addEventListener("visibilitychange", () => {
+    const item = sessions.find((session) => session.id === active);
+    if (panelVisible() && view === "terminal" && item && item.agent && item.agent.attention) markSeen(item.id);
   });
 }
 
@@ -68,38 +109,199 @@ function renderTabs() {
   const tabs = panel.querySelector(".terminals-tabs");
   tabs.replaceChildren(
     ...sessions.map((item) => {
-      // Shell prompts set titles like "user@host: ~/path"; programs such as agents set their name.
-      const title = titles.get(item.id) || "";
-      const label = title && !title.includes("@") ? `${folderLabel(item.path)} · ${title}` : folderLabel(item.path);
+      const status = statusOf(item);
+      const attention = item.agent && item.agent.attention;
       const tab = el("button", {
         type: "button",
         role: "tab",
-        "aria-selected": item.id === active ? "true" : "false",
-        class: item.running ? "" : "ended",
-        title: `${item.path || "/"} — ${title || item.shell}${item.running ? "" : " (ended)"}`,
-      }, label);
-      tab.addEventListener("click", () => activate(item.id));
+        "aria-selected": view === "terminal" && item.id === active ? "true" : "false",
+        class: [item.running ? "" : "ended", attention ? "has-attention" : ""].join(" ").trim() || null,
+        title: `${item.path || "/"}${item.agent && item.agent.detail ? ` — ${item.agent.detail}` : ""}${attention ? `\n${attention}` : ""}`,
+      });
+      tab.append(el("span", { class: "agent-dot", "data-status": status, "aria-hidden": "true" }), el("span", {}, tabLabel(item)));
+      tab.addEventListener("click", () => {
+        setView("terminal");
+        activate(item.id);
+      });
       return tab;
     }),
   );
   const has = sessions.length > 0;
-  panel.querySelector(".terminals-empty").hidden = has;
-  for (const button of panel.querySelectorAll(".terminals-actions button")) {
-    if (button.textContent !== "Hide") button.disabled = !has;
+  panel.querySelector(".terminals-empty").hidden = has || view === "overview";
+  for (const action of ["new", "popout", "end"]) {
+    panel.querySelector(`[data-action="${action}"]`).disabled = !has || view === "overview";
   }
+  panel.querySelector(".terminals-overview-btn").setAttribute("aria-pressed", view === "overview" ? "true" : "false");
+}
+
+/// The line under the tabs: which agent runs here and what it is doing.
+function renderStrip() {
+  const strip = panel.querySelector(".terminals-agent");
+  const item = sessions.find((session) => session.id === active);
+  if (!item || view !== "terminal") {
+    strip.hidden = true;
+    panel.querySelector(".terminals-drawer").hidden = true;
+    return;
+  }
+  const agent = item.agent || {};
+  const status = statusOf(item);
+  strip.hidden = false;
+  const line = el("div", { class: "terminals-agent-line" });
+  line.append(el("span", { class: "agent-dot", "data-status": status, "aria-hidden": "true" }));
+  if (!item.running) {
+    line.append(el("span", {}, `This terminal has ended${item.exitCode !== undefined ? ` (exit code ${item.exitCode})` : ""}.`));
+  } else if (agent.name) {
+    line.append(el("strong", {}, agent.label || agent.name), el("span", { class: "agent-status" }, STATUS_WORDS[agent.status] || ""));
+    if (agent.detail) line.append(el("span", { class: "agent-detail" }, agent.detail));
+    if (!agent.hooked && ["claude", "opencode"].includes(agent.name)) {
+      const hint = el("button", { type: "button", class: "linkish", title: "Show what it is doing, step by step" }, "More detail…");
+      hint.addEventListener("click", () => ctx.openSettings("terminal"));
+      line.append(hint);
+    }
+  } else {
+    line.append(el("span", { class: "muted" }, `${item.shell} in ${item.path || "/"}`));
+  }
+  const tools = el("div", { class: "terminals-agent-tools" });
+  const files = el("button", { type: "button", "aria-pressed": drawer === "files" ? "true" : "false", hidden: !(agent.files && agent.files.length) }, `Edited (${(agent.files || []).length})`);
+  const changes = el("button", { type: "button", "aria-pressed": drawer === "changes" ? "true" : "false", title: "Uncommitted changes in this folder's Git repository" }, "Changes");
+  files.addEventListener("click", () => toggleDrawer("files"));
+  changes.addEventListener("click", () => toggleDrawer("changes"));
+  tools.append(files, changes);
+  const rows = [line];
+  if (agent.attention) rows.push(el("p", { class: "agent-attention" }, agent.attention));
+  else if (agent.status === "done" && agent.lastMessage) rows.push(el("p", { class: "agent-message muted" }, agent.lastMessage));
+  const text = el("div", { class: "terminals-agent-text" });
+  text.append(...rows);
+  strip.replaceChildren(text, tools);
+  if (drawer === "files") renderFiles(item);
+}
+
+function fileButton(path, label = path) {
+  return el("button", { type: "button", class: "linkish", "data-open-file": path, title: `Open ${path}` }, label);
+}
+
+function renderFiles(item) {
+  const box = panel.querySelector(".terminals-drawer");
+  const files = (item.agent && item.agent.files) || [];
+  box.hidden = false;
+  const list = el("ul", { class: "terminals-files" });
+  for (const path of files) {
+    const row = el("li");
+    row.append(fileButton(path));
+    list.append(row);
+  }
+  box.replaceChildren(el("p", { class: "muted" }, "Files the agent edited in this session, newest first."), list);
+}
+
+async function renderChanges(item) {
+  const box = panel.querySelector(".terminals-drawer");
+  box.hidden = false;
+  box.replaceChildren(el("p", { class: "muted" }, "Reading Git status…"));
+  let data;
+  try {
+    data = await ctx.api(`/api/terminals/changes?id=${encodeURIComponent(item.id)}`);
+  } catch (err) {
+    box.replaceChildren(el("p", { class: "form-error" }, err.message));
+    return;
+  }
+  if (drawer !== "changes" || active !== item.id) return;
+  if (!data.repo) {
+    box.replaceChildren(el("p", { class: "muted" }, "This folder is not in a Git repository."));
+    return;
+  }
+  const head = el("p", { class: "muted" }, [
+    data.branch ? `On ${data.branch}.` : "",
+    data.total ? `${data.total} changed ${data.total === 1 ? "file" : "files"}${data.summary ? ` (${data.summary})` : ""}.` : "No uncommitted changes.",
+  ].join(" ").trim());
+  const list = el("ul", { class: "terminals-files" });
+  for (const file of data.files) {
+    const row = el("li");
+    row.append(el("span", { class: "git-status" }, file.status));
+    row.append(file.path ? fileButton(file.path, file.name) : el("span", {}, file.name));
+    list.append(row);
+  }
+  const refresh = el("button", { type: "button" }, "Refresh");
+  refresh.addEventListener("click", () => renderChanges(item));
+  box.replaceChildren(head, list, refresh);
+}
+
+function toggleDrawer(kind) {
+  drawer = drawer === kind ? "" : kind;
+  const box = panel.querySelector(".terminals-drawer");
+  box.hidden = !drawer;
+  const item = sessions.find((session) => session.id === active);
+  renderStrip();
+  if (drawer === "changes" && item) renderChanges(item);
+}
+
+function renderOverview() {
+  const grid = panel.querySelector(".terminals-overview");
+  grid.hidden = view !== "overview";
+  for (const frame of frames.values()) frame.hidden = view === "overview" || frame.dataset.id !== active;
+  if (view !== "overview") return;
+  const cards = sessions.map((item) => {
+    const agent = item.agent || {};
+    const card = el("article", { class: `agent-card${agent.attention ? " has-attention" : ""}` });
+    const open = el("button", { type: "button", class: "agent-card-open", "data-card": item.id });
+    open.append(el("span", { class: "agent-dot", "data-status": statusOf(item), "aria-hidden": "true" }), el("strong", {}, tabLabel(item)));
+    card.append(open);
+    const state = !item.running ? "Ended" : agent.name ? `${STATUS_WORDS[agent.status] || "Running"}${agent.hooked ? "" : " (detected)"}` : "Shell";
+    card.append(el("p", { class: "muted" }, `${item.path || "/"} · ${state}`));
+    if (agent.detail) card.append(el("p", {}, agent.detail));
+    if (agent.attention) card.append(el("p", { class: "agent-attention" }, agent.attention));
+    if (agent.lastMessage && agent.status === "done") card.append(el("p", { class: "agent-message muted" }, agent.lastMessage));
+    if (agent.files && agent.files.length) {
+      const files = el("p", { class: "agent-card-files" });
+      files.append(el("span", { class: "muted" }, "Edited: "));
+      agent.files.slice(0, 5).forEach((path, index) => {
+        if (index) files.append(", ");
+        files.append(fileButton(path, path.split("/").pop()));
+      });
+      if (agent.files.length > 5) files.append(el("span", { class: "muted" }, ` and ${agent.files.length - 5} more`));
+      card.append(files);
+    }
+    return card;
+  });
+  const head = el("div", { class: "agent-overview-head" });
+  head.append(el("p", { class: "muted" }, sessions.length ? `${sessions.length} ${sessions.length === 1 ? "terminal" : "terminals"}` : "No terminals are running."));
+  if (window.isSecureContext && "Notification" in window && Notification.permission === "default") {
+    const enable = el("button", { type: "button" }, "Notify me when an agent needs me");
+    enable.addEventListener("click", async () => {
+      await Notification.requestPermission();
+      renderOverview();
+    });
+    head.append(enable);
+  }
+  grid.replaceChildren(head, ...cards);
+}
+
+function render() {
+  renderTabs();
+  renderStrip();
+  renderOverview();
+  ctx.setBadge(sessions.filter((item) => item.agent && item.agent.attention).length);
+}
+
+function setView(next) {
+  view = next;
+  if (view === "terminal") activate(active);
+  else render();
 }
 
 function activate(id) {
   active = id;
-  for (const [frameId, frame] of frames) frame.hidden = frameId !== id;
+  for (const [frameId, frame] of frames) frame.hidden = frameId !== id || view !== "terminal";
   if (id && !frames.has(id)) {
-    const frame = el("iframe", { src: `/terminal?id=${encodeURIComponent(id)}`, title: "Terminal", class: "terminals-frame" });
+    const frame = el("iframe", { src: `/terminal?id=${encodeURIComponent(id)}`, title: "Terminal", class: "terminals-frame", "data-id": id });
     frames.set(id, frame);
     panel.querySelector(".terminals-body").append(frame);
   }
-  renderTabs();
+  const item = sessions.find((session) => session.id === id);
+  if (drawer === "changes" && item) renderChanges(item);
+  if (item && item.agent && item.agent.attention && panelVisible()) markSeen(id);
+  render();
   const frame = frames.get(id);
-  if (frame) {
+  if (frame && view === "terminal") {
     requestAnimationFrame(() => {
       frame.focus();
       frame.contentWindow?.postMessage({ type: "ownnas-terminal-focus" }, location.origin);
@@ -107,18 +309,91 @@ function activate(id) {
   }
 }
 
-async function refresh() {
-  const data = await withUnlock(() => ctx.api("/api/terminals"));
-  if (!data) return false;
-  sessions = data.terminals || [];
+function markSeen(id) {
+  const item = sessions.find((session) => session.id === id);
+  if (item && item.agent) item.agent.attention = null;
+  shownAttention.delete(id);
+  ctx.api("/api/terminals/seen", { method: "POST", json: { id } }).catch(() => {});
+}
+
+/// Announces new attention requests unless the user is already looking at that terminal.
+function announce(item) {
+  const message = item.agent.attention;
+  if (panelVisible() && view === "terminal" && item.id === active) {
+    markSeen(item.id);
+    return;
+  }
+  const label = tabLabel(item);
+  ctx.toast(`${label}: ${message}`);
+  if (document.hidden && "Notification" in window && Notification.permission === "granted") {
+    const notice = new Notification(`OwnNAS · ${label}`, { body: message, tag: `ownnas-${item.id}` });
+    notice.addEventListener("click", () => {
+      window.focus();
+      showPanel();
+      setView("terminal");
+      activate(item.id);
+      notice.close();
+    });
+  }
+}
+
+function applyList(list) {
+  sessions = list;
   for (const [id, frame] of frames) {
     if (!sessions.some((item) => item.id === id)) {
       frame.remove();
       frames.delete(id);
-      titles.delete(id);
+      shownAttention.delete(id);
+    }
+  }
+  for (const item of sessions) {
+    const attention = item.agent && item.agent.attention;
+    if (attention && shownAttention.get(item.id) !== attention) {
+      shownAttention.set(item.id, attention);
+      announce(item);
+    } else if (!attention) {
+      shownAttention.delete(item.id);
     }
   }
   if (!sessions.some((item) => item.id === active)) active = sessions.length ? sessions[sessions.length - 1].id : "";
+  if (panel && !panel.hidden) {
+    for (const [id, frame] of frames) frame.hidden = id !== active || view !== "terminal";
+    if (active && !frames.has(active) && view === "terminal") activate(active);
+  }
+  render();
+}
+
+/// Follows terminal and agent changes from the server; retries when the connection drops.
+function watch() {
+  if (stream) return;
+  clearTimeout(streamTimer);
+  stream = new EventSource("/api/agents/stream");
+  stream.addEventListener("terminals", (event) => {
+    streamRetry = 0;
+    try {
+      applyList(JSON.parse(event.data).terminals || []);
+    } catch {}
+  });
+  stream.addEventListener("error", () => {
+    stream.close();
+    stream = null;
+    const delay = Math.min(60000, 3000 * 2 ** streamRetry++);
+    streamTimer = setTimeout(() => {
+      ctx.api("/api/terminal/config")
+        .then((config) => {
+          if (config.enabled && (!config.passwordSet || config.unlocked)) watch();
+          else streamTimer = setTimeout(() => watch(), 60000);
+        })
+        .catch(() => {});
+    }, delay);
+  });
+}
+
+async function refresh() {
+  const data = await withUnlock(() => ctx.api("/api/terminals"));
+  if (!data) return false;
+  applyList(data.terminals || []);
+  watch();
   return true;
 }
 
@@ -138,7 +413,8 @@ async function withUnlock(request) {
 function showPanel() {
   panel.hidden = false;
   document.body.classList.add("terminals-open");
-  activate(active);
+  if (view === "terminal") activate(active);
+  else render();
 }
 
 function hidePanel() {
@@ -150,6 +426,7 @@ async function openTerminal(path) {
   const data = await withUnlock(() => ctx.api("/api/terminals", { method: "POST", json: { path: path || "", cols: 100, rows: 30 } }));
   if (!data) return;
   await refresh();
+  view = "terminal";
   showPanel();
   activate(data.terminal.id);
 }
@@ -175,6 +452,15 @@ export async function open(path) {
 
 export async function show() {
   if (await refresh()) showPanel();
+}
+
+/// Starts following terminals in the background (for badges and notifications) without
+/// asking for the terminal password.
+export async function background() {
+  try {
+    const config = await ctx.api("/api/terminal/config");
+    if (config.enabled && (!config.passwordSet || config.unlocked)) watch();
+  } catch {}
 }
 
 /// Fills the Terminal tab of Settings.
@@ -221,6 +507,11 @@ export async function renderSettings(section) {
     });
     section.append(lock);
   }
+  if (config.enabled) {
+    const box = el("div", { class: "agent-integrations" });
+    section.append(box);
+    renderIntegrations(box).catch((err) => box.replaceChildren(el("p", { class: "form-error" }, err.message)));
+  }
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     error.textContent = "";
@@ -235,6 +526,7 @@ export async function renderSettings(section) {
         for (const frame of frames.values()) frame.remove();
         frames.clear();
         hidePanel();
+        ctx.setBadge(0);
       }
       await ctx.refreshMe();
       await renderSettings(section);
@@ -242,4 +534,39 @@ export async function renderSettings(section) {
       error.textContent = err.message;
     }
   });
+}
+
+/// Agent integrations: hooks that report each step to OwnNAS. They only act inside OwnNAS
+/// terminals, so the agents behave as before everywhere else.
+async function renderIntegrations(box) {
+  const data = await withUnlock(() => ctx.api("/api/agents/integrations"));
+  if (!data) {
+    box.replaceChildren(el("p", { class: "muted" }, "Unlock terminals to manage agent integrations."));
+    return;
+  }
+  box.replaceChildren(
+    el("h3", {}, "Agent integrations"),
+    el("p", { class: "muted" }, "Without an integration, OwnNAS still sees which agent runs in a terminal and when it rings for you. With one, it also shows each step, the files it edits, and when it needs permission or finishes. Integrations only act inside OwnNAS terminals."),
+  );
+  for (const item of data.integrations) {
+    const row = el("div", { class: "agent-integration" });
+    const text = el("div");
+    text.append(el("strong", {}, item.label), el("p", { class: "muted" }, item.installed
+      ? `Installed in ${item.location}`
+      : item.found ? `Adds a hook to ${item.location}` : `${item.label} does not seem to be set up for this account yet.`));
+    const button = el("button", { type: "button", class: item.installed ? "" : "primary" }, item.installed ? "Remove" : "Install");
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        await ctx.api("/api/agents/integrations", { method: "POST", json: { agent: item.agent, installed: !item.installed } });
+        ctx.toast(item.installed ? `${item.label} integration removed` : `${item.label} integration installed. Restart ${item.label} sessions to use it.`);
+        await renderIntegrations(box);
+      } catch (err) {
+        ctx.toast(err.message, true);
+        button.disabled = false;
+      }
+    });
+    row.append(text, button);
+    box.append(row);
+  }
 }

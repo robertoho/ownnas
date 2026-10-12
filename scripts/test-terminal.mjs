@@ -22,8 +22,14 @@ const port = await new Promise((resolve) => {
   });
 });
 const base = `http://127.0.0.1:${port}`;
+// A throwaway home folder, so installing agent integrations never touches the real ones.
+const home = path.join(tmp, 'home');
+await fs.mkdir(path.join(home, '.claude'), { recursive: true });
+const serverEnv = { ...process.env, OWNNAS_PASSWORD: PASSWORD, HOME: home, USERPROFILE: home };
+delete serverEnv.CLAUDE_CONFIG_DIR;
+delete serverEnv.XDG_CONFIG_HOME;
 const server = spawn(binary, ['serve', '--root', library, '--data', path.join(tmp, 'data'), '--addr', `127.0.0.1:${port}`,
-  '--username', 'admin', '--password', PASSWORD], { stdio: 'ignore', env: { ...process.env, OWNNAS_PASSWORD: PASSWORD } });
+  '--username', 'admin', '--password', PASSWORD], { stdio: 'ignore', env: serverEnv });
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let cookie = '';
@@ -168,6 +174,111 @@ try {
 
   const activity = (await call('GET', '/api/activity')).data.events.map((event) => event.action);
   for (const action of ['terminal-settings', 'terminal-open', 'terminal-close']) assert.ok(activity.includes(action), action);
+
+  // --- Coding agents ---
+  const agentTerminal = (await call('POST', '/api/terminals', { path: 'proj' })).data.terminal.id;
+  const shell = attach(agentTerminal);
+  await until(() => shell.opened, 'agent terminal');
+  const type = (text) => shell.socket.send(new TextEncoder().encode(text));
+  const agentOf = async () => (await call('GET', '/api/terminals')).data.terminals.find((t) => t.id === agentTerminal).agent;
+
+  // Live updates arrive over server-sent events.
+  const streamed = [];
+  const streamAbort = new AbortController();
+  fetch(`${base}/api/agents/stream`, { headers: { cookie }, signal: streamAbort.signal }).then(async (response) => {
+    const decoder = new TextDecoder();
+    for await (const chunk of response.body) streamed.push(decoder.decode(chunk));
+  }).catch(() => {});
+
+  // A bell in a plain shell asks for attention; typing clears it.
+  type("printf '\\a'\r");
+  let agent;
+  for (let i = 0; i < 100 && !(agent = await agentOf()).attention; i++) await sleep(50);
+  assert.equal(agent.attention, 'The terminal rang its bell');
+  type(' ');
+  for (let i = 0; i < 100 && (agent = await agentOf()).attention; i++) await sleep(50);
+  assert.equal(agent.attention, null, 'typing marks the terminal as seen');
+  type('\x15'); // clear the line
+
+  // Claude Code hooks run `ownnas agent-hook claude` with the event on stdin.
+  await fs.writeFile(path.join(library, 'proj', 'a.txt'), 'x');
+  const hook = (event) => `printf '%s' '${JSON.stringify(event)}' | '${binary}' agent-hook claude\r`;
+  type(hook({ hook_event_name: 'SessionStart', session_id: 'sess-1', model: 'claude-opus-5-5' }));
+  type(hook({ hook_event_name: 'UserPromptSubmit', session_id: 'sess-1', prompt: 'Fix the tests' }));
+  type(hook({ hook_event_name: 'PreToolUse', session_id: 'sess-1', tool_name: 'Edit', tool_input: { file_path: path.join(library, 'proj', 'a.txt'), old_string: 'x', new_string: 'y' } }));
+  type(hook({ hook_event_name: 'PostToolUse', session_id: 'sess-1', tool_name: 'Edit', tool_input: { file_path: path.join(library, 'proj', 'a.txt') }, tool_response: { big: 'output' } }));
+  for (let i = 0; i < 200 && !((agent = await agentOf()).files || []).length; i++) await sleep(50);
+  assert.equal(agent.name, 'claude');
+  assert.equal(agent.label, 'Claude Code');
+  assert.equal(agent.hooked, true);
+  assert.equal(agent.sessionId, 'sess-1');
+  assert.equal(agent.detail, 'Editing proj/a.txt');
+  assert.deepEqual(agent.files, ['proj/a.txt']);
+  type(hook({ hook_event_name: 'Notification', session_id: 'sess-1', notification_type: 'permission_prompt', message: 'Claude needs your permission to use Bash' }));
+  for (let i = 0; i < 200 && (agent = await agentOf()).status !== 'waiting'; i++) await sleep(50);
+  assert.equal(agent.attention, 'Claude needs your permission to use Bash');
+  assert.equal((await call('POST', '/api/terminals/seen', { id: agentTerminal })).status, 200);
+  assert.equal((await agentOf()).attention, null);
+  type(hook({ hook_event_name: 'Stop', session_id: 'sess-1', last_assistant_message: 'Fixed 2 tests.' }));
+  for (let i = 0; i < 200 && (agent = await agentOf()).status !== 'done'; i++) await sleep(50);
+  assert.equal(agent.lastMessage, 'Fixed 2 tests.');
+  await until(() => streamed.join('').includes('Fixed 2 tests.'), 'stream update');
+  assert.match(streamed.join(''), /event: terminals/);
+  streamAbort.abort();
+
+  // The hook endpoint listens on loopback only and needs the terminal's token.
+  type('echo "url=$OWNNAS_AGENT_URL"\r');
+  await until(() => /url=http:\/\/127\.0\.0\.1:\d+\/agent-events/.test(shell.text), 'agent url');
+  const agentUrl = shell.text.match(/url=(http:\/\/127\.0\.0\.1:\d+\/agent-events)/)[1];
+  const forged = await fetch(agentUrl, { method: 'POST', headers: { 'content-type': 'application/json', 'x-ownnas-agent-token': 'guess' }, body: '{"agent":"claude","event":{}}' });
+  assert.equal(forged.status, 401);
+  // Outside OwnNAS terminals the hook does nothing and still succeeds.
+  const { spawnSync } = await import('node:child_process');
+  const outside = spawnSync(binary, ['agent-hook', 'claude'], { input: '{"hook_event_name":"Stop"}', env: { PATH: process.env.PATH } });
+  assert.equal(outside.status, 0);
+
+  // Agents without hooks are recognized from the foreground process (macOS and Linux).
+  if (process.platform !== 'win32') {
+    const fakeDir = path.join(tmp, 'bin');
+    await fs.mkdir(fakeDir, { recursive: true });
+    await fs.writeFile(path.join(fakeDir, 'codex'), '#!/bin/sh\nsleep 30\n', { mode: 0o755 });
+    type(`${path.join(fakeDir, 'codex')}\r`);
+    for (let i = 0; i < 200 && (agent = await agentOf()).name !== 'codex'; i++) await sleep(50);
+    assert.equal(agent.name, 'codex');
+    assert.equal(agent.label, 'Codex');
+    assert.equal(agent.hooked, false);
+    type('\x03');
+    for (let i = 0; i < 200 && (agent = await agentOf()).name; i++) await sleep(50);
+    assert.equal(agent.name, null, 'the agent is forgotten when it exits');
+  }
+
+  // Git changes for the terminal's folder.
+  type('git init -q . && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init && echo hi > b.txt && echo y > a.txt && echo git-ready\r');
+  await until(() => shell.text.includes('git-ready\r\n') || shell.text.split('git-ready').length > 2, 'git setup');
+  const changes = (await call('GET', `/api/terminals/changes?id=${agentTerminal}`)).data;
+  assert.equal(changes.repo, true);
+  assert.deepEqual(changes.files.map((f) => [f.status, f.path]).sort(), [['new', 'proj/a.txt'], ['new', 'proj/b.txt']]);
+
+  // Installing integrations writes to the agent's config and can be undone.
+  let integrations = (await call('GET', '/api/agents/integrations')).data.integrations;
+  assert.deepEqual(integrations.map((i) => [i.agent, i.installed, i.found]), [['claude', false, true], ['opencode', false, false]]);
+  await fs.writeFile(path.join(home, '.claude', 'settings.json'), '{\n  "theme": "dark"\n}\n');
+  assert.equal((await call('POST', '/api/agents/integrations', { agent: 'claude', installed: true })).status, 200);
+  assert.equal((await call('POST', '/api/agents/integrations', { agent: 'opencode', installed: true })).status, 200);
+  const settings = JSON.parse(await fs.readFile(path.join(home, '.claude', 'settings.json'), 'utf8'));
+  assert.equal(settings.theme, 'dark');
+  assert.match(settings.hooks.PreToolUse[0].hooks[0].command, /agent-hook claude$/);
+  assert.equal(settings.hooks.PreToolUse[0].hooks[0].async, true);
+  const plugin = await fs.readFile(path.join(home, '.config', 'opencode', 'plugins', 'ownnas.js'), 'utf8');
+  assert.match(plugin, /export const OwnNASAgentPlugin/);
+  integrations = (await call('GET', '/api/agents/integrations')).data.integrations;
+  assert.deepEqual(integrations.map((i) => i.installed), [true, true]);
+  await call('POST', '/api/agents/integrations', { agent: 'claude', installed: false });
+  await call('POST', '/api/agents/integrations', { agent: 'opencode', installed: false });
+  assert.deepEqual(JSON.parse(await fs.readFile(path.join(home, '.claude', 'settings.json'), 'utf8')), { theme: 'dark' });
+  await assert.rejects(fs.access(path.join(home, '.config', 'opencode', 'plugins', 'ownnas.js')));
+  shell.socket.close();
+  await call('DELETE', `/api/terminals?id=${agentTerminal}`);
 
   // Signing out locks terminals again.
   const running = (await call('POST', '/api/terminals', { path: '' })).data.terminal.id;
