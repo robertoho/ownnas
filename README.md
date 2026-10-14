@@ -109,13 +109,16 @@ files. It is off by default: turn it on in **Settings → Terminal**.
 - The panel sits beside the files, with every terminal tiled in a grid; drag the edge between
   them to resize. **⇧⌘L** (Ctrl+Shift+L off a Mac) or **Ctrl+`** shows and hides it, **⇧⌘E**
   opens a terminal in the folder you are browsing, **⇧⌘ + arrows** move the keyboard between
-  the files and the terminals, and **⇧⌘K** lists every keyboard shortcut. They work from
+  the files and the terminals, **⇧⌘U** hides a terminal (it keeps running; its tab brings it
+  back), **⇧⌘X** closes it, and **⇧⌘K** lists every keyboard shortcut. They work from
   inside a terminal too.
 - On phones the panel keeps one row of tabs, with everything else under **⋯**, and follows
   the on-screen keyboard. The key row has Esc, Tab, Shift+Tab, sticky Ctrl and Alt (they also
   modify arrows, Home/End, and PgUp/PgDn), Paste (images too), **Select** (the output as text
   you can select and copy), text size, and a button that hides the keyboard. Add OwnNAS to
   your home screen to use it full screen without the browser's address bar.
+- Drag files from the file list into a terminal to type their paths (relative to the folder
+  the shell is in, when they are inside it).
 - Paste or drop files (such as a screenshot) into a terminal to upload them and type their
   paths, as a local terminal would. They are kept in a temporary folder for that terminal and
   deleted when it closes or the server restarts.

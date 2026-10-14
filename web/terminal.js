@@ -60,7 +60,12 @@ function storedFontSize() {
     const size = Number(localStorage.getItem(FONT_KEY));
     if (size >= 8 && size <= 28) return size;
   } catch {}
-  return window.matchMedia("(max-width: 600px)").matches ? 12 : 14;
+  // A phone-sized page, not a small tile: inside the panel this window is only the tile.
+  let page = window;
+  try {
+    page = window.top.matchMedia ? window.top : window;
+  } catch {}
+  return page.matchMedia("(max-width: 600px)").matches ? 12 : 14;
 }
 
 applyTheme();
@@ -163,12 +168,15 @@ term.onData((data) => {
 });
 // The page's ⇧⌘ shortcuts (Ctrl+Shift elsewhere); arrows only move between tiles while tiled.
 const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
-const PAGE_SHORTCUTS = { KeyK: "shortcuts", KeyL: "terminals", KeyE: "new-terminal" };
+const PAGE_SHORTCUTS = { KeyK: "shortcuts", KeyL: "terminals", KeyE: "new-terminal", KeyU: "hide-terminal", KeyX: "close-terminal" };
 const TILE_MOVES = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
 let tiled = false;
 
 function pageShortcut(event) {
   const command = isMac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+  // ⌃1…⌃9 on Macs (⇧⌘3 and up take screenshots there), Alt+1… elsewhere: pick a terminal.
+  const picker = isMac ? event.ctrlKey && !event.metaKey && !event.altKey : event.altKey && !event.ctrlKey && !event.metaKey;
+  if (picker && !event.shiftKey && /^Digit[1-9]$/.test(event.code)) return `select-${event.code.slice(5)}`;
   if (!command || !event.shiftKey || event.altKey) return "";
   if (PAGE_SHORTCUTS[event.code]) return PAGE_SHORTCUTS[event.code];
   if (tiled && TILE_MOVES[event.code]) return `focus-${TILE_MOVES[event.code]}`;

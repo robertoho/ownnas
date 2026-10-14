@@ -14,6 +14,24 @@ let streamTimer = 0;
 const frames = new Map(); // id -> tile: a header and the terminal's iframe
 let tiled = false; // while showing on a wide screen: the files beside a grid of every terminal
 let focusOnLoad = ""; // a terminal to give the keyboard once its page has loaded
+const STASHED_KEY = "ownnas-terminals-hidden";
+// Terminals put away with ⇧⌘U: still running and in the tabs, but without a tile.
+const stashed = new Set(loadStashed());
+
+function loadStashed() {
+  try {
+    const list = JSON.parse(localStorage.getItem(STASHED_KEY) || "[]");
+    return Array.isArray(list) ? list.filter((id) => typeof id === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveStashed() {
+  try {
+    localStorage.setItem(STASHED_KEY, JSON.stringify([...stashed]));
+  } catch {}
+}
 const shownAttention = new Map(); // id -> attention text already announced
 
 const STATUS_WORDS = {
@@ -97,6 +115,10 @@ function build() {
     window.visualViewport.addEventListener("scroll", fitToViewport);
   }
   resize.addEventListener("pointerdown", startResize);
+  // The best grid depends on the space: work it out again when the panel changes size.
+  new ResizeObserver(() => {
+    if (tiled && view === "terminal") syncFrames();
+  }).observe(body);
   // Phones get the full-screen panel with one terminal at a time instead of tiles.
   narrow.addEventListener("change", () => {
     if (!panel.hidden) setTiled(!narrow.matches);
@@ -152,10 +174,15 @@ function renderTabs() {
         role: "tab",
         "aria-selected": view === "terminal" && item.id === active ? "true" : "false",
         "data-tab": item.id,
-        class: [item.running ? "" : "ended", attention ? "has-attention" : ""].join(" ").trim() || null,
+        class: [item.running ? "" : "ended", attention ? "has-attention" : "", stashed.has(item.id) ? "stashed" : ""].join(" ").trim() || null,
         title: `${item.path || "/"}${item.agent && item.agent.detail ? ` — ${item.agent.detail}` : ""}${attention ? `\n${attention}` : ""}`,
       });
       tab.append(el("span", { class: "agent-dot", "data-status": status, "aria-hidden": "true" }), el("span", {}, tabLabel(item)));
+      const number = sessions.indexOf(item) + 1;
+      if (number <= 9) {
+        tab.append(el("span", { class: "terminals-number", "aria-hidden": "true" }, String(number)));
+        tab.title += `\n${ctx.selectLabel(number)}`;
+      }
       let pressTimer = 0;
       let pressed = false;
       let pressStart = null;
@@ -200,7 +227,12 @@ function renderTabs() {
     }),
   );
   const has = sessions.length > 0;
-  panel.querySelector(".terminals-empty").hidden = has || view === "overview";
+  const empty = panel.querySelector(".terminals-empty");
+  const allStashed = has && sessions.every((item) => stashed.has(item.id));
+  empty.hidden = (has && !allStashed) || view === "overview";
+  empty.textContent = allStashed
+    ? "Every terminal is hidden. They keep running: choose one in the tabs to show it again."
+    : "No terminals are running. Choose New to open one in this folder, or right-click a folder and choose Open terminal here.";
   // New works with no terminals open too: it starts one in the folder being browsed.
   for (const action of ["popout", "end"]) {
     panel.querySelector(`[data-action="${action}"]`).disabled = !has || view === "overview";
@@ -368,6 +400,7 @@ function setView(next) {
 
 function activate(id) {
   active = id;
+  if (id && stashed.delete(id)) saveStashed();
   if (id) tileFor(id);
   syncFrames();
   const item = sessions.find((session) => session.id === id);
@@ -415,26 +448,89 @@ function focusTerminal(id) {
 function syncFrames() {
   if (!panel) return;
   const body = panel.querySelector(".terminals-body");
+  const shown = sessions.filter((item) => !stashed.has(item.id));
   if (tiled && view === "terminal") {
-    for (const item of sessions) tileFor(item.id);
-    // Same order as the tabs. (Moving an iframe in the page would reload it.)
-    sessions.forEach((item, index) => { frames.get(item.id).style.order = String(index); });
-    const count = sessions.length;
-    const cols = count <= 2 ? 1 : count <= 6 ? 2 : 3;
-    body.style.setProperty("--tile-cols", String(cols));
-    body.style.setProperty("--tile-rows", String(Math.max(1, Math.ceil(count / cols))));
+    for (const item of shown) tileFor(item.id);
+    layoutTiles(shown.map((item) => frames.get(item.id)));
   }
   for (const [id, tile] of frames) {
-    tile.hidden = view !== "terminal" || (!tiled && id !== active);
+    tile.hidden = view !== "terminal" || (tiled ? stashed.has(id) : id !== active);
     // A hidden terminal would keep the keyboard and swallow every key.
     if (tile.hidden && tile.contains(document.activeElement)) document.activeElement.blur();
     tile.classList.toggle("is-active", id === active);
     const item = sessions.find((session) => session.id === id);
     if (!item) continue;
     const head = tile.querySelector(".terminals-tile-head");
-    head.replaceChildren(el("span", { class: "agent-dot", "data-status": statusOf(item), "aria-hidden": "true" }), el("span", {}, tabLabel(item)));
+    const number = sessions.indexOf(item) + 1;
+    head.replaceChildren(
+      el("span", { class: "agent-dot", "data-status": statusOf(item), "aria-hidden": "true" }),
+      el("span", {}, tabLabel(item)),
+      ...(number <= 9 ? [el("span", { class: "terminals-number", title: ctx.selectLabel(number) }, String(number))] : []),
+    );
     head.title = item.path || "/";
   }
+}
+
+// Terminals look best around 80×24 characters, about 1.6 times wider than tall.
+const TILE_ASPECT = 1.6;
+
+/// Picks the grid that keeps every tile closest to a terminal's shape: how many columns,
+/// and whether a short last row widens its tiles or the tiles above it grow down into the gap.
+function planTiles(count, width, height) {
+  const fit = (w, h) => Math.abs(Math.log(w / h / TILE_ASPECT));
+  let best = null;
+  for (let cols = 1; cols <= Math.min(count, 4); cols++) {
+    const rows = Math.ceil(count / cols);
+    const last = count - cols * (rows - 1); // tiles in the last row, 1..cols
+    const w = width / cols;
+    const h = height / rows;
+    const plans = [{ cols, rows, last, grow: "wide", score: (count - last) * fit(w, h) + last * fit(width / last, h) }];
+    if (last < cols && rows > 1) {
+      const tall = cols - last;
+      plans.push({ cols, rows, last, grow: "tall", score: (count - tall) * fit(w, h) + tall * fit(w, h * 2) });
+    }
+    for (const plan of plans) if (!best || plan.score < best.score - 1e-9) best = plan;
+  }
+  return best;
+}
+
+const gcd = (a, b) => (b ? gcd(b, a % b) : a);
+
+/// Places the tiles (in tab order) on the grid planned for the space they have.
+function layoutTiles(tiles) {
+  const body = panel.querySelector(".terminals-body");
+  if (!tiles.length) {
+    body.style.gridTemplateColumns = "";
+    body.style.gridTemplateRows = "";
+    return;
+  }
+  const plan = planTiles(tiles.length, Math.max(1, body.clientWidth), Math.max(1, body.clientHeight));
+  const { cols, rows, last, grow } = plan;
+  // Enough grid columns to split both a full row and the last row evenly.
+  const span = grow === "wide" ? cols * last / gcd(cols, last) : cols;
+  body.style.gridTemplateColumns = `repeat(${span}, minmax(0, 1fr))`;
+  body.style.gridTemplateRows = `repeat(${rows}, minmax(0, 1fr))`;
+  const full = tiles.length - last;
+  tiles.forEach((tile, index) => {
+    let row;
+    let col;
+    let colSpan;
+    let rowSpan = 1;
+    if (index < full) {
+      row = Math.floor(index / cols);
+      col = index % cols;
+      colSpan = span / cols;
+      // Above the gap in the last row: grow down into it.
+      if (grow === "tall" && row === rows - 2 && col >= last) rowSpan = 2;
+      col *= colSpan;
+    } else {
+      row = rows - 1;
+      colSpan = grow === "wide" ? span / last : 1;
+      col = (index - full) * colSpan;
+    }
+    tile.style.gridRow = `${row + 1} / span ${rowSpan}`;
+    tile.style.gridColumn = `${col + 1} / span ${colSpan}`;
+  });
 }
 
 function markFocused(id) {
@@ -606,7 +702,8 @@ function openTabMenu(id, x, y, { full = false } = {}) {
       items.push(action("changes", "Git changes"));
     }
     items.push(action("popout", "Pop out"));
-    items.push(action("close", "Close", { class: "danger" }));
+    items.push(action("hide", "Hide (keeps running)", { title: ctx.shortcutLabel("U") }));
+    items.push(action("close", "Close", { class: "danger", title: ctx.shortcutLabel("X") }));
   }
   tabMenu.replaceChildren(...items);
   tabMenu.hidden = false;
@@ -653,9 +750,35 @@ async function runTabAction(action, id) {
     await showFolder(id);
   } else if (action === "popout") {
     window.open(`/terminal?id=${encodeURIComponent(id)}`, "_blank", "noopener");
+  } else if (action === "hide") {
+    stashTerminal(id);
   } else if (action === "close") {
     await endTerminal(id);
   }
+}
+
+/// Puts a terminal away without stopping it, and moves on to the next one.
+function stashTerminal(id) {
+  const index = sessions.findIndex((item) => item.id === id);
+  if (index < 0) return;
+  stashed.add(id);
+  saveStashed();
+  if (id !== active) {
+    render();
+    syncFrames();
+    return;
+  }
+  const shown = sessions.filter((item) => !stashed.has(item.id));
+  const next = shown.find((item) => sessions.indexOf(item) > index) || shown[shown.length - 1];
+  if (next) {
+    activate(next.id);
+    return;
+  }
+  active = "";
+  render();
+  syncFrames();
+  if (tiled) ctx.focusFiles();
+  else hidePanel();
 }
 
 function markSeen(id) {
@@ -704,7 +827,14 @@ function applyList(list) {
       shownAttention.delete(item.id);
     }
   }
-  if (!sessions.some((item) => item.id === active)) active = sessions.length ? sessions[sessions.length - 1].id : "";
+  for (const id of [...stashed]) {
+    if (!sessions.some((item) => item.id === id)) stashed.delete(id);
+  }
+  saveStashed();
+  if (!sessions.some((item) => item.id === active)) {
+    const shown = sessions.filter((item) => !stashed.has(item.id));
+    active = shown.length ? shown[shown.length - 1].id : "";
+  }
   if (panel && !panel.hidden) {
     syncFrames();
     if (active && !frames.has(active) && view === "terminal") activate(active);
@@ -827,6 +957,8 @@ async function endTerminal(id) {
   await refresh();
   if (!sessions.length) hidePanel();
   else activate(active);
+  // Every terminal left is hidden: the keyboard goes back to the files.
+  if (!active && tiled) ctx.focusFiles();
 }
 
 export function init(context) {
@@ -840,6 +972,25 @@ export async function open(path) {
 
 export function toggle() {
   togglePanel();
+}
+
+/// ⇧⌘U and ⇧⌘X: hide or end the terminal being used.
+export function hideActive() {
+  if (panel && !panel.hidden && active) stashTerminal(active);
+}
+
+export async function closeActive() {
+  if (panel && !panel.hidden && active) await endTerminal(active);
+}
+
+/// ⌃1…⌃9 (Alt+1… elsewhere): the terminal with that number, showing the panel if needed.
+export async function select(number) {
+  if (panel.hidden && !(await refresh())) return;
+  const item = sessions[number - 1];
+  if (!item) return;
+  view = "terminal";
+  if (panel.hidden) showPanel();
+  activate(item.id);
 }
 
 export function moveFocus(direction) {

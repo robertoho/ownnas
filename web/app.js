@@ -1223,6 +1223,7 @@ async function terminalPanel() {
       currentPath: () => state.path,
       runShortcut: (name) => runShortcut(name),
       shortcutLabel: (key) => shortcutLabel(key),
+      selectLabel: (number) => selectLabel(number),
       focusFiles: () => $("files").focus({ preventScroll: true }),
       rootName: () => state.me && state.me.rootName,
       refreshMe: async () => {
@@ -1263,11 +1264,15 @@ function syncTerminalButton() {
 // Page-wide shortcuts: ⇧⌘ and a key on Macs, Ctrl+Shift elsewhere. Terminals forward them
 // too (terminal.js), so they work wherever the keyboard is.
 const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
-const PAGE_SHORTCUTS = { KeyK: "shortcuts", KeyL: "terminals", KeyE: "new-terminal" };
+const PAGE_SHORTCUTS = { KeyK: "shortcuts", KeyL: "terminals", KeyE: "new-terminal", KeyU: "hide-terminal", KeyX: "close-terminal" };
 const TILE_MOVES = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
 
 function shortcutLabel(key) {
   return IS_MAC ? `⇧⌘${key}` : `Ctrl+Shift+${key}`;
+}
+
+function selectLabel(number) {
+  return IS_MAC ? `⌃${number}` : `Alt+${number}`;
 }
 
 function commandLabel(key) {
@@ -1276,6 +1281,9 @@ function commandLabel(key) {
 
 function pageShortcut(event) {
   const command = IS_MAC ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+  // ⌃1…⌃9 on Macs (⇧⌘3 and up take screenshots there), Alt+1… elsewhere: pick a terminal.
+  const picker = IS_MAC ? event.ctrlKey && !event.metaKey && !event.altKey : event.altKey && !event.ctrlKey && !event.metaKey;
+  if (picker && !event.shiftKey && /^Digit[1-9]$/.test(event.code)) return `select-${event.code.slice(5)}`;
   if (!command || !event.shiftKey || event.altKey) return "";
   if (PAGE_SHORTCUTS[event.code]) return PAGE_SHORTCUTS[event.code];
   if (TILE_MOVES[event.code] && terminalModule && terminalModule.isTiled()) return `focus-${TILE_MOVES[event.code]}`;
@@ -1294,6 +1302,9 @@ function runShortcut(name) {
   }
   if (name === "terminals") terminalPanel().then((module) => module.toggle()).catch((err) => toast(err.message, true));
   if (name === "new-terminal") openTerminalAt(inTrashPath(state.path) ? "" : state.path);
+  if (name === "hide-terminal") terminalPanel().then((module) => module.hideActive()).catch(() => {});
+  if (name === "close-terminal") terminalPanel().then((module) => module.closeActive()).catch((err) => toast(err.message, true));
+  if (name.startsWith("select-")) terminalPanel().then((module) => module.select(Number(name.slice(7)))).catch((err) => toast(err.message, true));
   if (name.startsWith("focus-")) terminalPanel().then((module) => module.moveFocus(name.slice(6))).catch(() => {});
 }
 
@@ -1317,7 +1328,10 @@ function showShortcuts() {
       [shortcutLabel("K"), "Show these shortcuts"],
       terminal && [`${shortcutLabel("L")}, Ctrl+\``, "Show or hide the terminals, tiled beside the files"],
       terminal && [shortcutLabel("E"), "New terminal in this folder"],
+      terminal && [shortcutLabel("U"), "Hide this terminal (it keeps running; its tab brings it back)"],
+      terminal && [shortcutLabel("X"), "Close this terminal and stop what runs in it"],
       terminal && [IS_MAC ? "⇧⌘ ← ↑ ↓ →" : "Ctrl+Shift+arrows", "Move between the files and the terminals"],
+      terminal && [`${selectLabel(1)} … ${selectLabel(9)}`, "Go to the terminal with that number"],
     ]],
     ["Files", [
       ["Type", "Filter this folder"],

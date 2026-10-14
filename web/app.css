@@ -2746,7 +2746,6 @@ dialog { color: var(--text); }
   .terminals.is-resizing iframe { pointer-events: none; }
   .terminals.is-tiled .terminals-body {
     display: grid;
-    grid-template-columns: repeat(var(--tile-cols, 1), minmax(0, 1fr));
     grid-auto-rows: minmax(0, 1fr);
     gap: 6px;
     padding: 6px;
@@ -2828,6 +2827,9 @@ dialog { color: var(--text); }
   border-color: transparent;
 }
 .terminals-tabs button.ended { opacity: 0.6; text-decoration: line-through; }
+.terminals-number { font: 0.68rem var(--mono); opacity: 0.6; padding: 0 0.25rem; border: 1px solid currentColor; border-radius: 4px; line-height: 1.2; }
+.terminals-tile-head .terminals-number { margin-left: auto; }
+.terminals-tabs button.stashed:not([aria-selected="true"]) { opacity: 0.55; border-style: dashed; }
 .terminals-tabs button { display: inline-flex; align-items: center; gap: 0.4rem; }
 .terminals-tabs button.has-attention:not([aria-selected="true"]) { border-color: var(--danger); }
 .terminals-overview-btn[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
