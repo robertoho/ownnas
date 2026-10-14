@@ -142,6 +142,10 @@ function build() {
   window.addEventListener("message", (event) => {
     if (event.origin !== location.origin || !event.data || event.data.source !== "ownnas-terminal") return;
     if (event.data.type === "toggle-panel") togglePanel();
+    if (event.data.type === "exit" && event.data.id) {
+      const item = sessions.find((session) => session.id === event.data.id);
+      if (item) cleanEnded([{ ...item, running: false, exitCode: event.data.code }]);
+    }
     if (event.data.type === "shortcut") ctx.runShortcut(event.data.name);
     if (event.data.type === "focused" && event.data.id) {
       markFocused(event.data.id);
@@ -840,7 +844,32 @@ function announce(item) {
   }
 }
 
+const cleaning = new Set();
+
+/// Closes terminals whose shell has exited (`exit`, or a crash), so they do not linger.
+/// Only an unexpected end is mentioned, with its exit code.
+function cleanEnded(list) {
+  for (const item of list) {
+    if (item.running || cleaning.has(item.id)) continue;
+    cleaning.add(item.id);
+    if (item.exitCode !== undefined && item.exitCode !== null && item.exitCode !== 0) {
+      ctx.toast(`“${tabLabel(item)}” ended with exit code ${item.exitCode}`);
+    }
+    ctx.api(`/api/terminals?id=${encodeURIComponent(item.id)}`, { method: "DELETE" })
+      .catch(() => {})
+      .then(() => refresh())
+      .then(() => {
+        if (panel && !panel.hidden && !sessions.length) hidePanel();
+        else if (tiled && !active) ctx.focusFiles();
+      })
+      .catch(() => {})
+      .finally(() => cleaning.delete(item.id));
+  }
+}
+
 function applyList(list) {
+  cleanEnded(list);
+  list = list.filter((item) => item.running);
   sessions = list;
   for (const [id, frame] of frames) {
     if (!sessions.some((item) => item.id === id)) {
