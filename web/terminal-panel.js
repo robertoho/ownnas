@@ -60,7 +60,7 @@ function build() {
   const overview = el("button", { type: "button", class: "terminals-overview-btn", "aria-pressed": "false", title: "All terminals and their agents" }, "Overview");
   const tabs = el("div", { class: "terminals-tabs", role: "tablist", "aria-label": "Open terminals" });
   const actions = el("div", { class: "terminals-actions" });
-  const add = el("button", { type: "button", "data-action": "new", title: "New terminal in the same folder" }, "New");
+  const add = el("button", { type: "button", "data-action": "new", title: "New terminal in the folder you are browsing" }, "New");
   const popout = el("button", { type: "button", "data-action": "popout", title: "Open this terminal in its own browser tab" }, "Pop out");
   const end = el("button", { type: "button", "data-action": "end", class: "danger", title: "Stop the shell and everything running in it" }, "Close");
   const hide = el("button", { type: "button", "data-action": "hide", title: "Hide the panel (Ctrl+`). Terminals keep running." }, "Hide");
@@ -73,17 +73,14 @@ function build() {
   const strip = el("div", { class: "terminals-agent", hidden: true });
   const drawerBox = el("div", { class: "terminals-drawer", hidden: true });
   const body = el("div", { class: "terminals-body" });
-  const empty = el("p", { class: "terminals-empty muted" }, "No terminals are running. Right-click a folder and choose Open terminal here.");
+  const empty = el("p", { class: "terminals-empty muted" }, "No terminals are running. Choose New to open one in this folder, or right-click a folder and choose Open terminal here.");
   const grid = el("div", { class: "terminals-overview", hidden: true });
   body.append(empty, grid);
   panel.append(bar, strip, drawerBox, body);
   document.body.append(panel);
 
   overview.addEventListener("click", () => setView(view === "overview" ? "terminal" : "overview"));
-  add.addEventListener("click", () => {
-    const current = sessions.find((item) => item.id === active);
-    openTerminal(current ? current.path : ctx.currentPath()).catch((err) => ctx.toast(err.message, true));
-  });
+  add.addEventListener("click", () => openTerminal(ctx.currentPath()).catch((err) => ctx.toast(err.message, true)));
   popout.addEventListener("click", () => {
     if (active) window.open(`/terminal?id=${encodeURIComponent(active)}`, "_blank", "noopener");
   });
@@ -210,7 +207,8 @@ function renderTabs() {
   );
   const has = sessions.length > 0;
   panel.querySelector(".terminals-empty").hidden = has || view === "overview";
-  for (const action of ["new", "popout", "end"]) {
+  // New works with no terminals open too: it starts one in the folder being browsed.
+  for (const action of ["popout", "end"]) {
     panel.querySelector(`[data-action="${action}"]`).disabled = !has || view === "overview";
   }
   panel.querySelector(".terminals-overview-btn").setAttribute("aria-pressed", view === "overview" ? "true" : "false");
