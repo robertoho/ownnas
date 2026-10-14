@@ -1221,6 +1221,9 @@ async function terminalPanel() {
       askText,
       askConfirm,
       currentPath: () => state.path,
+      runShortcut: (name) => runShortcut(name),
+      shortcutLabel: (key) => shortcutLabel(key),
+      focusFiles: () => $("files").focus({ preventScroll: true }),
       rootName: () => state.me && state.me.rootName,
       refreshMe: async () => {
         Object.assign(state.me, await api("/api/me"));
@@ -1255,6 +1258,106 @@ function syncTerminalButton() {
     $("terminals-badge").hidden = true;
     document.title = "OwnNAS";
   }
+}
+
+// Page-wide shortcuts: ⇧⌘ and a key on Macs, Ctrl+Shift elsewhere. Terminals forward them
+// too (terminal.js), so they work wherever the keyboard is.
+const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+const PAGE_SHORTCUTS = { KeyK: "shortcuts", KeyL: "tiling", KeyE: "new-terminal" };
+const TILE_MOVES = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
+
+function shortcutLabel(key) {
+  return IS_MAC ? `⇧⌘${key}` : `Ctrl+Shift+${key}`;
+}
+
+function commandLabel(key) {
+  return IS_MAC ? `⌘${key}` : `Ctrl+${key}`;
+}
+
+function pageShortcut(event) {
+  const command = IS_MAC ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+  if (!command || !event.shiftKey || event.altKey) return "";
+  if (PAGE_SHORTCUTS[event.code]) return PAGE_SHORTCUTS[event.code];
+  if (TILE_MOVES[event.code] && terminalModule && terminalModule.isTiled()) return `focus-${TILE_MOVES[event.code]}`;
+  return "";
+}
+
+function runShortcut(name) {
+  if (!state.me || $("app-view").hidden) return;
+  if (name === "shortcuts") {
+    showShortcuts();
+    return;
+  }
+  if (!state.me.terminal) {
+    toast("Terminals are turned off. An admin can turn them on in Settings.", true);
+    return;
+  }
+  if (name === "tiling") terminalPanel().then((module) => module.toggleTiling()).catch((err) => toast(err.message, true));
+  if (name === "new-terminal") openTerminalAt(inTrashPath(state.path) ? "" : state.path);
+  if (name.startsWith("focus-")) terminalPanel().then((module) => module.moveFocus(name.slice(6))).catch(() => {});
+}
+
+window.addEventListener("keydown", (event) => {
+  const name = pageShortcut(event);
+  if (!name) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (!event.repeat) runShortcut(name);
+}, true);
+
+function showShortcuts() {
+  const dialog = $("shortcuts-dialog");
+  if (dialog.open) {
+    dialog.close();
+    return;
+  }
+  const terminal = !!(state.me && state.me.terminal);
+  const groups = [
+    ["Layout and terminals", [
+      [shortcutLabel("K"), "Show these shortcuts"],
+      terminal && [shortcutLabel("L"), "Tiling layout: files beside every terminal"],
+      terminal && [shortcutLabel("E"), "New terminal in this folder"],
+      terminal && [IS_MAC ? "⇧⌘ ← ↑ ↓ →" : "Ctrl+Shift+arrows", "Move between tiles (tiling layout)"],
+      terminal && ["Ctrl+`", "Show or hide the terminals"],
+    ]],
+    ["Files", [
+      ["Type", "Filter this folder"],
+      ["← ↑ ↓ →", "Move the selection (with Shift to extend it)"],
+      [`Enter, ${commandLabel("↓")}`, "Open"],
+      [commandLabel("↑"), "Go to the parent folder"],
+      [commandLabel("A"), "Select everything"],
+      [`${commandLabel("C")}, ${commandLabel("X")}, ${commandLabel("V")}`, "Copy, cut, paste"],
+      ["Delete", "Delete the selection"],
+      [commandLabel("Z"), "Undo the last file change"],
+      [commandLabel("S"), "Save in the editor"],
+      ["Esc", "Close, or clear the selection"],
+    ]],
+  ];
+  const list = $("shortcuts-list");
+  list.replaceChildren();
+  for (const [title, rows] of groups) {
+    const section = document.createElement("section");
+    const heading = document.createElement("h4");
+    heading.textContent = title;
+    const table = document.createElement("dl");
+    for (const row of rows.filter(Boolean)) {
+      const keys = document.createElement("dt");
+      const kbd = document.createElement("kbd");
+      kbd.textContent = row[0];
+      keys.append(kbd);
+      const what = document.createElement("dd");
+      what.textContent = row[1];
+      table.append(keys, what);
+    }
+    section.append(heading, table);
+    list.append(section);
+  }
+  // Opened from a terminal: give it the keyboard back afterwards.
+  const before = document.activeElement;
+  dialog.addEventListener("close", () => {
+    if (before && before.tagName === "IFRAME") before.contentWindow?.postMessage({ type: "ownnas-terminal-focus" }, location.origin);
+  }, { once: true });
+  dialog.showModal();
 }
 
 function openTerminalAt(path) {

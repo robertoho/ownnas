@@ -161,6 +161,20 @@ term.onData((data) => {
   }
   sendText(data);
 });
+// The page's ⇧⌘ shortcuts (Ctrl+Shift elsewhere); arrows only move between tiles while tiled.
+const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+const PAGE_SHORTCUTS = { KeyK: "shortcuts", KeyL: "tiling", KeyE: "new-terminal" };
+const TILE_MOVES = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
+let tiled = false;
+
+function pageShortcut(event) {
+  const command = isMac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+  if (!command || !event.shiftKey || event.altKey) return "";
+  if (PAGE_SHORTCUTS[event.code]) return PAGE_SHORTCUTS[event.code];
+  if (tiled && TILE_MOVES[event.code]) return `focus-${TILE_MOVES[event.code]}`;
+  return "";
+}
+
 // Ctrl+` (the key left of 1, on any layout) hides the OwnNAS terminal panel, like VS Code.
 term.attachCustomKeyEventHandler((event) => {
   if (embedded && event.ctrlKey && !event.altKey && !event.metaKey && event.code === "Backquote") {
@@ -169,6 +183,14 @@ term.attachCustomKeyEventHandler((event) => {
   }
   return true;
 });
+// Caught on the window, not by xterm, so they work even when the terminal itself has no focus.
+window.addEventListener("keydown", (event) => {
+  const shortcut = embedded ? pageShortcut(event) : "";
+  if (!shortcut) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (!event.repeat) notifyParent({ type: "shortcut", name: shortcut });
+}, true);
 term.onBinary((data) => sendBytes(Uint8Array.from(data, (char) => char.charCodeAt(0) & 0xff)));
 term.onResize(sendResize);
 term.onTitleChange((title) => {
@@ -179,8 +201,12 @@ new ResizeObserver(() => {
   if (host.clientWidth && host.clientHeight) fit.fit();
 }).observe(host);
 window.addEventListener("message", (event) => {
-  if (event.origin === location.origin && event.data && event.data.type === "ownnas-terminal-focus") term.focus();
+  if (event.origin !== location.origin || !event.data) return;
+  if (event.data.type === "ownnas-terminal-focus") term.focus();
+  if (event.data.type === "ownnas-terminal-tiled") tiled = !!event.data.on;
 });
+// Lets the page mark which tile has the keyboard.
+term.textarea?.addEventListener("focus", () => notifyParent({ type: "focused" }));
 
 /// Works out whether a dropped connection is worth retrying.
 async function closeReason() {

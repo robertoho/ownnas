@@ -11,7 +11,9 @@ let sessions = [];
 let stream = null;
 let streamRetry = 0;
 let streamTimer = 0;
-const frames = new Map(); // id -> iframe
+const frames = new Map(); // id -> tile: a header and the terminal's iframe
+let tiled = false; // the tiling layout: files beside a grid of every terminal
+let focusOnLoad = ""; // a terminal to give the keyboard once its page has loaded
 const shownAttention = new Map(); // id -> attention text already announced
 
 const STATUS_WORDS = {
@@ -65,9 +67,10 @@ function build() {
   const end = el("button", { type: "button", "data-action": "end", class: "danger", title: "Stop the shell and everything running in it" }, "Close");
   const hide = el("button", { type: "button", "data-action": "hide", title: "Hide the panel (Ctrl+`). Terminals keep running." }, "Hide");
   const wide = el("button", { type: "button", "data-action": "wide", class: "terminals-wide-btn", "aria-pressed": "false" }, "Expand");
+  const tile = el("button", { type: "button", "data-action": "tile", class: "terminals-tile-btn", "aria-pressed": "false", title: `Files beside every terminal (${ctx.shortcutLabel("L")})` }, "Tile");
   // On phones the other buttons move into this menu, leaving one row for the tabs.
   const more = el("button", { type: "button", "data-action": "more", class: "terminals-more-btn", "aria-label": "More terminal actions", "aria-haspopup": "menu" }, "⋯");
-  actions.append(add, popout, end, wide, more, hide);
+  actions.append(add, popout, end, tile, wide, more, hide);
   bar.append(overview, tabs, actions);
 
   const strip = el("div", { class: "terminals-agent", hidden: true });
@@ -76,7 +79,8 @@ function build() {
   const empty = el("p", { class: "terminals-empty muted" }, "No terminals are running. Choose New to open one in this folder, or right-click a folder and choose Open terminal here.");
   const grid = el("div", { class: "terminals-overview", hidden: true });
   body.append(empty, grid);
-  panel.append(bar, strip, drawerBox, body);
+  const resize = el("div", { class: "terminals-resize", role: "separator", "aria-orientation": "vertical", "aria-label": "Resize the terminals" });
+  panel.append(resize, bar, strip, drawerBox, body);
   document.body.append(panel);
 
   overview.addEventListener("click", () => setView(view === "overview" ? "terminal" : "overview"));
@@ -95,6 +99,13 @@ function build() {
     window.visualViewport.addEventListener("scroll", fitToViewport);
   }
   wide.addEventListener("click", () => setWide(!panel.classList.contains("is-wide")));
+  tile.addEventListener("click", () => setTiled(!tiled).catch((err) => ctx.toast(err.message, true)));
+  resize.addEventListener("pointerdown", startResize);
+  narrow.addEventListener("change", () => {
+    if (narrow.matches && tiled) setTiled(false);
+  });
+  // When the page itself takes the keyboard back, no terminal tile has it.
+  window.addEventListener("focus", () => markFocused(""));
   setWide(storedWide());
   panel.addEventListener("click", (event) => {
     const file = event.target.closest("[data-open-file]");
@@ -112,6 +123,15 @@ function build() {
   window.addEventListener("message", (event) => {
     if (event.origin !== location.origin || !event.data || event.data.source !== "ownnas-terminal") return;
     if (event.data.type === "toggle-panel") togglePanel();
+    if (event.data.type === "shortcut") ctx.runShortcut(event.data.name);
+    if (event.data.type === "focused" && event.data.id) {
+      markFocused(event.data.id);
+      if (event.data.id !== active && sessions.some((item) => item.id === event.data.id)) {
+        active = event.data.id;
+        render();
+        syncFrames();
+      }
+    }
   });
   document.addEventListener("keydown", (event) => {
     if (event.ctrlKey && !event.altKey && !event.metaKey && event.code === "Backquote" && !event.repeat) {
@@ -321,7 +341,7 @@ function toggleDrawer(kind) {
 function renderOverview() {
   const grid = panel.querySelector(".terminals-overview");
   grid.hidden = view !== "overview";
-  for (const frame of frames.values()) frame.hidden = view === "overview" || frame.dataset.id !== active;
+  syncFrames();
   if (view !== "overview") return;
   const cards = sessions.map((item) => {
     const agent = item.agent || {};
@@ -374,24 +394,185 @@ function setView(next) {
 
 function activate(id) {
   active = id;
-  for (const [frameId, frame] of frames) frame.hidden = frameId !== id || view !== "terminal";
-  if (id && !frames.has(id)) {
-    const frame = el("iframe", { src: `/terminal?id=${encodeURIComponent(id)}`, title: "Terminal", class: "terminals-frame is-loading", "data-id": id });
-    // A page is white until its styles load; show the panel's background meanwhile.
-    frame.addEventListener("load", () => frame.classList.remove("is-loading"), { once: true });
-    frames.set(id, frame);
-    panel.querySelector(".terminals-body").append(frame);
-  }
+  if (id) tileFor(id);
+  syncFrames();
   const item = sessions.find((session) => session.id === id);
   if (drawer === "changes" && item) renderChanges(item);
   if (item && item.agent && item.agent.attention && panelVisible()) markSeen(id);
   render();
-  const frame = frames.get(id);
-  if (frame && view === "terminal") {
-    requestAnimationFrame(() => {
-      frame.focus();
-      frame.contentWindow?.postMessage({ type: "ownnas-terminal-focus" }, location.origin);
-    });
+  if (id && view === "terminal") {
+    focusOnLoad = id;
+    requestAnimationFrame(() => focusTerminal(id));
+  }
+}
+
+/// The tile showing terminal `id`, made the first time it is needed.
+function tileFor(id) {
+  let tile = frames.get(id);
+  if (tile) return tile;
+  tile = el("div", { class: "terminals-tile", "data-id": id });
+  const head = el("button", { type: "button", class: "terminals-tile-head", tabindex: "-1" });
+  head.addEventListener("click", () => {
+    setView("terminal");
+    activate(id);
+  });
+  const frame = el("iframe", { src: `/terminal?id=${encodeURIComponent(id)}`, title: "Terminal", class: "terminals-frame is-loading", "data-id": id });
+  // A page is white until its styles load; show the panel's background meanwhile.
+  frame.addEventListener("load", () => {
+    frame.classList.remove("is-loading");
+    frame.contentWindow?.postMessage({ type: "ownnas-terminal-tiled", on: tiled }, location.origin);
+    // Focusing a frame before its page loads does not always stick.
+    if (focusOnLoad === id && id === active && panelVisible()) focusTerminal(id);
+  }, { once: true });
+  tile.append(head, frame);
+  frames.set(id, tile);
+  panel.querySelector(".terminals-body").append(tile);
+  return tile;
+}
+
+function focusTerminal(id) {
+  const frame = frames.get(id)?.querySelector("iframe");
+  if (!frame) return;
+  frame.focus();
+  frame.contentWindow?.postMessage({ type: "ownnas-terminal-focus" }, location.origin);
+}
+
+/// Shows the active terminal, or every terminal as tiles; labels the tiles.
+function syncFrames() {
+  if (!panel) return;
+  const body = panel.querySelector(".terminals-body");
+  if (tiled && view === "terminal") {
+    for (const item of sessions) tileFor(item.id);
+    // Same order as the tabs. (Moving an iframe in the page would reload it.)
+    sessions.forEach((item, index) => { frames.get(item.id).style.order = String(index); });
+    const count = sessions.length;
+    const cols = count <= 2 ? 1 : count <= 6 ? 2 : 3;
+    body.style.setProperty("--tile-cols", String(cols));
+    body.style.setProperty("--tile-rows", String(Math.max(1, Math.ceil(count / cols))));
+  }
+  for (const [id, tile] of frames) {
+    tile.hidden = view !== "terminal" || (!tiled && id !== active);
+    // A hidden terminal would keep the keyboard and swallow every key.
+    if (tile.hidden && tile.contains(document.activeElement)) document.activeElement.blur();
+    tile.classList.toggle("is-active", id === active);
+    const item = sessions.find((session) => session.id === id);
+    if (!item) continue;
+    const head = tile.querySelector(".terminals-tile-head");
+    head.replaceChildren(el("span", { class: "agent-dot", "data-status": statusOf(item), "aria-hidden": "true" }), el("span", {}, tabLabel(item)));
+    head.title = item.path || "/";
+  }
+}
+
+function markFocused(id) {
+  if (id) focusOnLoad = "";
+  for (const [tileId, tile] of frames) tile.classList.toggle("is-focused", tileId === id);
+}
+
+const TILED_KEY = "ownnas-terminals-tiled";
+const TILES_WIDTH_KEY = "ownnas-terminals-tiles-width";
+const narrow = window.matchMedia("(max-width: 820px)");
+
+function stored(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function store(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {}
+}
+
+function applyTilesWidth(fraction) {
+  const value = Math.min(0.8, Math.max(0.25, Number(fraction) || 0.6));
+  document.body.style.setProperty("--tiles-width", `${(value * 100).toFixed(2)}vw`);
+  return value;
+}
+
+/// The tiling layout: the files on the left, every terminal in a grid on the right.
+async function setTiled(on) {
+  if (on && narrow.matches) {
+    ctx.toast("The tiling layout needs a wider window", true);
+    return;
+  }
+  if (on && panel.hidden) {
+    if (!(await refresh())) return;
+    view = "terminal";
+    showPanel();
+  }
+  tiled = on;
+  store(TILED_KEY, on ? "1" : "0");
+  applyTilesWidth(stored(TILES_WIDTH_KEY));
+  panel.classList.toggle("is-tiled", on);
+  document.body.classList.toggle("is-tiled", on);
+  const button = panel.querySelector('[data-action="tile"]');
+  button.setAttribute("aria-pressed", on ? "true" : "false");
+  button.textContent = on ? "Untile" : "Tile";
+  if (on) view = "terminal";
+  for (const tile of frames.values()) {
+    tile.querySelector("iframe").contentWindow?.postMessage({ type: "ownnas-terminal-tiled", on }, location.origin);
+  }
+  activate(active);
+}
+
+/// Dragging the panel's left edge in the tiling layout.
+function startResize(event) {
+  if (!tiled) return;
+  event.preventDefault();
+  const handle = event.currentTarget;
+  handle.setPointerCapture(event.pointerId);
+  // The terminals' iframes would swallow the pointer while it passes over them.
+  panel.classList.add("is-resizing");
+  let fraction = 0;
+  const move = (moved) => {
+    fraction = applyTilesWidth((window.innerWidth - moved.clientX) / window.innerWidth);
+  };
+  const end = () => {
+    panel.classList.remove("is-resizing");
+    handle.removeEventListener("pointermove", move);
+    if (fraction) store(TILES_WIDTH_KEY, String(fraction));
+  };
+  handle.addEventListener("pointermove", move);
+  handle.addEventListener("pointerup", end, { once: true });
+  handle.addEventListener("pointercancel", end, { once: true });
+}
+
+/// Moves the keyboard to the next tile (the files count as one) in a direction.
+function focusTile(direction) {
+  if (!tiled || panel.hidden) return;
+  const files = document.querySelector(".explorer-content");
+  const tiles = [{ id: "", rect: files.getBoundingClientRect() }];
+  for (const [id, tile] of frames) if (!tile.hidden) tiles.push({ id, rect: tile.getBoundingClientRect() });
+  const focusedFrame = document.activeElement && document.activeElement.closest && document.activeElement.closest(".terminals-tile");
+  const current = tiles.find((tile) => tile.id === (focusedFrame ? focusedFrame.dataset.id : "")) || tiles[0];
+  const center = (rect) => ({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+  const from = center(current.rect);
+  let best = null;
+  let bestScore = Infinity;
+  for (const tile of tiles) {
+    if (tile === current) continue;
+    const to = center(tile.rect);
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const ahead = { left: -dx, right: dx, up: -dy, down: dy }[direction];
+    if (ahead <= 1) continue;
+    const aside = direction === "left" || direction === "right" ? Math.abs(dy) : Math.abs(dx);
+    const score = ahead + aside * 2;
+    if (score < bestScore) {
+      bestScore = score;
+      best = tile;
+    }
+  }
+  if (!best) return;
+  if (best.id) {
+    activate(best.id);
+  } else {
+    markFocused("");
+    window.focus();
+    ctx.focusFiles();
   }
 }
 
@@ -563,7 +744,7 @@ function applyList(list) {
   }
   if (!sessions.some((item) => item.id === active)) active = sessions.length ? sessions[sessions.length - 1].id : "";
   if (panel && !panel.hidden) {
-    for (const [id, frame] of frames) frame.hidden = id !== active || view !== "terminal";
+    syncFrames();
     if (active && !frames.has(active) && view === "terminal") activate(active);
   }
   render();
@@ -641,6 +822,14 @@ function showPanel() {
 
 function hidePanel() {
   closeTabMenu();
+  if (tiled) {
+    tiled = false;
+    store(TILED_KEY, "0");
+    panel.classList.remove("is-tiled");
+    document.body.classList.remove("is-tiled");
+    panel.querySelector('[data-action="tile"]').setAttribute("aria-pressed", "false");
+    panel.querySelector('[data-action="tile"]').textContent = "Tile";
+  }
   const hadFocus = panel.contains(document.activeElement);
   panel.hidden = true;
   document.body.classList.remove("terminals-open");
@@ -691,6 +880,18 @@ export async function open(path) {
   await openTerminal(path);
 }
 
+export async function toggleTiling() {
+  await setTiled(!tiled);
+}
+
+export function moveFocus(direction) {
+  focusTile(direction);
+}
+
+export function isTiled() {
+  return tiled;
+}
+
 export async function show() {
   if (await refresh()) showPanel();
 }
@@ -700,7 +901,11 @@ export async function show() {
 export async function background() {
   try {
     const config = await ctx.api("/api/terminal/config");
-    if (config.enabled && (!config.passwordSet || config.unlocked)) watch();
+    if (config.enabled && (!config.passwordSet || config.unlocked)) {
+      watch();
+      // Come back to the tiling layout after a reload.
+      if (stored(TILED_KEY) === "1" && !narrow.matches) await setTiled(true);
+    }
   } catch {}
 }
 
