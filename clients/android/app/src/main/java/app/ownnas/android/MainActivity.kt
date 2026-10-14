@@ -1,5 +1,6 @@
 package app.ownnas.android
 
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -10,6 +11,8 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -22,6 +25,7 @@ import app.ownnas.android.ui.HomeScreen
 import app.ownnas.android.ui.SignInScreen
 import app.ownnas.android.ui.SyncScreen
 import app.ownnas.android.ui.BackupScreen
+import app.ownnas.android.data.Backup
 import app.ownnas.android.ui.gallery.GalleryAlbumScreen
 import app.ownnas.android.ui.gallery.GalleryHiddenScreen
 import app.ownnas.android.ui.gallery.GalleryPersonScreen
@@ -34,19 +38,35 @@ import app.ownnas.android.ui.terminal.TerminalsScreen
 import app.ownnas.android.ui.theme.OwnNasTheme
 
 class MainActivity : ComponentActivity() {
+    /** Bumped each time the backup notification is tapped. */
+    private val showBackup = mutableIntStateOf(0)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        if (savedInstanceState == null) handle(intent)
         setContent {
             OwnNasTheme {
-                App()
+                App(showBackup.intValue)
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handle(intent)
+    }
+
+    private fun handle(intent: Intent?) {
+        if (intent?.action == Backup.SHOW) showBackup.intValue++
     }
 }
 
 @Composable
-private fun App(vm: AppViewModel = viewModel()) {
+private fun App(showBackup: Int, vm: AppViewModel = viewModel()) {
+    LaunchedEffect(showBackup) {
+        if (showBackup > 0 && vm.stack.last() != Screen.Backup) vm.push(Screen.Backup)
+    }
     val screen = vm.stack.last()
     val conflict by vm.conflict.collectAsStateWithLifecycle()
     val saveable = rememberSaveableStateHolder()

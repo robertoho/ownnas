@@ -41,6 +41,8 @@
             </intent-filter>
         </activity>
 
+        <receiver android:name=".data.BackupActions" android:exported="false" />
+
         <!-- Shows signed-in servers in the system file picker and Files app. -->
         <provider
             android:name=".data.OwnNasDocuments"

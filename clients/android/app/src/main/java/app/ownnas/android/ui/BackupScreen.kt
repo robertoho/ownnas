@@ -1,6 +1,25 @@
 package app.ownnas.android.ui
 
 import android.Manifest
+import android.content.Context
+import android.util.Size
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextOverflow
+import app.ownnas.android.data.BackedUpItem
+import app.ownnas.android.data.BackupState
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import android.os.Build
 import android.text.format.DateUtils
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -16,7 +35,10 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.Button
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
@@ -124,19 +146,10 @@ fun BackupScreen(vm: AppViewModel) {
                             FilledTonalButton(onClick = { checked++ }) { Text("Check again") }
                         }
                     }
-                    else -> Card(Modifier.fillMaxWidth()) {
-                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            folder?.let { Text("Saved to “$it/${vm.backup.deviceName()}”", style = MaterialTheme.typography.titleSmall) }
-                            if (state.running) {
-                                Text("Backing up ${state.done} of ${state.total}…")
-                                LinearProgressIndicator(progress = { if (state.total == 0) 0f else state.done.toFloat() / state.total }, modifier = Modifier.fillMaxWidth())
-                            } else {
-                                val last = if (state.lastRun == 0L) "Not backed up yet" else "${DateUtils.getRelativeTimeSpanString(state.lastRun)}: ${state.lastResult.orEmpty()}"
-                                Text(last)
-                            }
-                            Text("${state.backedUp} photos and videos backed up from this phone", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            FilledTonalButton(onClick = { vm.backup.backUpNow() }, enabled = !state.running) { Text("Back up now") }
-                        }
+                    else -> {
+                        StatusCard(vm, settings.paused, state, folder)
+                        StatsCard(state)
+                        RecentCard(vm, state.lastRun, state.backedUp)
                     }
                 }
             }
@@ -162,3 +175,147 @@ private fun SwitchRow(title: String, detail: String, on: Boolean, onChange: (Boo
         Switch(checked = on, onCheckedChange = onChange)
     }
 }
+
+@Composable
+private fun StatusCard(vm: AppViewModel, paused: Boolean, state: BackupState, folder: String?) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            folder?.let { Text("Saved to “$it/${vm.backup.deviceName()}”", style = MaterialTheme.typography.titleSmall) }
+            when {
+                state.running -> {
+                    Text("Backing up ${state.done} of ${state.total}…")
+                    LinearProgressIndicator(progress = { if (state.total == 0) 0f else state.done.toFloat() / state.total }, modifier = Modifier.fillMaxWidth())
+                    state.current?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                }
+                paused -> Text("Backups are paused. Nothing is sent until you resume.")
+                else -> {
+                    val last = if (state.lastRun == 0L) "Not backed up yet" else "${DateUtils.getRelativeTimeSpanString(state.lastRun)}: ${state.lastResult.orEmpty()}"
+                    Text(last)
+                }
+            }
+            Text(
+                buildString {
+                    append("${state.backedUp} photos and videos from this phone are on the server")
+                    if (state.left > 0) append("; ${state.left} still to send")
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (paused) {
+                    Button(onClick = { vm.backup.resume() }) {
+                        Icon(Icons.Filled.PlayArrow, contentDescription = null)
+                        Text("Resume", Modifier.padding(start = 6.dp))
+                    }
+                } else {
+                    FilledTonalButton(onClick = { vm.backup.backUpNow() }, enabled = !state.running) { Text("Back up now") }
+                    OutlinedButton(onClick = { vm.backup.pause() }) {
+                        Icon(Icons.Filled.Pause, contentDescription = null)
+                        Text("Pause", Modifier.padding(start = 6.dp))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatsCard(state: BackupState) {
+    val context = LocalContext.current
+    // Ticks once a second while running, so the elapsed time and speed stay current.
+    var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(state.running) {
+        while (state.running) {
+            now = System.currentTimeMillis()
+            delay(1000)
+        }
+    }
+    val rows = buildList {
+        if (state.running) {
+            val elapsed = (now - state.runStarted).coerceAtLeast(1)
+            add("This run" to "${state.done} of ${state.total} · ${bytes(state.runBytes)} in ${duration(elapsed)}")
+            add("Speed" to speed(state.runBytes, elapsed))
+        } else if (state.lastRun != 0L && state.runStarted != 0L) {
+            add("Last run" to DateUtils.formatDateTime(context, state.runStarted, DateUtils.FORMAT_SHOW_DATE or DateUtils.FORMAT_SHOW_TIME or DateUtils.FORMAT_ABBREV_MONTH))
+            add("Took" to duration(state.lastDurationMs))
+            add("Sent" to "${state.lastSent} new · ${bytes(state.lastBytes)}")
+            if (state.lastBytes > 0) add("Speed" to speed(state.lastBytes, state.lastDurationMs))
+        }
+        add("On the server" to "${state.backedUp} photos and videos")
+        if (state.totalSent > 0) add("Sent in total" to "${state.totalSent} · ${bytes(state.totalBytes)}")
+    }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Statistics", style = MaterialTheme.typography.titleSmall)
+            for ((label, value) in rows) {
+                Row(Modifier.fillMaxWidth()) {
+                    Text(label, Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(value)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RecentCard(vm: AppViewModel, lastRun: Long, backedUp: Int) {
+    val context = LocalContext.current
+    var items by remember { mutableStateOf<List<BackedUpItem>>(emptyList()) }
+    LaunchedEffect(lastRun, backedUp / 10) {
+        items = withContext(Dispatchers.IO) { vm.backup.recent().take(200) }
+    }
+    if (items.isEmpty()) return
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(vertical = 10.dp)) {
+            Text("Recently backed up", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp))
+            for (item in items) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    LocalThumb(context, item)
+                    Column(Modifier.weight(1f).padding(start = 12.dp)) {
+                        Text(item.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            "${bytes(item.size)} · ${DateUtils.getRelativeTimeSpanString(item.at)}${if (item.skipped) " · already on the server" else ""}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LocalThumb(context: Context, item: BackedUpItem) {
+    var bitmap by remember(item.uri) { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(item.uri) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            bitmap = withContext(Dispatchers.IO) {
+                runCatching { context.contentResolver.loadThumbnail(item.uri, Size(144, 144), null).asImageBitmap() }.getOrNull()
+            }
+        }
+    }
+    val modifier = Modifier.size(48.dp).clip(RoundedCornerShape(6.dp)).background(MaterialTheme.colorScheme.surfaceVariant)
+    bitmap?.let { Image(it, contentDescription = null, modifier = modifier, contentScale = ContentScale.Crop) } ?: Box(modifier)
+}
+
+private fun bytes(n: Long): String {
+    if (n < 1024) return "$n B"
+    var value = n.toDouble()
+    for (unit in listOf("KB", "MB", "GB", "TB")) {
+        value /= 1024
+        if (value < 1024 || unit == "TB") return if (value < 10) "%.1f %s".format(value, unit) else "%.0f %s".format(value, unit)
+    }
+    return "$n B"
+}
+
+private fun duration(ms: Long): String {
+    val s = ms / 1000
+    return when {
+        s < 60 -> "${s}s"
+        s < 3600 -> "${s / 60}m ${s % 60}s"
+        else -> "${s / 3600}h ${s / 60 % 60}m"
+    }
+}
+
+private fun speed(bytes: Long, ms: Long): String = "${bytes(bytes * 1000 / ms.coerceAtLeast(1))}/s"
