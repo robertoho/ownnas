@@ -55,6 +55,8 @@ export function mountGallery(root, ctx) {
   let statusTimer = 0;
   let generation = 0;
   let current = null; // the album shown, if any
+  let cardAlbums = new Map(); // id -> the albums shown as cards
+  let menu = null;
 
   const tabs = el("nav", { class: "gallery-tabs", "aria-label": "Gallery sections" });
   for (const [tab, label] of [["photos", "Photos"], ["albums", "Albums"], ["tags", "Tags"]]) {
@@ -268,6 +270,7 @@ export function mountGallery(root, ctx) {
       if (stale(mine)) return;
       current = data.album;
       items = data.items;
+      cardAlbums = new Map(data.albums.map((album) => [album.id, album]));
       status.textContent = current ? `${plural(current.count, "photo")}${current.albums ? ` · ${plural(current.albums, "album")}` : ""}` : plural(data.albums.length, "album");
       renderAlbumActions();
       const crumbs = el("nav", { class: "gallery-crumbs", "aria-label": "Album path" },
@@ -296,7 +299,7 @@ export function mountGallery(root, ctx) {
       ? el("img", { src: thumbUrl({ path: album.cover }), alt: "", loading: "lazy" })
       : el("span", { class: "gallery-album-empty", "aria-hidden": "true" }, "▢");
     const detail = [album.count ? plural(album.count, "photo") : "", album.albums ? plural(album.albums, "album") : ""].filter(Boolean).join(" · ") || "Empty";
-    return el("a", { class: "gallery-album", href: `#gallery/albums/${album.id}` },
+    return el("a", { class: "gallery-album", href: `#gallery/albums/${album.id}`, "data-album": String(album.id) },
       el("span", { class: "gallery-album-cover" }, cover),
       el("strong", {}, album.name),
       el("span", { class: "muted" }, detail));
@@ -308,9 +311,9 @@ export function mountGallery(root, ctx) {
     actions.append(el("button", { type: "button", onclick: () => newAlbum(current ? current.id : null) }, current ? "New album inside" : "New album"));
     if (!current) return;
     actions.append(
-      el("button", { type: "button", onclick: renameAlbum }, "Rename"),
-      el("button", { type: "button", onclick: moveAlbum }, "Move…"),
-      el("button", { type: "button", class: "danger", onclick: deleteAlbum }, "Delete album"),
+      el("button", { type: "button", onclick: () => renameAlbum() }, "Rename"),
+      el("button", { type: "button", onclick: () => moveAlbum() }, "Move…"),
+      el("button", { type: "button", class: "danger", onclick: () => deleteAlbum() }, "Delete album"),
     );
   }
 
@@ -327,38 +330,37 @@ export function mountGallery(root, ctx) {
     }
   }
 
-  async function renameAlbum() {
-    const name = await ctx.askText("Rename album", "Name", current.name, "Rename");
-    if (name === null || !name.trim() || name.trim() === current.name) return;
+  async function renameAlbum(album = current) {
+    const name = await ctx.askText("Rename album", "Name", album.name, "Rename");
+    if (name === null || !name.trim() || name.trim() === album.name) return;
     try {
-      await ctx.api("/api/albums", { method: "PATCH", json: { id: current.id, name: name.trim() } });
-      showAlbums(current.id);
+      await ctx.api("/api/albums", { method: "PATCH", json: { id: album.id, name: name.trim() } });
+      showAlbums(route.id);
     } catch (err) {
       ctx.toast(err.message, true);
     }
   }
 
-  async function moveAlbum() {
-    const album = current;
+  async function moveAlbum(album = current) {
     const target = await chooseAlbum({ title: `Move “${album.name}” into…`, ok: "Move here", top: true, exclude: album.id });
     if (target === undefined) return;
     try {
       await ctx.api("/api/albums", { method: "PATCH", json: { id: album.id, move: true, parentId: target } });
       ctx.toast(target === null ? `Moved “${album.name}” to the top` : "Album moved");
-      showAlbums(album.id);
+      showAlbums(route.id);
     } catch (err) {
       ctx.toast(err.message, true);
     }
   }
 
-  async function deleteAlbum() {
-    const album = current;
+  async function deleteAlbum(album = current) {
     const inside = album.albums ? ` and the ${plural(album.albums, "album")} inside it` : "";
     if (!(await ctx.askConfirm(`Delete the album “${album.name}”${inside}? The photos stay where they are; only the album goes.`, "Delete album"))) return;
     try {
       await ctx.api(`/api/albums?id=${album.id}`, { method: "DELETE" });
       ctx.toast(`Deleted the album “${album.name}”`);
-      location.hash = album.parentId ? `#gallery/albums/${album.parentId}` : "#gallery/albums";
+      if (current && album.id === current.id) location.hash = album.parentId ? `#gallery/albums/${album.parentId}` : "#gallery/albums";
+      else showAlbums(route.id);
     } catch (err) {
       ctx.toast(err.message, true);
     }
@@ -384,6 +386,116 @@ export function mountGallery(root, ctx) {
       ctx.toast(err.message, true);
     }
   }
+
+  // ---- Context menus ----
+
+  function closeMenu() {
+    if (!menu) return;
+    menu.remove();
+    menu = null;
+    document.removeEventListener("pointerdown", onOutside, true);
+    document.removeEventListener("keydown", onMenuKey, true);
+    window.removeEventListener("blur", closeMenu);
+    root.removeEventListener("scroll", closeMenu);
+  }
+
+  function onOutside(event) {
+    if (menu && !menu.contains(event.target)) closeMenu();
+  }
+
+  function onMenuKey(event) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeMenu();
+    }
+  }
+
+  /// A menu like the file browser's: `entries` are {label, icon, run, danger}; falsy ones are skipped.
+  function openMenu(x, y, label, entries) {
+    closeMenu();
+    menu = el("div", { class: "menu gallery-menu", role: "menu" }, label ? el("div", { class: "menu-label" }, label) : null);
+    for (const entry of entries.filter(Boolean)) {
+      const button = el("button", { type: "button", role: "menuitem", "data-menu": entry.icon, class: entry.danger ? "danger" : null }, entry.label);
+      button.addEventListener("click", () => {
+        closeMenu();
+        entry.run();
+      });
+      menu.append(button);
+    }
+    document.body.append(menu);
+    ctx.decorateMenu(menu);
+    const rect = menu.getBoundingClientRect();
+    menu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - rect.width - 8))}px`;
+    menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - rect.height - 8))}px`;
+    document.addEventListener("pointerdown", onOutside, true);
+    document.addEventListener("keydown", onMenuKey, true);
+    window.addEventListener("blur", closeMenu);
+    root.addEventListener("scroll", closeMenu, { once: true });
+    menu.querySelector("button")?.focus();
+  }
+
+  function photoMenu(event, item) {
+    // A right-click on a selected photo acts on the whole selection; otherwise on that photo.
+    const picked = selected.has(item.path) ? selectedItems() : [item];
+    const present = picked.filter((entry) => !entry.missing);
+    const paths = present.map((entry) => entry.path);
+    const one = picked.length === 1 ? picked[0] : null;
+    const write = ctx.canWrite();
+    openMenu(event.clientX, event.clientY, one ? nameOf(one.path) : `${number(picked.length)} photos`, [
+      one && !one.missing && { label: "Open", icon: "open", run: () => ctx.openPreview(one, items.filter((entry) => !entry.missing)) },
+      write && paths.length && { label: "Add to album…", icon: "addToAlbum", run: () => pickAlbum(paths) },
+      write && paths.length && { label: "Tag…", icon: "bulkTag", run: () => ctx.tag(paths) },
+      paths.length && { label: "Download", icon: "download", run: () => ctx.download(paths) },
+      one && !one.missing && { label: "Show in folder", icon: "folder", run: () => ctx.showInFolder(one.path) },
+      !one || selected.has(one.path) ? { label: "Clear selection", icon: "close", run: clearSelection } : { label: "Select", icon: "check", run: () => { selected.add(one.path); paintSelection(); } },
+      write && current && one && !one.missing && { label: "Use as album cover", icon: "cover", run: () => setCover(one.path) },
+      write && current && { label: picked.length === 1 ? "Remove from album" : `Remove ${number(picked.length)} from album`, icon: "removeFromAlbum", danger: true, run: () => removeFromAlbum(picked.map((entry) => entry.path)) },
+    ]);
+  }
+
+  function albumMenu(event, album) {
+    const write = ctx.canWrite();
+    openMenu(event.clientX, event.clientY, album.name, [
+      { label: "Open", icon: "open", run: () => { location.hash = `#gallery/albums/${album.id}`; } },
+      write && { label: "New album inside…", icon: "newAlbum", run: () => newAlbum(album.id) },
+      write && { label: "Rename…", icon: "rename", run: () => renameAlbum(album) },
+      write && { label: "Move…", icon: "move", run: () => moveAlbum(album) },
+      write && { label: "Delete album", icon: "delete", danger: true, run: () => deleteAlbum(album) },
+    ]);
+  }
+
+  function spaceMenu(event) {
+    const write = ctx.canWrite();
+    openMenu(event.clientX, event.clientY, current ? current.name : "Albums", [
+      write && { label: current ? "New album inside…" : "New album…", icon: "newAlbum", run: () => newAlbum(current ? current.id : null) },
+      items.length && { label: "Select all", icon: "check", run: () => { selected = new Set(items.map((item) => item.path)); paintSelection(); } },
+      write && current && { label: "Rename…", icon: "rename", run: () => renameAlbum() },
+      write && current && { label: "Move…", icon: "move", run: () => moveAlbum() },
+      current && current.parentId !== null && { label: "Open the album above", icon: "open", run: () => { location.hash = `#gallery/albums/${current.parentId}`; } },
+      write && current && { label: "Delete album", icon: "delete", danger: true, run: () => deleteAlbum() },
+    ]);
+  }
+
+  root.addEventListener("contextmenu", (event) => {
+    if (event.target.closest(".gallery-head, .gallery-selection, input, textarea")) return;
+    const tileNode = event.target.closest(".gallery-tile");
+    const card = event.target.closest(".gallery-album");
+    if (tileNode) {
+      const item = items[Number(tileNode.dataset.index)];
+      if (!item) return;
+      event.preventDefault();
+      photoMenu(event, item);
+    } else if (card) {
+      const album = cardAlbums.get(Number(card.dataset.album));
+      if (!album) return;
+      event.preventDefault();
+      albumMenu(event, album);
+    } else if (route.tab === "albums") {
+      event.preventDefault();
+      spaceMenu(event);
+    }
+  });
 
   // ---- Choosing an album (to add photos to, or to move an album into) ----
 
@@ -568,6 +680,7 @@ export function mountGallery(root, ctx) {
   }
 
   function hide() {
+    closeMenu();
     root.hidden = true;
     generation++;
     observer?.disconnect();

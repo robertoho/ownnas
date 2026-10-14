@@ -874,6 +874,10 @@ const MENU_ICONS = {
   library: "M2.5 2.5h3v11h-3z M6.5 2.5h3v11h-3z M10.5 3.5l3 1v9l-3-1z",
   gallery: "M2.5 3h11a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z M1.5 10.5l3.5-3.5 3 3 2-2 4.5 4 M10.5 5.5h.01",
   addToAlbum: "M1.5 4.5h9a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-8a1 1 0 0 1-1-1z M3.5 2.5h9.5a1 1 0 0 1 1 1V10 M6 7v4 M4 9h4",
+  newAlbum: "M1.5 4.5h9a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-8a1 1 0 0 1-1-1z M3.5 2.5h9.5a1 1 0 0 1 1 1V10 M6 7v4 M4 9h4",
+  removeFromAlbum: "M1.5 4.5h9a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-8a1 1 0 0 1-1-1z M3.5 2.5h9.5a1 1 0 0 1 1 1V10 M4 9h4",
+  cover: "M2.5 3h11a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z M1.5 10.5l3.5-3.5 3 3 2-2 4.5 4 M10.5 5.5h.01",
+  check: "M3 8.5l3 3 7-7",
   bookmark: "M4 2.5h8v11l-4-2.5-4 2.5z",
   usage: `${ICON_FOLDER} M4.5 9.25h7v2.5h-7z M4.75 10.5h3.75`,
   duplicates: "M2.5 3.5h6v6h-6z M7.5 6.5h6v6h-6z",
@@ -1506,6 +1510,7 @@ async function gallery() {
       download: (paths) => downloadEntries(paths.map((path) => toEntry({ path }))).catch((err) => toast(err.message, true)),
       tag: (paths) => bulkTagEntries(paths.map((path) => toEntry({ path }))).catch((err) => toast(err.message, true)),
       showInFolder: (path) => openFileByPath(path).catch((err) => toast(err.message, true)),
+      decorateMenu: (menu) => decorateMenu(menu),
     });
   }
   return galleryApi;
