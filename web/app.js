@@ -1263,7 +1263,7 @@ function syncTerminalButton() {
 // Page-wide shortcuts: ⇧⌘ and a key on Macs, Ctrl+Shift elsewhere. Terminals forward them
 // too (terminal.js), so they work wherever the keyboard is.
 const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
-const PAGE_SHORTCUTS = { KeyK: "shortcuts", KeyL: "tiling", KeyE: "new-terminal" };
+const PAGE_SHORTCUTS = { KeyK: "shortcuts", KeyL: "terminals", KeyE: "new-terminal" };
 const TILE_MOVES = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
 
 function shortcutLabel(key) {
@@ -1292,7 +1292,7 @@ function runShortcut(name) {
     toast("Terminals are turned off. An admin can turn them on in Settings.", true);
     return;
   }
-  if (name === "tiling") terminalPanel().then((module) => module.toggleTiling()).catch((err) => toast(err.message, true));
+  if (name === "terminals") terminalPanel().then((module) => module.toggle()).catch((err) => toast(err.message, true));
   if (name === "new-terminal") openTerminalAt(inTrashPath(state.path) ? "" : state.path);
   if (name.startsWith("focus-")) terminalPanel().then((module) => module.moveFocus(name.slice(6))).catch(() => {});
 }
@@ -1315,10 +1315,9 @@ function showShortcuts() {
   const groups = [
     ["Layout and terminals", [
       [shortcutLabel("K"), "Show these shortcuts"],
-      terminal && [shortcutLabel("L"), "Tiling layout: files beside every terminal"],
+      terminal && [`${shortcutLabel("L")}, Ctrl+\``, "Show or hide the terminals, tiled beside the files"],
       terminal && [shortcutLabel("E"), "New terminal in this folder"],
-      terminal && [IS_MAC ? "⇧⌘ ← ↑ ↓ →" : "Ctrl+Shift+arrows", "Move between tiles (tiling layout)"],
-      terminal && ["Ctrl+`", "Show or hide the terminals"],
+      terminal && [IS_MAC ? "⇧⌘ ← ↑ ↓ →" : "Ctrl+Shift+arrows", "Move between the files and the terminals"],
     ]],
     ["Files", [
       ["Type", "Filter this folder"],

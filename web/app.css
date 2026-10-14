@@ -2730,8 +2730,7 @@ dialog { color: var(--text); }
 .terminals-tile[hidden] { display: none; }
 @media (min-width: 821px) {
   body.is-tiled .app { margin-right: var(--tiles-width, 60vw); }
-  .terminals.is-tiled, .terminals.is-tiled.is-wide { width: var(--tiles-width, 60vw); border-left: 1px solid var(--line); box-shadow: none; z-index: 20; }
-  .terminals.is-tiled .terminals-wide-btn { display: none; }
+  .terminals.is-tiled { width: var(--tiles-width, 60vw); border-left: 1px solid var(--line); box-shadow: none; z-index: 20; }
   .terminals.is-tiled .terminals-resize {
     display: block;
     position: absolute;
@@ -2800,7 +2799,6 @@ dialog { color: var(--text); }
   white-space: nowrap;
 }
 #shortcuts-dialog form { margin-top: 1rem; display: flex; justify-content: flex-end; }
-.terminals.is-wide { width: 100vw; border-left: 0; }
 .terminals-bar {
   display: flex;
   gap: 0.5rem;
@@ -2960,9 +2958,7 @@ button.linkish {
   .terminals-overview-btn,
   .terminals-actions [data-action="new"],
   .terminals-actions [data-action="popout"],
-  .terminals-actions [data-action="end"],
-  .terminals-wide-btn,
-  .terminals-tile-btn { display: none; }
+  .terminals-actions [data-action="end"] { display: none; }
   .terminals-more-btn { display: inline-flex; min-width: 2.6rem; justify-content: center; font-size: 1.1rem; }
   .terminals-tabs { scrollbar-width: none; }
   .terminals-tabs::-webkit-scrollbar { display: none; }

@@ -163,7 +163,7 @@ term.onData((data) => {
 });
 // The page's ⇧⌘ shortcuts (Ctrl+Shift elsewhere); arrows only move between tiles while tiled.
 const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
-const PAGE_SHORTCUTS = { KeyK: "shortcuts", KeyL: "tiling", KeyE: "new-terminal" };
+const PAGE_SHORTCUTS = { KeyK: "shortcuts", KeyL: "terminals", KeyE: "new-terminal" };
 const TILE_MOVES = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
 let tiled = false;
 

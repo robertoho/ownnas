@@ -12,7 +12,7 @@ let stream = null;
 let streamRetry = 0;
 let streamTimer = 0;
 const frames = new Map(); // id -> tile: a header and the terminal's iframe
-let tiled = false; // the tiling layout: files beside a grid of every terminal
+let tiled = false; // while showing on a wide screen: the files beside a grid of every terminal
 let focusOnLoad = ""; // a terminal to give the keyboard once its page has loaded
 const shownAttention = new Map(); // id -> attention text already announced
 
@@ -65,12 +65,10 @@ function build() {
   const add = el("button", { type: "button", "data-action": "new", title: "New terminal in the folder you are browsing" }, "New");
   const popout = el("button", { type: "button", "data-action": "popout", title: "Open this terminal in its own browser tab" }, "Pop out");
   const end = el("button", { type: "button", "data-action": "end", class: "danger", title: "Stop the shell and everything running in it" }, "Close");
-  const hide = el("button", { type: "button", "data-action": "hide", title: "Hide the panel (Ctrl+`). Terminals keep running." }, "Hide");
-  const wide = el("button", { type: "button", "data-action": "wide", class: "terminals-wide-btn", "aria-pressed": "false" }, "Expand");
-  const tile = el("button", { type: "button", "data-action": "tile", class: "terminals-tile-btn", "aria-pressed": "false", title: `Files beside every terminal (${ctx.shortcutLabel("L")})` }, "Tile");
+  const hide = el("button", { type: "button", "data-action": "hide", title: `Hide the panel (${ctx.shortcutLabel("L")} or Ctrl+\`). Terminals keep running.` }, "Hide");
   // On phones the other buttons move into this menu, leaving one row for the tabs.
   const more = el("button", { type: "button", "data-action": "more", class: "terminals-more-btn", "aria-label": "More terminal actions", "aria-haspopup": "menu" }, "⋯");
-  actions.append(add, popout, end, tile, wide, more, hide);
+  actions.append(add, popout, end, more, hide);
   bar.append(overview, tabs, actions);
 
   const strip = el("div", { class: "terminals-agent", hidden: true });
@@ -98,15 +96,13 @@ function build() {
     window.visualViewport.addEventListener("resize", fitToViewport);
     window.visualViewport.addEventListener("scroll", fitToViewport);
   }
-  wide.addEventListener("click", () => setWide(!panel.classList.contains("is-wide")));
-  tile.addEventListener("click", () => setTiled(!tiled).catch((err) => ctx.toast(err.message, true)));
   resize.addEventListener("pointerdown", startResize);
+  // Phones get the full-screen panel with one terminal at a time instead of tiles.
   narrow.addEventListener("change", () => {
-    if (narrow.matches && tiled) setTiled(false);
+    if (!panel.hidden) setTiled(!narrow.matches);
   });
   // When the page itself takes the keyboard back, no terminal tile has it.
   window.addEventListener("focus", () => markFocused(""));
-  setWide(storedWide());
   panel.addEventListener("click", (event) => {
     const file = event.target.closest("[data-open-file]");
     if (file) {
@@ -143,28 +139,6 @@ function build() {
     const item = sessions.find((session) => session.id === active);
     if (panelVisible() && view === "terminal" && item && item.agent && item.agent.attention) markSeen(item.id);
   });
-}
-
-const WIDE_KEY = "ownnas-terminals-wide";
-
-function storedWide() {
-  try {
-    return localStorage.getItem(WIDE_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
-
-/// Full-width panel, or the default side panel. Remembered in this browser.
-function setWide(on) {
-  panel.classList.toggle("is-wide", on);
-  const button = panel.querySelector('[data-action="wide"]');
-  button.textContent = on ? "Collapse" : "Expand";
-  button.title = on ? "Make the panel narrower so the files show beside it" : "Make the panel full width";
-  button.setAttribute("aria-pressed", on ? "true" : "false");
-  try {
-    localStorage.setItem(WIDE_KEY, on ? "1" : "0");
-  } catch {}
 }
 
 function renderTabs() {
@@ -468,7 +442,7 @@ function markFocused(id) {
   for (const [tileId, tile] of frames) tile.classList.toggle("is-focused", tileId === id);
 }
 
-const TILED_KEY = "ownnas-terminals-tiled";
+const OPEN_KEY = "ownnas-terminals-open";
 const TILES_WIDTH_KEY = "ownnas-terminals-tiles-width";
 const narrow = window.matchMedia("(max-width: 820px)");
 
@@ -493,29 +467,17 @@ function applyTilesWidth(fraction) {
 }
 
 /// The tiling layout: the files on the left, every terminal in a grid on the right.
-async function setTiled(on) {
-  if (on && narrow.matches) {
-    ctx.toast("The tiling layout needs a wider window", true);
-    return;
-  }
-  if (on && panel.hidden) {
-    if (!(await refresh())) return;
-    view = "terminal";
-    showPanel();
-  }
+function setTiled(on) {
+  const changed = tiled !== on;
   tiled = on;
-  store(TILED_KEY, on ? "1" : "0");
-  applyTilesWidth(stored(TILES_WIDTH_KEY));
+  if (on) applyTilesWidth(stored(TILES_WIDTH_KEY));
   panel.classList.toggle("is-tiled", on);
   document.body.classList.toggle("is-tiled", on);
-  const button = panel.querySelector('[data-action="tile"]');
-  button.setAttribute("aria-pressed", on ? "true" : "false");
-  button.textContent = on ? "Untile" : "Tile";
-  if (on) view = "terminal";
+  if (!changed) return;
   for (const tile of frames.values()) {
     tile.querySelector("iframe").contentWindow?.postMessage({ type: "ownnas-terminal-tiled", on }, location.origin);
   }
-  activate(active);
+  if (!panel.hidden && view === "terminal") activate(active);
 }
 
 /// Dragging the panel's left edge in the tiling layout.
@@ -815,6 +777,8 @@ function fitToViewport() {
 function showPanel() {
   panel.hidden = false;
   document.body.classList.add("terminals-open");
+  store(OPEN_KEY, "1");
+  setTiled(!narrow.matches);
   fitToViewport();
   if (view === "terminal") activate(active);
   else render();
@@ -822,14 +786,8 @@ function showPanel() {
 
 function hidePanel() {
   closeTabMenu();
-  if (tiled) {
-    tiled = false;
-    store(TILED_KEY, "0");
-    panel.classList.remove("is-tiled");
-    document.body.classList.remove("is-tiled");
-    panel.querySelector('[data-action="tile"]').setAttribute("aria-pressed", "false");
-    panel.querySelector('[data-action="tile"]').textContent = "Tile";
-  }
+  store(OPEN_KEY, "0");
+  setTiled(false);
   const hadFocus = panel.contains(document.activeElement);
   panel.hidden = true;
   document.body.classList.remove("terminals-open");
@@ -880,8 +838,8 @@ export async function open(path) {
   await openTerminal(path);
 }
 
-export async function toggleTiling() {
-  await setTiled(!tiled);
+export function toggle() {
+  togglePanel();
 }
 
 export function moveFocus(direction) {
@@ -903,8 +861,11 @@ export async function background() {
     const config = await ctx.api("/api/terminal/config");
     if (config.enabled && (!config.passwordSet || config.unlocked)) {
       watch();
-      // Come back to the tiling layout after a reload.
-      if (stored(TILED_KEY) === "1" && !narrow.matches) await setTiled(true);
+      // Come back to the terminals after a reload.
+      if (stored(OPEN_KEY) === "1" && !narrow.matches && panel.hidden && (await refresh())) {
+        view = "terminal";
+        showPanel();
+      }
     }
   } catch {}
 }

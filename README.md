@@ -105,12 +105,12 @@ files. It is off by default: turn it on in **Settings → Terminal**.
   the right-click menu (**Terminals**) on any device; recent output (up to 2 MB) is replayed.
   **Pop out** opens one in its own browser tab, and phones get a row of Esc/Tab/Ctrl/arrow keys.
 - Right-click (or long-press) a terminal tab to rename, duplicate, or close it, or to show its
-  current folder in the file browser (**Show folder** does the same). **Expand** makes the
-  panel full width. **Ctrl+`** (the key left of 1) hides the panel and brings it back.
-- **Tile** (**⇧⌘L**, or Ctrl+Shift+L off a Mac) puts the files on the left and every terminal
-  in a grid beside them; drag the edge between them to resize. **⇧⌘E** opens a terminal in
-  the folder you are browsing, and **⇧⌘ + arrows** move the keyboard between tiles. **⇧⌘K**
-  lists every keyboard shortcut. They work from inside a terminal too.
+  current folder in the file browser (**Show folder** does the same).
+- The panel sits beside the files, with every terminal tiled in a grid; drag the edge between
+  them to resize. **⇧⌘L** (Ctrl+Shift+L off a Mac) or **Ctrl+`** shows and hides it, **⇧⌘E**
+  opens a terminal in the folder you are browsing, **⇧⌘ + arrows** move the keyboard between
+  the files and the terminals, and **⇧⌘K** lists every keyboard shortcut. They work from
+  inside a terminal too.
 - On phones the panel keeps one row of tabs, with everything else under **⋯**, and follows
   the on-screen keyboard. The key row has Esc, Tab, Shift+Tab, sticky Ctrl and Alt (they also
   modify arrows, Home/End, and PgUp/PgDn), Paste (images too), **Select** (the output as text
