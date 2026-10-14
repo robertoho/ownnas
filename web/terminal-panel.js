@@ -146,7 +146,7 @@ function build() {
       const item = sessions.find((session) => session.id === event.data.id);
       if (item) cleanEnded([{ ...item, running: false, exitCode: event.data.code }]);
     }
-    if (event.data.type === "shortcut") ctx.runShortcut(event.data.name);
+    if (event.data.type === "shortcut") ctx.runShortcut(event.data.name, "terminal");
     if (event.data.type === "focused" && event.data.id) {
       markFocused(event.data.id);
       if (event.data.id !== active && sessions.some((item) => item.id === event.data.id)) {

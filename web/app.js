@@ -1269,7 +1269,7 @@ function setPreviewFullscreen(on) {
   const btn = $("preview-expand");
   preview.classList.toggle("is-fullscreen", !!on);
   btn.setAttribute("aria-pressed", on ? "true" : "false");
-  btn.title = on ? "Collapse preview" : "Expand preview";
+  btn.title = `${on ? "Collapse preview" : "Expand preview"} (${shortcutLabel("↵")})`;
   btn.setAttribute("aria-label", on ? "Collapse preview" : "Expand preview");
 }
 
@@ -1314,7 +1314,7 @@ async function terminalPanel() {
       askText,
       askConfirm,
       currentPath: () => state.path,
-      runShortcut: (name) => runShortcut(name),
+      runShortcut: (name, from) => runShortcut(name, from),
       shortcutLabel: (key) => shortcutLabel(key),
       selectLabel: (number) => selectLabel(number),
       focusFiles: () => $("files").focus({ preventScroll: true }),
@@ -1384,10 +1384,16 @@ function pageShortcut(event) {
   return "";
 }
 
-function runShortcut(name) {
+/// `from` is "terminal" when a terminal passed the keys on.
+function runShortcut(name, from = "") {
   if (!state.me || $("app-view").hidden) return;
   if (name === "shortcuts") {
     showShortcuts();
+    return;
+  }
+  // ⇧⌘↵ outside a terminal expands (or collapses) the open preview.
+  if (name === "expand-terminal" && from !== "terminal" && !$("preview").hidden) {
+    setPreviewFullscreen(!$("preview").classList.contains("is-fullscreen"));
     return;
   }
   if (!state.me.terminal) {
@@ -1423,7 +1429,7 @@ function showShortcuts() {
       [shortcutLabel("K"), "Show these shortcuts"],
       terminal && [`${shortcutLabel("L")}, Ctrl+\``, "Show or hide the terminals, tiled beside the files"],
       terminal && [shortcutLabel("E"), "New terminal in this folder"],
-      terminal && [shortcutLabel("↵"), "Expand this terminal to fill the space, or put it back"],
+      [shortcutLabel("↵"), terminal ? "Expand the preview, or the terminal you are typing in; again to put it back" : "Expand the preview, or put it back"],
       terminal && [shortcutLabel("U"), "Hide this terminal (it keeps running; its tab brings it back)"],
       terminal && [shortcutLabel("X"), "Close this terminal and stop what runs in it"],
       terminal && [IS_MAC ? "⇧⌘ ← ↑ ↓ →" : "Ctrl+Shift+arrows", "Move between the files and the terminals"],
@@ -3891,6 +3897,7 @@ $("preview-close").addEventListener("click", () => {
 $("preview-expand").addEventListener("click", () => {
   setPreviewFullscreen(!$("preview").classList.contains("is-fullscreen"));
 });
+setPreviewFullscreen(false);
 
 $("preview-body").addEventListener("click", (event) => {
   const button = event.target.closest("[data-editor]");
