@@ -3484,5 +3484,20 @@ body.is-gallery .app > .explorer-status-bar { display: none; }
 .person-picker-row:hover { background: var(--bg-3); }
 .person-picker-row .gallery-person-face { width: 72px; }
 .person-picker .spacer { flex: 1; }
-.backup-form { display: flex; gap: 0.5rem; margin: 0.6rem 0; }
-.backup-form input { flex: 1; min-width: 0; }
+
+.backup-choice { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin: 0.6rem 0; padding: 0.6rem 0.75rem; border: 1px solid var(--line); border-radius: 12px; background: var(--bg-2); }
+.backup-folder-icon { display: inline-flex; color: var(--accent); }
+.backup-folder-label { flex: 1 1 10rem; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
+.folder-picker { width: min(520px, calc(100vw - 2rem)); display: grid; gap: 0.6rem; }
+.folder-picker:not([open]) { display: none; }
+.folder-picker-crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 0.2rem; }
+.folder-picker-crumbs button { border: 0; background: transparent; padding: 0.2rem 0.4rem; border-radius: 6px; color: var(--accent); }
+.folder-picker-crumbs button:last-of-type { color: var(--text); font-weight: 600; }
+.folder-picker-list { display: grid; gap: 2px; min-height: 12rem; max-height: min(55vh, 26rem); overflow: auto; padding: 0.25rem; border: 1px solid var(--line); border-radius: 10px; align-content: start; }
+.folder-picker-list p { margin: 0.8rem; }
+.folder-picker-row { display: flex; align-items: center; gap: 0.6rem; width: 100%; padding: 0.5rem 0.6rem; border: 0; border-radius: 8px; background: transparent; text-align: left; justify-content: flex-start; }
+.folder-picker-row:hover { background: var(--bg-3); }
+.folder-picker-row svg { color: var(--accent); flex: 0 0 auto; }
+.folder-picker-row span:nth-of-type(1) { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.folder-picker-open { color: var(--muted); }
+.folder-picker .spacer { flex: 1; }

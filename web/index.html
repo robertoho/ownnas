@@ -349,11 +349,15 @@
       <button id="index-rescan" type="button">Rescan the library now</button>
       <div class="smart-settings">
         <h3>Phone backups</h3>
-        <p class="muted">The OwnNAS phone app can back up a phone’s photos and videos here, each phone in its own folder, by year and month. Leave it empty to turn phone backups off.</p>
-        <form id="backup-form" class="backup-form">
-          <input id="backup-folder" type="text" placeholder="Media upload folder, for example Phone backups" autocomplete="off" aria-label="Media upload folder">
-          <button type="submit">Save</button>
-        </form>
+        <p class="muted">The OwnNAS phone app can back up a phone’s photos and videos to a folder here, each phone in its own folder, by year and month.</p>
+        <div class="backup-choice">
+          <span class="backup-folder-icon" aria-hidden="true">
+            <svg viewBox="0 0 16 16" width="18" height="18"><path d="M1.5 4.5h4l1.2 1.5H14.5v7.5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-8a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+          </span>
+          <span id="backup-folder-label" class="backup-folder-label">Off</span>
+          <button id="backup-choose" type="button">Choose folder…</button>
+          <button id="backup-off" type="button" hidden>Turn off</button>
+        </div>
       </div>
       <div id="smart-settings" class="smart-settings" hidden>
         <h3>Smart features</h3>

@@ -1369,7 +1369,7 @@ async function refreshIndexSettings() {
     api("/api/backup").catch(() => ({ folder: null })),
   ]);
   renderSmartSettings(smart);
-  if (document.activeElement !== $("backup-folder")) $("backup-folder").value = backup.folder || "";
+  renderBackupFolder(backup.folder);
   for (const input of document.querySelectorAll('input[name="index-speed"]')) input.checked = input.value === data.speed;
   $("index-status").textContent = describeIndexStatus(data.status);
   clearTimeout(indexStatusTimer);
@@ -1404,16 +1404,128 @@ for (const [id, key] of [["smart-search", "search"], ["smart-faces", "faces"]]) 
   });
 }
 
-$("backup-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
+function renderBackupFolder(folder) {
+  const label = $("backup-folder-label");
+  label.textContent = folder ? libraryPath(folder) : "Off: no media upload folder";
+  label.classList.toggle("muted", !folder);
+  $("backup-choose").textContent = folder ? "Change…" : "Choose folder…";
+  $("backup-off").hidden = !folder;
+  $("backup-choose").dataset.folder = folder || "";
+}
+
+async function saveBackupFolder(folder) {
   try {
-    const data = await api("/api/backup", { method: "POST", json: { folder: $("backup-folder").value } });
-    $("backup-folder").value = data.folder || "";
+    const data = await api("/api/backup", { method: "POST", json: { folder } });
+    renderBackupFolder(data.folder);
     toast(data.folder ? `Phones back up to “${data.folder}”` : "Phone backups are off");
   } catch (err) {
     toast(err.message, true);
   }
+}
+
+$("backup-choose").addEventListener("click", async () => {
+  const folder = await pickFolder({ title: "Media upload folder", ok: "Use this folder", start: $("backup-choose").dataset.folder || "" });
+  if (folder === null) return;
+  if (!folder) {
+    toast("Choose a folder inside the library, not the library itself", true);
+    return;
+  }
+  await saveBackupFolder(folder);
 });
+
+$("backup-off").addEventListener("click", async () => {
+  if (!(await askConfirm("Turn phone backups off? Photos already backed up stay where they are; phones stop sending new ones.", "Turn off"))) return;
+  await saveBackupFolder("");
+});
+
+/// A dialog to pick a folder in the library: browse into folders, go back up with the path at
+/// the top, or make a new one. Resolves with the folder's path ("" for the library itself), or
+/// null when cancelled.
+function pickFolder({ title = "Choose a folder", ok = "Choose", start = "" } = {}) {
+  return new Promise((resolve) => {
+    const dialog = document.createElement("dialog");
+    dialog.className = "folder-picker";
+    dialog.innerHTML = `
+      <h3></h3>
+      <nav class="folder-picker-crumbs" aria-label="Folder"></nav>
+      <div class="folder-picker-list" role="listbox" aria-label="Folders"></div>
+      <div class="dialog-actions">
+        <button type="button" data-picker="new">New folder</button>
+        <span class="spacer"></span>
+        <button type="button" data-picker="cancel">Cancel</button>
+        <button type="button" data-picker="ok" class="primary"></button>
+      </div>`;
+    dialog.querySelector("h3").textContent = title;
+    dialog.querySelector('[data-picker="ok"]').textContent = ok;
+    document.body.append(dialog);
+    const crumbs = dialog.querySelector(".folder-picker-crumbs");
+    const list = dialog.querySelector(".folder-picker-list");
+    let current = "";
+    let result = null;
+    let generation = 0;
+
+    async function open(path) {
+      const mine = ++generation;
+      list.innerHTML = `<p class="muted">Loading…</p>`;
+      let data;
+      try {
+        data = await api(`/api/list?path=${encodeURIComponent(path)}`);
+      } catch (err) {
+        // The folder is gone (or never was): start from the top instead.
+        if (path) return open("");
+        list.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
+        return;
+      }
+      if (mine !== generation) return;
+      current = data.path || "";
+      const parts = current ? current.split("/") : [];
+      let walked = "";
+      crumbs.innerHTML = `<button type="button" data-go="">${esc(state.me.rootName || "Library")}</button>` + parts.map((part) => {
+        walked = walked ? `${walked}/${part}` : part;
+        return `<span class="muted">/</span><button type="button" data-go="${esc(walked)}">${esc(part)}</button>`;
+      }).join("");
+      const folders = (data.entries || []).filter((entry) => entry.dir && !inTrashPath(entry.path) && !entry.name.startsWith("."));
+      list.innerHTML = folders.length
+        ? folders.map((entry) => `<button type="button" class="folder-picker-row" data-go="${esc(entry.path)}">
+            <svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><path d="M1.5 4.5h4l1.2 1.5H14.5v7.5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-8a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+            <span>${esc(entry.name)}</span><span class="folder-picker-open" aria-hidden="true">›</span></button>`).join("")
+        : `<p class="muted">No folders in here. Choose this one, or make a new one.</p>`;
+      dialog.querySelector('[data-picker="ok"]').title = current ? `Use “${current}”` : "Use the library itself";
+    }
+
+    dialog.addEventListener("click", async (event) => {
+      const go = event.target.closest("[data-go]");
+      if (go) {
+        open(go.dataset.go);
+        return;
+      }
+      const action = event.target.closest("[data-picker]")?.dataset.picker;
+      if (action === "cancel") dialog.close();
+      if (action === "ok") {
+        result = current;
+        dialog.close();
+      }
+      if (action === "new") {
+        const name = ((await askText("New folder", "Folder name", "", "Create")) || "").trim();
+        if (!name) return;
+        try {
+          await api("/api/mkdir", { method: "POST", json: { path: current, name } });
+          invalidateFolderSizes();
+          open(current ? `${current}/${name}` : name);
+        } catch (err) {
+          toast(err.message, true);
+        }
+      }
+    });
+    dialog.addEventListener("close", () => {
+      dialog.remove();
+      resolve(result);
+    });
+    dialog.showModal();
+    // Open where it was (or at the top, if that folder is gone).
+    open(start);
+  });
+}
 
 $("smart-forget").addEventListener("click", async () => {
   if (!(await askConfirm("Delete every face and person OwnNAS has found, and the face model? Your photos are not touched; faces are found again only if you switch Faces back on.", "Delete face data"))) return;
