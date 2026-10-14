@@ -298,6 +298,13 @@ try {
   for (let i = 0; i < 100 && !(cwd = (await call('GET', `/api/terminals/cwd?id=${agentTerminal}`)).data).outside; i++) await sleep(50);
   assert.equal(cwd.path, 'proj', 'outside the library, the start folder is shown');
   type(`cd ${path.join(library, 'proj')}\r`);
+  for (let i = 0; i < 100 && (cwd = (await call('GET', `/api/terminals/cwd?id=${agentTerminal}`)).data).path !== 'proj'; i++) await sleep(50);
+
+  // Files dragged from the file list are typed relative to the shell's folder, or in full.
+  const dropped = await call('POST', `/api/terminals/paths?id=${agentTerminal}`, { paths: ['proj/a.txt', 'proj', ''] });
+  assert.deepEqual(dropped.data.paths, ['a.txt', '.', await fs.realpath(library)]);
+  assert.equal((await call('POST', `/api/terminals/paths?id=${agentTerminal}`, { paths: ['../etc'] })).status, 403);
+  assert.equal((await call('POST', `/api/terminals/paths?id=${agentTerminal}`, { paths: ['proj/missing.txt'] })).status, 404);
 
   // Git changes for the terminal's folder.
   type('git init -q . && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init && echo hi > b.txt && echo y > a.txt && echo git-ready\r');

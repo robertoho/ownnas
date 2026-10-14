@@ -266,6 +266,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/terminals/seen", post(terminal_seen))
         .route("/api/terminals/rename", post(rename_terminal))
         .route("/api/terminals/cwd", get(terminal_cwd))
+        .route("/api/terminals/paths", post(terminal_paths))
         .route(
             "/api/terminals/upload",
             post(terminal_upload).layer(DefaultBodyLimit::disable()),
@@ -2988,6 +2989,50 @@ async fn terminal_cwd(
             "current": current.display().to_string(),
         }))),
     }
+}
+
+#[derive(Deserialize)]
+struct TerminalPathsBody {
+    paths: Vec<String>,
+}
+
+/// Turns library paths (files dragged from the file list) into paths to type in a terminal:
+/// relative to the folder the shell is in when they are inside it, absolute otherwise.
+async fn terminal_paths(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    peer: Peer,
+    Query(query): Query<TerminalIdQuery>,
+    Json(body): Json<TerminalPathsBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    terminal_access(&state, &headers, &peer)?;
+    let session = state
+        .terminals
+        .get(&query.id)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That terminal is closed"))?;
+    if body.paths.len() > 1000 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Too many files"));
+    }
+    let root = state.root.clone();
+    let paths = tokio::task::spawn_blocking(move || -> Result<Vec<String>, FileError> {
+        let here = session.current_dir().canonicalize().ok();
+        body.paths
+            .iter()
+            .map(|rel| {
+                let full = files::resolve(&root, rel)?.full;
+                let relative = here.as_ref().and_then(|dir| full.strip_prefix(dir).ok());
+                Ok(match relative {
+                    Some(inside) if inside.as_os_str().is_empty() => ".".to_string(),
+                    Some(inside) => inside.to_string_lossy().into_owned(),
+                    None => full.to_string_lossy().into_owned(),
+                })
+            })
+            .collect()
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not find the files"))??;
+    Ok(Json(json!({ "paths": paths })))
 }
 
 #[derive(Deserialize)]

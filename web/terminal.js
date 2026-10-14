@@ -319,8 +319,30 @@ document.addEventListener("paste", (event) => {
   event.stopImmediatePropagation();
   pasteFiles(files);
 }, true);
+// Files dragged from OwnNAS's own file list: they are on the server already, so type their paths.
+const LIBRARY_DRAG = "application/x-ownnas-paths";
+
+async function pasteLibraryPaths(paths) {
+  if (!paths.length || finished) return;
+  try {
+    const response = await fetch(`/api/terminals/paths?id=${encodeURIComponent(id)}`, {
+      method: "POST",
+      headers: { "X-OwnNAS": "1", "Content-Type": "application/json" },
+      body: JSON.stringify({ paths }),
+      credentials: "same-origin",
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "Could not find the files");
+    term.paste(`${data.paths.map(shellQuote).join(" ")} `);
+    term.focus();
+  } catch (err) {
+    flash(err.message);
+  }
+}
+
 host.addEventListener("dragover", (event) => {
-  if (![...(event.dataTransfer?.types || [])].includes("Files")) return;
+  const types = [...(event.dataTransfer?.types || [])];
+  if (!types.includes("Files") && !types.includes(LIBRARY_DRAG)) return;
   event.preventDefault();
   event.dataTransfer.dropEffect = "copy";
   host.classList.add("is-drop-target");
@@ -328,6 +350,16 @@ host.addEventListener("dragover", (event) => {
 host.addEventListener("dragleave", () => host.classList.remove("is-drop-target"));
 host.addEventListener("drop", (event) => {
   host.classList.remove("is-drop-target");
+  const library = event.dataTransfer?.getData(LIBRARY_DRAG);
+  if (library) {
+    event.preventDefault();
+    let paths = [];
+    try {
+      paths = JSON.parse(library);
+    } catch {}
+    pasteLibraryPaths(Array.isArray(paths) ? paths.filter((path) => typeof path === "string") : []);
+    return;
+  }
   const files = [...(event.dataTransfer?.files || [])];
   if (!files.length) return;
   event.preventDefault();
