@@ -281,6 +281,8 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/gallery/timeline", get(gallery_timeline))
         .route("/api/gallery/days", get(gallery_days))
         .route("/api/ml", get(ml_status).post(set_ml_settings))
+        .route("/api/backup", get(backup_config).post(set_backup_config))
+        .route("/api/backup/upload", post(backup_upload).layer(DefaultBodyLimit::disable()))
         .route("/api/ml/forget-faces", post(forget_faces))
         .route("/api/gallery/search", get(gallery_search))
         .route("/api/gallery/similar", get(gallery_similar).post(gallery_similar).layer(DefaultBodyLimit::max(60 * 1024 * 1024)))
@@ -1998,6 +2000,166 @@ async fn faces_in_photo(
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     let faces = crate::smart::faces_in(&conn, &path).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     Ok(Json(json!({ "faces": faces.into_iter().map(|(id, person, name)| json!({ "id": id, "personId": person, "name": name })).collect::<Vec<_>>() })))
+}
+
+// ---- Phone backups: a media upload folder that phones back their photos up to ----
+
+const SETTING_BACKUP_FOLDER: &str = "backup_folder";
+
+fn backup_folder(state: &AppState) -> Option<String> {
+    setting(state, SETTING_BACKUP_FOLDER).filter(|folder| !folder.is_empty())
+}
+
+async fn backup_config(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    Ok(Json(json!({ "folder": backup_folder(&state) })))
+}
+
+#[derive(Deserialize)]
+struct BackupConfigBody {
+    /// A folder in the library ("" or null turns phone backups off).
+    folder: Option<String>,
+}
+
+/// Sets where phones back their photos up to (administrators). The folder is made if needed.
+async fn set_backup_config(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<BackupConfigBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    require_write(&state)?;
+    let folder = body.folder.unwrap_or_default().trim().trim_matches('/').to_string();
+    if !folder.is_empty() {
+        if files::is_under_trash(&folder) {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose a folder outside the Trash"));
+        }
+        // Made now (like a folder upload would), so it shows in the library straight away.
+        let root = state.root.clone();
+        let probe = format!("{folder}/.ownnas-probe");
+        tokio::task::spawn_blocking(move || files::prepare_upload(&root, "", &probe, Some(files::UploadChoice::KeepBoth)))
+            .await
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not make the folder"))?
+            .map_err(ApiError::from)?;
+    }
+    {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        db::set_setting(&conn, SETTING_BACKUP_FOLDER, (!folder.is_empty()).then_some(folder.as_str()))
+            .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    }
+    record(&state, &user, "backup-folder", if folder.is_empty() { "off" } else { &folder });
+    Ok(Json(json!({ "folder": (!folder.is_empty()).then_some(folder) })))
+}
+
+#[derive(Deserialize)]
+struct BackupUploadQuery {
+    /// The phone's name: each phone gets its own folder.
+    device: String,
+    name: String,
+    /// When the photo was taken or last changed, in milliseconds (also picks the month folder).
+    mtime: i64,
+    size: Option<u64>,
+}
+
+/// A name safe to use as one folder or file name.
+fn safe_name(raw: &str, fallback: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim().trim_matches('.').trim().to_string();
+    if cleaned.is_empty() { fallback.to_string() } else { cleaned.chars().take(120).collect() }
+}
+
+/// One photo or video from a phone, filed as `<backup folder>/<phone>/<year>/<month>/<name>`.
+/// A file already there with the same name and size is not sent again (`skipped`); a different
+/// one with the same name is kept too, under a numbered name. The original time is kept.
+async fn backup_upload(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<BackupUploadQuery>,
+    body: Body,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let folder = backup_folder(&state)
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "Phone backups are off. An administrator can choose a media upload folder in Settings → Gallery."))?;
+    let device = safe_name(&query.device, "Phone");
+    let name = safe_name(&query.name, "photo.jpg");
+    let (year, month) = year_month(query.mtime / 1000);
+    let rel = format!("{folder}/{device}/{year:04}/{month:02}/{name}");
+    let root = state.root.clone();
+    let probe = rel.clone();
+    let size = query.size;
+    // Already backed up (same name and size)?
+    let already = tokio::task::spawn_blocking(move || {
+        files::resolve(&root, &probe).ok().and_then(|found| std::fs::metadata(&found.full).ok()).map(|meta| meta.is_file() && Some(meta.len()) == size)
+    })
+    .await
+    .unwrap_or(None)
+    .unwrap_or(false);
+    if already {
+        return Ok(Json(json!({ "path": rel, "skipped": true })));
+    }
+    let root = state.root.clone();
+    let target = rel.clone();
+    let prepared = tokio::task::spawn_blocking(move || files::prepare_upload(&root, "", &target, Some(files::UploadChoice::KeepBoth)))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload"))?
+        .map_err(ApiError::from)?;
+    let files::PreparedUpload::Write(dest) = prepared else {
+        return Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload"));
+    };
+    let partial = dest.with_file_name(format!(".{}.part", dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
+    let written = async {
+        let mut out = tokio::fs::File::create(&partial).await.ok()?;
+        let mut stream = body.into_data_stream();
+        let mut total = 0u64;
+        while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+            let chunk = chunk.ok()?;
+            total += chunk.len() as u64;
+            tokio::io::AsyncWriteExt::write_all(&mut out, &chunk).await.ok()?;
+        }
+        tokio::io::AsyncWriteExt::flush(&mut out).await.ok()?;
+        let file = out.into_std().await;
+        if query.mtime > 0 {
+            let _ = file.set_modified(std::time::UNIX_EPOCH + Duration::from_millis(query.mtime as u64));
+        }
+        Some(total)
+    }
+    .await;
+    // Only a complete file takes the photo's name, so an interrupted upload is never mistaken for one.
+    let complete = matches!((written, query.size), (Some(got), Some(want)) if got == want) || matches!((written, query.size), (Some(_), None));
+    if !complete || tokio::fs::rename(&partial, &dest).await.is_err() {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "The upload was interrupted"));
+    }
+    let saved = dest
+        .strip_prefix(state.root.canonicalize().unwrap_or_else(|_| state.root.clone()))
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .unwrap_or(rel);
+    invalidate_sizes(&state, &parent_rel_path(&saved));
+    record(&state, &user, "backup", &saved);
+    state.media.rescan_soon();
+    Ok(Json(json!({ "path": saved, "skipped": false })))
+}
+
+/// The year and month (UTC) of a Unix time.
+fn year_month(secs: i64) -> (i64, i64) {
+    let days = secs.div_euclid(86_400);
+    // Howard Hinnant's civil-from-days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+    (year, month)
 }
 
 async fn gallery_hidden(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
@@ -5073,6 +5235,18 @@ async fn send_temp_zip(tmp: PathBuf, name: &str) -> Result<Response, ApiError> {
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .body(body)
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not send the zip"))
+}
+
+#[cfg(test)]
+mod backup_name_tests {
+    #[test]
+    fn months_and_names() {
+        assert_eq!(super::year_month(0), (1970, 1));
+        assert_eq!(super::year_month(1_700_000_000), (2023, 11));
+        assert_eq!(super::year_month(951_825_600), (2000, 2), "29 Feb 2000");
+        assert_eq!(super::safe_name("../Pixel: 8?", "Phone"), "_Pixel_ 8_");
+        assert_eq!(super::safe_name("  ", "Phone"), "Phone");
+    }
 }
 
 #[cfg(test)]

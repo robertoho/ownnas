@@ -1363,8 +1363,13 @@ function renderSmartSettings(data) {
 
 /// The Gallery tab of Settings: indexing speed and progress (refreshed while it shows).
 async function refreshIndexSettings() {
-  const [data, smart] = await Promise.all([api("/api/gallery/settings"), api("/api/ml").catch(() => ({ available: false }))]);
+  const [data, smart, backup] = await Promise.all([
+    api("/api/gallery/settings"),
+    api("/api/ml").catch(() => ({ available: false })),
+    api("/api/backup").catch(() => ({ folder: null })),
+  ]);
   renderSmartSettings(smart);
+  if (document.activeElement !== $("backup-folder")) $("backup-folder").value = backup.folder || "";
   for (const input of document.querySelectorAll('input[name="index-speed"]')) input.checked = input.value === data.speed;
   $("index-status").textContent = describeIndexStatus(data.status);
   clearTimeout(indexStatusTimer);
@@ -1398,6 +1403,17 @@ for (const [id, key] of [["smart-search", "search"], ["smart-faces", "faces"]]) 
     }
   });
 }
+
+$("backup-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    const data = await api("/api/backup", { method: "POST", json: { folder: $("backup-folder").value } });
+    $("backup-folder").value = data.folder || "";
+    toast(data.folder ? `Phones back up to “${data.folder}”` : "Phone backups are off");
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
 
 $("smart-forget").addEventListener("click", async () => {
   if (!(await askConfirm("Delete every face and person OwnNAS has found, and the face model? Your photos are not touched; faces are found again only if you switch Faces back on.", "Delete face data"))) return;

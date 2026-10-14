@@ -347,6 +347,14 @@
       </div>
       <p id="index-status" class="muted index-status"></p>
       <button id="index-rescan" type="button">Rescan the library now</button>
+      <div class="smart-settings">
+        <h3>Phone backups</h3>
+        <p class="muted">The OwnNAS phone app can back up a phone’s photos and videos here, each phone in its own folder, by year and month. Leave it empty to turn phone backups off.</p>
+        <form id="backup-form" class="backup-form">
+          <input id="backup-folder" type="text" placeholder="Media upload folder, for example Phone backups" autocomplete="off" aria-label="Media upload folder">
+          <button type="submit">Save</button>
+        </form>
+      </div>
       <div id="smart-settings" class="smart-settings" hidden>
         <h3>Smart features</h3>
         <p class="muted">These run entirely on this computer: no photo or face leaves it. Their models are downloaded once, when you switch them on, and they work at the indexing speed above.</p>

@@ -109,6 +109,7 @@ pub struct Indexer {
     wake: Mutex<bool>,
     signal: Condvar,
     speed: std::sync::atomic::AtomicU8,
+    soon: std::sync::atomic::AtomicBool,
     /// The photos' search descriptions, as searched in memory.
     pub descriptions: crate::smart::DescriptionCache,
     #[cfg(not(target_os = "android"))]
@@ -122,6 +123,7 @@ impl Default for Indexer {
             wake: Mutex::new(false),
             signal: Condvar::new(),
             speed: std::sync::atomic::AtomicU8::new(1),
+            soon: std::sync::atomic::AtomicBool::new(false),
             descriptions: crate::smart::DescriptionCache::default(),
             #[cfg(not(target_os = "android"))]
             models: std::sync::OnceLock::new(),
@@ -152,6 +154,19 @@ impl Indexer {
         let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner()).clone();
         status.speed = Some(self.speed());
         status
+    }
+
+    /// Asks for a scan a minute from now, once: for uploads that arrive one after another.
+    pub fn rescan_soon(self: &Arc<Self>) {
+        if self.soon.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let indexer = self.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(60));
+            indexer.soon.store(false, std::sync::atomic::Ordering::Relaxed);
+            indexer.rescan();
+        });
     }
 
     /// Asks for a scan as soon as the current one (if any) finishes.
