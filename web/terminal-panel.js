@@ -733,6 +733,7 @@ function openTabMenu(id, x, y, { full = false } = {}) {
     items.push(action("close", "Close", { class: "danger", title: ctx.shortcutLabel("X") }));
   }
   tabMenu.replaceChildren(...items);
+  ctx.decorateMenu(tabMenu);
   tabMenu.hidden = false;
   const rect = tabMenu.getBoundingClientRect();
   tabMenu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - rect.width - 8))}px`;

@@ -17,7 +17,7 @@
   <link rel="stylesheet" href="/assets/docx-editor.css">
   <script>
     (() => {
-      const allowed = ["ownnas","tokyo-night","catppuccin","catppuccin-latte","everforest","gruvbox","kanagawa","osaka-jade","matte-black","rose-pine"];
+      const allowed = ["ownnas","tokyo-night","catppuccin","catppuccin-latte","everforest","gruvbox","kanagawa","osaka-jade","matte-black","rose-pine","liquid-glass","windows-11"];
       const theme = localStorage.getItem("ownnas-theme");
       document.documentElement.setAttribute("data-theme", allowed.includes(theme) ? theme : "ownnas");
     })();
@@ -201,9 +201,9 @@
         </button>
         <button id="usage-btn" class="icon-btn tool-secondary" type="button" title="Folder size" aria-label="Folder size">
           <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
-            <path d="M2.5 4.5h11v8a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
-            <path d="M5 4.5V3.5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1" fill="none" stroke="currentColor" stroke-width="1.5"/>
-            <path d="M5.5 9h5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            <path d="M1.5 4.5h4l1.2 1.5H14.5v7.5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-8a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+            <rect x="4" y="9" width="8" height="2.75" rx="0.75" fill="none" stroke="currentColor" stroke-width="1.2"/>
+            <rect x="4" y="9" width="4.75" height="2.75" rx="0.75" fill="currentColor"/>
           </svg>
         </button>
         <button id="activity-btn" class="icon-btn tool-secondary" type="button" title="Activity" aria-label="Activity">

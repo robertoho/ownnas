@@ -74,6 +74,8 @@ const THEMES = [
   { id: "osaka-jade", name: "Osaka Jade", mode: "dark", swatches: ["#111c18", "#1a2a22", "#509475", "#c1c497"] },
   { id: "matte-black", name: "Matte Black", mode: "dark", swatches: ["#121212", "#1c1c1c", "#e68e0d", "#eaeaea"] },
   { id: "rose-pine", name: "Rose Pine", mode: "light", swatches: ["#faf4ed", "#fffaf3", "#56949f", "#575279"] },
+  { id: "liquid-glass", name: "macOS Liquid Glass", mode: "light", swatches: ["#eef1f8", "#ffffff", "#007aff", "#1d1d1f"] },
+  { id: "windows-11", name: "Windows 11", mode: "light", swatches: ["#eaf0f8", "#ffffff", "#005fb8", "#1a1a1a"] },
 ];
 
 function normalizeTheme(value) {
@@ -844,6 +846,95 @@ function positionMenuSub(anchorButton) {
   sub.style.top = `${Math.max(8, top)}px`;
 }
 
+// Icons for menu entries, by their action (16×16, drawn with strokes).
+const ICON_FOLDER = "M1.5 4.5h4l1.2 1.5H14.5v7.5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-8a1 1 0 0 1 1-1z";
+const ICON_FILE = "M4.5 2.5h5L12.5 5.5V13a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1z M9.5 2.5V5.5H12.5";
+const ICON_COPY = "M5.5 5.5h7a.5.5 0 0 1 .5.5v7a.5.5 0 0 1-.5.5h-7a.5.5 0 0 1-.5-.5v-7a.5.5 0 0 1 .5-.5z M3.5 10.5H3a.5.5 0 0 1-.5-.5V3a.5.5 0 0 1 .5-.5h7a.5.5 0 0 1 .5.5v.5";
+const ICON_TRASH = "M2.5 4.5h11 M6 4.5V3a.5.5 0 0 1 .5-.5h3a.5.5 0 0 1 .5.5v1.5 M4 4.5l.7 9a1 1 0 0 0 1 .9h4.6a1 1 0 0 0 1-.9l.7-9 M6.75 7v4.5 M9.25 7v4.5";
+const ICON_OPEN = "M9 2.5h4.5V7 M13.5 2.5 7.5 8.5 M11.5 9.5v3a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1h3";
+const ICON_TERMINAL = "M2.5 3h11a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z M4.5 6.5l2 1.5-2 1.5 M8 10h3";
+const ICON_RENAME = "M10.5 2.5l3 3-8 8H2.5v-3z M9 4l3 3";
+const ICON_SCISSORS = "M4.5 10.5a2 2 0 1 1 0 4a2 2 0 1 1 0-4z M11.5 10.5a2 2 0 1 1 0 4a2 2 0 1 1 0-4z M5.9 11 11 2.5 M10.1 11 5 2.5";
+const ICON_ROTATE = "M13 8a5 5 0 1 1-1.5-3.55 M13.5 2.5v2.5H11";
+const ICON_ARCHIVE = "M2.5 3.5h11v3h-11z M3.5 6.5v6a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1v-6 M6.5 9h3";
+const ICON_CONVERT = "M2.5 5.5h10 M10 3l2.5 2.5L10 8 M13.5 10.5h-10 M6 8l-2.5 2.5L6 13";
+const ICON_GRID = "M2.5 2.5h4.5v4.5H2.5z M9 2.5h4.5v4.5H9z M2.5 9h4.5v4.5H2.5z M9 9h4.5v4.5H9z";
+const MENU_ICONS = {
+  open: ICON_OPEN,
+  popout: ICON_OPEN,
+  download: "M8 2.5v8 M5 8l3 3 3-3 M2.5 12.5v1a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-1",
+  downloadZip: "M4 2.5h5.5L13.5 6v7.5a1 1 0 0 1-1 1h-8.5a1 1 0 0 1-1-1v-10a1 1 0 0 1 1-1z M9.5 2.5V6H13.5 M7 4.5v1 M7 6.5v1 M7 8.5v1 M6 10.5h2v2H6z",
+  upload: "M8 11.5V3.5 M5 6l3-3 3 3 M2.5 12.5v1a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-1",
+  uploadFolder: `${ICON_FOLDER} M8 12V7.5 M5.75 9.25 8 7l2.25 2.25`,
+  mkdir: `${ICON_FOLDER} M8 8v5 M5.5 10.5H10.5`,
+  folderWith: `${ICON_FOLDER} M8 8v5 M5.5 10.5H10.5`,
+  newfile: `${ICON_FILE} M8 8v4 M6 10h4`,
+  folderAppearance: "M8 2a6 6 0 1 0 0 12c1 0 1.5-.6 1.5-1.4 0-.9-.8-1.1-.8-2 0-.8.7-1.3 1.6-1.3H12a2.5 2.5 0 0 0 2.5-2.5C14.5 4.3 11.6 2 8 2z M5 7.5h.01 M7 4.75h.01 M10 5h.01",
+  search: "M7 2.75a4.25 4.25 0 1 1 0 8.5a4.25 4.25 0 1 1 0-8.5z M10.25 10.25 13.5 13.5",
+  library: "M2.5 2.5h3v11h-3z M6.5 2.5h3v11h-3z M10.5 3.5l3 1v9l-3-1z",
+  bookmark: "M4 2.5h8v11l-4-2.5-4 2.5z",
+  usage: `${ICON_FOLDER} M4.5 9.25h7v2.5h-7z M4.75 10.5h3.75`,
+  duplicates: "M2.5 3.5h6v6h-6z M7.5 6.5h6v6h-6z",
+  activity: "M8 2.5a5.5 5.5 0 1 1 0 11a5.5 5.5 0 1 1 0-11z M8 5v3.25L10.25 10",
+  toggleHidden: "M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8s-2.5 4.5-6.5 4.5S1.5 8 1.5 8z M8 6a2 2 0 1 1 0 4a2 2 0 1 1 0-4z",
+  terminal: ICON_TERMINAL,
+  "new-here": ICON_TERMINAL,
+  duplicate: "M2.5 2.5h7v7h-7z M6.5 6.5v7h7v-7h-3 M10 9v3 M8.5 10.5h3",
+  terminals: ICON_GRID,
+  overview: ICON_GRID,
+  emptyTrash: ICON_TRASH,
+  delete: ICON_TRASH,
+  paste: "M5.5 3h-1a1 1 0 0 0-1 1v9.5a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1V4a1 1 0 0 0-1-1h-1 M6 2h4v2H6z",
+  restore: "M3 8a5 5 0 1 0 1.5-3.55 M2.5 2.5v2.5H5",
+  copy: ICON_COPY,
+  cut: ICON_SCISSORS,
+  move: "M1.5 8h8 M7 5.5 9.5 8 7 10.5 M11.5 3h2a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1h-2",
+  bulkTag: "M2.5 2.5h5.2l6 6-5.2 5.2-6-6z M5.25 5.25h.01",
+  convertMenu: ICON_CONVERT,
+  convert: ICON_CONVERT,
+  pdfMenu: `${ICON_FILE} M6 8.5h4 M6 11h4`,
+  pdfMerge: "M2.5 2.5h5v7h-5z M8.5 6.5h5v7h-5z M6 11.5h2.5",
+  pdfExtract: `${ICON_FILE} M8 7.5v4.5 M6 10l2 2 2-2`,
+  pdfSplit: ICON_SCISSORS,
+  pdfRotate: ICON_ROTATE,
+  compressMenu: ICON_ARCHIVE,
+  compress: ICON_ARCHIVE,
+  rename: ICON_RENAME,
+  folder: ICON_FOLDER,
+  edited: `${ICON_FILE} M6 8.5h4 M6 11h2.5`,
+  changes: "M5 3.5a1.5 1.5 0 1 1 0 .01 M5 12.5a1.5 1.5 0 1 1 0 .01 M11 5.5a1.5 1.5 0 1 1 0 .01 M5 5v6 M11 7a3 3 0 0 1-3 3H5",
+  hide: "M2 2l12 12 M6.5 3.7A6.6 6.6 0 0 1 8 3.5c4 0 6.5 4.5 6.5 4.5a11 11 0 0 1-1.7 2.2 M4.2 5.2A11 11 0 0 0 1.5 8s2.5 4.5 6.5 4.5a6 6 0 0 0 2.6-.6",
+  close: "M4 4l8 8 M12 4l-8 8",
+};
+
+function menuIcon(name) {
+  const path = MENU_ICONS[name] || "M8 7.25a.75.75 0 1 1 0 1.5a.75.75 0 1 1 0-1.5z";
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  icon.setAttribute("class", "menu-icon");
+  icon.setAttribute("viewBox", "0 0 16 16");
+  icon.setAttribute("width", "16");
+  icon.setAttribute("height", "16");
+  icon.setAttribute("aria-hidden", "true");
+  icon.innerHTML = `<path d="${path}" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>`;
+  return icon;
+}
+
+/// Gives every entry of a menu its icon and sorts the entries alphabetically. The heading stays
+/// on top and actions that remove things (in red) stay last, apart from the rest.
+function decorateMenu(menu) {
+  const label = menu.querySelector(":scope > .menu-label");
+  const items = [...menu.querySelectorAll(":scope > button")];
+  for (const item of items) {
+    if (item.querySelector(".menu-icon")) continue;
+    const action = item.dataset.menu || item.dataset.tabAction || "";
+    item.prepend(menuIcon(action));
+  }
+  const byName = (a, b) => a.textContent.trim().localeCompare(b.textContent.trim(), undefined, { numeric: true, sensitivity: "base" });
+  const safe = items.filter((item) => !item.classList.contains("danger")).sort(byName);
+  const risky = items.filter((item) => item.classList.contains("danger")).sort(byName);
+  menu.replaceChildren(...[label, ...safe, ...risky].filter(Boolean));
+}
+
 function openMenuSub(kind, anchorButton) {
   let buttons = [];
   if (kind === "pdf") {
@@ -865,6 +956,7 @@ function openMenuSub(kind, anchorButton) {
     }
   }
   $("menu-sub").innerHTML = buttons.join("");
+  decorateMenu($("menu-sub"));
   state.menuSub = kind;
   positionMenuSub(anchorButton);
 }
@@ -1135,6 +1227,7 @@ function openSelectionMenu(x, y, pasteInto) {
   closeMenuSub();
   const menu = $("menu");
   menu.innerHTML = buttons.join("");
+  decorateMenu(menu);
   menu.hidden = false;
   const rect = menu.getBoundingClientRect();
   menu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - rect.width - 8))}px`;
@@ -1225,6 +1318,7 @@ async function terminalPanel() {
       shortcutLabel: (key) => shortcutLabel(key),
       selectLabel: (number) => selectLabel(number),
       focusFiles: () => $("files").focus({ preventScroll: true }),
+      decorateMenu: (menu) => decorateMenu(menu),
       rootName: () => state.me && state.me.rootName,
       refreshMe: async () => {
         Object.assign(state.me, await api("/api/me"));

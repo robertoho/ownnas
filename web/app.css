@@ -181,6 +181,49 @@
   --shadow: 0 18px 40px rgba(87, 82, 121, 0.12);
 }
 
+[data-theme="liquid-glass"] {
+  color-scheme: light;
+  --bg: rgba(255, 255, 255, 0.28);
+  --bg-2: rgba(255, 255, 255, 0.52);
+  --bg-3: rgba(255, 255, 255, 0.62);
+  --line: rgba(60, 60, 67, 0.16);
+  --text: #1d1d1f;
+  --muted: #6e6e73;
+  --accent: #007aff;
+  --accent-ink: #ffffff;
+  --danger: #ff3b30;
+  --input-bg: rgba(255, 255, 255, 0.6);
+  --thumb-bg: rgba(255, 255, 255, 0.4);
+  --panel-deep: #f5f5f7;
+  --hover-line: rgba(0, 122, 255, 0.45);
+  --shadow: 0 24px 60px rgba(30, 40, 80, 0.18), 0 2px 8px rgba(30, 40, 80, 0.08);
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", sans-serif;
+  --mono: "SF Mono", ui-monospace, Menlo, monospace;
+  /* The bright rim and inner light that make a surface read as glass. */
+  --glass-rim: inset 0 0 0 0.5px rgba(255, 255, 255, 0.75), inset 0 1px 1px rgba(255, 255, 255, 0.95), inset 0 -1px 1px rgba(0, 0, 0, 0.04);
+  --glass-blur: blur(28px) saturate(185%);
+}
+
+[data-theme="windows-11"] {
+  color-scheme: light;
+  --bg: #f3f3f3;
+  --bg-2: #fbfbfb;
+  --bg-3: #ffffff;
+  --line: #e5e5e5;
+  --text: #1a1a1a;
+  --muted: #5d5d5d;
+  --accent: #005fb8;
+  --accent-ink: #ffffff;
+  --danger: #c42b1c;
+  --input-bg: #ffffff;
+  --thumb-bg: #f0f0f0;
+  --panel-deep: #f9f9f9;
+  --hover-line: #c9c9c9;
+  --shadow: 0 8px 16px rgba(0, 0, 0, 0.14);
+  --sans: "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  --mono: "Cascadia Mono", "Cascadia Code", Consolas, monospace;
+}
+
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 html, body { margin: 0; min-height: 100%; }
@@ -1060,6 +1103,9 @@ input, select, textarea {
 }
 .menu button:hover { background: var(--bg-3); }
 .menu button.danger { color: var(--danger); }
+.menu button { gap: 0.6rem; }
+.menu-icon { flex: 0 0 auto; opacity: 0.75; }
+.menu button:hover .menu-icon { opacity: 1; }
 .menu button.menu-has-sub::after {
   content: "›";
   margin-left: auto;
@@ -3024,3 +3070,170 @@ button.linkish {
 .sqlite-query-actions { display: flex; align-items: center; justify-content: space-between; gap: 0.6rem; font-size: 0.8rem; }
 .sqlite-results { display: flex; flex-direction: column; min-height: 0; }
 .sqlite-error { margin: 0; padding: 0.6rem 0.75rem; border: 1px solid var(--danger); border-radius: 8px; color: var(--danger); font: 0.82rem var(--mono); white-space: pre-wrap; }
+
+/* macOS Liquid Glass: frosted, translucent layers over a bright wallpaper. */
+[data-theme="liquid-glass"] body {
+  background:
+    radial-gradient(60vw 60vw at 8% 12%, rgba(120, 180, 255, 0.85), transparent 60%),
+    radial-gradient(55vw 55vw at 92% 8%, rgba(255, 170, 210, 0.8), transparent 60%),
+    radial-gradient(70vw 60vw at 85% 95%, rgba(255, 200, 130, 0.75), transparent 60%),
+    radial-gradient(60vw 60vw at 10% 95%, rgba(140, 230, 200, 0.75), transparent 60%),
+    #eef1f8;
+  background-attachment: fixed;
+}
+[data-theme="liquid-glass"] .boot,
+[data-theme="liquid-glass"] .login-view { background-image: none; }
+[data-theme="liquid-glass"] :is(.top, .toolbar, .explorer-status-bar, .jobs-panel-head, .details-header) {
+  background: rgba(255, 255, 255, 0.34);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border-color: rgba(255, 255, 255, 0.55);
+}
+[data-theme="liquid-glass"] :is(.preview, .library, .settings, .terminals) {
+  background: rgba(246, 247, 251, 0.62);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border-color: rgba(255, 255, 255, 0.7);
+  box-shadow: var(--shadow), var(--glass-rim);
+}
+[data-theme="liquid-glass"] :is(.menu, dialog, .login-card) {
+  background: rgba(250, 250, 253, 0.66);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  box-shadow: var(--shadow), var(--glass-rim);
+}
+[data-theme="liquid-glass"] dialog { border-radius: 26px; }
+[data-theme="liquid-glass"] .menu { border-radius: 18px; }
+[data-theme="liquid-glass"] .menu button { border-radius: 10px; }
+[data-theme="liquid-glass"] .menu button:hover { background: var(--accent); color: var(--accent-ink); }
+[data-theme="liquid-glass"] dialog::backdrop { background: rgba(30, 35, 60, 0.18); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
+[data-theme="liquid-glass"] .card {
+  border-radius: 18px;
+  border-color: rgba(255, 255, 255, 0.7);
+  background: rgba(255, 255, 255, 0.5);
+  box-shadow: 0 6px 20px rgba(30, 40, 80, 0.08), var(--glass-rim);
+}
+[data-theme="liquid-glass"] .card:hover { border-color: rgba(255, 255, 255, 0.95); background: rgba(255, 255, 255, 0.62); }
+[data-theme="liquid-glass"] .card.selected { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.35), var(--glass-rim); }
+[data-theme="liquid-glass"] :is(button, .button) {
+  background: rgba(255, 255, 255, 0.55);
+  border-color: rgba(255, 255, 255, 0.8);
+  box-shadow: 0 1px 4px rgba(30, 40, 80, 0.1), var(--glass-rim);
+  -webkit-backdrop-filter: blur(12px) saturate(170%);
+  backdrop-filter: blur(12px) saturate(170%);
+  transition: background 0.15s, box-shadow 0.15s, transform 0.1s;
+}
+[data-theme="liquid-glass"] :is(button, .button):hover { background: rgba(255, 255, 255, 0.78); border-color: rgba(255, 255, 255, 1); }
+[data-theme="liquid-glass"] :is(button, .button):active { transform: scale(0.97); }
+[data-theme="liquid-glass"] :is(.menu button, .card, .sqlite-sort, .terminals-tile-head button) { -webkit-backdrop-filter: none; backdrop-filter: none; }
+[data-theme="liquid-glass"] :is(.menu button, .sqlite-sort, .terminals-tile-head button) { box-shadow: none; background: transparent; border-color: transparent; }
+[data-theme="liquid-glass"] :is(button[aria-pressed="true"], button[aria-selected="true"], .login-card button[type="submit"]) {
+  background: linear-gradient(180deg, #3d9bff, #007aff);
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.45);
+  box-shadow: 0 4px 14px rgba(0, 122, 255, 0.35), inset 0 1px 1px rgba(255, 255, 255, 0.55);
+}
+[data-theme="liquid-glass"] button.danger { color: var(--danger); }
+[data-theme="liquid-glass"] :is(input, select, textarea) {
+  background: rgba(255, 255, 255, 0.6);
+  border-color: rgba(255, 255, 255, 0.75);
+  box-shadow: inset 0 1px 2px rgba(30, 40, 80, 0.08);
+}
+[data-theme="liquid-glass"] :is(input, select, textarea):focus-visible { outline: 3px solid rgba(0, 122, 255, 0.4); outline-offset: 0; }
+[data-theme="liquid-glass"] .terminals-tile { border-color: rgba(255, 255, 255, 0.75); border-radius: 14px; }
+[data-theme="liquid-glass"] .terminals-tile-head,
+[data-theme="liquid-glass"] .terminals-bar { background: rgba(255, 255, 255, 0.4); }
+
+/* Windows 11: Mica behind everything, white layers, acrylic flyouts, Fluent controls. */
+[data-theme="windows-11"] body {
+  background: linear-gradient(135deg, #eaf0f8 0%, #f3f3f3 45%, #f5eff3 100%);
+  background-attachment: fixed;
+}
+[data-theme="windows-11"] .boot,
+[data-theme="windows-11"] .login-view { background-image: none; }
+[data-theme="windows-11"] :is(.top, .toolbar) { background: transparent; border-color: transparent; -webkit-backdrop-filter: none; backdrop-filter: none; }
+[data-theme="windows-11"] .toolbar { background: rgba(243, 243, 243, 0.85); -webkit-backdrop-filter: blur(20px); backdrop-filter: blur(20px); }
+[data-theme="windows-11"] .explorer-status-bar { background: rgba(255, 255, 255, 0.5); }
+[data-theme="windows-11"] :is(.preview, .library, .settings, .terminals) {
+  background: rgba(249, 249, 249, 0.92);
+  -webkit-backdrop-filter: blur(30px) saturate(125%);
+  backdrop-filter: blur(30px) saturate(125%);
+  border-color: rgba(0, 0, 0, 0.08);
+}
+[data-theme="windows-11"] :is(.menu, .terminal-tab-menu) {
+  background: rgba(252, 252, 252, 0.86);
+  -webkit-backdrop-filter: blur(30px) saturate(125%);
+  backdrop-filter: blur(30px) saturate(125%);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  border-radius: 8px;
+  padding: 4px;
+}
+[data-theme="windows-11"] .menu button { border-radius: 4px; padding: 0.4rem 0.75rem; }
+[data-theme="windows-11"] .menu button:hover { background: rgba(0, 0, 0, 0.04); }
+[data-theme="windows-11"] :is(dialog, .login-card) {
+  background: #ffffff;
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  border-radius: 8px;
+  box-shadow: 0 32px 64px rgba(0, 0, 0, 0.19), 0 2px 21px rgba(0, 0, 0, 0.15);
+}
+[data-theme="windows-11"] dialog::backdrop { background: rgba(0, 0, 0, 0.3); }
+[data-theme="windows-11"] .card {
+  border-radius: 8px;
+  background: #ffffff;
+  border-color: rgba(0, 0, 0, 0.06);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.04);
+}
+[data-theme="windows-11"] .card:hover { background: #fbfbfb; border-color: rgba(0, 0, 0, 0.1); }
+[data-theme="windows-11"] .card.selected { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); background: #f2f7fc; }
+[data-theme="windows-11"] :is(button, .button) {
+  border-radius: 4px;
+  background: #ffffff;
+  border: 1px solid rgba(0, 0, 0, 0.0578);
+  border-bottom-color: rgba(0, 0, 0, 0.1622);
+}
+[data-theme="windows-11"] :is(button, .button):hover { background: #f9f9f9; border-color: rgba(0, 0, 0, 0.0578); border-bottom-color: rgba(0, 0, 0, 0.1622); }
+[data-theme="windows-11"] :is(button, .button):active { background: #f5f5f5; color: #5d5d5d; border-bottom-color: rgba(0, 0, 0, 0.0578); }
+[data-theme="windows-11"] :is(.menu button, .sqlite-sort, .terminals-tile-head button) { border: 0; background: transparent; }
+[data-theme="windows-11"] :is(button[aria-pressed="true"], button[aria-selected="true"], .login-card button[type="submit"]) {
+  background: var(--accent);
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.08);
+  border-bottom-color: rgba(0, 0, 0, 0.4);
+}
+[data-theme="windows-11"] :is(button[aria-pressed="true"], button[aria-selected="true"]):hover { background: #1a6fc0; }
+[data-theme="windows-11"] button.danger { background: #ffffff; color: var(--danger); }
+[data-theme="windows-11"] :is(input, select, textarea) {
+  border-radius: 4px;
+  background: #ffffff;
+  border: 1px solid rgba(0, 0, 0, 0.0578);
+  border-bottom: 1px solid #8a8a8a;
+}
+[data-theme="windows-11"] :is(input, select, textarea):focus-visible {
+  outline: none;
+  border-bottom-color: var(--accent);
+  box-shadow: inset 0 -1px 0 var(--accent);
+}
+[data-theme="windows-11"] :is(button, a):focus-visible { outline: 2px solid #1a1a1a; outline-offset: 1px; }
+[data-theme="windows-11"] .terminals-tile { border-radius: 8px; }
+[data-theme="windows-11"] .terminals-tabs button[aria-selected="true"] { box-shadow: inset 0 -3px 0 rgba(255, 255, 255, 0.6); }
+
+.theme-card[data-theme-id="liquid-glass"] .theme-swatch {
+  background-image:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.7), rgba(255, 255, 255, 0.35)),
+    radial-gradient(circle at 15% 20%, #78b4ff, transparent 60%),
+    radial-gradient(circle at 85% 15%, #ffaad2, transparent 60%),
+    radial-gradient(circle at 80% 95%, #ffc882, transparent 60%),
+    radial-gradient(circle at 15% 90%, #8ce6c8, transparent 60%);
+  background-size: 60% 46%, 100% 100%, 100% 100%, 100% 100%, 100% 100%;
+  background-position: 50% 50%, 0 0, 0 0, 0 0, 0 0;
+}
+.theme-card[data-theme-id="windows-11"] .theme-swatch {
+  background-image: linear-gradient(
+    90deg,
+    #eaf0f8 0%, #eaf0f8 25%,
+    #ffffff 25%, #ffffff 50%,
+    #005fb8 50%, #005fb8 75%,
+    #1a1a1a 75%, #1a1a1a 100%
+  );
+}

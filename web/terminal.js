@@ -2,7 +2,7 @@
 import { Terminal } from "/assets/vendor/xterm/xterm.mjs";
 import { FitAddon } from "/assets/vendor/xterm/addon-fit.mjs";
 
-const THEMES = ["ownnas", "tokyo-night", "catppuccin", "catppuccin-latte", "everforest", "gruvbox", "kanagawa", "osaka-jade", "matte-black", "rose-pine"];
+const THEMES = ["ownnas", "tokyo-night", "catppuccin", "catppuccin-latte", "everforest", "gruvbox", "kanagawa", "osaka-jade", "matte-black", "rose-pine", "liquid-glass", "windows-11"];
 const KEYS = {
   esc: "\x1b",
   tab: "\t",
