@@ -177,6 +177,13 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             hidden_at INTEGER NOT NULL,
             hidden_by TEXT NOT NULL DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS file_hashes (
+            path TEXT PRIMARY KEY,
+            size INTEGER NOT NULL,
+            mtime INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            hashed_at INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS folder_sizes (
             path TEXT PRIMARY KEY,
             bytes INTEGER NOT NULL,
@@ -191,7 +198,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     .map_err(|_| "Could not create the database schema".to_string())?;
     ensure_admin_column(conn)?;
     conn.execute(
-        "INSERT INTO settings(key, value) VALUES('schema_version', '10')
+        "INSERT INTO settings(key, value) VALUES('schema_version', '11')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )
@@ -965,7 +972,7 @@ pub fn rewrite_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), 
         );
     }
     // Albums keep the photos they hold, wherever they move (into the Trash and back too).
-    for (table, column) in [("album_items", "path"), ("albums", "cover_path"), ("media_index", "path"), ("timeline_hidden", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path")] {
+    for (table, column) in [("album_items", "path"), ("albums", "cover_path"), ("media_index", "path"), ("timeline_hidden", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path"), ("file_hashes", "path")] {
         conn.execute(
             &format!(
                 "UPDATE OR REPLACE {table} SET {column} = CASE WHEN {column} = ?1 THEN ?2 ELSE ?2 || substr({column}, length(?1) + 1) END
@@ -1044,6 +1051,26 @@ pub fn copy_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), Str
     Ok(())
 }
 
+/// A file's SHA-256 (hex) noted earlier, while it still has the same size and time.
+pub fn cached_hash(conn: &Connection, path: &str, size: u64, mtime: i64) -> Option<String> {
+    conn.query_row(
+        "SELECT sha256 FROM file_hashes WHERE path = ?1 AND size = ?2 AND mtime = ?3",
+        params![path, size as i64, mtime],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+pub fn store_hash(conn: &Connection, path: &str, size: u64, mtime: i64, sha256: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO file_hashes(path, size, mtime, sha256, hashed_at) VALUES(?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(path) DO UPDATE SET size = excluded.size, mtime = excluded.mtime, sha256 = excluded.sha256, hashed_at = excluded.hashed_at",
+        params![path, size as i64, mtime, sha256, now_secs()],
+    )
+    .map_err(|_| "Could not store the file hash".to_string())?;
+    Ok(())
+}
+
 pub fn delete_path_meta(conn: &Connection, path: &str) -> Result<(), String> {
     if path.is_empty() {
         return Ok(());
@@ -1078,7 +1105,7 @@ pub fn delete_path_meta(conn: &Connection, path: &str) -> Result<(), String> {
         params![path, like],
     )
     .map_err(|_| "Could not remove recent files".to_string())?;
-    for (table, column) in [("album_items", "path"), ("media_index", "path"), ("timeline_hidden", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path")] {
+    for (table, column) in [("album_items", "path"), ("media_index", "path"), ("timeline_hidden", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path"), ("file_hashes", "path")] {
         conn.execute(
             &format!("DELETE FROM {table} WHERE {column} = ?1 OR substr({column}, 1, length(?1) + 1) = ?1 || '/'"),
             params![path],

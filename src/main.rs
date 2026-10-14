@@ -10,6 +10,7 @@ mod smart;
 mod ml;
 mod http;
 mod pdf_ops;
+mod photo_details;
 mod terminal;
 mod preview;
 mod sqlite_view;

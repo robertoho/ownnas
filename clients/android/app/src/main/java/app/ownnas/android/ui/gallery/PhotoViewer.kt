@@ -3,6 +3,7 @@ package app.ownnas.android.ui.gallery
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.Box
@@ -16,6 +17,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayCircle
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -70,6 +72,7 @@ fun PhotoViewer(vm: AppViewModel, serverId: String, start: Int, list: Long) {
     var chrome by remember { mutableStateOf(true) }
     var menu by remember { mutableStateOf(false) }
     var picking by remember { mutableStateOf(false) }
+    var details by remember { mutableStateOf(false) }
     var smart by remember { mutableStateOf(SmartFeatures(search = false, faces = false)) }
     LaunchedEffect(serverId) { runCatching { vm.call(serverId) { it.smartFeatures() } }.onSuccess { smart = it } }
     val snackbar = remember { SnackbarHostState() }
@@ -83,7 +86,7 @@ fun PhotoViewer(vm: AppViewModel, serverId: String, start: Int, list: Long) {
     }
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         HorizontalPager(pager, beyondViewportPageCount = 1, modifier = Modifier.fillMaxSize()) { page ->
-            ViewerPage(vm, serverId, items[page], onTap = { chrome = !chrome }, onPlay = { withFile(false) })
+            ViewerPage(vm, serverId, items[page], onTap = { chrome = !chrome }, onPlay = { withFile(false) }, onSwipeUp = { details = true })
         }
         if (chrome) {
             TopAppBar(
@@ -95,6 +98,7 @@ fun PhotoViewer(vm: AppViewModel, serverId: String, start: Int, list: Long) {
                 },
                 navigationIcon = { IconButton(onClick = { vm.pop() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } },
                 actions = {
+                    IconButton(onClick = { details = true }) { Icon(Icons.Outlined.Info, contentDescription = "Details") }
                     IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "More") }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                         if (smart.search) DropdownMenuItem(text = { Text("Find similar photos") }, onClick = { menu = false; vm.push(Screen.GalleryResults(serverId, similarTo = current.path)) })
@@ -121,6 +125,9 @@ fun PhotoViewer(vm: AppViewModel, serverId: String, start: Int, list: Long) {
         }
         SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter))
     }
+    if (details) {
+        PhotoDetailsSheet(vm, serverId, current, onDismiss = { details = false })
+    }
     if (picking) {
         AlbumPicker(vm, serverId, "Add to…", onDismiss = { picking = false }) { album ->
             picking = false
@@ -134,7 +141,7 @@ fun PhotoViewer(vm: AppViewModel, serverId: String, start: Int, list: Long) {
 
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun ViewerPage(vm: AppViewModel, serverId: String, item: MediaItem, onTap: () -> Unit, onPlay: () -> Unit) {
+private fun ViewerPage(vm: AppViewModel, serverId: String, item: MediaItem, onTap: () -> Unit, onPlay: () -> Unit, onSwipeUp: () -> Unit) {
     val key = "g:$serverId:${item.path}:${item.takenAt ?: 0}:${item.size ?: 0}"
     val screen = with(LocalDensity.current) { LocalConfiguration.current.screenHeightDp.dp.toPx().toInt() }
     val thumb by produceState(vm.cachedThumbnail(key), key) { if (value == null) value = vm.thumbnailOf(serverId, item.path, key) }
@@ -157,6 +164,19 @@ private fun ViewerPage(vm: AppViewModel, serverId: String, item: MediaItem, onTa
                     onDoubleTap = {
                         if (scale > 1f) { scale = 1f; offset = Offset.Zero } else scale = 2.5f
                     },
+                )
+            }
+            // Swiping up (when not zoomed in) shows the details, as in other photo apps.
+            .pointerInput(item.path, scale == 1f) {
+                if (scale != 1f) return@pointerInput
+                var pulled = 0f
+                detectVerticalDragGestures(
+                    onDragStart = { pulled = 0f },
+                    onVerticalDrag = { change, dy ->
+                        pulled += dy
+                        change.consume()
+                    },
+                    onDragEnd = { if (pulled < -60.dp.toPx()) onSwipeUp() },
                 )
             }
             .then(if (video) Modifier else Modifier.transformable(transform, lockRotationOnZoomPan = true, canPan = { scale > 1f })),

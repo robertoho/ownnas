@@ -277,12 +277,14 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/tags", post(add_tag).delete(remove_tag))
         .route("/api/tags/all", get(all_tags))
         .route("/api/gallery/status", get(gallery_status))
+        .route("/api/gallery/details", get(photo_details))
         .route("/api/gallery/rescan", post(gallery_rescan))
         .route("/api/gallery/timeline", get(gallery_timeline))
         .route("/api/gallery/days", get(gallery_days))
         .route("/api/ml", get(ml_status).post(set_ml_settings))
         .route("/api/backup", get(backup_config).post(set_backup_config))
         .route("/api/backup/upload", post(backup_upload).layer(DefaultBodyLimit::disable()))
+        .route("/api/backup/has", get(backup_has))
         .route("/api/ml/forget-faces", post(forget_faces))
         .route("/api/gallery/search", get(gallery_search))
         .route("/api/gallery/similar", get(gallery_similar).post(gallery_similar).layer(DefaultBodyLimit::max(60 * 1024 * 1024)))
@@ -2061,6 +2063,97 @@ struct BackupUploadQuery {
     /// When the photo was taken or last changed, in milliseconds (also picks the month folder).
     mtime: i64,
     size: Option<u64>,
+    /// The file's SHA-256 (hex). Without it (older apps) a same-named file of the same size counts
+    /// as the same photo.
+    #[serde(default)]
+    sha256: Option<String>,
+}
+
+/// Where a photo goes: `<backup folder>/<phone>/<year>/<month>/<name>`.
+fn backup_target(state: &AppState, query: &BackupUploadQuery) -> Result<String, ApiError> {
+    let folder = backup_folder(state)
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "Phone backups are off. An administrator can choose a media upload folder in Settings → Gallery."))?;
+    let device = safe_name(&query.device, "Phone");
+    let name = safe_name(&query.name, "photo.jpg");
+    let (year, month) = year_month(query.mtime / 1000);
+    Ok(format!("{folder}/{device}/{year:04}/{month:02}/{name}"))
+}
+
+/// Whether `candidate` is `wanted` or a numbered copy of it ("IMG_1 (2).jpg" for "IMG_1.jpg").
+fn same_or_numbered(candidate: &str, wanted: &str) -> bool {
+    if candidate == wanted {
+        return true;
+    }
+    let (stem, ext) = match wanted.rfind('.') {
+        Some(dot) if dot > 0 => (&wanted[..dot], &wanted[dot..]),
+        _ => (wanted, ""),
+    };
+    let Some(rest) = candidate.strip_prefix(stem).and_then(|rest| rest.strip_prefix(" (")) else {
+        return false;
+    };
+    let Some(number) = rest.strip_suffix(ext).and_then(|rest| rest.strip_suffix(')')) else {
+        return false;
+    };
+    !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A file's SHA-256 (hex), from the cache while its size and time are unchanged.
+fn file_sha256(state: &AppState, rel: &str, full: &std::path::Path, meta: &std::fs::Metadata) -> Option<String> {
+    use sha2::Digest;
+    let mtime = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as i64;
+    {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(hash) = db::cached_hash(&conn, rel, meta.len(), mtime) {
+            return Some(hash);
+        }
+    }
+    let mut file = std::fs::File::open(full).ok()?;
+    let mut hasher = sha2::Sha256::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    let hash = hex::encode(hasher.finalize());
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let _ = db::store_hash(&conn, rel, meta.len(), mtime, &hash);
+    Some(hash)
+}
+
+/// The photo already in its month folder, under its name or a numbered copy of it: the same size
+/// and contents. Without a hash, only a file with its exact name and size counts.
+fn find_backup_copy(state: &AppState, target: &str, size: Option<u64>, sha256: Option<&str>) -> Option<String> {
+    let (dir, wanted) = target.rsplit_once('/')?;
+    let found = files::resolve(&state.root, dir).ok()?;
+    let Some(sha256) = sha256 else {
+        let meta = std::fs::metadata(found.full.join(wanted)).ok()?;
+        return (meta.is_file() && Some(meta.len()) == size).then(|| target.to_string());
+    };
+    for entry in std::fs::read_dir(&found.full).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !same_or_numbered(&name, wanted) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() || size.is_some_and(|size| size != meta.len()) {
+            continue;
+        }
+        let rel = format!("{dir}/{name}");
+        if file_sha256(state, &rel, &entry.path(), &meta).is_some_and(|hash| hash.eq_ignore_ascii_case(sha256)) {
+            return Some(rel);
+        }
+    }
+    None
+}
+
+/// Whether a phone's photo is on the server already, so it need not be sent.
+async fn backup_has(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<BackupUploadQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let target = backup_target(&state, &query)?;
+    let found = tokio::task::spawn_blocking(move || find_backup_copy(&state, &target, query.size, query.sha256.as_deref()))
+        .await
+        .unwrap_or(None);
+    Ok(Json(json!({ "path": found })))
 }
 
 /// A name safe to use as one folder or file name.
@@ -2074,35 +2167,30 @@ fn safe_name(raw: &str, fallback: &str) -> String {
 }
 
 /// One photo or video from a phone, filed as `<backup folder>/<phone>/<year>/<month>/<name>`.
-/// A file already there with the same name and size is not sent again (`skipped`); a different
-/// one with the same name is kept too, under a numbered name. The original time is kept.
+/// A copy already there (same contents, under its name or a numbered one) is not stored again
+/// (`skipped`); a different photo with the same name is kept too, under a numbered name. The
+/// original time is kept, and a file whose contents don't match its hash is refused.
 async fn backup_upload(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<BackupUploadQuery>,
     body: Body,
 ) -> Result<impl IntoResponse, ApiError> {
+    use sha2::Digest;
     check_csrf(&headers)?;
     let (user, _) = require_user(&state, &headers)?;
     require_write(&state)?;
-    let folder = backup_folder(&state)
-        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "Phone backups are off. An administrator can choose a media upload folder in Settings → Gallery."))?;
-    let device = safe_name(&query.device, "Phone");
-    let name = safe_name(&query.name, "photo.jpg");
-    let (year, month) = year_month(query.mtime / 1000);
-    let rel = format!("{folder}/{device}/{year:04}/{month:02}/{name}");
-    let root = state.root.clone();
-    let probe = rel.clone();
-    let size = query.size;
-    // Already backed up (same name and size)?
-    let already = tokio::task::spawn_blocking(move || {
-        files::resolve(&root, &probe).ok().and_then(|found| std::fs::metadata(&found.full).ok()).map(|meta| meta.is_file() && Some(meta.len()) == size)
-    })
-    .await
-    .unwrap_or(None)
-    .unwrap_or(false);
-    if already {
-        return Ok(Json(json!({ "path": rel, "skipped": true })));
+    let rel = backup_target(&state, &query)?;
+    let sha256 = query.sha256.as_ref().map(|hash| hash.to_ascii_lowercase());
+    if sha256.as_ref().is_some_and(|hash| hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit())) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "The photo's hash is not valid"));
+    }
+    let probe = (state.clone(), rel.clone(), query.size, sha256.clone());
+    let already = tokio::task::spawn_blocking(move || find_backup_copy(&probe.0, &probe.1, probe.2, probe.3.as_deref()))
+        .await
+        .unwrap_or(None);
+    if let Some(path) = already {
+        return Ok(Json(json!({ "path": path, "skipped": true })));
     }
     let root = state.root.clone();
     let target = rel.clone();
@@ -2118,9 +2206,11 @@ async fn backup_upload(
         let mut out = tokio::fs::File::create(&partial).await.ok()?;
         let mut stream = body.into_data_stream();
         let mut total = 0u64;
+        let mut hasher = sha2::Sha256::new();
         while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
             let chunk = chunk.ok()?;
             total += chunk.len() as u64;
+            hasher.update(&chunk);
             tokio::io::AsyncWriteExt::write_all(&mut out, &chunk).await.ok()?;
         }
         tokio::io::AsyncWriteExt::flush(&mut out).await.ok()?;
@@ -2128,19 +2218,32 @@ async fn backup_upload(
         if query.mtime > 0 {
             let _ = file.set_modified(std::time::UNIX_EPOCH + Duration::from_millis(query.mtime as u64));
         }
-        Some(total)
+        Some((total, hex::encode(hasher.finalize())))
     }
     .await;
     // Only a complete file takes the photo's name, so an interrupted upload is never mistaken for one.
-    let complete = matches!((written, query.size), (Some(got), Some(want)) if got == want) || matches!((written, query.size), (Some(_), None));
-    if !complete || tokio::fs::rename(&partial, &dest).await.is_err() {
+    let complete = match (&written, query.size) {
+        (Some((got, _)), Some(want)) => *got == want,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    let damaged = matches!((&written, &sha256), (Some((_, got)), Some(want)) if got != want);
+    if !complete || damaged || tokio::fs::rename(&partial, &dest).await.is_err() {
         let _ = tokio::fs::remove_file(&partial).await;
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "The upload was interrupted"));
+        let message = if damaged { "The photo arrived damaged or changed while it was sent" } else { "The upload was interrupted" };
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, message));
     }
     let saved = dest
         .strip_prefix(state.root.canonicalize().unwrap_or_else(|_| state.root.clone()))
         .map(|rel| rel.to_string_lossy().replace('\\', "/"))
         .unwrap_or(rel);
+    // The next phone asking about this photo needn't read it again.
+    if let (Some((size, hash)), Ok(meta)) = (&written, std::fs::metadata(&dest)) {
+        if let Some(mtime) = meta.modified().ok().and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()) {
+            let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+            let _ = db::store_hash(&conn, &saved, *size, mtime.as_millis() as i64, hash);
+        }
+    }
     invalidate_sizes(&state, &parent_rel_path(&saved));
     record(&state, &user, "backup", &saved);
     state.media.rescan_soon();
@@ -4931,6 +5034,26 @@ async fn set_folder_appearance(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// Everything known about one photo or video (see `photo_details`).
+async fn photo_details(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let rel = rel_of(&query.path);
+    let resolved = files::resolve(&state.root, &rel).map_err(ApiError::from)?;
+    if !resolved.full.is_file() {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "That photo is not there any more"));
+    }
+    let payload = tokio::task::spawn_blocking(move || {
+        crate::photo_details::details(&state.db, &resolved.rel, &resolved.full)
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the photo"))?;
+    Ok(Json(payload))
+}
+
 async fn get_annotations(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
@@ -5252,6 +5375,18 @@ mod backup_name_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_copies_are_the_name_or_a_numbered_one() {
+        assert!(same_or_numbered("IMG_1.jpg", "IMG_1.jpg"));
+        assert!(same_or_numbered("IMG_1 (2).jpg", "IMG_1.jpg"));
+        assert!(same_or_numbered("IMG_1 (12).jpg", "IMG_1.jpg"));
+        assert!(!same_or_numbered("IMG_1 ().jpg", "IMG_1.jpg"));
+        assert!(!same_or_numbered("IMG_1 (2).png", "IMG_1.jpg"));
+        assert!(!same_or_numbered("IMG_12.jpg", "IMG_1.jpg"));
+        assert!(!same_or_numbered("IMG_1 (x).jpg", "IMG_1.jpg"));
+        assert!(same_or_numbered("notes (3)", "notes"));
+    }
     use axum::body::Body;
     use axum::http::Request;
     use std::sync::Arc;

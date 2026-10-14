@@ -42,6 +42,49 @@ pub struct MediaItem {
     pub face_id: Option<i64>,
 }
 
+/// One line of a photo's details.
+#[derive(uniffi::Record, Deserialize, Clone, Debug)]
+pub struct DetailRow {
+    pub label: String,
+    pub value: String,
+    /// A real moment (seconds since the Unix epoch), to show in the phone's time zone instead of `value`.
+    #[serde(default)]
+    pub time: Option<i64>,
+}
+
+#[derive(uniffi::Record, Deserialize, Clone, Debug)]
+pub struct DetailSection {
+    pub title: String,
+    pub rows: Vec<DetailRow>,
+}
+
+#[derive(uniffi::Record, Deserialize, Clone, Debug)]
+pub struct GeoPoint {
+    pub lat: f64,
+    pub lon: f64,
+}
+
+#[derive(uniffi::Record, Deserialize, Clone, Debug)]
+pub struct AlbumRef {
+    pub id: i64,
+    pub name: String,
+}
+
+/// Everything the server knows about one photo or video.
+#[derive(uniffi::Record, Deserialize, Clone, Debug)]
+pub struct PhotoDetails {
+    pub name: String,
+    pub path: String,
+    /// Where it was taken, from the camera's GPS.
+    #[serde(default)]
+    pub location: Option<GeoPoint>,
+    #[serde(default)]
+    pub albums: Vec<AlbumRef>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub sections: Vec<DetailSection>,
+}
+
 #[derive(uniffi::Record, Deserialize, Clone, Debug)]
 pub struct DayCount {
     /// "2024-07-15" (UTC).
@@ -274,6 +317,11 @@ impl Server {
         Ok(())
     }
 
+    /// Everything known about a photo or video: file, camera, exposure, place, streams, albums…
+    pub fn photo_details(&self, path: String) -> Result<PhotoDetails, ClientError> {
+        Ok(self.api.get_json("/api/gallery/details", &[("path", &path)])?)
+    }
+
     /// JPEG of one face, cut out of its photo.
     pub fn face_picture(&self, face_id: i64) -> Result<Vec<u8>, ClientError> {
         let id = face_id.to_string();
@@ -287,18 +335,50 @@ impl Server {
     }
 
     /// Backs one photo or video up, read from the open file descriptor `fd` (handed over).
-    /// It goes to `<folder>/<device>/<year>/<month>/<name>`; the server skips it when it is
-    /// already there. `mtime_ms` is when it was taken.
+    /// It goes to `<folder>/<device>/<year>/<month>/<name>`. The file is hashed first and not sent
+    /// when the server has the same contents already (under its name or a numbered copy); the
+    /// server checks the hash of what arrives too. `mtime_ms` is when it was taken.
     #[cfg(unix)]
     pub fn backup_fd(&self, device: String, name: String, fd: i32, size: u64, mtime_ms: i64, transfer: Arc<dyn Transfer>) -> Result<BackupResult, ClientError> {
+        use std::io::{Read, Seek};
         use std::os::fd::{FromRawFd, OwnedFd};
+        use sha2::Digest;
         if fd < 0 {
             return Err(failed("The file could not be opened".into()));
         }
         // SAFETY: the caller hands over an open descriptor it no longer uses.
-        let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        let mut hasher = sha2::Sha256::new();
+        let mut buffer = vec![0u8; 1 << 20];
+        loop {
+            if !transfer.keep_going(0) {
+                return Err(ClientError::Cancelled);
+            }
+            let read = file.read(&mut buffer).map_err(|err| failed(format!("The file could not be read: {err}")))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        let sha256: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+        file.rewind().map_err(|err| failed(format!("The file could not be read: {err}")))?;
         let (size_text, mtime_text) = (size.to_string(), mtime_ms.to_string());
-        let query = [("device", device.as_str()), ("name", name.as_str()), ("size", size_text.as_str()), ("mtime", mtime_text.as_str())];
+        let query = [
+            ("device", device.as_str()),
+            ("name", name.as_str()),
+            ("size", size_text.as_str()),
+            ("mtime", mtime_text.as_str()),
+            ("sha256", sha256.as_str()),
+        ];
+        // Ask first, so a photo the server has is never sent again. Older servers don't know
+        // this question; the upload itself still skips copies there.
+        #[derive(Deserialize)]
+        struct Found {
+            path: Option<String>,
+        }
+        if let Ok(Found { path: Some(path) }) = self.api.get_json::<Found>("/api/backup/has", &query) {
+            return Ok(BackupResult { path, skipped: true });
+        }
         Ok(self.api.post_stream("/api/backup/upload", &query, file, Some(size), &|done| transfer.keep_going(done))?)
     }
 }
@@ -327,5 +407,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(person.person.cover_face, Some(3));
+        let details: PhotoDetails = serde_json::from_str(
+            r#"{"name":"a.jpg","path":"p/a.jpg","kind":"image","location":{"lat":41.3,"lon":2.1},"albums":[{"id":1,"name":"Trips"}],"tags":["sea"],"sections":[{"title":"File","rows":[{"label":"Modified","value":"x","time":5},{"label":"Size","value":"1 KB"}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!((details.sections[0].rows[0].time, details.location.unwrap().lat), (Some(5), 41.3));
     }
 }
