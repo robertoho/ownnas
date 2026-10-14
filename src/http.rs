@@ -31,6 +31,7 @@ const DOCX_EDITOR_CSS: &str = include_str!("../web/docx-editor.css");
 const DOCX_EDITOR_JS: &str = include_str!("../web/docx-editor.js");
 const ODT_EDITOR_JS: &str = include_str!("../web/odt-editor.js");
 const XLSX_EDITOR_JS: &str = include_str!("../web/xlsx-editor.js");
+const SQLITE_VIEWER_JS: &str = include_str!("../web/sqlite-viewer.js");
 const APP_JS: &str = include_str!("../web/app.js");
 const MODEL_VIEWER_JS: &str = include_str!("../web/model-viewer.js");
 const DXF_VIEWER_JS: &str = include_str!("../web/dxf-viewer.js");
@@ -144,6 +145,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/assets/docx-editor.js", get(docx_editor_javascript))
         .route("/assets/odt-editor.js", get(odt_editor_javascript))
         .route("/assets/xlsx-editor.js", get(xlsx_editor_javascript))
+        .route("/assets/sqlite-viewer.js", get(sqlite_viewer_javascript))
         .route("/assets/docx-editor.css", get(docx_editor_css))
         .route("/assets/model-viewer.js", get(model_viewer_javascript))
         .route("/assets/dxf-viewer.js", get(dxf_viewer_javascript))
@@ -207,6 +209,10 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/docx", get(read_docx))
         .route("/api/odt", get(read_odt))
         .route("/api/xlsx", get(read_xlsx))
+        .route("/api/sqlite", get(sqlite_overview))
+        .route("/api/sqlite/rows", get(sqlite_rows))
+        .route("/api/sqlite/query", post(sqlite_query))
+        .route("/api/sqlite/value", get(sqlite_value))
         .route("/api/thumb", get(thumb))
         .route("/api/mkdir", post(mkdir))
         .route("/api/create", post(create_entry))
@@ -798,6 +804,10 @@ async fn xlsx_editor_javascript() -> impl IntoResponse {
     app_module_javascript(XLSX_EDITOR_JS)
 }
 
+async fn sqlite_viewer_javascript() -> impl IntoResponse {
+    app_module_javascript(SQLITE_VIEWER_JS)
+}
+
 async fn model_viewer_javascript() -> impl IntoResponse {
     app_module_javascript(MODEL_VIEWER_JS)
 }
@@ -1326,6 +1336,129 @@ async fn read_xlsx(
     let hash = hex::encode(sha2::Sha256::digest(&bytes));
     Ok(([(header::CONTENT_TYPE.as_str(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
         ("x-xlsx-hash", hash.as_str()), ("cache-control", "no-store")], bytes).into_response())
+}
+
+impl From<crate::sqlite_view::ViewError> for ApiError {
+    fn from(err: crate::sqlite_view::ViewError) -> Self {
+        use crate::sqlite_view::ViewError;
+        let status = match err {
+            ViewError::NotFound(_) => StatusCode::NOT_FOUND,
+            _ => StatusCode::BAD_REQUEST,
+        };
+        ApiError::new(status, err.to_string())
+    }
+}
+
+/// Opens the SQLite database at a library path (read-only) and runs `work` on it.
+async fn with_sqlite<T: Send + 'static>(
+    state: &AppState,
+    path: &Option<String>,
+    work: impl FnOnce(&rusqlite::Connection) -> Result<T, crate::sqlite_view::ViewError> + Send + 'static,
+) -> Result<T, ApiError> {
+    let target = files::resolve(&state.root, &rel_of(path))?;
+    if !target.full.is_file() {
+        return Err(FileError::NotFound.into());
+    }
+    tokio::task::spawn_blocking(move || work(&crate::sqlite_view::open(&target.full)?))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the database"))?
+        .map_err(ApiError::from)
+}
+
+async fn sqlite_overview(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    Ok(Json(with_sqlite(&state, &query.path, crate::sqlite_view::overview).await?))
+}
+
+#[derive(Deserialize)]
+struct SqliteRowsQuery {
+    path: Option<String>,
+    table: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    order: Option<String>,
+    desc: Option<String>,
+    filter: Option<String>,
+}
+
+async fn sqlite_rows(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<SqliteRowsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let path = query.path.clone();
+    let result = with_sqlite(&state, &path, move |conn| {
+        crate::sqlite_view::rows(conn, &crate::sqlite_view::Page {
+            table: &query.table,
+            offset: query.offset.unwrap_or(0),
+            limit: query.limit.unwrap_or(100),
+            order: query.order.as_deref().filter(|order| !order.is_empty()),
+            descending: query.desc.as_deref() == Some("1"),
+            filter: query.filter.as_deref().unwrap_or(""),
+        })
+    })
+    .await?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+struct SqliteQueryBody {
+    path: Option<String>,
+    sql: String,
+}
+
+async fn sqlite_query(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<SqliteQueryBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    require_user(&state, &headers)?;
+    if body.sql.len() > 100_000 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "That query is too long"));
+    }
+    let sql = body.sql;
+    Ok(Json(with_sqlite(&state, &body.path, move |conn| crate::sqlite_view::query(conn, &sql)).await?))
+}
+
+#[derive(Deserialize)]
+struct SqliteValueQuery {
+    path: Option<String>,
+    table: String,
+    rowid: i64,
+    column: String,
+}
+
+/// One whole value from a table: text to read, or a blob to download.
+async fn sqlite_value(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<SqliteValueQuery>,
+) -> Result<Response, ApiError> {
+    require_user(&state, &headers)?;
+    let name = format!("{}-{}-{}", query.table, query.rowid, query.column);
+    let (bytes, text) = with_sqlite(&state, &query.path.clone(), move |conn| {
+        crate::sqlite_view::value(conn, &query.table, query.rowid, &query.column)
+    })
+    .await?;
+    let response = Response::builder()
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff");
+    let response = if text {
+        response.header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+    } else {
+        response
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_DISPOSITION, files::content_disposition(&format!("{name}.bin"), true))
+    };
+    response
+        .body(Body::from(bytes))
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not send the value"))
 }
 
 async fn raw(

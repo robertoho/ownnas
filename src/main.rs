@@ -7,6 +7,7 @@ mod http;
 mod pdf_ops;
 mod terminal;
 mod preview;
+mod sqlite_view;
 mod thumbs;
 mod tls;
 mod update;

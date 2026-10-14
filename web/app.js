@@ -1687,6 +1687,16 @@ async function openEntry(entry) {
         body.innerHTML = `<p class="muted">${esc(err.message || "Could not open CAD preview")}</p>`;
       }
     });
+  } else if (/\.(db|sqlite|sqlite3|db3)$/i.test(entry.name)) {
+    body.innerHTML = '<p class="muted">Opening database…</p>';
+    try {
+      const module = await import('/assets/sqlite-viewer.js');
+      if (state.current !== entry) return;
+      const viewer = module.mountSqliteViewer(body, { path: entry.path, api });
+      state.editor = { dirty: false, destroy: () => viewer.destroy() };
+    } catch (err) {
+      if (state.current === entry) body.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
+    }
   } else if (entry.kind === "model3d") {
     openModelPreview(body, entry, raw).catch((err) => {
       if (state.current && state.current.path === entry.path) {

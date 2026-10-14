@@ -13,6 +13,7 @@ pub mod http;
 pub mod pdf_ops;
 pub mod terminal;
 pub mod preview;
+pub mod sqlite_view;
 pub mod thumbs;
 pub mod tls;
 pub mod update;

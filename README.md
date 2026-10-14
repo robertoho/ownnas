@@ -234,6 +234,8 @@ New installations check the signed GitHub release feed once per day. Administrat
 
 OwnNAS also includes a basic embedded ODT editor. Open an `.odt` file or create one from **New file → OpenDocument text**. Its browser module can be reused in other projects; see [web/odt-editor.md](web/odt-editor.md).
 
+
+SQLite databases (`.db`, `.sqlite`, `.sqlite3`, `.db3`) open in a read-only viewer: pick a table or view to page through its rows (sorted by any column and filtered by text in any column), see its columns, `CREATE` statement, and indexes, or run your own `SELECT` queries (up to 1,000 rows, stopped after 10 seconds). The database is opened read-only, so the viewer never changes or locks it for the program that uses it; long text and blobs can be opened or downloaded whole.
 ## Native HTTPS with your own certificates
 
 OwnNAS can serve HTTPS directly without a proxy. Generate a private CA and a
