@@ -3452,3 +3452,35 @@ body.is-gallery .app > .explorer-status-bar { display: none; }
 .index-speed-option > span { display: grid; gap: 0.2rem; }
 .index-speed-option .muted { font-size: 0.85rem; }
 .index-status { min-height: 1.3rem; }
+
+.smart-settings { margin-top: 1.4rem; padding-top: 1rem; border-top: 1px solid var(--line); }
+.smart-settings h3 { margin: 0 0 0.4rem; }
+.smart-option { display: flex; align-items: flex-start; gap: 0.7rem; margin: 0.7rem 0; padding: 0.7rem 0.85rem; border: 1px solid var(--line); border-radius: 12px; background: var(--bg-2); cursor: pointer; }
+.smart-option:has(input:checked) { border-color: var(--accent); }
+.smart-option input { margin-top: 0.2rem; accent-color: var(--accent); }
+.smart-option > span { display: grid; gap: 0.25rem; }
+.smart-option .muted { font-size: 0.85rem; }
+.smart-state { font-size: 0.85rem; color: var(--accent); }
+.smart-state:empty { display: none; }
+
+.gallery-search { flex: 1 1 14rem; max-width: 26rem; min-width: 0; }
+.gallery.is-drop-target .gallery-viewport { outline: 2px dashed var(--accent); outline-offset: -6px; }
+.gallery-sample { display: flex; align-items: center; gap: 0.9rem; margin: 0.6rem 0 1rem; }
+.gallery-sample p { margin: 0.2rem 0 0; overflow-wrap: anywhere; }
+.gallery-sample-picture { flex: 0 0 auto; width: 88px; height: 88px; border-radius: 10px; overflow: hidden; background: var(--thumb-bg); }
+.gallery-sample-picture img { width: 100%; height: 100%; object-fit: cover; }
+.gallery-people { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(calc(var(--gallery-tile) - 10px), 40vw), 1fr)); gap: 1rem 0.8rem; margin-top: 0.6rem; }
+.gallery-person { display: grid; justify-items: center; gap: 0.25rem; color: var(--text); text-decoration: none; text-align: center; min-width: 0; }
+.gallery-person strong { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gallery-person .muted { font-size: 0.8rem; }
+.gallery-person-face { display: grid; place-items: center; width: 100%; max-width: 160px; aspect-ratio: 1; border-radius: 50%; overflow: hidden; background: var(--bg-2); border: 2px solid var(--line); }
+.gallery-person:hover .gallery-person-face { border-color: var(--accent); }
+.gallery-person-face img { width: 100%; height: 100%; object-fit: cover; }
+.gallery-person-empty { color: var(--muted); font-size: 2rem; }
+.person-picker { width: min(520px, calc(100vw - 2rem)); display: grid; gap: 0.6rem; }
+.person-picker:not([open]) { display: none; }
+.person-picker-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 0.6rem; max-height: min(55vh, 26rem); overflow: auto; padding: 0.2rem; }
+.person-picker-row { display: grid; justify-items: center; gap: 0.3rem; padding: 0.4rem; border: 0; border-radius: 10px; background: transparent; font-size: 0.85rem; }
+.person-picker-row:hover { background: var(--bg-3); }
+.person-picker-row .gallery-person-face { width: 72px; }
+.person-picker .spacer { flex: 1; }

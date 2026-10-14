@@ -44,6 +44,11 @@ jni = "0.21"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 portable-pty = "0.9"
+# Smart photo search and faces (models are downloaded when switched on). Linked statically,
+# so the server stays one file.
+ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-native", "api-31"] }
+ndarray = "0.17"
+regex = "1"
 
 [profile.release]
 lto = "thin"

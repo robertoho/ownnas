@@ -134,6 +134,44 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             indexed_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS media_index_taken ON media_index(taken_at DESC, path DESC);
+        CREATE TABLE IF NOT EXISTS image_vectors (
+            path TEXT PRIMARY KEY,
+            size INTEGER NOT NULL,
+            mtime INTEGER NOT NULL,
+            vector BLOB NOT NULL,
+            indexed_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS face_scans (
+            path TEXT PRIMARY KEY,
+            size INTEGER NOT NULL,
+            mtime INTEGER NOT NULL,
+            faces INTEGER NOT NULL,
+            scanned_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS people (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            hidden INTEGER NOT NULL DEFAULT 0,
+            centroid BLOB,
+            faces INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS faces (
+            id INTEGER PRIMARY KEY,
+            path TEXT NOT NULL,
+            x REAL NOT NULL,
+            y REAL NOT NULL,
+            w REAL NOT NULL,
+            h REAL NOT NULL,
+            score REAL NOT NULL,
+            vector BLOB NOT NULL,
+            person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
+            manual INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS faces_path ON faces(path);
+        CREATE INDEX IF NOT EXISTS faces_person ON faces(person_id);
         CREATE TABLE IF NOT EXISTS timeline_hidden (
             path TEXT PRIMARY KEY,
             hidden_at INTEGER NOT NULL,
@@ -153,7 +191,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     .map_err(|_| "Could not create the database schema".to_string())?;
     ensure_admin_column(conn)?;
     conn.execute(
-        "INSERT INTO settings(key, value) VALUES('schema_version', '9')
+        "INSERT INTO settings(key, value) VALUES('schema_version', '10')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )
@@ -927,7 +965,7 @@ pub fn rewrite_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), 
         );
     }
     // Albums keep the photos they hold, wherever they move (into the Trash and back too).
-    for (table, column) in [("album_items", "path"), ("albums", "cover_path"), ("media_index", "path"), ("timeline_hidden", "path")] {
+    for (table, column) in [("album_items", "path"), ("albums", "cover_path"), ("media_index", "path"), ("timeline_hidden", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path")] {
         conn.execute(
             &format!(
                 "UPDATE OR REPLACE {table} SET {column} = CASE WHEN {column} = ?1 THEN ?2 ELSE ?2 || substr({column}, length(?1) + 1) END
@@ -1040,7 +1078,7 @@ pub fn delete_path_meta(conn: &Connection, path: &str) -> Result<(), String> {
         params![path, like],
     )
     .map_err(|_| "Could not remove recent files".to_string())?;
-    for (table, column) in [("album_items", "path"), ("media_index", "path"), ("timeline_hidden", "path")] {
+    for (table, column) in [("album_items", "path"), ("media_index", "path"), ("timeline_hidden", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path")] {
         conn.execute(
             &format!("DELETE FROM {table} WHERE {column} = ?1 OR substr({column}, 1, length(?1) + 1) = ?1 || '/'"),
             params![path],
@@ -1052,6 +1090,12 @@ pub fn delete_path_meta(conn: &Connection, path: &str) -> Result<(), String> {
         params![path],
     )
     .map_err(|_| "Could not update album covers".to_string())?;
+    // People who lost faces with it: keep their counts right, and drop unnamed ones left empty.
+    conn.execute_batch(
+        "UPDATE people SET faces = (SELECT count(*) FROM faces WHERE person_id = people.id);
+         DELETE FROM people WHERE faces = 0 AND name IS NULL;",
+    )
+    .map_err(|_| "Could not update people".to_string())?;
     invalidate_folder_sizes(conn, path)?;
     Ok(())
 }

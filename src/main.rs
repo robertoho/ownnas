@@ -5,6 +5,9 @@ mod content_index;
 mod db;
 mod files;
 mod media_index;
+mod smart;
+#[cfg(not(target_os = "android"))]
+mod ml;
 mod http;
 mod pdf_ops;
 mod terminal;

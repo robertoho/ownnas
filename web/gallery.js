@@ -72,15 +72,20 @@ export function mountGallery(root, ctx) {
   let menu = null;
 
   const tabs = el("nav", { class: "gallery-tabs", "aria-label": "Gallery sections" });
-  for (const [tab, label] of [["photos", "Photos"], ["albums", "Albums"], ["tags", "Tags"]]) {
-    tabs.append(el("a", { href: `#gallery${tab === "photos" ? "" : `/${tab}`}`, "data-tab": tab }, label));
+  for (const [tab, label] of [["photos", "Photos"], ["albums", "Albums"], ["people", "People"], ["tags", "Tags"]]) {
+    tabs.append(el("a", { href: `#gallery${tab === "photos" ? "" : `/${tab}`}`, "data-tab": tab, hidden: tab === "people" }, label));
   }
+  const searchBox = el("input", { type: "search", class: "gallery-search", placeholder: "Search photos: “dog on the beach”…", "aria-label": "Search photos by what they show", hidden: true, title: "Search in words, or drop a picture here to find photos like it" });
+  let smart = null; // what /api/ml says
+  let sample = null; // a picture dropped in, to find photos like it
+  let people = [];
+  let currentPerson = null;
   const status = el("span", { class: "gallery-status", role: "status" });
   const actions = el("div", { class: "gallery-actions" });
   const size = el("input", { type: "range", class: "gallery-size", min: "80", max: "320", step: "10", "aria-label": "Photo size", title: "Photo size" });
   const sizeControl = el("label", { class: "gallery-size-control", title: "Photo size" },
     el("span", { class: "gallery-size-small", "aria-hidden": "true" }), size, el("span", { class: "gallery-size-large", "aria-hidden": "true" }));
-  const head = el("div", { class: "gallery-head" }, tabs, status, actions, sizeControl);
+  const head = el("div", { class: "gallery-head" }, tabs, searchBox, status, actions, sizeControl);
   const selectionBar = el("div", { class: "gallery-selection", hidden: true });
   const body = el("div", { class: "gallery-body" });
   const scroller = el("div", { class: "gallery-scroller" }, body);
@@ -186,6 +191,9 @@ export function mountGallery(root, ctx) {
       write && picked.some((item) => item.hidden) ? button("Show in Photos", () => setHidden(picked.filter((item) => item.hidden).map((item) => item.path), false)) : null,
       write && current && picked.length === 1 && !picked[0].missing ? button("Use as cover", () => setCover(picked[0].path)) : null,
       write && current ? button("Remove from album", () => removeFromAlbum(picked.map((item) => item.path)), { class: "danger" }) : null,
+      write && route.tab === "person" && picked.every((item) => item.faceId)
+        ? button(`Not ${currentPerson && currentPerson.name ? currentPerson.name : "this person"}`, () => moveFaces(picked.map((item) => item.faceId), null), { class: "danger" })
+        : null,
       button("Clear", clearSelection, { class: "gallery-clear" }),
     ].filter(Boolean));
   }
@@ -698,6 +706,21 @@ export function mountGallery(root, ctx) {
       write && paths.length && { label: "Tag…", icon: "bulkTag", run: () => ctx.tag(paths) },
       paths.length && { label: "Download", icon: "download", run: () => ctx.download(paths) },
       one && !one.missing && { label: "Show in folder", icon: "folder", run: () => ctx.showInFolder(one.path) },
+      one && !one.missing && searchOn() && { label: "Find similar photos", icon: "search", run: () => { location.hash = `#gallery/similar/${encodeURIComponent(one.path)}`; } },
+      write && route.tab === "person" && picked.every((entry) => entry.faceId) && {
+        label: `Not ${currentPerson && currentPerson.name ? currentPerson.name : "this person"}`,
+        icon: "removeFromAlbum",
+        danger: true,
+        run: () => moveFaces(picked.map((entry) => entry.faceId), null),
+      },
+      write && route.tab === "person" && picked.every((entry) => entry.faceId) && {
+        label: "This is someone else…",
+        icon: "move",
+        run: async () => {
+          const to = await choosePerson("Who is it?", currentPerson && currentPerson.id);
+          if (to) moveFaces(picked.map((entry) => entry.faceId), to);
+        },
+      },
       write && route.tab !== "hidden" && picked.some((entry) => !entry.hidden) && {
         label: picked.length === 1 ? "Hide from Photos" : `Hide ${number(picked.length)} from Photos`,
         icon: "hide",
@@ -768,6 +791,20 @@ export function mountGallery(root, ctx) {
     if (event.target.closest(".gallery-head, .gallery-selection, input, textarea")) return;
     const tileNode = event.target.closest(".gallery-tile");
     const card = event.target.closest(".gallery-album");
+    const personCard = event.target.closest(".gallery-person");
+    if (personCard) {
+      const person = people.find((entry) => entry.id === Number(personCard.dataset.person));
+      if (!person) return;
+      event.preventDefault();
+      const write = ctx.canWrite();
+      openMenu(event.clientX, event.clientY, person.name || "Unnamed person", [
+        { label: "Open", icon: "open", run: () => { location.hash = `#gallery/people/${person.id}`; } },
+        write && { label: person.name ? "Rename…" : "Add a name…", icon: "rename", run: () => renamePerson(person) },
+        write && { label: "Same person as…", icon: "move", run: () => mergePerson(person) },
+        write && { label: person.hidden ? "Show in People" : "Hide from People", icon: "hide", run: () => hidePerson(person, !person.hidden) },
+      ]);
+      return;
+    }
     if (tileNode) {
       const item = byPath.get(tileNode.dataset.path);
       if (!item) return;
@@ -943,6 +980,254 @@ export function mountGallery(root, ctx) {
     }
   }
 
+  // ---- Smart search: by words, or by a photo ----
+
+  /// What the smart features can do right now (fetched again on each visit).
+  async function loadSmart() {
+    try {
+      smart = await ctx.api("/api/ml");
+    } catch {
+      smart = { available: false };
+    }
+    const searchOn = !!(smart.available && smart.search.enabled && smart.search.ready);
+    const facesOn = !!(smart.available && smart.faces.enabled && smart.faces.ready);
+    searchBox.hidden = !searchOn;
+    tabs.querySelector('[data-tab="people"]').hidden = !facesOn;
+  }
+
+  const searchOn = () => !!(smart && smart.available && smart.search.enabled && smart.search.ready);
+
+  searchBox.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    const query = searchBox.value.trim();
+    if (query) location.hash = `#gallery/search/${encodeURIComponent(query)}`;
+  });
+  // Drop or paste a picture onto the search box (or anywhere in the Gallery) to find photos like it.
+  const pictureOf = (transfer) => [...((transfer && transfer.files) || [])].find((file) => file.type.startsWith("image/") || /\.(heic|heif|avif)$/i.test(file.name));
+  searchBox.addEventListener("paste", (event) => {
+    const picture = pictureOf(event.clipboardData);
+    if (!picture) return;
+    event.preventDefault();
+    findLike(picture);
+  });
+  root.addEventListener("dragover", (event) => {
+    if (searchOn() && [...(event.dataTransfer?.types || [])].includes("Files")) {
+      event.preventDefault();
+      root.classList.add("is-drop-target");
+    }
+  });
+  root.addEventListener("dragleave", (event) => {
+    if (!root.contains(event.relatedTarget)) root.classList.remove("is-drop-target");
+  });
+  root.addEventListener("drop", (event) => {
+    root.classList.remove("is-drop-target");
+    const picture = pictureOf(event.dataTransfer);
+    if (!picture || !searchOn()) return;
+    event.preventDefault();
+    findLike(picture);
+  });
+
+  function findLike(picture) {
+    sample = picture;
+    if (location.hash === "#gallery/similar") show(location.hash);
+    else location.hash = "#gallery/similar";
+  }
+
+  async function showSearch(query) {
+    const mine = ++generation;
+    searchBox.value = query;
+    actions.replaceChildren();
+    body.replaceChildren(el("p", { class: "muted gallery-message" }, "Searching…"));
+    try {
+      const data = await ctx.api(`/api/gallery/search?q=${encodeURIComponent(query)}`);
+      if (stale(mine)) return;
+      items = data.items;
+      status.textContent = items.length ? `${plural(items.length, "photo")}, best matches first` : "";
+      body.replaceChildren(
+        el("nav", { class: "gallery-crumbs" }, el("a", { href: "#gallery" }, "Photos"), el("span", { "aria-hidden": "true" }, "›"), el("strong", {}, `“${query}”`)),
+        items.length ? grid(items) : el("p", { class: "muted gallery-message" }, "Nothing matches. Try other words, in English: “red car”, “people at a table”, “snowy mountains”."),
+      );
+    } catch (err) {
+      if (!stale(mine)) body.replaceChildren(el("p", { class: "muted gallery-message" }, err.message));
+    }
+  }
+
+  async function showSimilar(path) {
+    const mine = ++generation;
+    actions.replaceChildren();
+    body.replaceChildren(el("p", { class: "muted gallery-message" }, "Looking for similar photos…"));
+    try {
+      let data;
+      let preview;
+      if (path) {
+        data = await ctx.api(`/api/gallery/similar?path=${encodeURIComponent(path)}`);
+        preview = el("img", { src: thumbUrl({ path }), alt: nameOf(path) });
+      } else if (sample) {
+        const response = await fetch("/api/gallery/similar", { method: "POST", body: sample, credentials: "same-origin", headers: { "X-OwnNAS": "1" } });
+        data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || "Could not search");
+        preview = el("img", { src: URL.createObjectURL(sample), alt: sample.name || "Sample picture" });
+      } else {
+        body.replaceChildren(el("p", { class: "muted gallery-message" }, "Drop or paste a picture onto the search box to find photos like it."));
+        return;
+      }
+      if (stale(mine)) return;
+      items = data.items;
+      status.textContent = plural(items.length, "similar photo");
+      body.replaceChildren(
+        el("div", { class: "gallery-sample" }, el("span", { class: "gallery-sample-picture" }, preview), el("div", {},
+          el("strong", {}, "Photos like this one"),
+          el("p", { class: "muted" }, path ? path : "From the picture you dropped in. It was not saved."))),
+        items.length ? grid(items) : el("p", { class: "muted gallery-message" }, "No photo looks much like this one."),
+      );
+    } catch (err) {
+      if (!stale(mine)) body.replaceChildren(el("p", { class: "muted gallery-message" }, err.message));
+    }
+  }
+
+  // ---- People ----
+
+  function faceImage(faceId, name) {
+    return faceId
+      ? el("img", { src: `/api/faces/crop?id=${faceId}`, alt: name || "", loading: "lazy" })
+      : el("span", { class: "gallery-person-empty", "aria-hidden": "true" }, "?");
+  }
+
+  async function showPeople(hiddenOnes) {
+    const mine = ++generation;
+    actions.replaceChildren();
+    body.replaceChildren(el("p", { class: "muted gallery-message" }, "Loading people…"));
+    try {
+      const data = await ctx.api(`/api/people${hiddenOnes ? "?hidden=1" : ""}`);
+      if (stale(mine)) return;
+      people = data.people;
+      items = [];
+      status.textContent = plural(people.length, hiddenOnes ? "hidden person" : "person", hiddenOnes ? "hidden people" : "people");
+      if (!hiddenOnes && data.hiddenCount) actions.append(el("a", { class: "button", href: "#gallery/people/hidden" }, `Hidden · ${number(data.hiddenCount)}`));
+      const scanning = smart && smart.scanned < smart.images;
+      body.replaceChildren(...[
+        hiddenOnes ? el("nav", { class: "gallery-crumbs" }, el("a", { href: "#gallery/people" }, "People"), el("span", { "aria-hidden": "true" }, "›"), el("strong", {}, "Hidden")) : null,
+        people.length
+          ? el("div", { class: "gallery-people" }, people.map((person) =>
+            el("a", { class: "gallery-person", href: `#gallery/people/${person.id}`, "data-person": String(person.id) },
+              el("span", { class: "gallery-person-face" }, faceImage(person.coverFace, person.name)),
+              el("strong", { class: person.name ? null : "muted" }, person.name || "Add a name"),
+              el("span", { class: "muted" }, plural(person.photos, "photo")))))
+          : el("p", { class: "muted gallery-message" }, hiddenOnes ? "Nobody is hidden."
+            : scanning ? `Looking for faces… ${number(smart.scanned)} of ${number(smart.images)} photos so far. People show up here once someone is in two photos.`
+              : "No people yet. Someone shows up here once they are in two photos."),
+      ].filter(Boolean));
+    } catch (err) {
+      if (!stale(mine)) body.replaceChildren(el("p", { class: "muted gallery-message" }, err.message));
+    }
+  }
+
+  async function showPerson(id) {
+    const mine = ++generation;
+    body.replaceChildren(el("p", { class: "muted gallery-message" }, "Loading…"));
+    try {
+      const data = await ctx.api(`/api/people/photos?id=${id}`);
+      if (stale(mine)) return;
+      currentPerson = data.person;
+      items = data.items;
+      const write = ctx.canWrite();
+      status.textContent = plural(items.length, "photo");
+      actions.replaceChildren(...[
+        write && el("button", { type: "button", onclick: () => renamePerson(currentPerson) }, currentPerson.name ? "Rename" : "Add a name"),
+        write && el("button", { type: "button", onclick: () => mergePerson(currentPerson) }, "Same person as…"),
+        write && el("button", { type: "button", onclick: () => hidePerson(currentPerson, !currentPerson.hidden) }, currentPerson.hidden ? "Show in People" : "Hide"),
+      ].filter(Boolean));
+      body.replaceChildren(
+        el("nav", { class: "gallery-crumbs" }, el("a", { href: "#gallery/people" }, "People"), el("span", { "aria-hidden": "true" }, "›"), el("strong", {}, currentPerson.name || "Unnamed person")),
+        items.length ? grid(items) : el("p", { class: "muted gallery-message" }, "No photos left for this person."),
+      );
+    } catch (err) {
+      if (!stale(mine)) body.replaceChildren(el("p", { class: "muted gallery-message" }, err.message));
+    }
+  }
+
+  async function renamePerson(person) {
+    const name = await ctx.askText(person.name ? "Rename" : "Who is this?", "Name", person.name || "", "Save");
+    if (name === null) return;
+    try {
+      await ctx.api("/api/people", { method: "POST", json: { id: person.id, name } });
+      show(location.hash);
+    } catch (err) {
+      ctx.toast(err.message, true);
+    }
+  }
+
+  async function hidePerson(person, hidden) {
+    try {
+      await ctx.api("/api/people", { method: "POST", json: { id: person.id, hidden } });
+      ctx.toast(hidden ? `${person.name || "This person"} is hidden from People` : `${person.name || "This person"} is back in People`);
+      if (route.tab === "person") location.hash = hidden ? "#gallery/people" : `#gallery/people/${person.id}`;
+      else show(location.hash);
+    } catch (err) {
+      ctx.toast(err.message, true);
+    }
+  }
+
+  async function mergePerson(person) {
+    const into = await choosePerson(`${person.name || "This person"} is the same as…`, person.id);
+    if (!into) return;
+    try {
+      await ctx.api("/api/people", { method: "POST", json: { id: person.id, into } });
+      ctx.toast("Put together");
+      location.hash = `#gallery/people/${into}`;
+    } catch (err) {
+      ctx.toast(err.message, true);
+    }
+  }
+
+  /// "This is not them": the faces move out to a person of their own (or to `to`).
+  async function moveFaces(faceIds, to) {
+    try {
+      await ctx.api("/api/faces/move", { method: "POST", json: { faces: faceIds, to } });
+      ctx.toast(to ? "Moved" : `Taken out of ${currentPerson && currentPerson.name ? currentPerson.name : "this person"}`);
+      selected = new Set();
+      show(location.hash);
+    } catch (err) {
+      ctx.toast(err.message, true);
+    }
+  }
+
+  /// Resolves with the id of the person chosen, or null.
+  function choosePerson(title, exclude) {
+    return new Promise(async (resolve) => {
+      let list = [];
+      try {
+        list = (await ctx.api("/api/people")).people.filter((person) => person.id !== exclude);
+      } catch (err) {
+        ctx.toast(err.message, true);
+        resolve(null);
+        return;
+      }
+      let result = null;
+      const filter = el("input", { type: "search", placeholder: "Find someone", "aria-label": "Find someone" });
+      const grid_ = el("div", { class: "person-picker-list" });
+      const dialog = el("dialog", { class: "person-picker" }, el("h3", {}, title), filter, grid_,
+        el("div", { class: "dialog-actions" }, el("span", { class: "spacer" }), el("button", { type: "button", onclick: () => dialog.close() }, "Cancel")));
+      const render = () => {
+        const query = filter.value.trim().toLowerCase();
+        const shown = list.filter((person) => !query || (person.name || "").toLowerCase().includes(query));
+        grid_.replaceChildren(...(shown.length ? shown.map((person) => el("button", {
+          type: "button",
+          class: "person-picker-row",
+          onclick: () => { result = person.id; dialog.close(); },
+        }, el("span", { class: "gallery-person-face" }, faceImage(person.coverFace, person.name)), el("span", {}, person.name || `Unnamed (${plural(person.photos, "photo")})`))) : [el("p", { class: "muted" }, "Nobody else yet.")]));
+      };
+      filter.addEventListener("input", render);
+      dialog.addEventListener("close", () => {
+        dialog.remove();
+        resolve(result);
+      });
+      document.body.append(dialog);
+      render();
+      dialog.showModal();
+    });
+  }
+
   // ---- Routing ----
 
   function parse(hash) {
@@ -950,6 +1235,11 @@ export function mountGallery(root, ctx) {
     if (parts[0] === "albums") return { tab: "albums", id: parts[1] ? Number(parts[1]) : null };
     if (parts[0] === "tags") return { tab: "tags", tag: parts[1] || "" };
     if (parts[0] === "hidden") return { tab: "hidden" };
+    if (parts[0] === "search") return { tab: "search", query: parts.slice(1).join("/") };
+    if (parts[0] === "similar") return { tab: "similar", path: parts.slice(1).join("/") };
+    if (parts[0] === "people" && parts[1] === "hidden") return { tab: "people", hidden: true };
+    if (parts[0] === "people" && parts[1]) return { tab: "person", id: Number(parts[1]) };
+    if (parts[0] === "people") return { tab: "people" };
     return { tab: "photos" };
   }
 
@@ -969,13 +1259,19 @@ export function mountGallery(root, ctx) {
     status.textContent = "";
     scrubber.hidden = true;
     applySize(Number(size.value));
-    const tab = route.tab === "hidden" ? "photos" : route.tab;
+    const tab = { hidden: "photos", search: "photos", similar: "photos", person: "people" }[route.tab] || route.tab;
+    if (route.tab !== "search") searchBox.value = "";
     for (const link of tabs.children) link.setAttribute("aria-current", link.dataset.tab === tab ? "page" : "false");
     scroller.scrollTop = 0;
     if (route.tab === "albums") showAlbums(route.id);
     else if (route.tab === "tags") showTags(route.tag);
     else if (route.tab === "hidden") showHidden();
+    else if (route.tab === "search") showSearch(route.query);
+    else if (route.tab === "similar") showSimilar(route.path);
+    else if (route.tab === "people") showPeople(!!route.hidden);
+    else if (route.tab === "person") showPerson(route.id);
     else showPhotos();
+    loadSmart();
   }
 
   function hide() {

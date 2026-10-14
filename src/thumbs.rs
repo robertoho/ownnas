@@ -238,6 +238,42 @@ fn render_converted(source: &Path, dest: &Path) -> Result<(), String> {
     result
 }
 
+/// A photo opened for analysis (search descriptions, faces): upright, its longest side at
+/// most `max` pixels. HEIC and AVIF go through the converter. Only ever reads the file.
+pub fn decode_for_analysis(source: &Path, max: u32) -> Result<image::DynamicImage, String> {
+    let extension = source.extension().map(|ext| ext.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    if needs_converter(&extension) {
+        let stamp = std::time::SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let out = std::env::temp_dir().join(format!("ownnas-analysis-{}-{stamp}.jpg", std::process::id()));
+        let result = (|| {
+            match converter().ok_or("No tool to read this picture is installed")? {
+                Converter::Sips => run(tool("/usr/bin/sips")
+                    .args(["-s", "format", "jpeg", "-s", "formatOptions", "90", "-Z", &max.to_string()])
+                    .arg(source)
+                    .arg("--out")
+                    .arg(&out))?,
+                Converter::HeifConvert => run(tool("heif-convert").args(["-q", "90"]).arg(source).arg(&out))?,
+                Converter::Ffmpeg => run(tool("ffmpeg").args(["-y", "-hide_banner", "-loglevel", "error", "-i"]).arg(source).args(["-frames:v", "1", "-q:v", "2"]).arg(&out))?,
+            }
+            // sips leaves the camera's rotation in the file's EXIF rather than in the pixels.
+            let image = apply_orientation(decode(&out)?, read_orientation(&out));
+            Ok(shrink(image, max))
+        })();
+        let _ = std::fs::remove_file(&out);
+        return result;
+    }
+    let image = apply_orientation(decode(source)?, read_orientation(source));
+    Ok(shrink(image, max))
+}
+
+fn shrink(image: image::DynamicImage, max: u32) -> image::DynamicImage {
+    if image.width().max(image.height()) > max {
+        image.resize(max, max, image::imageops::FilterType::Triangle)
+    } else {
+        image
+    }
+}
+
 /// Runs a converter, giving up after 30 seconds.
 fn run(command: &mut Command) -> Result<(), String> {
     let mut child = command

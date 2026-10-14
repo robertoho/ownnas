@@ -338,6 +338,20 @@ pub fn taken_between(conn: &Connection, from: i64, to: i64, limit: usize) -> Res
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+/// The media items for some paths, in the same order (paths not indexed get no details).
+pub fn media_items(conn: &Connection, paths: &[String]) -> Result<Vec<MediaItem>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT ?1, m.kind, m.taken_at, m.date_source, m.width, m.height, m.size,
+                EXISTS(SELECT 1 FROM timeline_hidden h WHERE h.path = ?1)
+         FROM (SELECT 1) LEFT JOIN media_index m ON m.path = ?1"
+    ))?;
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        out.push(stmt.query_row([path], media_item)?);
+    }
+    Ok(out)
+}
+
 /// Hides photos from the timeline (or shows them again); returns how many changed.
 pub fn set_hidden(conn: &Connection, paths: &[String], hidden: bool, by: &str) -> Result<usize> {
     if paths.len() > MAX_ITEMS_PER_CHANGE {

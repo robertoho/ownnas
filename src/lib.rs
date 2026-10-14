@@ -11,6 +11,9 @@ pub mod content_index;
 pub mod db;
 pub mod files;
 pub mod media_index;
+pub mod smart;
+#[cfg(not(target_os = "android"))]
+pub mod ml;
 pub mod http;
 pub mod pdf_ops;
 pub mod terminal;

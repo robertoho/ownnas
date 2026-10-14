@@ -85,6 +85,9 @@ pub struct AppState {
     pub agent_url: std::sync::OnceLock<String>,
     /// The Gallery's photo index, kept up to date in the background once started.
     pub media: std::sync::Arc<crate::media_index::Indexer>,
+    /// The Gallery's machine-learning models (downloaded when switched on).
+    #[cfg(not(target_os = "android"))]
+    pub models: std::sync::Arc<crate::ml::Models>,
     pub db_path: PathBuf,
 }
 
@@ -95,6 +98,8 @@ impl AppState {
             .and_then(|value| crate::media_index::Speed::parse(&value))
             .unwrap_or(crate::media_index::Speed::Medium);
         self.media.set_speed(speed);
+        #[cfg(not(target_os = "android"))]
+        let _ = self.media.models.set(self.models.clone());
         self.media.start(self.db_path.clone(), self.root.clone(), self.thumbs.clone(), self.ffmpeg);
     }
 }
@@ -149,6 +154,8 @@ pub fn new_state(
         terminals: crate::terminal::Terminals::default(),
         agent_url: std::sync::OnceLock::new(),
         media: std::sync::Arc::default(),
+        #[cfg(not(target_os = "android"))]
+        models: std::sync::Arc::new(crate::ml::Models::new(&data_dir)),
         db_path,
     })
 }
@@ -273,6 +280,15 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/gallery/rescan", post(gallery_rescan))
         .route("/api/gallery/timeline", get(gallery_timeline))
         .route("/api/gallery/days", get(gallery_days))
+        .route("/api/ml", get(ml_status).post(set_ml_settings))
+        .route("/api/ml/forget-faces", post(forget_faces))
+        .route("/api/gallery/search", get(gallery_search))
+        .route("/api/gallery/similar", get(gallery_similar).post(gallery_similar).layer(DefaultBodyLimit::max(60 * 1024 * 1024)))
+        .route("/api/people", get(list_people).post(change_person))
+        .route("/api/people/photos", get(person_photos))
+        .route("/api/faces/move", post(move_faces))
+        .route("/api/faces/crop", get(face_crop))
+        .route("/api/faces/in", get(faces_in_photo))
         .route("/api/gallery/settings", get(gallery_settings).post(set_gallery_settings))
         .route("/api/gallery/hidden", get(gallery_hidden).post(set_gallery_hidden).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
         .route("/api/gallery/tag", get(gallery_tag))
@@ -1567,6 +1583,421 @@ async fn set_gallery_settings(
     state.media.set_speed(speed);
     record(&state, &user, "index-speed", speed.as_str());
     Ok(Json(json!({ "speed": speed, "status": state.media.status() })))
+}
+
+// ---- Smart search and people (on-device machine learning) ----
+
+#[cfg(not(target_os = "android"))]
+fn ml_feature_on(state: &AppState, feature: crate::ml::Feature) -> bool {
+    setting(state, feature.setting()).as_deref() == Some("1")
+}
+
+/// What the smart features are doing, for Settings and the Gallery.
+async fn ml_status(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    #[cfg(target_os = "android")]
+    {
+        return Ok(Json(json!({ "available": false })));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        use crate::ml::Feature;
+        let progress = {
+            let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+            crate::smart::progress_with_photos(&conn).unwrap_or_default()
+        };
+        let feature = |feature: Feature| {
+            json!({
+                "enabled": ml_feature_on(&state, feature),
+                "ready": state.models.ready(feature),
+                "download": state.models.download_state(feature),
+                "size": feature.download_size(),
+            })
+        };
+        Ok(Json(json!({
+            "available": true,
+            "search": feature(Feature::Search),
+            "faces": feature(Feature::Faces),
+            "photos": progress.0,
+            "described": progress.1,
+            "scanned": progress.2,
+            "images": progress.3,
+            "status": state.media.status(),
+        })))
+    }
+}
+
+#[derive(Deserialize)]
+struct MlSettingsBody {
+    search: Option<bool>,
+    faces: Option<bool>,
+}
+
+/// Turns smart search or faces on (downloading their models first) or off (administrators).
+async fn set_ml_settings(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<MlSettingsBody>,
+) -> Result<Response, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    #[cfg(target_os = "android")]
+    {
+        let _ = body;
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Smart search is not available on this device"));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        use crate::ml::Feature;
+        for (feature, on) in [(Feature::Search, body.search), (Feature::Faces, body.faces)] {
+            let Some(on) = on else { continue };
+            {
+                let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+                db::set_setting(&conn, feature.setting(), Some(if on { "1" } else { "0" }))
+                    .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+            }
+            record(&state, &user, if on { "ml-on" } else { "ml-off" }, &format!("{feature:?}"));
+            if on {
+                let media = state.media.clone();
+                if state.models.ready(feature) {
+                    media.rescan();
+                } else {
+                    state.models.download(feature, move || media.rescan());
+                }
+            }
+        }
+        Ok(ml_status(State(state), headers).await?.into_response())
+    }
+}
+
+/// Deletes every face and person, and the face models (administrators). Photos are untouched.
+async fn forget_faces(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::smart::forget_faces(&conn).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+        #[cfg(not(target_os = "android"))]
+        db::set_setting(&conn, crate::ml::Feature::Faces.setting(), Some("0")).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    }
+    #[cfg(not(target_os = "android"))]
+    state.models.remove(crate::ml::Feature::Faces);
+    let _ = std::fs::remove_dir_all(state.thumbs.join("faces"));
+    record(&state, &user, "faces-forget", "all faces and people");
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(not(target_os = "android"))]
+fn search_ready(state: &AppState) -> Result<(), ApiError> {
+    if !ml_feature_on(state, crate::ml::Feature::Search) || !state.models.ready(crate::ml::Feature::Search) {
+        return Err(ApiError::new(StatusCode::CONFLICT, "Smart search is off. An administrator can turn it on in Settings → Gallery."));
+    }
+    Ok(())
+}
+
+/// Photos for a list of (path, score), best first.
+fn scored_items(state: &AppState, found: Vec<(String, f32)>) -> Vec<serde_json::Value> {
+    let paths: Vec<String> = found.iter().map(|(path, _)| path.clone()).collect();
+    let items = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::albums::media_items(&conn, &paths).unwrap_or_default()
+    };
+    gallery_items(state, items, false)
+        .into_iter()
+        .zip(found)
+        .map(|(mut item, (_, score))| {
+            item["score"] = json!(score);
+            item
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct SmartSearchQuery {
+    q: String,
+}
+
+/// Photos that show what the words describe ("dog on a beach").
+async fn gallery_search(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<SmartSearchQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    #[cfg(target_os = "android")]
+    {
+        let _ = query;
+        return Err::<Json<serde_json::Value>, _>(ApiError::new(StatusCode::BAD_REQUEST, "Smart search is not available on this device"));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        search_ready(&state)?;
+        let text = query.q.trim().chars().take(300).collect::<String>();
+        if text.is_empty() {
+            return Ok(Json(json!({ "items": [] })));
+        }
+        let worker = state.clone();
+        let found = tokio::task::spawn_blocking(move || -> Result<Vec<(String, f32)>, String> {
+            let vector = worker.models.describe_text(&text)?;
+            let neutral = worker.models.neutral_text()?;
+            let descriptions = {
+                let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
+                worker.media.descriptions.get(&conn)?
+            };
+            Ok(crate::smart::matching_text(&descriptions, &vector, &neutral, 300))
+        })
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not search"))?
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+        Ok(Json(json!({ "items": scored_items(&state, found) })))
+    }
+}
+
+#[derive(Deserialize)]
+struct SimilarQuery {
+    path: Option<String>,
+}
+
+/// Photos that look like one in the library (`?path=`) or like an image sent in the body.
+async fn gallery_similar(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<SimilarQuery>,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    #[cfg(target_os = "android")]
+    {
+        let _ = (query, body);
+        return Err::<Json<serde_json::Value>, _>(ApiError::new(StatusCode::BAD_REQUEST, "Smart search is not available on this device"));
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        search_ready(&state)?;
+        let sample = match &query.path {
+            Some(path) => Some(files::resolve(&state.root, path)?),
+            None if body.is_empty() => return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose a photo, or drop one in")),
+            None => None,
+        };
+        let worker = state.clone();
+        let skip = sample.as_ref().map(|target| target.rel.clone());
+        let found = tokio::task::spawn_blocking(move || -> Result<Vec<(String, f32)>, String> {
+            let stored = match &sample {
+                Some(target) => {
+                    let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
+                    crate::smart::description(&conn, &target.rel)?.filter(|vector| !vector.is_empty())
+                }
+                None => None,
+            };
+            let vector = match stored {
+                Some(vector) => vector,
+                None => {
+                    let image = match &sample {
+                        Some(target) => crate::thumbs::decode_for_analysis(&target.full, 640)?,
+                        None => {
+                            // Written to a file first, so HEIC and the like go through the converter too.
+                            let temp = std::env::temp_dir().join(format!("ownnas-sample-{}", rand::random::<u64>()));
+                            let kind = image::guess_format(&body).ok().and_then(|format| format.extensions_str().first().copied()).unwrap_or("heic");
+                            let file = temp.with_extension(kind);
+                            std::fs::write(&file, &body).map_err(|_| "Could not read the image".to_string())?;
+                            let decoded = crate::thumbs::decode_for_analysis(&file, 640);
+                            let _ = std::fs::remove_file(&file);
+                            decoded.map_err(|_| "That does not look like a picture OwnNAS can read".to_string())?
+                        }
+                    };
+                    worker.models.describe_image(&image, 2)?
+                }
+            };
+            let descriptions = {
+                let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
+                worker.media.descriptions.get(&conn)?
+            };
+            let found = crate::smart::nearest(&descriptions, &vector, 200, skip.as_deref());
+            Ok(found.into_iter().filter(|(_, score)| *score >= 0.6).collect())
+        })
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not search"))?
+        .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+        Ok(Json(json!({ "items": scored_items(&state, found) })))
+    }
+}
+
+#[derive(Deserialize)]
+struct PeopleQuery {
+    hidden: Option<String>,
+}
+
+async fn list_people(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PeopleQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let hidden = query.hidden.as_deref() == Some("1");
+    let people = crate::smart::people(&conn, hidden).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let hidden_count = if hidden { 0 } else { crate::smart::people(&conn, true).map(|list| list.len()).unwrap_or(0) };
+    Ok(Json(json!({ "people": people, "hiddenCount": hidden_count })))
+}
+
+#[derive(Deserialize)]
+struct PersonQuery {
+    id: i64,
+}
+
+async fn person_photos(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PersonQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let (person, photos) = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        let person = crate::smart::person(&conn, query.id)
+            .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That person is no longer there"))?;
+        (person, crate::smart::person_photos(&conn, query.id).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?)
+    };
+    let face_ids: Vec<i64> = photos.iter().map(|(_, face)| *face).collect();
+    let items = gallery_items(&state, photos.into_iter().map(|(item, _)| item).collect(), true)
+        .into_iter()
+        .zip(face_ids)
+        .map(|(mut item, face)| {
+            item["faceId"] = json!(face);
+            item
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "person": person, "items": items })))
+}
+
+#[derive(Deserialize)]
+struct PersonChangeBody {
+    id: i64,
+    name: Option<String>,
+    hidden: Option<bool>,
+    /// Merge this person into another (they are the same).
+    into: Option<i64>,
+}
+
+async fn change_person(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<PersonChangeBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let fail = |err: String| ApiError::new(StatusCode::BAD_REQUEST, err);
+    if let Some(name) = &body.name {
+        crate::smart::rename_person(&conn, body.id, name).map_err(fail)?;
+    }
+    if let Some(hidden) = body.hidden {
+        crate::smart::hide_person(&conn, body.id, hidden).map_err(fail)?;
+    }
+    let id = match body.into {
+        Some(into) => {
+            crate::smart::merge_people(&conn, body.id, into).map_err(fail)?;
+            into
+        }
+        None => body.id,
+    };
+    drop(conn);
+    record(&state, &user, "person-change", &id.to_string());
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    Ok(Json(json!({ "person": crate::smart::person(&conn, id).map_err(fail)? })))
+}
+
+#[derive(Deserialize)]
+struct MoveFacesBody {
+    faces: Vec<i64>,
+    /// Another person, or null for "not this person" (a new person of their own).
+    to: Option<i64>,
+}
+
+async fn move_faces(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<MoveFacesBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    if body.faces.is_empty() || body.faces.len() > 10_000 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose some faces"));
+    }
+    let to = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::smart::move_faces(&conn, &body.faces, body.to).map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?
+    };
+    record(&state, &user, "faces-move", &format!("{} faces", body.faces.len()));
+    Ok(Json(json!({ "to": to })))
+}
+
+#[derive(Deserialize)]
+struct FaceQuery {
+    id: i64,
+}
+
+/// A face cut out of its photo (square, 192 pixels), for the People view.
+async fn face_crop(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<FaceQuery>,
+) -> Result<Response, ApiError> {
+    require_user(&state, &headers)?;
+    let found = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::smart::face_box(&conn, query.id).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?
+    };
+    let (path, x, y, w, h) = found.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "No such face"))?;
+    let target = files::resolve(&state.root, &path)?;
+    let cache = state.thumbs.join("faces");
+    let id = query.id;
+    let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let meta = std::fs::metadata(&target.full).map_err(|_| "The photo is gone".to_string())?;
+        let modified = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+        let file = cache.join(format!("{id}-{}-{modified}.jpg", meta.len()));
+        if let Ok(bytes) = std::fs::read(&file) {
+            return Ok(bytes);
+        }
+        let image = crate::thumbs::decode_for_analysis(&target.full, 1600)?;
+        let (iw, ih) = (image.width() as f32, image.height() as f32);
+        // A square around the face, with some room for hair and chin.
+        let side = (w * iw).max(h * ih) * 1.6;
+        let cx = (x + w / 2.0) * iw;
+        let cy = (y + h / 2.0) * ih;
+        let left = (cx - side / 2.0).clamp(0.0, (iw - 1.0).max(0.0));
+        let top = (cy - side / 2.0).clamp(0.0, (ih - 1.0).max(0.0));
+        let side = side.min(iw - left).min(ih - top).max(1.0);
+        let crop = image.crop_imm(left as u32, top as u32, side as u32, side as u32).resize_exact(192, 192, image::imageops::FilterType::CatmullRom);
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85)
+            .encode_image(&crop.to_rgb8())
+            .map_err(|_| "Could not make the picture".to_string())?;
+        let _ = std::fs::create_dir_all(&cache);
+        let _ = std::fs::write(&file, &out);
+        Ok(out)
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not make the picture"))?
+    .map_err(|err| ApiError::new(StatusCode::NOT_FOUND, err))?;
+    Ok(([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "private, max-age=86400")], bytes).into_response())
+}
+
+/// The people in one photo, for the preview.
+async fn faces_in_photo(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let path = rel_of(&query.path);
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let faces = crate::smart::faces_in(&conn, &path).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(Json(json!({ "faces": faces.into_iter().map(|(id, person, name)| json!({ "id": id, "personId": person, "name": name })).collect::<Vec<_>>() })))
 }
 
 async fn gallery_hidden(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
@@ -3799,11 +4230,13 @@ fn record(state: &AppState, user: &User, action: &str, detail: &str) {
 fn rewrite_meta(state: &AppState, from: &str, to: &str) {
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     let _ = db::rewrite_path_meta(&conn, from, to);
+    state.media.descriptions.invalidate();
 }
 
 fn delete_meta(state: &AppState, path: &str) {
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     let _ = db::delete_path_meta(&conn, path);
+    state.media.descriptions.invalidate();
 }
 
 fn invalidate_sizes(state: &AppState, path: &str) {

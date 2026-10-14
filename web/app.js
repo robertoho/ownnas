@@ -1322,6 +1322,10 @@ let indexStatusTimer = 0;
 function describeIndexStatus(status) {
   const count = `${Number(status.total).toLocaleString()} photos and videos indexed`;
   if (status.scanning) return `Looking through the library… ${Number(status.seen).toLocaleString()} found so far.`;
+  if (status.analyzing) {
+    const what = status.analyzing === "faces" ? "Looking for faces" : "Describing photos for search";
+    return `${count}. ${what}: ${Number(status.analysisDone).toLocaleString()} of ${Number(status.analysisTotal).toLocaleString()}.`;
+  }
   if (status.thumbnailing && status.thumbsDone < status.thumbsTotal) {
     return `${count}. Making thumbnails: ${Number(status.thumbsDone).toLocaleString()} of ${Number(status.thumbsTotal).toLocaleString()}.`;
   }
@@ -1329,14 +1333,45 @@ function describeIndexStatus(status) {
   return status.finishedAt ? `${count}. Last scan finished ${formatDate(status.finishedAt)}.` : count;
 }
 
+function megabytes(bytes) {
+  return `${Math.round(bytes / 1_000_000).toLocaleString()} MB`;
+}
+
+/// One smart feature's line: off, downloading its models, describing photos, or ready.
+function smartState(feature, data, stage) {
+  if (!feature.enabled) return "";
+  const d = feature.download;
+  if (d && d.downloading) return `Downloading the model… ${Math.floor((d.done / Math.max(1, d.total)) * 100)}%`;
+  if (d && d.error) return `Could not download the model: ${d.error}`;
+  if (!feature.ready) return "Waiting to download the model…";
+  const done = stage === "faces" ? data.scanned : data.described;
+  const all = stage === "faces" ? data.images : data.photos;
+  if (done < all) return `${Number(done).toLocaleString()} of ${Number(all).toLocaleString()} photos done${data.status.analyzing === stage ? "" : " (waiting for the scan and thumbnails)"}`;
+  return `Ready: all ${Number(all).toLocaleString()} photos done`;
+}
+
+function renderSmartSettings(data) {
+  $("smart-settings").hidden = !data.available;
+  if (!data.available) return;
+  $("smart-search").checked = data.search.enabled;
+  $("smart-faces").checked = data.faces.enabled;
+  $("smart-search-size").textContent = `Downloads ${megabytes(data.search.size)}.`;
+  $("smart-faces-size").textContent = `Downloads ${megabytes(data.faces.size)}.`;
+  $("smart-search-state").textContent = smartState(data.search, data, "search");
+  $("smart-faces-state").textContent = smartState(data.faces, data, "faces");
+}
+
 /// The Gallery tab of Settings: indexing speed and progress (refreshed while it shows).
 async function refreshIndexSettings() {
-  const data = await api("/api/gallery/settings");
+  const [data, smart] = await Promise.all([api("/api/gallery/settings"), api("/api/ml").catch(() => ({ available: false }))]);
+  renderSmartSettings(smart);
   for (const input of document.querySelectorAll('input[name="index-speed"]')) input.checked = input.value === data.speed;
   $("index-status").textContent = describeIndexStatus(data.status);
   clearTimeout(indexStatusTimer);
   if (!$("settings").hidden && !$("settings-gallery").hidden) {
-    indexStatusTimer = setTimeout(() => refreshIndexSettings().catch(() => {}), data.status.scanning || data.status.thumbnailing ? 2000 : 10000);
+    const busy = data.status.scanning || data.status.thumbnailing || data.status.analyzing
+      || (smart.available && [smart.search, smart.faces].some((feature) => feature.download && feature.download.downloading));
+    indexStatusTimer = setTimeout(() => refreshIndexSettings().catch(() => {}), busy ? 2000 : 10000);
   }
 }
 
@@ -1349,6 +1384,29 @@ $("index-speed").addEventListener("change", async (event) => {
   } catch (err) {
     toast(err.message, true);
     refreshIndexSettings().catch(() => {});
+  }
+});
+
+for (const [id, key] of [["smart-search", "search"], ["smart-faces", "faces"]]) {
+  $(id).addEventListener("change", async (event) => {
+    try {
+      renderSmartSettings(await api("/api/ml", { method: "POST", json: { [key]: event.target.checked } }));
+      refreshIndexSettings().catch(() => {});
+    } catch (err) {
+      toast(err.message, true);
+      refreshIndexSettings().catch(() => {});
+    }
+  });
+}
+
+$("smart-forget").addEventListener("click", async () => {
+  if (!(await askConfirm("Delete every face and person OwnNAS has found, and the face model? Your photos are not touched; faces are found again only if you switch Faces back on.", "Delete face data"))) return;
+  try {
+    await api("/api/ml/forget-faces", { method: "POST" });
+    toast("Face data deleted");
+    refreshIndexSettings().catch(() => {});
+  } catch (err) {
+    toast(err.message, true);
   }
 });
 

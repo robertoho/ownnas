@@ -97,6 +97,10 @@ pub struct Status {
     pub thumbs_done: u64,
     pub thumbs_total: u64,
     pub speed: Option<Speed>,
+    /// Describing photos for search ("search") or looking for faces ("faces"), after thumbnails.
+    pub analyzing: Option<String>,
+    pub analysis_done: u64,
+    pub analysis_total: u64,
 }
 
 /// Runs scans in a background thread: at start, every half hour, and when asked to.
@@ -105,11 +109,23 @@ pub struct Indexer {
     wake: Mutex<bool>,
     signal: Condvar,
     speed: std::sync::atomic::AtomicU8,
+    /// The photos' search descriptions, as searched in memory.
+    pub descriptions: crate::smart::DescriptionCache,
+    #[cfg(not(target_os = "android"))]
+    pub models: std::sync::OnceLock<Arc<crate::ml::Models>>,
 }
 
 impl Default for Indexer {
     fn default() -> Self {
-        Self { status: Mutex::new(Status::default()), wake: Mutex::new(false), signal: Condvar::new(), speed: std::sync::atomic::AtomicU8::new(1) }
+        Self {
+            status: Mutex::new(Status::default()),
+            wake: Mutex::new(false),
+            signal: Condvar::new(),
+            speed: std::sync::atomic::AtomicU8::new(1),
+            descriptions: crate::smart::DescriptionCache::default(),
+            #[cfg(not(target_os = "android"))]
+            models: std::sync::OnceLock::new(),
+        }
     }
 }
 
@@ -151,6 +167,8 @@ impl Indexer {
             .spawn(move || loop {
                 indexer.run(&db_path, &root);
                 indexer.make_thumbnails(&db_path, &root, &thumbs, ffmpeg);
+                #[cfg(not(target_os = "android"))]
+                indexer.analyze(&db_path, &root, &thumbs, ffmpeg);
                 let wake = indexer.wake.lock().unwrap_or_else(|err| err.into_inner());
                 let (mut wake, _) = indexer
                     .signal
@@ -238,6 +256,98 @@ impl Indexer {
     }
 }
 
+#[cfg(not(target_os = "android"))]
+impl Indexer {
+    fn asked_to_stop(&self) -> bool {
+        *self.wake.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    fn set_analysis(&self, stage: Option<&str>, done: u64, total: u64) {
+        let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());
+        status.analyzing = stage.map(String::from);
+        status.analysis_done = done;
+        status.analysis_total = total;
+    }
+
+    /// Describes photos for search and looks for faces, when those features are on and their
+    /// models are here. Photos are only read.
+    fn analyze(&self, db_path: &Path, root: &Path, thumbs: &Path, ffmpeg: bool) {
+        let Some(models) = self.models.get() else { return };
+        let Ok(conn) = open(db_path) else { return };
+        let enabled = |feature: crate::ml::Feature| {
+            conn.query_row("SELECT value FROM settings WHERE key = ?1", [feature.setting()], |row| row.get::<_, String>(0)).ok().as_deref() == Some("1")
+                && models.ready(feature)
+        };
+        let threads = || if self.speed() == Speed::Fast { 4 } else { 1 };
+        let (total, mut described, mut scanned) = crate::smart::progress(&conn).unwrap_or_default();
+        if enabled(crate::ml::Feature::Search) {
+            loop {
+                let Ok(batch) = crate::smart::pending_descriptions(&conn, 32) else { break };
+                if batch.is_empty() {
+                    break;
+                }
+                for item in batch {
+                    if self.asked_to_stop() {
+                        self.set_analysis(None, 0, 0);
+                        return;
+                    }
+                    self.set_analysis(Some("search"), described as u64, total as u64);
+                    let started = std::time::Instant::now();
+                    // The thumbnail is plenty for a 224-pixel model, and covers videos and HEIC.
+                    let vector = crate::thumbs::ensure(&root.join(&item.path), thumbs, item.kind == "video")
+                        .and_then(|thumb| image::open(&thumb).map_err(|err| err.to_string()))
+                        .and_then(|image| models.describe_image(&image, threads()))
+                        .unwrap_or_default();
+                    let _ = crate::smart::store_description(&conn, &item, &vector);
+                    described += 1;
+                    self.descriptions.invalidate();
+                    self.pace(started);
+                }
+            }
+        }
+        if enabled(crate::ml::Feature::Faces) {
+            let Ok(mut people) = crate::smart::PeopleIndex::load(&conn) else { return };
+            loop {
+                let Ok(batch) = crate::smart::pending_faces(&conn, 16) else { break };
+                if batch.is_empty() {
+                    break;
+                }
+                for item in batch {
+                    if self.asked_to_stop() {
+                        self.set_analysis(None, 0, 0);
+                        return;
+                    }
+                    self.set_analysis(Some("faces"), scanned as u64, total as u64);
+                    let started = std::time::Instant::now();
+                    let found = crate::thumbs::decode_for_analysis(&root.join(&item.path), 1600)
+                        .map(|image| image.to_rgb8())
+                        .and_then(|image| {
+                            let (w, h) = (image.width() as f32, image.height() as f32);
+                            Ok(models
+                                .find_faces(&image, threads())?
+                                .into_iter()
+                                .map(|(face, vector)| crate::smart::FoundFace {
+                                    x: (face.x / w).clamp(0.0, 1.0),
+                                    y: (face.y / h).clamp(0.0, 1.0),
+                                    w: (face.width / w).clamp(0.0, 1.0),
+                                    h: (face.height / h).clamp(0.0, 1.0),
+                                    score: face.score,
+                                    vector,
+                                })
+                                .collect::<Vec<_>>())
+                        })
+                        .unwrap_or_default();
+                    let _ = crate::smart::store_faces(&conn, &item, &found, &mut people);
+                    scanned += 1;
+                    self.pace(started);
+                }
+            }
+        }
+        let _ = (ffmpeg, described, scanned);
+        self.set_analysis(None, 0, 0);
+    }
+}
+
 fn open(db_path: &Path) -> Result<Connection, String> {
     let conn = Connection::open(db_path).map_err(|err| format!("Could not open the database: {err}"))?;
     conn.busy_timeout(Duration::from_secs(10)).map_err(|err| err.to_string())?;
@@ -264,6 +374,7 @@ struct Found {
 }
 
 /// Brings the index in line with the library. `progress(seen, read)` is called as it goes.
+#[cfg(test)]
 pub fn scan(conn: &Connection, root: &Path, progress: &dyn Fn(u64, u64)) -> Result<(), String> {
     scan_paced(conn, root, progress, &|_| {})
 }
