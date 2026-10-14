@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material.icons.outlined.CloudUpload
 import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -64,6 +65,7 @@ fun ServersScreen(vm: AppViewModel, insets: WindowInsets = ScaffoldDefaults.cont
                 title = { Text("OwnNAS") },
                 actions = {
                     if (servers.isNotEmpty()) {
+                        IconButton(onClick = { vm.push(Screen.Backup) }) { Icon(Icons.Outlined.CloudUpload, contentDescription = "Back up this phone") }
                         IconButton(onClick = { vm.push(Screen.Sync) }) { Icon(Icons.Outlined.Sync, contentDescription = "Sync") }
                     }
                 },
@@ -88,6 +90,7 @@ fun ServersScreen(vm: AppViewModel, insets: WindowInsets = ScaffoldDefaults.cont
                     ServerRow(
                         server = server,
                         onOpen = { vm.push(Screen.Browse(server.id, "")) },
+                        onGallery = { vm.push(Screen.Gallery(server.id)) },
                         onSignIn = { vm.push(Screen.SignIn(server)) },
                         onRemove = { removing = server },
                     )
@@ -109,7 +112,7 @@ fun ServersScreen(vm: AppViewModel, insets: WindowInsets = ScaffoldDefaults.cont
 }
 
 @Composable
-private fun ServerRow(server: SavedServer, onOpen: () -> Unit, onSignIn: () -> Unit, onRemove: () -> Unit) {
+private fun ServerRow(server: SavedServer, onOpen: () -> Unit, onGallery: () -> Unit, onSignIn: () -> Unit, onRemove: () -> Unit) {
     var menu by remember { mutableStateOf(false) }
     ListItem(
         modifier = Modifier.clickable(onClick = onOpen),
@@ -120,6 +123,7 @@ private fun ServerRow(server: SavedServer, onOpen: () -> Unit, onSignIn: () -> U
             Box {
                 IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "More") }
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                    DropdownMenuItem(text = { Text("Gallery") }, onClick = { menu = false; onGallery() })
                     DropdownMenuItem(text = { Text("Sign in again") }, onClick = { menu = false; onSignIn() })
                     DropdownMenuItem(text = { Text("Remove") }, onClick = { menu = false; onRemove() })
                 }

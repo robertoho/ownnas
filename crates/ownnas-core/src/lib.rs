@@ -6,5 +6,6 @@ pub mod local;
 pub mod manage;
 pub mod model;
 pub mod plan;
+pub mod rest;
 pub mod terminal;
 pub mod trust;

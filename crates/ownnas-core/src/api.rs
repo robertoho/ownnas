@@ -98,7 +98,7 @@ fn base_param(base: Option<Stamp>) -> String {
 
 /// Sends a request without a body, once more on a fresh connection when a pooled one turns
 /// out to be dead: phones and NATs drop idle connections, and ureq does not always notice.
-pub(crate) trait Fetch {
+pub trait Fetch {
     fn fetch(self) -> Result<ureq::Response, ApiError>;
 }
 

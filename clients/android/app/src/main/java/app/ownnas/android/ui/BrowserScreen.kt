@@ -36,6 +36,7 @@ import androidx.compose.material.icons.outlined.FolderZip
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.PictureAsPdf
+import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material3.DropdownMenu
@@ -231,6 +232,9 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
                 actions = {
                     // Shown to administrators when terminals are turned on, as in the web app.
                     if (terminalsOn) {
+                        IconButton(onClick = { vm.push(Screen.Gallery(serverId)) }) {
+                            Icon(Icons.Outlined.PhotoLibrary, contentDescription = "Gallery")
+                        }
                         IconButton(onClick = { vm.push(Screen.Terminals(serverId, path)) }) {
                             BadgedBox(badge = {
                                 if (attention > 0) Badge { Text(if (attention > 9) "9+" else attention.toString()) }

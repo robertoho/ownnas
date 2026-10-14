@@ -55,12 +55,33 @@ sealed interface Screen {
     data class Terminal(val serverId: String, val terminalId: String, val startup: String? = null) : Screen
 
     data object Sync : Screen
+
+    /** A server's Gallery: photos by date, albums, people, and tags. */
+    data class Gallery(val serverId: String, val tab: String = "photos") : Screen
+
+    data class GalleryAlbum(val serverId: String, val albumId: Long) : Screen
+
+    data class GalleryPerson(val serverId: String, val personId: Long) : Screen
+
+    data class GalleryTag(val serverId: String, val tag: String) : Screen
+
+    /** Search results: photos that show `words`, or that look like the photo at `similarTo`. */
+    data class GalleryResults(val serverId: String, val words: String? = null, val similarTo: String? = null) : Screen
+
+    data class GalleryHidden(val serverId: String) : Screen
+
+    /** Photos full screen, swiping through the list the Gallery handed over ([AppViewModel.viewer]). */
+    data class PhotoViewer(val serverId: String, val start: Int, val list: Long) : Screen
+
+    /** Backing this phone's photos up to a server. */
+    data object Backup : Screen
 }
 
 class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val hub = (application as OwnNasApp).servers
     val syncs = (application as OwnNasApp).syncs
     val shortcuts = (application as OwnNasApp).shortcuts
+    val backup = (application as OwnNasApp).backup
     private val store = hub.store
     val servers = store.servers
 
@@ -98,7 +119,46 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun server(id: String): SavedServer? = store.find(id)
 
-    private suspend fun <T> call(id: String, block: (Server) -> T): T = hub.call(id, block)
+    internal suspend fun <T> call(id: String, block: (Server) -> T): T = hub.call(id, block)
+
+    /** The photos the viewer swipes through, by list id (kept while the viewer is open). */
+    val viewerLists = HashMap<Long, List<app.ownnas.core.MediaItem>>()
+    private var nextList = 0L
+
+    fun viewer(serverId: String, items: List<app.ownnas.core.MediaItem>, start: Int) {
+        val id = nextList++
+        viewerLists[id] = items
+        push(Screen.PhotoViewer(serverId, start, id))
+    }
+
+    /** A thumbnail by library path. `null` when the server has none. */
+    suspend fun thumbnailOf(id: String, path: String, key: String): ImageBitmap? = thumbnailSlots.withPermit {
+        thumbnails.get(key) ?: runCatching {
+            val bytes = call(id) { it.thumbnail(path) }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+        }.getOrNull()?.also { thumbnails.put(key, it) }
+    }
+
+    /** A face cut out of its photo, for the People screens. */
+    suspend fun facePicture(id: String, faceId: Long): ImageBitmap? {
+        val key = "face:$id:$faceId"
+        return thumbnails.get(key) ?: thumbnailSlots.withPermit {
+            runCatching {
+                val bytes = call(id) { it.facePicture(faceId) }
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+            }.getOrNull()?.also { thumbnails.put(key, it) }
+        }
+    }
+
+    /** The whole photo (downloaded once into the cache), scaled to at most `maxPx`. */
+    suspend fun fullPhoto(id: String, path: String, size: Long, maxPx: Int): ImageBitmap? = withContext(Dispatchers.IO) {
+        runCatching {
+            val file = hub.cachedCopy(id, path, size, 0L, object : app.ownnas.core.Transfer {
+                override fun keepGoing(done: ULong) = true
+            })
+            decodeScaled(file, maxPx)
+        }.getOrNull()
+    }
 
     suspend fun signIn(address: String, username: String, password: String, trust: Trust): SavedServer =
         withContext(Dispatchers.IO) { hub.signIn(address, username, password, trust) }
@@ -115,6 +175,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         folders.keys.removeAll { it.first == id }
         syncs.pairs.value.filter { it.serverId == id }.forEach { syncs.remove(it.id) }
         shortcuts.forgetServer(id)
+        backup.forgetServer(id)
         viewModelScope.launch(Dispatchers.IO) { hub.remove(id) }
     }
 
@@ -355,6 +416,28 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private companion object {
         const val THUMBNAIL_CACHE_BYTES = 32 * 1024 * 1024
     }
+}
+
+/** A picture file decoded no larger than `maxPx` on its long side (HEIC too, on Android 9+). */
+fun decodeScaled(file: File, maxPx: Int): ImageBitmap? {
+    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+        val source = android.graphics.ImageDecoder.createSource(file)
+        return runCatching {
+            android.graphics.ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                val long = maxOf(info.size.width, info.size.height)
+                if (long > maxPx) {
+                    val scale = maxPx.toFloat() / long
+                    decoder.setTargetSize((info.size.width * scale).toInt().coerceAtLeast(1), (info.size.height * scale).toInt().coerceAtLeast(1))
+                }
+                decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
+            }.asImageBitmap()
+        }.getOrNull()
+    }
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(file.path, bounds)
+    var sample = 1
+    while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= maxPx) sample *= 2
+    return BitmapFactory.decodeFile(file.path, BitmapFactory.Options().apply { inSampleSize = sample })?.asImageBitmap()
 }
 
 /** The folder that holds `path` ("" at the top). */

@@ -9,6 +9,9 @@ use ownnas_core::{browse, manage, terminal};
 
 uniffi::setup_scaffolding!();
 
+mod gallery;
+pub use gallery::*;
+
 #[derive(Debug, uniffi::Error)]
 pub enum ClientError {
     /// The token or password was rejected; sign in again.

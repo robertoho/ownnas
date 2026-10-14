@@ -95,3 +95,20 @@ adb reverse tcp:8787 tcp:8787
 
 On your own network, use the server's LAN or VPN address. Use `https://` for anything
 reachable from outside it.
+
+## Gallery
+
+Each server has a Gallery (the picture button in a folder, or Gallery in a server's menu):
+photos and videos by the day they were taken with a year scrubber on the right, nested albums,
+people (when the server has faces switched on), tags, and search in words or "Find similar"
+(when smart search is on). Long-press photos to add them to an album, tag them, hide them from
+Photos, or (in a person) say they are not that person. Photos open full screen: swipe between
+them, pinch or double-tap to zoom; videos open in the phone's player.
+
+## Phone backups
+
+"Back up this phone" (the cloud button on the main screen, or in the Gallery's menu) copies new
+photos and videos to a server's media upload folder, which an administrator sets in the web app
+(Settings → Gallery → Phone backups). Each phone gets its own folder, by year and month, and
+photos keep their original dates. It runs hourly and soon after new photos appear (on Wi-Fi only,
+unless switched off), never deletes anything, and skips what is already on the server.

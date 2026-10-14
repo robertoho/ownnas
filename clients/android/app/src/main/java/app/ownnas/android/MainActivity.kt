@@ -21,6 +21,14 @@ import app.ownnas.android.ui.Screen
 import app.ownnas.android.ui.HomeScreen
 import app.ownnas.android.ui.SignInScreen
 import app.ownnas.android.ui.SyncScreen
+import app.ownnas.android.ui.BackupScreen
+import app.ownnas.android.ui.gallery.GalleryAlbumScreen
+import app.ownnas.android.ui.gallery.GalleryHiddenScreen
+import app.ownnas.android.ui.gallery.GalleryPersonScreen
+import app.ownnas.android.ui.gallery.GalleryResultsScreen
+import app.ownnas.android.ui.gallery.GalleryScreen
+import app.ownnas.android.ui.gallery.GalleryTagScreen
+import app.ownnas.android.ui.gallery.PhotoViewer
 import app.ownnas.android.ui.terminal.TerminalScreen
 import app.ownnas.android.ui.terminal.TerminalsScreen
 import app.ownnas.android.ui.theme.OwnNasTheme
@@ -53,6 +61,14 @@ private fun App(vm: AppViewModel = viewModel()) {
                 is Screen.Terminals -> TerminalsScreen(vm, target.serverId, target.path)
                 is Screen.Terminal -> TerminalScreen(vm, target.serverId, target.terminalId, target.startup)
                 Screen.Sync -> SyncScreen(vm)
+                is Screen.Gallery -> GalleryScreen(vm, target.serverId, target.tab)
+                is Screen.GalleryAlbum -> GalleryAlbumScreen(vm, target.serverId, target.albumId)
+                is Screen.GalleryPerson -> GalleryPersonScreen(vm, target.serverId, target.personId)
+                is Screen.GalleryTag -> GalleryTagScreen(vm, target.serverId, target.tag)
+                is Screen.GalleryResults -> GalleryResultsScreen(vm, target.serverId, target.words, target.similarTo)
+                is Screen.GalleryHidden -> GalleryHiddenScreen(vm, target.serverId)
+                is Screen.PhotoViewer -> PhotoViewer(vm, target.serverId, target.start, target.list)
+                Screen.Backup -> BackupScreen(vm)
             }
         }
     }
