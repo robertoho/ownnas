@@ -316,6 +316,7 @@
       <button id="settings-tab-updates" type="button" role="tab" aria-selected="false" data-settings-tab="updates">Updates</button>
       <button id="settings-tab-users" type="button" role="tab" aria-selected="false" data-settings-tab="users" hidden>Users</button>
       <button id="settings-tab-terminal" type="button" role="tab" aria-selected="false" data-settings-tab="terminal" hidden>Terminal</button>
+      <button id="settings-tab-gallery" type="button" role="tab" aria-selected="false" data-settings-tab="gallery" hidden>Gallery</button>
     </div>
     <section id="settings-theme" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-theme">
       <p class="muted">Themes inspired by Omarchy palettes. Choice is saved in this browser.</p>
@@ -336,6 +337,17 @@
       </div>
     </section>
     <section id="settings-terminal" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-terminal" hidden></section>
+    <section id="settings-gallery" class="settings-panel gallery-settings" role="tabpanel" aria-labelledby="settings-tab-gallery" hidden>
+      <h3>Indexing speed</h3>
+      <p class="muted">How hard OwnNAS may work the computer while it looks through the library for photos and makes their thumbnails. Thumbnails you are waiting for are always made right away.</p>
+      <div id="index-speed" class="index-speed" role="radiogroup" aria-label="Indexing speed">
+        <label class="index-speed-option"><input type="radio" name="index-speed" value="slow"><span><strong>Slow</strong><span class="muted">One task at a time, resting three times as long as it works, at low priority: about a quarter of one processor core. Barely noticeable, but the first scan of a big library can take many hours.</span></span></label>
+        <label class="index-speed-option"><input type="radio" name="index-speed" value="medium"><span><strong>Medium</strong><span class="muted">One task at a time, resting as long as it works, at low priority: about half of one core. A good balance for a computer that is also used for other things.</span></span></label>
+        <label class="index-speed-option"><input type="radio" name="index-speed" value="fast"><span><strong>Fast</strong><span class="muted">Up to four tasks at once without resting. Finishes soonest, but the fans may spin up.</span></span></label>
+      </div>
+      <p id="index-status" class="muted index-status"></p>
+      <button id="index-rescan" type="button">Rescan the library now</button>
+    </section>
     <section id="settings-users" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-users" hidden>
       <p class="muted">Administrators can add accounts, reset passwords, and grant admin access.</p>
       <div id="users-list"></div>

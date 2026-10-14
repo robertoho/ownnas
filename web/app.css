@@ -3443,3 +3443,12 @@ body.is-gallery .app > .explorer-status-bar { display: none; }
   .gallery-actions { margin-left: 0; }
   .gallery-check { opacity: 1; }
 }
+
+.gallery-settings h3 { margin: 0.2rem 0 0.4rem; }
+.index-speed { display: grid; gap: 0.5rem; margin: 0.9rem 0; }
+.index-speed-option { display: flex; align-items: flex-start; gap: 0.7rem; margin: 0; padding: 0.7rem 0.85rem; border: 1px solid var(--line); border-radius: 12px; background: var(--bg-2); cursor: pointer; }
+.index-speed-option:has(input:checked) { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.index-speed-option input { margin-top: 0.2rem; accent-color: var(--accent); }
+.index-speed-option > span { display: grid; gap: 0.2rem; }
+.index-speed-option .muted { font-size: 0.85rem; }
+.index-status { min-height: 1.3rem; }

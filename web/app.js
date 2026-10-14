@@ -1296,6 +1296,11 @@ function setSettingsTab(tab) {
   const updates = tab === "updates";
   const users = tab === "users";
   const terminal = tab === "terminal";
+  const galleryTab = tab === "gallery";
+  $("settings-tab-gallery").setAttribute("aria-selected", galleryTab ? "true" : "false");
+  $("settings-gallery").hidden = !galleryTab;
+  clearTimeout(indexStatusTimer);
+  if (galleryTab) refreshIndexSettings().catch((err) => toast(err.message, true));
   $("settings-tab-theme").setAttribute("aria-selected", theme ? "true" : "false");
   $("settings-tab-updates").setAttribute("aria-selected", updates ? "true" : "false");
   $("settings-tab-users").setAttribute("aria-selected", users ? "true" : "false");
@@ -1311,6 +1316,53 @@ function setSettingsTab(tab) {
       .catch((err) => toast(err.message, true));
   }
 }
+
+let indexStatusTimer = 0;
+
+function describeIndexStatus(status) {
+  const count = `${Number(status.total).toLocaleString()} photos and videos indexed`;
+  if (status.scanning) return `Looking through the library… ${Number(status.seen).toLocaleString()} found so far.`;
+  if (status.thumbnailing && status.thumbsDone < status.thumbsTotal) {
+    return `${count}. Making thumbnails: ${Number(status.thumbsDone).toLocaleString()} of ${Number(status.thumbsTotal).toLocaleString()}.`;
+  }
+  if (status.error) return `The last scan stopped: ${status.error}`;
+  return status.finishedAt ? `${count}. Last scan finished ${formatDate(status.finishedAt)}.` : count;
+}
+
+/// The Gallery tab of Settings: indexing speed and progress (refreshed while it shows).
+async function refreshIndexSettings() {
+  const data = await api("/api/gallery/settings");
+  for (const input of document.querySelectorAll('input[name="index-speed"]')) input.checked = input.value === data.speed;
+  $("index-status").textContent = describeIndexStatus(data.status);
+  clearTimeout(indexStatusTimer);
+  if (!$("settings").hidden && !$("settings-gallery").hidden) {
+    indexStatusTimer = setTimeout(() => refreshIndexSettings().catch(() => {}), data.status.scanning || data.status.thumbnailing ? 2000 : 10000);
+  }
+}
+
+$("index-speed").addEventListener("change", async (event) => {
+  const speed = event.target.value;
+  try {
+    const data = await api("/api/gallery/settings", { method: "POST", json: { speed } });
+    toast(`Indexing speed: ${speed}`);
+    $("index-status").textContent = describeIndexStatus(data.status);
+  } catch (err) {
+    toast(err.message, true);
+    refreshIndexSettings().catch(() => {});
+  }
+});
+
+$("index-rescan").addEventListener("click", async () => {
+  try {
+    await api("/api/gallery/rescan", { method: "POST" });
+    toast("Looking through the library for photos");
+    refreshIndexSettings().catch(() => {});
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+$("settings-tab-gallery").addEventListener("click", () => setSettingsTab("gallery"));
 
 let terminalModule = null;
 
@@ -1547,7 +1599,8 @@ function openSettings(tab) {
   const admin = !!(state.me && state.me.admin);
   $("settings-tab-users").hidden = !admin;
   $("settings-tab-terminal").hidden = !admin;
-  if (!admin && (tab === "users" || tab === "terminal")) tab = "theme";
+  $("settings-tab-gallery").hidden = !admin;
+  if (!admin && (tab === "users" || tab === "terminal" || tab === "gallery")) tab = "theme";
   if (!tab) tab = "theme";
   setSettingsTab(tab);
   renderThemeGrid();

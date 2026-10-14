@@ -17,6 +17,25 @@ const JPEG_QUALITY: u8 = 80;
 /// The cache's own folder inside `thumbs/`: a new one when the format changes.
 pub const CACHE_VERSION: &str = "v2";
 
+static LOW_PRIORITY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Runs outside tools (ffmpeg, sips, heif-convert) at low priority, for background indexing
+/// that should not compete with everything else.
+pub fn set_low_priority(low: bool) {
+    LOW_PRIORITY.store(low, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A command for an outside tool, under `nice` when running at low priority.
+fn tool(program: &str) -> Command {
+    if cfg!(unix) && LOW_PRIORITY.load(std::sync::atomic::Ordering::Relaxed) && Path::new("/usr/bin/nice").is_file() {
+        let mut command = Command::new("/usr/bin/nice");
+        command.args(["-n", "15", program]);
+        command
+    } else {
+        Command::new(program)
+    }
+}
+
 pub fn ffmpeg_available() -> bool {
     static FOUND: OnceLock<bool> = OnceLock::new();
     *FOUND.get_or_init(|| runs("ffmpeg", &["-version"]))
@@ -198,15 +217,15 @@ fn render_converted(source: &Path, dest: &Path) -> Result<(), String> {
         match converter {
             // sips scales as it converts, so its output is the thumbnail already.
             Converter::Sips => {
-                run(Command::new("/usr/bin/sips")
+                run(tool("/usr/bin/sips")
                     .args(["-s", "format", "jpeg", "-s", "formatOptions", &JPEG_QUALITY.to_string(), "-Z", &SIZE.to_string()])
                     .arg(source)
                     .arg("--out")
                     .arg(dest))?;
                 return if dest.is_file() { Ok(()) } else { Err("sips could not read the picture".to_string()) };
             }
-            Converter::HeifConvert => run(Command::new("heif-convert").args(["-q", "90"]).arg(source).arg(&full))?,
-            Converter::Ffmpeg => run(Command::new("ffmpeg")
+            Converter::HeifConvert => run(tool("heif-convert").args(["-q", "90"]).arg(source).arg(&full))?,
+            Converter::Ffmpeg => run(tool("ffmpeg")
                 .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
                 .arg(source)
                 .args(["-frames:v", "1", "-q:v", "2"])
@@ -251,7 +270,7 @@ fn render_video(source: &Path, dest: &Path) -> Result<(), String> {
 }
 
 fn render_video_at(source: &Path, dest: &Path, seek: &str) -> Result<(), String> {
-    run(Command::new("ffmpeg")
+    run(tool("ffmpeg")
         .args(["-y", "-hide_banner", "-loglevel", "error", "-ss", seek, "-i"])
         .arg(source)
         .args(["-frames:v", "1", "-vf", &format!("scale={SIZE}:{SIZE}:force_original_aspect_ratio=decrease"), "-f", "image2", "-c:v", "mjpeg", "-q:v", "4"])

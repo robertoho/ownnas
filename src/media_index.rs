@@ -12,6 +12,68 @@ use serde::Serialize;
 
 use crate::files;
 
+/// How hard background indexing may work the machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Speed {
+    /// One thread, resting three times as long as it works (about a quarter of one core),
+    /// with outside tools at low priority.
+    Slow,
+    /// One thread, resting as long as it works (about half of one core), at low priority.
+    Medium,
+    /// As many threads as half the processor's cores (up to four), without resting.
+    Fast,
+}
+
+impl Speed {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "slow" => Some(Self::Slow),
+            "medium" => Some(Self::Medium),
+            "fast" => Some(Self::Fast),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Slow => "slow",
+            Self::Medium => "medium",
+            Self::Fast => "fast",
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Slow,
+            2 => Self::Fast,
+            _ => Self::Medium,
+        }
+    }
+
+    fn workers(self) -> usize {
+        let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+        match self {
+            Self::Slow => 1,
+            Self::Medium => 1,
+            Self::Fast => (cores / 2).clamp(1, 4),
+        }
+    }
+
+    /// How long to rest after working for `worked`.
+    fn rest(self, worked: Duration) -> Duration {
+        let rest = match self {
+            Self::Slow => worked * 3,
+            Self::Medium => worked,
+            Self::Fast => Duration::ZERO,
+        };
+        rest.min(Duration::from_secs(5))
+    }
+}
+
+/// The setting that keeps the chosen speed.
+pub const SETTING_SPEED: &str = "index_speed";
+
 /// How often the library is scanned again on its own.
 const RESCAN_EVERY: Duration = Duration::from_secs(30 * 60);
 /// Index rows written per transaction, so the database is never held for long.
@@ -34,6 +96,7 @@ pub struct Status {
     pub thumbnailing: bool,
     pub thumbs_done: u64,
     pub thumbs_total: u64,
+    pub speed: Option<Speed>,
 }
 
 /// Runs scans in a background thread: at start, every half hour, and when asked to.
@@ -41,17 +104,38 @@ pub struct Indexer {
     status: Mutex<Status>,
     wake: Mutex<bool>,
     signal: Condvar,
+    speed: std::sync::atomic::AtomicU8,
 }
 
 impl Default for Indexer {
     fn default() -> Self {
-        Self { status: Mutex::new(Status::default()), wake: Mutex::new(false), signal: Condvar::new() }
+        Self { status: Mutex::new(Status::default()), wake: Mutex::new(false), signal: Condvar::new(), speed: std::sync::atomic::AtomicU8::new(1) }
     }
 }
 
 impl Indexer {
+    pub fn speed(&self) -> Speed {
+        Speed::from_u8(self.speed.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Takes effect at once, even in the middle of a scan.
+    pub fn set_speed(&self, speed: Speed) {
+        self.speed.store(speed as u8, std::sync::atomic::Ordering::Relaxed);
+        crate::thumbs::set_low_priority(speed != Speed::Fast);
+    }
+
+    /// Rests after a piece of work, as the speed asks.
+    fn pace(&self, started: std::time::Instant) {
+        let rest = self.speed().rest(started.elapsed());
+        if !rest.is_zero() {
+            std::thread::sleep(rest);
+        }
+    }
+
     pub fn status(&self) -> Status {
-        self.status.lock().unwrap_or_else(|err| err.into_inner()).clone()
+        let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner()).clone();
+        status.speed = Some(self.speed());
+        status
     }
 
     /// Asks for a scan as soon as the current one (if any) finishes.
@@ -82,11 +166,11 @@ impl Indexer {
             let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());
             *status = Status { scanning: true, total: status.total, finished_at: status.finished_at, ..Status::default() };
         }
-        let result = open(db_path).and_then(|conn| scan(&conn, root, &|seen, read| {
+        let result = open(db_path).and_then(|conn| scan_paced(&conn, root, &|seen, read| {
             let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());
             status.seen = seen;
             status.read = read;
-        }).map(|_| count(&conn)));
+        }, &|started| self.pace(started)).map(|_| count(&conn)));
         let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());
         status.scanning = false;
         status.finished_at = Some(crate::db::now_secs());
@@ -118,13 +202,23 @@ impl Indexer {
             status.thumbs_total = paths.len() as u64;
         }
         let next = std::sync::atomic::AtomicUsize::new(0);
-        // A few at a time: fast, without taking the whole machine.
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(1, 4));
+        // As many workers as the fastest speed allows; the speed (which can change meanwhile)
+        // decides how many of them work and how long they rest.
         std::thread::scope(|scope| {
-            for _ in 0..workers {
-                scope.spawn(|| loop {
+            for worker in 0..Speed::Fast.workers() {
+                let next = &next;
+                let paths = &paths;
+                scope.spawn(move || loop {
+                    if worker >= self.speed().workers() {
+                        if next.load(std::sync::atomic::Ordering::Relaxed) >= paths.len() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(250));
+                        continue;
+                    }
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some((path, kind)) = paths.get(index) else { break };
+                    let started = std::time::Instant::now();
                     let name = path.rsplit('/').next().unwrap_or(path);
                     // A new scan was asked for: stop here, it will start this again.
                     if *self.wake.lock().unwrap_or_else(|err| err.into_inner()) {
@@ -132,6 +226,7 @@ impl Indexer {
                     }
                     if files::can_thumb(name, ffmpeg) {
                         let _ = crate::thumbs::ensure(&root.join(path), thumbs, kind == "video");
+                        self.pace(started);
                     }
                     let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());
                     status.thumbs_done += 1;
@@ -170,6 +265,11 @@ struct Found {
 
 /// Brings the index in line with the library. `progress(seen, read)` is called as it goes.
 pub fn scan(conn: &Connection, root: &Path, progress: &dyn Fn(u64, u64)) -> Result<(), String> {
+    scan_paced(conn, root, progress, &|_| {})
+}
+
+/// `scan`, calling `pace` after reading each photo so it can rest.
+fn scan_paced(conn: &Connection, root: &Path, progress: &dyn Fn(u64, u64), pace: &dyn Fn(std::time::Instant)) -> Result<(), String> {
     let known: HashMap<String, (i64, i64)> = {
         let mut stmt = conn.prepare("SELECT path, size, mtime FROM media_index").map_err(|err| err.to_string())?;
         let rows = stmt
@@ -208,7 +308,7 @@ pub fn scan(conn: &Connection, root: &Path, progress: &dyn Fn(u64, u64)) -> Resu
                 pending.push(Found { rel, full: entry.path(), kind, size, mtime });
                 if pending.len() >= BATCH {
                     read += pending.len() as u64;
-                    store(conn, std::mem::take(&mut pending))?;
+                    store(conn, std::mem::take(&mut pending), pace)?;
                 }
             }
             if seen.len() % 500 == 0 {
@@ -217,7 +317,7 @@ pub fn scan(conn: &Connection, root: &Path, progress: &dyn Fn(u64, u64)) -> Resu
         }
     }
     read += pending.len() as u64;
-    store(conn, pending)?;
+    store(conn, pending, pace)?;
     // Forget what is gone (moves made by OwnNAS have already updated their rows).
     let gone: Vec<&String> = known.keys().filter(|path| !seen.contains(*path) && !files::is_under_trash(path)).collect();
     for chunk in gone.chunks(BATCH) {
@@ -231,13 +331,15 @@ pub fn scan(conn: &Connection, root: &Path, progress: &dyn Fn(u64, u64)) -> Resu
     Ok(())
 }
 
-fn store(conn: &Connection, found: Vec<Found>) -> Result<(), String> {
+fn store(conn: &Connection, found: Vec<Found>, pace: &dyn Fn(std::time::Instant)) -> Result<(), String> {
     if found.is_empty() {
         return Ok(());
     }
     // Reading dates happens before the transaction, so the database is locked only to write.
     let rows: Vec<(Found, Taken)> = found.into_iter().map(|item| {
+        let started = std::time::Instant::now();
         let taken = if item.kind == "image" { read_photo(&item.full) } else { Taken::default() };
+        pace(started);
         (item, taken)
     }).collect();
     let now = crate::db::now_secs();
@@ -403,6 +505,23 @@ mod tests {
         std::fs::remove_file(lib.join("trip/clip.mp4")).unwrap();
         scan(&conn, &lib, &|_, _| {}).unwrap();
         assert_eq!(rows(&conn).len(), 1);
+    }
+
+    #[test]
+    fn speeds_rest_and_share_the_work() {
+        let worked = Duration::from_millis(100);
+        assert_eq!(Speed::Fast.rest(worked), Duration::ZERO);
+        assert_eq!(Speed::Medium.rest(worked), Duration::from_millis(100));
+        assert_eq!(Speed::Slow.rest(worked), Duration::from_millis(300));
+        assert_eq!(Speed::Slow.rest(Duration::from_secs(60)), Duration::from_secs(5), "rests are capped");
+        assert_eq!(Speed::Slow.workers(), 1);
+        assert!(Speed::Medium.workers() <= Speed::Fast.workers());
+        assert_eq!(Speed::parse("medium"), Some(Speed::Medium));
+        assert_eq!(Speed::parse("turbo"), None);
+        let indexer = Indexer::default();
+        assert_eq!(indexer.speed(), Speed::Medium, "medium unless chosen otherwise");
+        indexer.set_speed(Speed::Slow);
+        assert_eq!(indexer.status().speed, Some(Speed::Slow));
     }
 
     #[test]

@@ -91,6 +91,10 @@ pub struct AppState {
 impl AppState {
     /// Starts indexing the library's photos and videos for the Gallery timeline.
     pub fn start_media_index(&self) {
+        let speed = setting(self, crate::media_index::SETTING_SPEED)
+            .and_then(|value| crate::media_index::Speed::parse(&value))
+            .unwrap_or(crate::media_index::Speed::Medium);
+        self.media.set_speed(speed);
         self.media.start(self.db_path.clone(), self.root.clone(), self.thumbs.clone(), self.ffmpeg);
     }
 }
@@ -269,6 +273,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/gallery/rescan", post(gallery_rescan))
         .route("/api/gallery/timeline", get(gallery_timeline))
         .route("/api/gallery/days", get(gallery_days))
+        .route("/api/gallery/settings", get(gallery_settings).post(set_gallery_settings))
         .route("/api/gallery/hidden", get(gallery_hidden).post(set_gallery_hidden).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
         .route("/api/gallery/tag", get(gallery_tag))
         .route("/api/albums", get(get_album).post(create_album).patch(update_album).delete(delete_album))
@@ -1531,6 +1536,37 @@ async fn gallery_days(State(state): State<std::sync::Arc<AppState>>, headers: He
         "hidden": hidden,
         "status": state.media.status(),
     })))
+}
+
+async fn gallery_settings(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    Ok(Json(json!({ "speed": state.media.speed(), "status": state.media.status() })))
+}
+
+#[derive(Deserialize)]
+struct GallerySettingsBody {
+    speed: String,
+}
+
+/// How hard background indexing works the machine (administrators only).
+async fn set_gallery_settings(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<GallerySettingsBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let speed = crate::media_index::Speed::parse(&body.speed)
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Choose slow, medium, or fast"))?;
+    {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        db::set_setting(&conn, crate::media_index::SETTING_SPEED, Some(speed.as_str()))
+            .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    }
+    state.media.set_speed(speed);
+    record(&state, &user, "index-speed", speed.as_str());
+    Ok(Json(json!({ "speed": speed, "status": state.media.status() })))
 }
 
 async fn gallery_hidden(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
