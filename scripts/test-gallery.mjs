@@ -144,6 +144,17 @@ try {
   assert.deepEqual((await call('GET', '/api/tags/all')).data.tags, [{ tag: 'beach', count: 2 }]);
   assert.deepEqual(paths((await call('GET', '/api/gallery/tag?tag=Beach')).data.items), ['trip/a.jpg'], 'only photos and videos');
 
+  // Hiding a photo leaves it out of the timeline only.
+  assert.equal((await call('POST', '/api/gallery/hidden', { paths: ['trip/b.jpg'], hidden: true })).data.changed, 1);
+  assert.equal((await call('POST', '/api/gallery/hidden', { paths: ['docs/notes.txt'], hidden: true })).status, 400);
+  assert.deepEqual(paths((await call('GET', '/api/gallery/timeline')).data.items), ['home/c.png', 'trip/a.jpg']);
+  let days = (await call('GET', '/api/gallery/days')).data;
+  assert.equal(days.hidden, 1);
+  assert.equal(days.days.reduce((sum, day) => sum + day.count, 0), 2);
+  const inAlbum = (await call('GET', `/api/albums?id=${italy.id}`)).data.items;
+  assert.deepEqual(inAlbum.map((item) => [item.path, item.hidden]), [['trip/b.jpg', true], ['trip/a.jpg', false]], 'albums still show it');
+  assert.deepEqual(paths((await call('GET', '/api/gallery/hidden')).data.items), ['trip/b.jpg']);
+
   // None of that changed a single file.
   assert.deepEqual(await snapshot(), before, 'albums and the index never touch the library');
 
@@ -152,6 +163,9 @@ try {
   view = (await call('GET', `/api/albums?id=${italy.id}`)).data;
   assert.deepEqual(paths(view.items), ['travel/b.jpg', 'travel/a.jpg']);
   assert.equal(view.album.cover, 'travel/a.jpg');
+  assert.deepEqual(paths((await call('GET', '/api/gallery/hidden')).data.items), ['travel/b.jpg'], 'the flag follows a renamed folder');
+  await call('POST', '/api/gallery/hidden', { paths: ['travel/b.jpg'], hidden: false });
+  assert.equal((await call('GET', '/api/gallery/days')).data.hidden, 0);
   const trashed = (await call('DELETE', '/api/entry?path=travel%2Fb.jpg')).data.path;
   assert.ok(trashed);
   assert.deepEqual(paths((await call('GET', `/api/albums?id=${italy.id}`)).data.items), ['travel/a.jpg'], 'the Trash hides it');

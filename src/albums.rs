@@ -250,6 +250,8 @@ pub struct MediaItem {
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub size: Option<i64>,
+    /// Left out of the Photos timeline (it still shows in folders, albums, and tags).
+    pub hidden: bool,
 }
 
 fn media_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItem> {
@@ -261,17 +263,24 @@ fn media_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItem> {
         width: row.get(4)?,
         height: row.get(5)?,
         size: row.get(6)?,
+        hidden: row.get(7)?,
     })
 }
 
 const MEDIA_COLUMNS: &str = "m.kind, m.taken_at, m.date_source, m.width, m.height, m.size";
+/// The "hidden from the timeline" flag of the row's path (`p`).
+fn hidden_column(alias: &str) -> String {
+    format!("EXISTS(SELECT 1 FROM timeline_hidden h WHERE h.path = {alias}.path)")
+}
+const NOT_HIDDEN: &str = "NOT EXISTS(SELECT 1 FROM timeline_hidden h WHERE h.path = m.path)";
 
 /// The photos added to an album itself, newest first by the date they were taken.
 pub fn items(conn: &Connection, id: i64) -> Result<Vec<MediaItem>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT i.path, {MEDIA_COLUMNS} FROM album_items i LEFT JOIN media_index m ON m.path = i.path
+        "SELECT i.path, {MEDIA_COLUMNS}, {} FROM album_items i LEFT JOIN media_index m ON m.path = i.path
          WHERE i.album_id = ?1 AND substr(i.path, 1, 14) <> '.ownnas-trash/' AND substr(i.path, 1, 6) <> 'Trash/'
-         ORDER BY coalesce(m.taken_at, i.added_at) DESC, i.path DESC"
+         ORDER BY coalesce(m.taken_at, i.added_at) DESC, i.path DESC",
+        hidden_column("i")
     ))?;
     let rows = stmt.query_map([id], media_item)?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -297,9 +306,9 @@ pub fn albums_for_path(conn: &Connection, path: &str) -> Result<Vec<(i64, String
 pub fn timeline(conn: &Connection, before: Option<(i64, String)>, limit: usize) -> Result<Vec<MediaItem>> {
     let (at, path) = before.unwrap_or((i64::MAX, String::new()));
     let mut stmt = conn.prepare(&format!(
-        "SELECT m.path, {MEDIA_COLUMNS} FROM media_index m
+        "SELECT m.path, {MEDIA_COLUMNS}, 0 FROM media_index m
          WHERE (m.taken_at < ?1 OR (m.taken_at = ?1 AND m.path < ?2 AND ?2 <> ''))
-           AND substr(m.path, 1, 14) <> '.ownnas-trash/' AND substr(m.path, 1, 6) <> 'Trash/'
+           AND substr(m.path, 1, 14) <> '.ownnas-trash/' AND substr(m.path, 1, 6) <> 'Trash/' AND {NOT_HIDDEN}
          ORDER BY m.taken_at DESC, m.path DESC LIMIT ?3"
     ))?;
     let rows = stmt.query_map(params![at, path, limit as i64], media_item)?;
@@ -310,8 +319,8 @@ pub fn timeline(conn: &Connection, before: Option<(i64, String)>, limit: usize) 
 /// Gallery to lay out the whole timeline before loading any of it.
 pub fn days(conn: &Connection) -> Result<Vec<(String, i64)>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT strftime('%Y-%m-%d', taken_at, 'unixepoch') AS day, count(*) FROM media_index
-         WHERE {NOT_IN_TRASH} GROUP BY day ORDER BY day DESC"
+        "SELECT strftime('%Y-%m-%d', taken_at, 'unixepoch') AS day, count(*) FROM media_index m
+         WHERE {NOT_IN_TRASH} AND {NOT_HIDDEN} GROUP BY day ORDER BY day DESC"
     ))?;
     let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -320,13 +329,54 @@ pub fn days(conn: &Connection) -> Result<Vec<(String, i64)>> {
 /// Photos and videos taken in `[from, to)`, newest first.
 pub fn taken_between(conn: &Connection, from: i64, to: i64, limit: usize) -> Result<Vec<MediaItem>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT m.path, {MEDIA_COLUMNS} FROM media_index m
+        "SELECT m.path, {MEDIA_COLUMNS}, 0 FROM media_index m
          WHERE m.taken_at >= ?1 AND m.taken_at < ?2
-           AND substr(m.path, 1, 14) <> '.ownnas-trash/' AND substr(m.path, 1, 6) <> 'Trash/'
+           AND substr(m.path, 1, 14) <> '.ownnas-trash/' AND substr(m.path, 1, 6) <> 'Trash/' AND {NOT_HIDDEN}
          ORDER BY m.taken_at DESC, m.path DESC LIMIT ?3"
     ))?;
     let rows = stmt.query_map(params![from, to, limit as i64], media_item)?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// Hides photos from the timeline (or shows them again); returns how many changed.
+pub fn set_hidden(conn: &Connection, paths: &[String], hidden: bool, by: &str) -> Result<usize> {
+    if paths.len() > MAX_ITEMS_PER_CHANGE {
+        return Err(AlbumError::Invalid(format!("Choose up to {MAX_ITEMS_PER_CHANGE} photos at a time")));
+    }
+    let now = now_secs();
+    let tx = conn.unchecked_transaction()?;
+    let mut changed = 0;
+    for path in paths {
+        changed += if hidden {
+            tx.execute(
+                "INSERT INTO timeline_hidden(path, hidden_at, hidden_by) VALUES(?1, ?2, ?3) ON CONFLICT(path) DO NOTHING",
+                params![path, now, by],
+            )?
+        } else {
+            tx.execute("DELETE FROM timeline_hidden WHERE path = ?1", [path])?
+        };
+    }
+    tx.commit()?;
+    Ok(changed)
+}
+
+/// The photos hidden from the timeline, newest first.
+pub fn hidden(conn: &Connection) -> Result<Vec<MediaItem>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT h.path, {MEDIA_COLUMNS}, 1 FROM timeline_hidden h LEFT JOIN media_index m ON m.path = h.path
+         WHERE substr(h.path, 1, 14) <> '.ownnas-trash/' AND substr(h.path, 1, 6) <> 'Trash/'
+         ORDER BY coalesce(m.taken_at, h.hidden_at) DESC, h.path DESC"
+    ))?;
+    let rows = stmt.query_map([], media_item)?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+pub fn hidden_count(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM timeline_hidden WHERE substr(path, 1, 14) <> '.ownnas-trash/' AND substr(path, 1, 6) <> 'Trash/'",
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 /// Every tag with how many files carry it.
@@ -341,9 +391,10 @@ pub fn tags(conn: &Connection) -> Result<Vec<(String, i64)>> {
 /// Files with a tag, newest first where the date is known.
 pub fn tagged(conn: &Connection, tag: &str) -> Result<Vec<MediaItem>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT t.path, {MEDIA_COLUMNS} FROM file_tags t LEFT JOIN media_index m ON m.path = t.path
+        "SELECT t.path, {MEDIA_COLUMNS}, {} FROM file_tags t LEFT JOIN media_index m ON m.path = t.path
          WHERE t.tag = ?1 COLLATE NOCASE AND substr(t.path, 1, 14) <> '.ownnas-trash/' AND substr(t.path, 1, 6) <> 'Trash/'
-         ORDER BY coalesce(m.taken_at, t.created_at) DESC, t.path DESC"
+         ORDER BY coalesce(m.taken_at, t.created_at) DESC, t.path DESC",
+        hidden_column("t")
     ))?;
     let rows = stmt.query_map([tag], media_item)?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -453,9 +504,20 @@ mod tests {
 
         assert_eq!(days(&conn).unwrap(), vec![("1970-01-01".into(), 4)]);
         assert_eq!(taken_between(&conn, 20, 31, 10).unwrap().iter().map(|i| i.path.as_str()).collect::<Vec<_>>(), ["c.jpg", "b.jpg", "d.jpg"]);
+        // Hidden photos leave the timeline (and its day counts) but keep their albums and tags.
+        assert_eq!(set_hidden(&conn, &["b.jpg".into()], true, "ana").unwrap(), 1);
+        assert_eq!(timeline(&conn, None, 10).unwrap().iter().map(|i| i.path.as_str()).collect::<Vec<_>>(), ["c.jpg", "d.jpg", "a.jpg"]);
+        assert_eq!(days(&conn).unwrap(), vec![("1970-01-01".into(), 3)]);
+        assert_eq!(hidden(&conn).unwrap().iter().map(|i| (i.path.as_str(), i.hidden)).collect::<Vec<_>>(), [("b.jpg", true)]);
+        db::rewrite_path_meta(&conn, "b.jpg", "moved/b.jpg").unwrap();
+        assert_eq!(hidden(&conn).unwrap()[0].path, "moved/b.jpg", "the flag follows the file");
+        db::rewrite_path_meta(&conn, "moved/b.jpg", "b.jpg").unwrap();
         db::add_tag(&conn, "a.jpg", "Beach").unwrap();
         db::add_tag(&conn, "b.jpg", "beach").unwrap();
         assert_eq!(tags(&conn).unwrap(), vec![("Beach".into(), 2)]);
-        assert_eq!(tagged(&conn, "BEACH").unwrap().iter().map(|i| i.path.as_str()).collect::<Vec<_>>(), ["b.jpg", "a.jpg"]);
+        let beach = tagged(&conn, "BEACH").unwrap();
+        assert_eq!(beach.iter().map(|i| (i.path.as_str(), i.hidden)).collect::<Vec<_>>(), [("b.jpg", true), ("a.jpg", false)]);
+        assert_eq!(set_hidden(&conn, &["b.jpg".into()], false, "ana").unwrap(), 1);
+        assert_eq!(hidden_count(&conn).unwrap(), 0);
     }
 }

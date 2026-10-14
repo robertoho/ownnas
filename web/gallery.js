@@ -64,6 +64,7 @@ export function mountGallery(root, ctx) {
   let monthObserver = null;
   let selected = new Set();
   let anchor = ""; // the path a Shift-click selects from
+  let hiddenCount = 0; // photos left out of the timeline
   let statusTimer = 0;
   let generation = 0;
   let current = null; // the album shown, if any
@@ -108,6 +109,10 @@ export function mountGallery(root, ctx) {
       img.addEventListener("error", () => node.classList.add("no-thumb"), { once: true });
       node.append(img, el("span", { class: "gallery-fallback" }, nameOf(item.path)));
       if (item.kind === "video") node.append(el("span", { class: "gallery-badge", "aria-label": "Video" }, "▶"));
+      if (item.hidden && route.tab !== "hidden") {
+        node.classList.add("is-hidden");
+        node.append(el("span", { class: "gallery-hidden-badge", title: "Hidden from Photos: it still shows here and in its folder" }, "Hidden"));
+      }
     }
     node.append(el("button", { type: "button", class: "gallery-check", "aria-label": "Select", tabindex: "-1" }));
     if (selected.has(item.path)) node.classList.add("is-selected");
@@ -177,6 +182,8 @@ export function mountGallery(root, ctx) {
       write && present.length ? button("Tag…", () => ctx.tag(present)) : null,
       present.length ? button("Download", () => ctx.download(present)) : null,
       present.length === 1 ? button("Show in folder", () => ctx.showInFolder(present[0])) : null,
+      write && picked.some((item) => !item.hidden) && route.tab !== "hidden" ? button("Hide from Photos", () => setHidden(picked.filter((item) => !item.hidden).map((item) => item.path), true)) : null,
+      write && picked.some((item) => item.hidden) ? button("Show in Photos", () => setHidden(picked.filter((item) => item.hidden).map((item) => item.path), false)) : null,
       write && current && picked.length === 1 && !picked[0].missing ? button("Use as cover", () => setCover(picked[0].path)) : null,
       write && current ? button("Remove from album", () => removeFromAlbum(picked.map((item) => item.path)), { class: "danger" }) : null,
       button("Clear", clearSelection, { class: "gallery-clear" }),
@@ -219,6 +226,8 @@ export function mountGallery(root, ctx) {
     }
     if (stale(mine)) return;
     showStatus(data.status);
+    hiddenCount = data.hidden || 0;
+    renderHiddenButton();
     if (!data.days.length) {
       body.replaceChildren(el("p", { class: "muted gallery-message" }, data.status.scanning
         ? "Looking for photos in the library…"
@@ -262,6 +271,73 @@ export function mountGallery(root, ctx) {
     }, { root: scroller, rootMargin: "1500px 0px" });
     for (const month of months) monthObserver.observe(month.section);
     scheduleScrubber();
+  }
+
+  function renderHiddenButton() {
+    actions.querySelector(".gallery-hidden-link")?.remove();
+    if (!hiddenCount) return;
+    actions.prepend(el("a", { class: "button gallery-hidden-link", href: "#gallery/hidden", title: "Photos left out of the timeline" }, `Hidden · ${number(hiddenCount)}`));
+  }
+
+  /// Hides photos from the timeline (or shows them again). The files are not touched.
+  async function setHidden(paths, hidden) {
+    if (!paths.length) return;
+    try {
+      const data = await ctx.api("/api/gallery/hidden", { method: "POST", json: { paths, hidden } });
+      ctx.toast(hidden
+        ? `Hid ${plural(data.changed, "photo")} from Photos. ${data.changed === 1 ? "It is" : "They are"} still in ${data.changed === 1 ? "its folder" : "their folders"} and albums; see Hidden.`
+        : `${plural(data.changed, "photo")} back in Photos`);
+      for (const path of paths) selected.delete(path);
+      if (route.tab === "photos" && hidden) {
+        removeFromTimeline(paths);
+        hiddenCount += data.changed;
+        renderHiddenButton();
+        paintSelection();
+      } else {
+        show(location.hash);
+      }
+    } catch (err) {
+      ctx.toast(err.message, true);
+    }
+  }
+
+  /// Takes photos out of the timeline in place, without reloading it.
+  function removeFromTimeline(paths) {
+    for (const path of paths) {
+      body.querySelector(`.gallery-tile[data-path="${CSS.escape(path)}"]`)?.remove();
+      byPath.delete(path);
+    }
+    for (const day of body.querySelectorAll(".gallery-day")) {
+      const grid_ = day.querySelector(".gallery-grid");
+      if (grid_ && !grid_.classList.contains("is-placeholder") && !grid_.children.length) day.remove();
+    }
+    months = months.filter((month) => {
+      if (month.section.querySelector(".gallery-day")) return true;
+      month.section.remove();
+      return false;
+    });
+    scheduleScrubber();
+  }
+
+  // ---- Hidden: photos left out of the timeline ----
+
+  async function showHidden() {
+    const mine = ++generation;
+    actions.replaceChildren();
+    body.replaceChildren(el("p", { class: "muted gallery-message" }, "Loading…"));
+    try {
+      const data = await ctx.api("/api/gallery/hidden");
+      if (stale(mine)) return;
+      items = data.items;
+      status.textContent = plural(items.length, "hidden photo");
+      body.replaceChildren(
+        el("nav", { class: "gallery-crumbs" }, el("a", { href: "#gallery" }, "Photos"), el("span", { "aria-hidden": "true" }, "›"), el("strong", {}, "Hidden")),
+        el("p", { class: "muted gallery-note" }, "These are left out of the Photos timeline. They are not moved or changed, and they still show in their folders, albums, and tags. Select some and choose Show in Photos to bring them back."),
+        items.length ? grid(items) : el("p", { class: "muted gallery-message" }, "Nothing is hidden."),
+      );
+    } catch (err) {
+      if (!stale(mine)) body.replaceChildren(el("p", { class: "muted gallery-message" }, err.message));
+    }
   }
 
   async function loadMonth(month, mine) {
@@ -622,6 +698,16 @@ export function mountGallery(root, ctx) {
       write && paths.length && { label: "Tag…", icon: "bulkTag", run: () => ctx.tag(paths) },
       paths.length && { label: "Download", icon: "download", run: () => ctx.download(paths) },
       one && !one.missing && { label: "Show in folder", icon: "folder", run: () => ctx.showInFolder(one.path) },
+      write && route.tab !== "hidden" && picked.some((entry) => !entry.hidden) && {
+        label: picked.length === 1 ? "Hide from Photos" : `Hide ${number(picked.length)} from Photos`,
+        icon: "hide",
+        run: () => setHidden(picked.filter((entry) => !entry.hidden).map((entry) => entry.path), true),
+      },
+      write && picked.some((entry) => entry.hidden) && {
+        label: "Show in Photos",
+        icon: "toggleHidden",
+        run: () => setHidden(picked.filter((entry) => entry.hidden).map((entry) => entry.path), false),
+      },
       !one || selected.has(one.path) ? { label: "Clear selection", icon: "close", run: clearSelection } : { label: "Select", icon: "check", run: () => { selected.add(one.path); paintSelection(); } },
       write && current && one && !one.missing && { label: "Use as album cover", icon: "cover", run: () => setCover(one.path) },
       write && current && { label: picked.length === 1 ? "Remove from album" : `Remove ${number(picked.length)} from album`, icon: "removeFromAlbum", danger: true, run: () => removeFromAlbum(picked.map((entry) => entry.path)) },
@@ -663,6 +749,7 @@ export function mountGallery(root, ctx) {
       write && { label: "Add this day to album…", icon: "addToAlbum", run: () => pickAlbum(paths) },
       write && { label: "Tag this day…", icon: "bulkTag", run: () => ctx.tag(paths) },
       { label: "Download this day", icon: "download", run: () => ctx.download(paths) },
+      write && { label: "Hide this day from Photos", icon: "hide", run: () => setHidden(paths, true) },
     ]);
     return true;
   }
@@ -673,6 +760,7 @@ export function mountGallery(root, ctx) {
       shown.length && { label: "Select all shown", icon: "check", run: () => { selected = new Set(shown.map((item) => item.path)); paintSelection(); } },
       selected.size && { label: "Clear selection", icon: "close", run: clearSelection },
       { label: "Rescan the library", icon: "restore", run: rescan },
+      hiddenCount && { label: `Hidden photos (${number(hiddenCount)})`, icon: "hide", run: () => { location.hash = "#gallery/hidden"; } },
     ]);
   }
 
@@ -861,6 +949,7 @@ export function mountGallery(root, ctx) {
     const parts = hash.replace(/^#?gallery\/?/, "").split("/").filter(Boolean).map(decodeURIComponent);
     if (parts[0] === "albums") return { tab: "albums", id: parts[1] ? Number(parts[1]) : null };
     if (parts[0] === "tags") return { tab: "tags", tag: parts[1] || "" };
+    if (parts[0] === "hidden") return { tab: "hidden" };
     return { tab: "photos" };
   }
 
@@ -880,10 +969,12 @@ export function mountGallery(root, ctx) {
     status.textContent = "";
     scrubber.hidden = true;
     applySize(Number(size.value));
-    for (const link of tabs.children) link.setAttribute("aria-current", link.dataset.tab === route.tab ? "page" : "false");
+    const tab = route.tab === "hidden" ? "photos" : route.tab;
+    for (const link of tabs.children) link.setAttribute("aria-current", link.dataset.tab === tab ? "page" : "false");
     scroller.scrollTop = 0;
     if (route.tab === "albums") showAlbums(route.id);
     else if (route.tab === "tags") showTags(route.tag);
+    else if (route.tab === "hidden") showHidden();
     else showPhotos();
   }
 

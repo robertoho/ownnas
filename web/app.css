@@ -3372,6 +3372,10 @@ body.is-gallery .app > .explorer-status-bar { display: none; }
 }
 .gallery-tile.is-selected img { transform: scale(0.88); border-radius: 6px; }
 .gallery-tile.is-selected { background: color-mix(in srgb, var(--accent) 22%, var(--thumb-bg)); }
+.gallery-hidden-badge { position: absolute; left: 6px; bottom: 6px; padding: 0.05rem 0.45rem; border-radius: 999px; background: rgba(0, 0, 0, 0.6); color: #fff; font-size: 0.68rem; }
+.gallery-tile.is-hidden img { opacity: 0.55; }
+.gallery-note { margin: 0 0 0.9rem; max-width: 46rem; }
+.gallery-hidden-link { text-decoration: none; }
 .gallery-badge { position: absolute; right: 6px; bottom: 6px; padding: 0.05rem 0.4rem; border-radius: 999px; background: rgba(0, 0, 0, 0.6); color: #fff; font-size: 0.7rem; }
 .gallery-check {
   position: absolute;

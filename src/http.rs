@@ -269,6 +269,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/gallery/rescan", post(gallery_rescan))
         .route("/api/gallery/timeline", get(gallery_timeline))
         .route("/api/gallery/days", get(gallery_days))
+        .route("/api/gallery/hidden", get(gallery_hidden).post(set_gallery_hidden).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
         .route("/api/gallery/tag", get(gallery_tag))
         .route("/api/albums", get(get_album).post(create_album).patch(update_album).delete(delete_album))
         .route("/api/albums/tree", get(album_tree))
@@ -1521,14 +1522,60 @@ fn gallery_items(state: &AppState, items: Vec<crate::albums::MediaItem>, check_m
 
 async fn gallery_days(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
-    let days = {
+    let (days, hidden) = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-        crate::albums::days(&conn)?
+        (crate::albums::days(&conn)?, crate::albums::hidden_count(&conn)?)
     };
     Ok(Json(json!({
         "days": days.into_iter().map(|(day, count)| json!({ "day": day, "count": count })).collect::<Vec<_>>(),
+        "hidden": hidden,
         "status": state.media.status(),
     })))
+}
+
+async fn gallery_hidden(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let items = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::albums::hidden(&conn)?
+    };
+    Ok(Json(json!({ "items": gallery_items(&state, items, true) })))
+}
+
+#[derive(Deserialize)]
+struct HiddenBody {
+    paths: Vec<String>,
+    hidden: bool,
+}
+
+/// Leaves photos out of the Photos timeline, or puts them back. The files are not touched.
+async fn set_gallery_hidden(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<HiddenBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let mut paths = Vec::new();
+    for raw in &body.paths {
+        let path = raw.trim().trim_start_matches('/').to_string();
+        if body.hidden {
+            let target = files::resolve(&state.root, &path)?;
+            if !target.full.is_file() || !matches!(files::kind_of(&target.rel), "image" | "video" | "svg") {
+                return Err(ApiError::new(StatusCode::BAD_REQUEST, "Only photos and videos can be hidden from Photos"));
+            }
+            paths.push(target.rel);
+        } else {
+            paths.push(path);
+        }
+    }
+    let changed = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::albums::set_hidden(&conn, &paths, body.hidden, &user.username)?
+    };
+    record(&state, &user, if body.hidden { "photos-hide" } else { "photos-show" }, &format!("{changed} photos"));
+    Ok(Json(json!({ "changed": changed })))
 }
 
 async fn gallery_status(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {

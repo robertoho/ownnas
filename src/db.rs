@@ -134,6 +134,11 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             indexed_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS media_index_taken ON media_index(taken_at DESC, path DESC);
+        CREATE TABLE IF NOT EXISTS timeline_hidden (
+            path TEXT PRIMARY KEY,
+            hidden_at INTEGER NOT NULL,
+            hidden_by TEXT NOT NULL DEFAULT ''
+        );
         CREATE TABLE IF NOT EXISTS folder_sizes (
             path TEXT PRIMARY KEY,
             bytes INTEGER NOT NULL,
@@ -148,7 +153,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     .map_err(|_| "Could not create the database schema".to_string())?;
     ensure_admin_column(conn)?;
     conn.execute(
-        "INSERT INTO settings(key, value) VALUES('schema_version', '8')
+        "INSERT INTO settings(key, value) VALUES('schema_version', '9')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )
@@ -922,7 +927,7 @@ pub fn rewrite_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), 
         );
     }
     // Albums keep the photos they hold, wherever they move (into the Trash and back too).
-    for (table, column) in [("album_items", "path"), ("albums", "cover_path"), ("media_index", "path")] {
+    for (table, column) in [("album_items", "path"), ("albums", "cover_path"), ("media_index", "path"), ("timeline_hidden", "path")] {
         conn.execute(
             &format!(
                 "UPDATE OR REPLACE {table} SET {column} = CASE WHEN {column} = ?1 THEN ?2 ELSE ?2 || substr({column}, length(?1) + 1) END
@@ -1035,7 +1040,7 @@ pub fn delete_path_meta(conn: &Connection, path: &str) -> Result<(), String> {
         params![path, like],
     )
     .map_err(|_| "Could not remove recent files".to_string())?;
-    for (table, column) in [("album_items", "path"), ("media_index", "path")] {
+    for (table, column) in [("album_items", "path"), ("media_index", "path"), ("timeline_hidden", "path")] {
         conn.execute(
             &format!("DELETE FROM {table} WHERE {column} = ?1 OR substr({column}, 1, length(?1) + 1) = ?1 || '/'"),
             params![path],
