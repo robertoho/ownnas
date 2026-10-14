@@ -32,6 +32,7 @@ const DOCX_EDITOR_JS: &str = include_str!("../web/docx-editor.js");
 const ODT_EDITOR_JS: &str = include_str!("../web/odt-editor.js");
 const XLSX_EDITOR_JS: &str = include_str!("../web/xlsx-editor.js");
 const SQLITE_VIEWER_JS: &str = include_str!("../web/sqlite-viewer.js");
+const GALLERY_JS: &str = include_str!("../web/gallery.js");
 const APP_JS: &str = include_str!("../web/app.js");
 const MODEL_VIEWER_JS: &str = include_str!("../web/model-viewer.js");
 const DXF_VIEWER_JS: &str = include_str!("../web/dxf-viewer.js");
@@ -82,6 +83,16 @@ pub struct AppState {
     pub terminals: crate::terminal::Terminals,
     /// Loopback URL that agent hooks inside terminals report to.
     pub agent_url: std::sync::OnceLock<String>,
+    /// The Gallery's photo index, kept up to date in the background once started.
+    pub media: std::sync::Arc<crate::media_index::Indexer>,
+    pub db_path: PathBuf,
+}
+
+impl AppState {
+    /// Starts indexing the library's photos and videos for the Gallery timeline.
+    pub fn start_media_index(&self) {
+        self.media.start(self.db_path.clone(), self.root.clone());
+    }
 }
 
 pub struct AttemptGate {
@@ -134,6 +145,8 @@ pub fn new_state(
         https: false,
         terminals: crate::terminal::Terminals::default(),
         agent_url: std::sync::OnceLock::new(),
+        media: std::sync::Arc::default(),
+        db_path,
     })
 }
 
@@ -146,6 +159,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/assets/odt-editor.js", get(odt_editor_javascript))
         .route("/assets/xlsx-editor.js", get(xlsx_editor_javascript))
         .route("/assets/sqlite-viewer.js", get(sqlite_viewer_javascript))
+        .route("/assets/gallery.js", get(gallery_javascript))
         .route("/assets/docx-editor.css", get(docx_editor_css))
         .route("/assets/model-viewer.js", get(model_viewer_javascript))
         .route("/assets/dxf-viewer.js", get(dxf_viewer_javascript))
@@ -251,6 +265,14 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/folder-appearance", get(get_folder_appearance).post(set_folder_appearance))
         .route("/api/annotations", get(get_annotations).post(ack_annotations))
         .route("/api/tags", post(add_tag).delete(remove_tag))
+        .route("/api/tags/all", get(all_tags))
+        .route("/api/gallery/status", get(gallery_status))
+        .route("/api/gallery/rescan", post(gallery_rescan))
+        .route("/api/gallery/timeline", get(gallery_timeline))
+        .route("/api/gallery/tag", get(gallery_tag))
+        .route("/api/albums", get(get_album).post(create_album).patch(update_album).delete(delete_album))
+        .route("/api/albums/tree", get(album_tree))
+        .route("/api/albums/items", post(album_items).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
         .route("/api/tags/bulk", post(bulk_tags))
         .route("/api/comments", post(add_comment).delete(remove_comment))
         .route("/manifest.webmanifest", get(manifest))
@@ -806,6 +828,10 @@ async fn xlsx_editor_javascript() -> impl IntoResponse {
 
 async fn sqlite_viewer_javascript() -> impl IntoResponse {
     app_module_javascript(SQLITE_VIEWER_JS)
+}
+
+async fn gallery_javascript() -> impl IntoResponse {
+    app_module_javascript(GALLERY_JS)
 }
 
 async fn model_viewer_javascript() -> impl IntoResponse {
@@ -1459,6 +1485,265 @@ async fn sqlite_value(
     response
         .body(Body::from(bytes))
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not send the value"))
+}
+
+impl From<crate::albums::AlbumError> for ApiError {
+    fn from(err: crate::albums::AlbumError) -> Self {
+        use crate::albums::AlbumError;
+        let status = match err {
+            AlbumError::NotFound => StatusCode::NOT_FOUND,
+            AlbumError::Invalid(_) => StatusCode::BAD_REQUEST,
+            AlbumError::Conflict(_) => StatusCode::CONFLICT,
+            AlbumError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        ApiError::new(status, err.to_string())
+    }
+}
+
+/// Media items as the Gallery shows them: with their kind, and whether the file is still there
+/// (it may have been moved or deleted outside OwnNAS).
+fn gallery_items(state: &AppState, items: Vec<crate::albums::MediaItem>, check_missing: bool) -> Vec<serde_json::Value> {
+    items
+        .into_iter()
+        .map(|mut item| {
+            if item.kind.is_none() {
+                let name = item.path.rsplit('/').next().unwrap_or(&item.path);
+                item.kind = Some(files::kind_of(name).to_string());
+            }
+            let mut value = serde_json::to_value(&item).unwrap_or_default();
+            if check_missing && !state.root.join(&item.path).exists() {
+                value["missing"] = json!(true);
+            }
+            value
+        })
+        .collect()
+}
+
+async fn gallery_status(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    Ok(Json(state.media.status()))
+}
+
+async fn gallery_rescan(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    require_user(&state, &headers)?;
+    state.media.rescan();
+    Ok(Json(state.media.status()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TimelineQuery {
+    before: Option<i64>,
+    before_path: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn gallery_timeline(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<TimelineQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let limit = query.limit.unwrap_or(200).clamp(1, 1000);
+    let before = query.before.map(|at| (at, query.before_path.unwrap_or_default()));
+    let items = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::albums::timeline(&conn, before, limit)?
+    };
+    let more = items.len() == limit;
+    Ok(Json(json!({ "items": gallery_items(&state, items, false), "more": more, "status": state.media.status() })))
+}
+
+#[derive(Deserialize)]
+struct AlbumQuery {
+    id: Option<i64>,
+}
+
+async fn get_album(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AlbumQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let (album, breadcrumb, children, items) = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        match query.id {
+            Some(id) => (
+                Some(crate::albums::get(&conn, id)?),
+                crate::albums::breadcrumb(&conn, id)?,
+                crate::albums::children(&conn, Some(id))?,
+                crate::albums::items(&conn, id)?,
+            ),
+            None => (None, Vec::new(), crate::albums::children(&conn, None)?, Vec::new()),
+        }
+    };
+    Ok(Json(json!({
+        "album": album,
+        "breadcrumb": breadcrumb.into_iter().map(|(id, name)| json!({ "id": id, "name": name })).collect::<Vec<_>>(),
+        "albums": children,
+        "items": gallery_items(&state, items, true),
+    })))
+}
+
+async fn album_tree(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    Ok(Json(json!({ "albums": crate::albums::all(&conn)? })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateAlbumBody {
+    name: String,
+    parent_id: Option<i64>,
+}
+
+async fn create_album(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<CreateAlbumBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let album = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        let id = crate::albums::create(&conn, body.parent_id, &body.name)?;
+        crate::albums::get(&conn, id)?
+    };
+    record(&state, &user, "album-create", &album.name);
+    Ok(Json(json!({ "album": album })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateAlbumBody {
+    id: i64,
+    name: Option<String>,
+    /// With `move: true`, the album goes inside `parentId` (or to the top when it is null).
+    #[serde(rename = "move", default)]
+    move_album: bool,
+    parent_id: Option<i64>,
+    /// With `setCover: true`, `cover` becomes the album's cover (null goes back to automatic).
+    #[serde(default)]
+    set_cover: bool,
+    cover: Option<String>,
+}
+
+async fn update_album(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateAlbumBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let album = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(name) = &body.name {
+            crate::albums::rename(&conn, body.id, name)?;
+        }
+        if body.move_album {
+            crate::albums::move_to(&conn, body.id, body.parent_id)?;
+        }
+        if body.set_cover {
+            let cover = body.cover.as_deref().map(|path| path.trim().trim_start_matches('/'));
+            crate::albums::set_cover(&conn, body.id, cover)?;
+        }
+        crate::albums::get(&conn, body.id)?
+    };
+    record(&state, &user, "album-update", &album.name);
+    Ok(Json(json!({ "album": album })))
+}
+
+async fn delete_album(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AlbumQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let id = query.id.ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Choose an album"))?;
+    let name = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        let name = crate::albums::get(&conn, id)?.name;
+        crate::albums::delete(&conn, id)?;
+        name
+    };
+    record(&state, &user, "album-delete", &name);
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AlbumItemsBody {
+    album_id: i64,
+    paths: Vec<String>,
+    action: Option<String>,
+}
+
+async fn album_items(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AlbumItemsBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let add = body.action.as_deref() != Some("remove");
+    let mut paths = Vec::new();
+    for raw in &body.paths {
+        let path = raw.trim().trim_start_matches('/').to_string();
+        if add {
+            // Only photos and videos that are really in the library go into albums.
+            let target = files::resolve(&state.root, &path)?;
+            let kind = files::kind_of(&target.rel);
+            if !target.full.is_file() || !matches!(kind, "image" | "video" | "svg") {
+                return Err(ApiError::new(StatusCode::BAD_REQUEST, "Only photos and videos can go in albums"));
+            }
+            paths.push(target.rel);
+        } else {
+            paths.push(path);
+        }
+    }
+    let (changed, album) = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        let changed = crate::albums::change_items(&conn, body.album_id, &paths, add, &user.username)?;
+        (changed, crate::albums::get(&conn, body.album_id)?)
+    };
+    record(&state, &user, if add { "album-add" } else { "album-remove" }, &format!("{} ({changed})", album.name));
+    Ok(Json(json!({ "changed": changed, "album": album })))
+}
+
+async fn all_tags(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let tags = crate::albums::tags(&conn)?;
+    Ok(Json(json!({ "tags": tags.into_iter().map(|(tag, count)| json!({ "tag": tag, "count": count })).collect::<Vec<_>>() })))
+}
+
+#[derive(Deserialize)]
+struct GalleryTagQuery {
+    tag: String,
+}
+
+async fn gallery_tag(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<GalleryTagQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let items = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::albums::tagged(&conn, query.tag.trim())?
+    };
+    let items: Vec<_> = gallery_items(&state, items, true)
+        .into_iter()
+        .filter(|item| matches!(item["kind"].as_str(), Some("image" | "video" | "svg")))
+        .collect();
+    Ok(Json(json!({ "items": items })))
 }
 
 async fn raw(
@@ -3963,6 +4248,12 @@ async fn get_annotations(
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     let notes = db::list_annotations(&conn, &path, size as i64, modified)
         .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let mut notes = serde_json::to_value(notes).unwrap_or_default();
+    // The albums this file is in, for the preview.
+    notes["albums"] = json!(crate::albums::albums_for_path(&conn, &path)?
+        .into_iter()
+        .map(|(id, name)| json!({ "id": id, "name": name }))
+        .collect::<Vec<_>>());
     Ok(Json(notes))
 }
 

@@ -1,8 +1,10 @@
 mod agents;
+mod albums;
 mod auth;
 mod content_index;
 mod db;
 mod files;
+mod media_index;
 mod http;
 mod pdf_ops;
 mod terminal;
@@ -299,6 +301,7 @@ fn serve(args: ServeArgs) -> Result<(), String> {
     app_state.supervisor_restart = args.restart_by_supervisor;
     app_state.https = args.tls_cert.is_some();
     let state = Arc::new(app_state);
+    state.start_media_index();
     {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
         let count = db::count_users(&conn)?;

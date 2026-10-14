@@ -724,12 +724,12 @@ function applyFolderSize(path, info) {
   const text = sub.textContent || "";
   if (text === "OwnNAS trash" || text === "OwnNAS archive" || text.startsWith("From ")) return;
   sub.textContent = formatFolderSize(info);
-  sub.title = info.truncated ? "Count stopped early" : "";
+  sub.title = info && info.truncated ? "Count stopped early" : "";
   const entry = state.entries.find((item) => item.path === path);
   if (entry) {
-    entry.size = info.bytes || 0;
-    entry.measuredSize = info.bytes || 0;
-    entry.measuredTruncated = !!info.truncated;
+    entry.size = (info && info.bytes) || 0;
+    entry.measuredSize = (info && info.bytes) || 0;
+    entry.measuredTruncated = !!(info && info.truncated);
   }
   if (state.selected.has(path)) updateSelectionSummary();
 }
@@ -872,6 +872,8 @@ const MENU_ICONS = {
   folderAppearance: "M8 2a6 6 0 1 0 0 12c1 0 1.5-.6 1.5-1.4 0-.9-.8-1.1-.8-2 0-.8.7-1.3 1.6-1.3H12a2.5 2.5 0 0 0 2.5-2.5C14.5 4.3 11.6 2 8 2z M5 7.5h.01 M7 4.75h.01 M10 5h.01",
   search: "M7 2.75a4.25 4.25 0 1 1 0 8.5a4.25 4.25 0 1 1 0-8.5z M10.25 10.25 13.5 13.5",
   library: "M2.5 2.5h3v11h-3z M6.5 2.5h3v11h-3z M10.5 3.5l3 1v9l-3-1z",
+  gallery: "M2.5 3h11a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z M1.5 10.5l3.5-3.5 3 3 2-2 4.5 4 M10.5 5.5h.01",
+  addToAlbum: "M1.5 4.5h9a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-8a1 1 0 0 1-1-1z M3.5 2.5h9.5a1 1 0 0 1 1 1V10 M6 7v4 M4 9h4",
   bookmark: "M4 2.5h8v11l-4-2.5-4 2.5z",
   usage: `${ICON_FOLDER} M4.5 9.25h7v2.5h-7z M4.75 10.5h3.75`,
   duplicates: "M2.5 3.5h6v6h-6z M7.5 6.5h6v6h-6z",
@@ -1166,6 +1168,7 @@ function openSelectionMenu(x, y, pasteInto) {
     buttons.push(`<button type="button" data-menu="downloadZip">Download folder zip</button>`);
     buttons.push(`<button type="button" data-menu="search">Search…</button>`);
     buttons.push(`<button type="button" data-menu="library">Library</button>`);
+    buttons.push(`<button type="button" data-menu="gallery">Gallery</button>`);
     if (write) {
       buttons.push(`<button type="button" data-menu="bookmark">${bookmarked ? "Remove bookmark" : "Bookmark this folder"}</button>`);
     }
@@ -1216,6 +1219,9 @@ function openSelectionMenu(x, y, pasteInto) {
     }
     if (write && entries.length >= 2 && !allInTrash) {
       buttons.push(`<button type="button" data-menu="folderWith">New folder with selection</button>`);
+    }
+    if (write && !allInTrash && entries.every((entry) => !entry.dir && ["image", "video", "svg"].includes(entry.kind))) {
+      buttons.push(`<button type="button" data-menu="addToAlbum">Add to album…</button>`);
     }
     if (write && entries.length && !allInTrash) {
       buttons.push(`<button type="button" data-menu="rename">Rename</button>`);
@@ -1475,6 +1481,55 @@ function showShortcuts() {
   dialog.showModal();
 }
 
+let galleryModule = null;
+let galleryApi = null;
+
+function galleryOpen() {
+  return document.body.classList.contains("is-gallery");
+}
+
+/// Loads the Gallery on first use.
+async function gallery() {
+  if (!galleryApi) {
+    galleryModule = galleryModule || await import("/assets/gallery.js");
+    const toEntry = (item) => ({ path: item.path, name: item.path.split("/").pop(), dir: false, size: item.size || 0, modified: item.takenAt || 0, kind: item.kind || "image" });
+    galleryApi = galleryModule.mountGallery($("gallery"), {
+      api,
+      toast,
+      askText,
+      askConfirm,
+      canWrite: () => !!(state.me && !state.me.readonly),
+      openPreview: (item, list) => {
+        state.gallerySequence = list.map(toEntry);
+        openEntry(toEntry(item)).catch((err) => toast(err.message, true));
+      },
+      download: (paths) => downloadEntries(paths.map((path) => toEntry({ path }))).catch((err) => toast(err.message, true)),
+      tag: (paths) => bulkTagEntries(paths.map((path) => toEntry({ path }))).catch((err) => toast(err.message, true)),
+      showInFolder: (path) => openFileByPath(path).catch((err) => toast(err.message, true)),
+    });
+  }
+  return galleryApi;
+}
+
+/// Shows what the address names: the Gallery (#gallery…) or a folder (#/path).
+async function route() {
+  if (location.hash.startsWith("#gallery")) {
+    const api = await gallery();
+    closeMenu();
+    state.selected = new Set();
+    document.body.classList.add("is-gallery");
+    $("crumbs").innerHTML = `<button type="button" data-go="">${esc(state.me.rootName || "Library")}</button><span class="muted">/</span><button type="button" aria-current="page" data-gallery-home>Gallery</button>`;
+    api.show(location.hash);
+    return;
+  }
+  if (galleryOpen()) {
+    document.body.classList.remove("is-gallery");
+    state.gallerySequence = null;
+    galleryApi?.hide();
+  }
+  await load(hashToPath());
+}
+
 function openTerminalAt(path) {
   terminalPanel()
     .then((module) => module.open(path))
@@ -1670,7 +1725,7 @@ async function openEntry(entry) {
   const write = state.me && !state.me.readonly;
   $("tag-form").hidden = !write;
   $("comment-form").hidden = !write;
-  const images = sortedEntries().filter((item) => item.kind === "image" || item.kind === "svg");
+  const images = previewSequence();
   const imageIndex = images.findIndex((item) => item.path === entry.path);
   $("preview-prev").hidden = imageIndex <= 0;
   $("preview-next").hidden = imageIndex < 0 || imageIndex >= images.length - 1;
@@ -2067,6 +2122,11 @@ function renderAnnotations(data) {
   $("preview-tags").innerHTML = tags.length
     ? tags.map((tag) => `<span class="tag-chip"><button type="button" class="tag-link" data-search-tag="${esc(tag)}">${esc(tag)}</button>${write ? `<button type="button" data-remove-tag="${esc(tag)}" aria-label="Remove tag ${esc(tag)}">×</button>` : ""}</span>`).join("")
     : `<span class="notes-empty">No tags yet</span>`;
+  const albums = data.albums || [];
+  $("preview-albums").innerHTML = albums.map((album) =>
+    `<a class="tag-chip album-chip" href="#gallery/albums/${album.id}">${esc(album.name)}</a>`).join("")
+    || `<span class="notes-empty">Not in any album</span>`;
+  $("preview-add-album").hidden = !write || !["image", "video", "svg"].includes(state.current && state.current.kind);
   $("preview-comments").innerHTML = comments.length
     ? comments.map((item) => `<article class="comment-item" data-comment-id="${item.id}">
         <div class="comment-head">
@@ -3489,7 +3549,7 @@ async function boot() {
   }
   syncControls();
   try {
-    await load(hashToPath());
+    await route();
   } catch (err) {
     toast(err.message, true);
   }
@@ -3562,6 +3622,23 @@ $("crumbs").addEventListener("click", (event) => {
   const button = event.target.closest("[data-go]");
   if (!button) return;
   go(button.dataset.go).catch((err) => toast(err.message, true));
+});
+
+$("gallery-btn").addEventListener("click", () => {
+  location.hash = "#gallery";
+});
+
+$("crumbs").addEventListener("click", (event) => {
+  if (event.target.closest("[data-gallery-home]")) location.hash = "#gallery";
+});
+
+$("preview-add-album").addEventListener("click", () => {
+  if (!state.current) return;
+  const path = state.current.path;
+  gallery()
+    .then((api) => api.pickAlbum([path]))
+    .then(() => (state.current && state.current.path === path ? loadAnnotations(path) : null))
+    .catch((err) => toast(err.message, true));
 });
 
 $("brand-home").addEventListener("click", () => {
@@ -3822,6 +3899,8 @@ function runMenuAction(button, entries, pasteInto) {
   if (action === "downloadZip") $("zip-link").click();
   if (action === "search") focusSearch();
   if (action === "library") $("library-btn").click();
+  if (action === "gallery") location.hash = "#gallery";
+  if (action === "addToAlbum") gallery().then((api) => api.pickAlbum(entries.map((entry) => entry.path))).catch((err) => toast(err.message, true));
   if (action === "bookmark") $("bookmark-btn").click();
   if (action === "usage") $("usage-btn").click();
   if (action === "duplicates") openDuplicatesFinder().catch((err) => toast(err.message, true));
@@ -4156,10 +4235,18 @@ $("folder-input").addEventListener("change", () => onPicked($("folder-input")));
 
 window.addEventListener("hashchange", () => {
   if (!state.me) return;
-  load(hashToPath()).catch((err) => toast(err.message, true));
+  route().catch((err) => toast(err.message, true));
 });
 
 window.addEventListener("keydown", (event) => {
+  if (galleryOpen() && !document.querySelector("dialog[open]") && !event.target.closest("input, textarea, select, [contenteditable]")) {
+    if ($("preview").hidden && galleryApi?.handleKey(event)) return;
+    if (!$("preview").hidden && (event.key === "ArrowLeft" || event.key === "ArrowRight") && !event.metaKey && !event.ctrlKey && !event.altKey) {
+      event.preventDefault();
+      imageStep(event.key === "ArrowLeft" ? -1 : 1);
+      return;
+    }
+  }
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
     if (state.editor && state.me && !state.me.readonly && !$("preview").hidden) {
       event.preventDefault();
@@ -4215,6 +4302,8 @@ window.addEventListener("keydown", (event) => {
   if (document.querySelector("dialog[open]")) return;
   const typing = event.target.closest("input, textarea, select, [contenteditable]:not([contenteditable=\"false\"])");
   if (typing) return;
+  // The file list is hidden behind the Gallery: its keys (type to filter, Delete…) are off.
+  if (galleryOpen()) return;
   if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === "z" && !document.querySelector("dialog[open]")) {
     event.preventDefault(); undoFileOperation(); return;
   }
@@ -4472,9 +4561,16 @@ async function refreshLibrary() {
   syncBookmarkBtn();
 }
 
+/// What the preview's previous and next step through: the Gallery's photos while it shows,
+/// otherwise the pictures in the folder.
+function previewSequence() {
+  if (galleryOpen() && state.gallerySequence) return state.gallerySequence;
+  return sortedEntries().filter((item) => item.kind === "image" || item.kind === "svg");
+}
+
 function imageStep(delta) {
   if (!state.current) return;
-  const images = sortedEntries().filter((item) => item.kind === "image" || item.kind === "svg");
+  const images = previewSequence();
   const index = images.findIndex((item) => item.path === state.current.path);
   const next = images[index + delta];
   if (next) openEntry(next).catch((err) => toast(err.message, true));

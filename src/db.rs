@@ -105,6 +105,35 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             color TEXT NOT NULL DEFAULT '',
             icon TEXT NOT NULL DEFAULT 'folder'
         );
+        CREATE TABLE IF NOT EXISTS albums (
+            id INTEGER PRIMARY KEY,
+            parent_id INTEGER REFERENCES albums(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            cover_path TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS albums_parent ON albums(parent_id);
+        CREATE TABLE IF NOT EXISTS album_items (
+            album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
+            path TEXT NOT NULL,
+            added_at INTEGER NOT NULL,
+            added_by TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (album_id, path)
+        );
+        CREATE INDEX IF NOT EXISTS album_items_path ON album_items(path);
+        CREATE TABLE IF NOT EXISTS media_index (
+            path TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime INTEGER NOT NULL,
+            taken_at INTEGER NOT NULL,
+            date_source TEXT NOT NULL,
+            width INTEGER,
+            height INTEGER,
+            indexed_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS media_index_taken ON media_index(taken_at DESC, path DESC);
         CREATE TABLE IF NOT EXISTS folder_sizes (
             path TEXT PRIMARY KEY,
             bytes INTEGER NOT NULL,
@@ -119,7 +148,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     .map_err(|_| "Could not create the database schema".to_string())?;
     ensure_admin_column(conn)?;
     conn.execute(
-        "INSERT INTO settings(key, value) VALUES('schema_version', '7')
+        "INSERT INTO settings(key, value) VALUES('schema_version', '8')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )
@@ -892,6 +921,17 @@ pub fn rewrite_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), 
             params![to, to],
         );
     }
+    // Albums keep the photos they hold, wherever they move (into the Trash and back too).
+    for (table, column) in [("album_items", "path"), ("albums", "cover_path"), ("media_index", "path")] {
+        conn.execute(
+            &format!(
+                "UPDATE OR REPLACE {table} SET {column} = CASE WHEN {column} = ?1 THEN ?2 ELSE ?2 || substr({column}, length(?1) + 1) END
+                 WHERE {column} = ?1 OR substr({column}, 1, length(?1) + 1) = ?1 || '/'"
+            ),
+            params![from, to],
+        )
+        .map_err(|_| "Could not move album entries".to_string())?;
+    }
     invalidate_folder_sizes(conn, from)?;
     invalidate_folder_sizes(conn, to)?;
     Ok(())
@@ -949,6 +989,15 @@ pub fn copy_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), Str
         params![from, to, like, start],
     )
     .map_err(|_| "Could not copy fingerprints".to_string())?;
+    // The copy shows in the timeline right away; it is not added to the original's albums.
+    conn.execute(
+        "INSERT OR REPLACE INTO media_index(path, kind, size, mtime, taken_at, date_source, width, height, indexed_at)
+         SELECT CASE WHEN path = ?1 THEN ?2 ELSE ?2 || substr(path, length(?1) + 1) END,
+                kind, size, mtime, taken_at, date_source, width, height, indexed_at
+         FROM media_index WHERE path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/'",
+        params![from, to],
+    )
+    .map_err(|_| "Could not copy the photo index".to_string())?;
     Ok(())
 }
 
@@ -986,6 +1035,18 @@ pub fn delete_path_meta(conn: &Connection, path: &str) -> Result<(), String> {
         params![path, like],
     )
     .map_err(|_| "Could not remove recent files".to_string())?;
+    for (table, column) in [("album_items", "path"), ("media_index", "path")] {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE {column} = ?1 OR substr({column}, 1, length(?1) + 1) = ?1 || '/'"),
+            params![path],
+        )
+        .map_err(|_| "Could not remove album entries".to_string())?;
+    }
+    conn.execute(
+        "UPDATE albums SET cover_path = NULL WHERE cover_path = ?1 OR substr(cover_path, 1, length(?1) + 1) = ?1 || '/'",
+        params![path],
+    )
+    .map_err(|_| "Could not update album covers".to_string())?;
     invalidate_folder_sizes(conn, path)?;
     Ok(())
 }

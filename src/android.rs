@@ -48,6 +48,7 @@ fn start_server(
         false,
         update::UpdateConfig::default(),
     )?);
+    state.start_media_index();
     {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
         if db::count_users(&conn)? == 0 {
