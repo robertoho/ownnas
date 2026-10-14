@@ -3501,3 +3501,8 @@ body.is-gallery .app > .explorer-status-bar { display: none; }
 .folder-picker-row span:nth-of-type(1) { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .folder-picker-open { color: var(--muted); }
 .folder-picker .spacer { flex: 1; }
+
+/* Windows tiled with the terminals (Settings). */
+.terminals-window-body { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--bg-2); }
+.settings.is-window { position: static; inset: auto; z-index: auto; width: auto; height: auto; flex: 1; min-height: 0; border: 0; box-shadow: none; }
+.settings.is-window #settings-close { display: none; }

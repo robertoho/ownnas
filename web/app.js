@@ -1287,7 +1287,16 @@ function closeLibrary() {
   $("library").hidden = true;
 }
 
+let settingsTiled = false;
+
 function closeSettings() {
+  if (settingsTiled) {
+    settingsTiled = false;
+    // Back from the tiles into the page, where it opens next time if tiling is not available.
+    const settings = terminalModule && terminalModule.closeWindow("settings");
+    if (settings) document.body.append(settings);
+    $("settings").classList.remove("is-window");
+  }
   $("settings").hidden = true;
 }
 
@@ -1790,8 +1799,23 @@ function openSettings(tab) {
   if (!tab) tab = "theme";
   setSettingsTab(tab);
   renderThemeGrid();
-  $("settings").hidden = false;
   if (admin && tab === "users") loadUsers().catch((err) => toast(err.message, true));
+  if (settingsTiled) return;
+  // On wide screens Settings opens as a window tiled with the terminals; otherwise it slides in.
+  const canTile = state.me && state.me.terminal && !window.matchMedia("(max-width: 820px)").matches;
+  if (!canTile) {
+    $("settings").hidden = false;
+    return;
+  }
+  const settings = $("settings");
+  terminalPanel()
+    .then((module) => module.openWindow("settings", "Settings", settings, closeSettings))
+    .catch(() => false)
+    .then((tiledNow) => {
+      settingsTiled = !!tiledNow;
+      settings.classList.toggle("is-window", settingsTiled);
+      settings.hidden = false;
+    });
 }
 
 async function refreshUpdatePanel() {

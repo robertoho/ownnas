@@ -14,7 +14,8 @@ let streamTimer = 0;
 const frames = new Map(); // id -> tile: a header and the terminal's iframe
 let tiled = false; // while showing on a wide screen: the files beside a grid of every terminal
 let focusOnLoad = ""; // a terminal to give the keyboard once its page has loaded
-let maximized = ""; // a terminal expanded to fill the whole grid, in the tiling layout
+let maximized = ""; // a terminal (or "w:<window>") expanded to fill the whole grid, in the tiling layout
+const windows = new Map(); // id -> { tile, onClose }: other windows tiled with the terminals, such as Settings
 const STASHED_KEY = "ownnas-terminals-hidden";
 // Terminals put away with ⇧⌘U: still running and in the tabs, but without a tile.
 const stashed = new Set(loadStashed());
@@ -122,6 +123,7 @@ function build() {
   }).observe(body);
   // Phones get the full-screen panel with one terminal at a time instead of tiles.
   narrow.addEventListener("change", () => {
+    if (narrow.matches) for (const win of [...windows.values()]) win.onClose();
     if (!panel.hidden) setTiled(!narrow.matches);
   });
   // When the page itself takes the keyboard back, no terminal tile has it.
@@ -234,7 +236,7 @@ function renderTabs() {
   const has = sessions.length > 0;
   const empty = panel.querySelector(".terminals-empty");
   const allStashed = has && sessions.every((item) => stashed.has(item.id));
-  empty.hidden = (has && !allStashed) || view === "overview";
+  empty.hidden = (has && !allStashed) || view === "overview" || windows.size > 0;
   empty.textContent = allStashed
     ? "Every terminal is hidden. They keep running: choose one in the tabs to show it again."
     : "No terminals are running. Choose New to open one in this folder, or right-click a folder and choose Open terminal here.";
@@ -467,12 +469,23 @@ function focusTerminal(id) {
 function syncFrames() {
   if (!panel) return;
   const body = panel.querySelector(".terminals-body");
-  if (maximized && (stashed.has(maximized) || !sessions.some((item) => item.id === maximized))) maximized = "";
-  // An expanded terminal has the grid to itself; the others keep running behind it.
+  const windowMaximized = maximized.startsWith("w:");
+  if (windowMaximized ? !windows.has(maximized.slice(2)) : maximized && (stashed.has(maximized) || !sessions.some((item) => item.id === maximized))) maximized = "";
+  // An expanded tile has the grid to itself; the others keep running behind it.
   const shown = sessions.filter((item) => !stashed.has(item.id) && (!maximized || item.id === maximized));
+  const shownWindows = [...windows].filter(([id]) => !maximized || maximized === `w:${id}`);
   if (tiled && view === "terminal") {
     for (const item of shown) tileFor(item.id);
-    layoutTiles(shown.map((item) => frames.get(item.id)));
+    // Windows come first, so Settings opens at the top left.
+    layoutTiles([...shownWindows.map(([, win]) => win.tile), ...shown.map((item) => frames.get(item.id))]);
+  }
+  for (const [id, win] of windows) {
+    win.tile.hidden = !tiled || view !== "terminal" || !shownWindows.some(([shownId]) => shownId === id);
+    const expand = win.tile.querySelector('[data-tile="expand"]');
+    const big = maximized === `w:${id}`;
+    expand.textContent = big ? "⤡" : "⤢";
+    expand.title = big ? "Back to the grid" : "Fill the whole space";
+    expand.setAttribute("aria-pressed", big ? "true" : "false");
   }
   for (const [id, tile] of frames) {
     tile.hidden = view !== "terminal" || (tiled ? !shown.some((item) => item.id === id) : id !== active);
@@ -631,8 +644,10 @@ function focusTile(direction) {
   const files = document.querySelector(".explorer-content");
   const tiles = [{ id: "", rect: files.getBoundingClientRect() }];
   for (const [id, tile] of frames) if (!tile.hidden) tiles.push({ id, rect: tile.getBoundingClientRect() });
+  for (const [id, win] of windows) if (!win.tile.hidden) tiles.push({ id: `w:${id}`, rect: win.tile.getBoundingClientRect(), tile: win.tile });
   const focusedFrame = document.activeElement && document.activeElement.closest && document.activeElement.closest(".terminals-tile");
-  const current = tiles.find((tile) => tile.id === (focusedFrame ? focusedFrame.dataset.id : "")) || tiles[0];
+  const focusedId = focusedFrame ? (focusedFrame.dataset.window ? `w:${focusedFrame.dataset.window}` : focusedFrame.dataset.id) : "";
+  const current = tiles.find((tile) => tile.id === focusedId) || tiles[0];
   const center = (rect) => ({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
   const from = center(current.rect);
   let best = null;
@@ -652,7 +667,10 @@ function focusTile(direction) {
     }
   }
   if (!best) return;
-  if (best.id) {
+  if (best.tile) {
+    markFocused("");
+    best.tile.querySelector(".terminals-window-body button, .terminals-window-body input, .terminals-window-body [tabindex]")?.focus();
+  } else if (best.id) {
     activate(best.id);
   } else {
     markFocused("");
@@ -785,10 +803,69 @@ async function runTabAction(action, id) {
   }
 }
 
+/// Opens `element` (such as Settings) as a window tiled with the terminals, opening the panel if
+/// needed. Resolves false where there is no tiling (phones, or terminals off or locked); the
+/// caller then shows it its usual way. `onClose` runs when the window's ✕ or the panel closes it.
+export async function openWindow(id, title, element, onClose) {
+  if (!panel || narrow.matches) return false;
+  if (panel.hidden) {
+    try {
+      // Not through `refresh`: opening Settings must never ask for the terminal password.
+      const data = await ctx.api("/api/terminals");
+      applyList(data.terminals || []);
+      watch();
+    } catch {
+      return false;
+    }
+    view = "terminal";
+    showPanel();
+  }
+  if (!tiled) return false;
+  if (view !== "terminal") view = "terminal";
+  if (!windows.has(id)) {
+    const tile = el("div", { class: "terminals-tile is-window", "data-window": id });
+    const head = el("div", { class: "terminals-tile-head" });
+    const name = el("button", { type: "button", class: "terminals-tile-title", tabindex: "-1" }, el("span", { class: "terminals-tile-name" }, title));
+    name.addEventListener("dblclick", () => toggleMaximized(`w:${id}`));
+    const expand = el("button", { type: "button", class: "terminals-tile-btn", "data-tile": "expand", tabindex: "-1" });
+    expand.addEventListener("click", () => toggleMaximized(`w:${id}`));
+    const close = el("button", { type: "button", class: "terminals-tile-btn", tabindex: "-1", title: `Close ${title}`, "aria-label": `Close ${title}` }, "✕");
+    close.addEventListener("click", () => onClose());
+    head.append(name, expand, close);
+    const content = el("div", { class: "terminals-window-body" });
+    content.append(element);
+    tile.append(head, content);
+    panel.querySelector(".terminals-body").append(tile);
+    windows.set(id, { tile, onClose });
+  }
+  syncFrames();
+  render();
+  return true;
+}
+
+/// Takes a window out of the tiles and hands back what was in it (to put back in the page).
+export function closeWindow(id) {
+  const win = windows.get(id);
+  if (!win) return null;
+  windows.delete(id);
+  if (maximized === `w:${id}`) maximized = "";
+  const content = win.tile.querySelector(".terminals-window-body").firstElementChild;
+  win.tile.remove();
+  syncFrames();
+  return content;
+}
+
 /// Expands a terminal to fill the grid, or puts it back among the others.
 function toggleMaximized(id) {
   if (!tiled || !id) return;
   maximized = maximized === id ? "" : id;
+  if (id.startsWith("w:")) {
+    // Not through setView: activating a terminal would move the expansion to it.
+    view = "terminal";
+    syncFrames();
+    render();
+    return;
+  }
   setView("terminal");
   activate(id);
 }
@@ -977,6 +1054,7 @@ function showPanel() {
 
 function hidePanel() {
   closeTabMenu();
+  for (const win of [...windows.values()]) win.onClose();
   store(OPEN_KEY, "0");
   setTiled(false);
   const hadFocus = panel.contains(document.activeElement);
