@@ -306,6 +306,29 @@ pub fn timeline(conn: &Connection, before: Option<(i64, String)>, limit: usize) 
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+/// How many photos and videos were taken each day (UTC dates), newest first: enough for the
+/// Gallery to lay out the whole timeline before loading any of it.
+pub fn days(conn: &Connection) -> Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT strftime('%Y-%m-%d', taken_at, 'unixepoch') AS day, count(*) FROM media_index
+         WHERE {NOT_IN_TRASH} GROUP BY day ORDER BY day DESC"
+    ))?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// Photos and videos taken in `[from, to)`, newest first.
+pub fn taken_between(conn: &Connection, from: i64, to: i64, limit: usize) -> Result<Vec<MediaItem>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT m.path, {MEDIA_COLUMNS} FROM media_index m
+         WHERE m.taken_at >= ?1 AND m.taken_at < ?2
+           AND substr(m.path, 1, 14) <> '.ownnas-trash/' AND substr(m.path, 1, 6) <> 'Trash/'
+         ORDER BY m.taken_at DESC, m.path DESC LIMIT ?3"
+    ))?;
+    let rows = stmt.query_map(params![from, to, limit as i64], media_item)?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
 /// Every tag with how many files carry it.
 pub fn tags(conn: &Connection) -> Result<Vec<(String, i64)>> {
     let mut stmt = conn.prepare(&format!(
@@ -428,6 +451,8 @@ mod tests {
         let next = timeline(&conn, Some((last.taken_at.unwrap(), last.path.clone())), 10).unwrap();
         assert_eq!(next.iter().map(|i| i.path.as_str()).collect::<Vec<_>>(), ["d.jpg", "a.jpg"]);
 
+        assert_eq!(days(&conn).unwrap(), vec![("1970-01-01".into(), 4)]);
+        assert_eq!(taken_between(&conn, 20, 31, 10).unwrap().iter().map(|i| i.path.as_str()).collect::<Vec<_>>(), ["c.jpg", "b.jpg", "d.jpg"]);
         db::add_tag(&conn, "a.jpg", "Beach").unwrap();
         db::add_tag(&conn, "b.jpg", "beach").unwrap();
         assert_eq!(tags(&conn).unwrap(), vec![("Beach".into(), 2)]);

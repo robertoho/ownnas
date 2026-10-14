@@ -269,6 +269,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/gallery/status", get(gallery_status))
         .route("/api/gallery/rescan", post(gallery_rescan))
         .route("/api/gallery/timeline", get(gallery_timeline))
+        .route("/api/gallery/days", get(gallery_days))
         .route("/api/gallery/tag", get(gallery_tag))
         .route("/api/albums", get(get_album).post(create_album).patch(update_album).delete(delete_album))
         .route("/api/albums/tree", get(album_tree))
@@ -1519,6 +1520,18 @@ fn gallery_items(state: &AppState, items: Vec<crate::albums::MediaItem>, check_m
         .collect()
 }
 
+async fn gallery_days(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let days = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::albums::days(&conn)?
+    };
+    Ok(Json(json!({
+        "days": days.into_iter().map(|(day, count)| json!({ "day": day, "count": count })).collect::<Vec<_>>(),
+        "status": state.media.status(),
+    })))
+}
+
 async fn gallery_status(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     Ok(Json(state.media.status()))
@@ -1537,6 +1550,9 @@ struct TimelineQuery {
     before: Option<i64>,
     before_path: Option<String>,
     limit: Option<usize>,
+    /// With `to`, the photos taken in `[from, to)` instead of a page.
+    from: Option<i64>,
+    to: Option<i64>,
 }
 
 async fn gallery_timeline(
@@ -1545,11 +1561,15 @@ async fn gallery_timeline(
     Query(query): Query<TimelineQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
-    let limit = query.limit.unwrap_or(200).clamp(1, 1000);
+    let ranged = query.from.zip(query.to);
+    let limit = query.limit.unwrap_or(200).clamp(1, if ranged.is_some() { 50_000 } else { 1000 });
     let before = query.before.map(|at| (at, query.before_path.unwrap_or_default()));
     let items = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-        crate::albums::timeline(&conn, before, limit)?
+        match ranged {
+            Some((from, to)) => crate::albums::taken_between(&conn, from, to, limit)?,
+            None => crate::albums::timeline(&conn, before, limit)?,
+        }
     };
     let more = items.len() == limit;
     Ok(Json(json!({ "items": gallery_items(&state, items, false), "more": more, "status": state.media.status() })))

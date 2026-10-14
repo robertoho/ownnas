@@ -41,17 +41,29 @@ function dateParts(item) {
   };
 }
 
+function utc(ms, options) {
+  return new Intl.DateTimeFormat(undefined, { ...options, timeZone: "UTC" }).format(new Date(ms));
+}
+
+/// "2024-07-15" as "Mon, 15 Jul 2024".
+function dayLabel(day) {
+  return utc(Date.parse(`${day}T00:00:00Z`), { weekday: "short", day: "numeric", month: "short", year: "numeric" });
+}
+
+const SIZE_KEY = "ownnas-gallery-size";
+
 function thumbUrl(item) {
   return `/api/thumb?path=${encodeURIComponent(item.path)}&v=${item.takenAt || 0}-${item.size || 0}`;
 }
 
 export function mountGallery(root, ctx) {
   let route = { tab: "photos" };
-  let items = []; // what is shown, in order: for selection ranges and stepping in the preview
+  let items = []; // the album's or tag's photos (the timeline loads month by month)
+  let byPath = new Map(); // path -> item, for every tile shown
+  let months = []; // the timeline's months, newest first
+  let monthObserver = null;
   let selected = new Set();
-  let anchor = -1;
-  let timeline = { more: false, loading: false, lastDay: "", lastMonth: "" };
-  let observer = null;
+  let anchor = ""; // the path a Shift-click selects from
   let statusTimer = 0;
   let generation = 0;
   let current = null; // the album shown, if any
@@ -64,11 +76,20 @@ export function mountGallery(root, ctx) {
   }
   const status = el("span", { class: "gallery-status", role: "status" });
   const actions = el("div", { class: "gallery-actions" });
-  const head = el("div", { class: "gallery-head" }, tabs, status, actions);
+  const size = el("input", { type: "range", class: "gallery-size", min: "80", max: "320", step: "10", "aria-label": "Photo size", title: "Photo size" });
+  const sizeControl = el("label", { class: "gallery-size-control", title: "Photo size" },
+    el("span", { class: "gallery-size-small", "aria-hidden": "true" }), size, el("span", { class: "gallery-size-large", "aria-hidden": "true" }));
+  const head = el("div", { class: "gallery-head" }, tabs, status, actions, sizeControl);
   const selectionBar = el("div", { class: "gallery-selection", hidden: true });
   const body = el("div", { class: "gallery-body" });
-  const sentinel = el("div", { class: "gallery-sentinel" });
-  root.replaceChildren(head, selectionBar, body);
+  const scroller = el("div", { class: "gallery-scroller" }, body);
+  const scrubberThumb = el("span", { class: "gallery-scrubber-thumb", "aria-hidden": "true" });
+  const scrubberBubble = el("span", { class: "gallery-scrubber-bubble", hidden: true });
+  const scrubber = el("div", { class: "gallery-scrubber", hidden: true, title: "Drag to jump to a date" });
+  const viewport = el("div", { class: "gallery-viewport" }, scroller, scrubber);
+  root.replaceChildren(head, selectionBar, viewport);
+  size.value = String(storedSize());
+  size.addEventListener("input", () => applySize(Number(size.value)));
 
   function stale(mine) {
     return mine !== generation || root.hidden;
@@ -76,8 +97,9 @@ export function mountGallery(root, ctx) {
 
   // ---- Tiles and selection ----
 
-  function tile(item, index) {
-    const node = el("div", { class: "gallery-tile", "data-index": String(index), title: item.missing ? `${item.path} is missing` : nameOf(item.path) });
+  function tile(item) {
+    byPath.set(item.path, item);
+    const node = el("div", { class: "gallery-tile", "data-path": item.path, title: item.missing ? `${item.path} is missing` : nameOf(item.path) });
     if (item.missing) {
       node.classList.add("is-missing");
       node.append(el("span", { class: "gallery-missing" }, "Missing", el("small", {}, item.path)));
@@ -92,51 +114,54 @@ export function mountGallery(root, ctx) {
     return node;
   }
 
-  function grid(list, offset = 0) {
-    return el("div", { class: "gallery-grid" }, list.map((item, i) => tile(item, offset + i)));
+  function grid(list) {
+    return el("div", { class: "gallery-grid" }, list.map(tile));
+  }
+
+  /// The photos shown, in order (in the timeline, only the months loaded so far).
+  function ordered() {
+    return [...body.querySelectorAll(".gallery-tile")].map((node) => byPath.get(node.dataset.path)).filter(Boolean);
   }
 
   body.addEventListener("click", (event) => {
     const node = event.target.closest(".gallery-tile");
     if (!node) return;
-    const index = Number(node.dataset.index);
-    const item = items[index];
+    const item = byPath.get(node.dataset.path);
     if (!item) return;
     const picking = event.target.closest(".gallery-check") || selected.size > 0 || event.metaKey || event.ctrlKey || event.shiftKey;
     if (!picking) {
       if (item.missing) return;
-      ctx.openPreview(item, items.filter((entry) => !entry.missing));
+      ctx.openPreview(item, ordered().filter((entry) => !entry.missing));
       return;
     }
-    if (event.shiftKey && anchor >= 0) {
-      const [from, to] = anchor < index ? [anchor, index] : [index, anchor];
-      for (let i = from; i <= to; i++) selected.add(items[i].path);
+    const list = ordered();
+    const from = list.findIndex((entry) => entry.path === anchor);
+    const to = list.indexOf(item);
+    if (event.shiftKey && from >= 0) {
+      for (let i = Math.min(from, to); i <= Math.max(from, to); i++) selected.add(list[i].path);
     } else if (selected.has(item.path)) {
       selected.delete(item.path);
     } else {
       selected.add(item.path);
     }
-    anchor = index;
+    anchor = item.path;
     paintSelection();
   });
 
   function paintSelection() {
-    for (const node of body.querySelectorAll(".gallery-tile")) {
-      const item = items[Number(node.dataset.index)];
-      node.classList.toggle("is-selected", !!item && selected.has(item.path));
-    }
+    for (const node of body.querySelectorAll(".gallery-tile")) node.classList.toggle("is-selected", selected.has(node.dataset.path));
     root.classList.toggle("is-selecting", selected.size > 0);
     renderSelectionBar();
   }
 
   function clearSelection() {
     selected = new Set();
-    anchor = -1;
+    anchor = "";
     paintSelection();
   }
 
   function selectedItems() {
-    return items.filter((item) => selected.has(item.path));
+    return ordered().filter((item) => selected.has(item.path));
   }
 
   function renderSelectionBar() {
@@ -158,77 +183,131 @@ export function mountGallery(root, ctx) {
     ].filter(Boolean));
   }
 
-  // ---- Photos: the timeline ----
+  // ---- Tile size ----
+
+  function storedSize() {
+    try {
+      const value = Number(localStorage.getItem(SIZE_KEY));
+      if (value >= 80 && value <= 320) return value;
+    } catch {}
+    return 150;
+  }
+
+  function applySize(value) {
+    root.style.setProperty("--gallery-tile", `${value}px`);
+    try {
+      localStorage.setItem(SIZE_KEY, String(value));
+    } catch {}
+    sizePlaceholders();
+    scheduleScrubber();
+  }
+
+  // ---- Photos: the whole timeline, laid out from the number of photos each day and
+  // filled in a month at a time as it comes into view ----
 
   async function showPhotos() {
     const mine = ++generation;
-    items = [];
-    timeline = { more: false, loading: false, lastDay: "", lastMonth: "" };
+    months = [];
     actions.replaceChildren(el("button", { type: "button", onclick: rescan, title: "Look through the library again for new or changed photos" }, "Rescan"));
     body.replaceChildren(el("p", { class: "muted gallery-message" }, "Loading photos…"));
-    await loadPage(mine, true);
-  }
-
-  async function loadPage(mine, first = false) {
-    if (timeline.loading) return;
-    timeline.loading = true;
-    const last = items[items.length - 1];
-    const params = new URLSearchParams({ limit: String(PAGE) });
-    if (!first && last) {
-      params.set("before", String(last.takenAt));
-      params.set("beforePath", last.path);
-    }
+    let data;
     try {
-      const data = await ctx.api(`/api/gallery/timeline?${params}`);
-      if (stale(mine)) return;
-      if (first) body.replaceChildren();
-      showStatus(data.status);
-      appendDays(data.items);
-      timeline.more = data.more;
-      if (first && !data.items.length) {
-        body.replaceChildren(el("p", { class: "muted gallery-message" }, data.status.scanning
-          ? "Looking for photos in the library…"
-          : "No photos or videos yet. Photos anywhere in the library show up here, newest first."));
-      }
-      sentinel.remove();
-      if (timeline.more) {
-        body.append(sentinel);
-        observe();
-      }
+      data = await ctx.api("/api/gallery/days");
     } catch (err) {
       if (!stale(mine)) body.replaceChildren(el("p", { class: "muted gallery-message" }, err.message));
+      return;
+    }
+    if (stale(mine)) return;
+    showStatus(data.status);
+    if (!data.days.length) {
+      body.replaceChildren(el("p", { class: "muted gallery-message" }, data.status.scanning
+        ? "Looking for photos in the library…"
+        : "No photos or videos yet. Photos anywhere in the library show up here, newest first."));
+      scheduleScrubber();
+      return;
+    }
+    const byMonth = new Map();
+    for (const { day, count } of data.days) {
+      const key = day.slice(0, 7);
+      if (!byMonth.has(key)) byMonth.set(key, { key, days: [], count: 0 });
+      const month = byMonth.get(key);
+      month.days.push({ day, count });
+      month.count += count;
+    }
+    months = [...byMonth.values()];
+    const sections = [];
+    for (const month of months) {
+      const [year, number_] = month.key.split("-").map(Number);
+      Object.assign(month, {
+        year,
+        from: Date.UTC(year, number_ - 1, 1) / 1000,
+        to: Date.UTC(year, number_, 1) / 1000,
+        label: utc(Date.UTC(year, number_ - 1, 1), { month: "long", year: "numeric" }),
+        short: utc(Date.UTC(year, number_ - 1, 1), { month: "short" }),
+      });
+      month.section = el("section", { class: "gallery-month-section", "data-month": month.key }, el("h2", { class: "gallery-month" }, month.label));
+      for (const day of month.days) {
+        day.grid = el("div", { class: "gallery-grid is-placeholder", "data-count": String(day.count) });
+        month.section.append(el("section", { class: "gallery-day", "data-day": day.day }, el("h3", {}, dayLabel(day.day)), day.grid));
+      }
+      sections.push(month.section);
+    }
+    body.replaceChildren(...sections);
+    sizePlaceholders();
+    monthObserver?.disconnect();
+    monthObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.isIntersecting) loadMonth(months.find((month) => month.section === entry.target), mine);
+      }
+    }, { root: scroller, rootMargin: "1500px 0px" });
+    for (const month of months) monthObserver.observe(month.section);
+    scheduleScrubber();
+  }
+
+  async function loadMonth(month, mine) {
+    if (!month || month.loaded || month.loading) return;
+    month.loading = true;
+    try {
+      const data = await ctx.api(`/api/gallery/timeline?from=${month.from}&to=${month.to}&limit=50000`);
+      if (stale(mine)) return;
+      const byDay = new Map();
+      for (const item of data.items) {
+        const day = new Date(item.takenAt * 1000).toISOString().slice(0, 10);
+        if (!byDay.has(day)) byDay.set(day, []);
+        byDay.get(day).push(item);
+      }
+      for (const day of month.days) {
+        day.grid.classList.remove("is-placeholder");
+        day.grid.style.height = "";
+        day.grid.replaceChildren(...(byDay.get(day.day) || []).map(tile));
+        byDay.delete(day.day);
+      }
+      // Days the layout did not know about yet (photos indexed since it was made).
+      for (const [day, list] of byDay) month.section.append(el("section", { class: "gallery-day" }, el("h3", {}, dayLabel(day)), grid(list)));
+      month.loaded = true;
+      monthObserver?.unobserve(month.section);
+      scheduleScrubber();
+    } catch (err) {
+      if (!stale(mine)) ctx.toast(err.message, true);
     } finally {
-      timeline.loading = false;
+      month.loading = false;
     }
   }
 
-  /// Adds photos under day headings (and a month heading when the month changes).
-  function appendDays(list) {
-    let section = body.lastElementChild && body.lastElementChild.classList.contains("gallery-day") ? body.lastElementChild : null;
-    for (const item of list) {
-      const index = items.push(item) - 1;
-      const parts = dateParts(item) || { day: "?", month: "?", dayLabel: "Unknown date", monthLabel: "Unknown date" };
-      if (parts.month !== timeline.lastMonth) {
-        timeline.lastMonth = parts.month;
-        body.append(el("h2", { class: "gallery-month" }, parts.monthLabel));
-        section = null;
-      }
-      if (parts.day !== timeline.lastDay || !section) {
-        timeline.lastDay = parts.day;
-        section = el("section", { class: "gallery-day" }, el("h3", {}, parts.dayLabel), el("div", { class: "gallery-grid" }));
-        body.append(section);
-      }
-      section.lastElementChild.append(tile(item, index));
+  /// Gives days not loaded yet the height their photos will take, so the page (and the
+  /// scrubber) has its real length from the start.
+  function sizePlaceholders() {
+    const sample = body.querySelector(".gallery-grid");
+    if (!sample) return;
+    const style = getComputedStyle(sample);
+    const tracks = style.gridTemplateColumns.split(" ").filter(Boolean);
+    const columns = Math.max(1, tracks.length);
+    const size = parseFloat(tracks[0]) || 150;
+    const gap = parseFloat(style.rowGap) || 4;
+    for (const placeholder of body.querySelectorAll(".gallery-grid.is-placeholder")) {
+      const rows = Math.ceil(Number(placeholder.dataset.count) / columns);
+      placeholder.style.height = `${rows * size + Math.max(0, rows - 1) * gap}px`;
     }
-  }
-
-  function observe() {
-    observer?.disconnect();
-    const mine = generation;
-    observer = new IntersectionObserver((entries) => {
-      if (entries.some((entry) => entry.isIntersecting) && timeline.more && !stale(mine)) loadPage(mine);
-    }, { root, rootMargin: "800px" });
-    observer.observe(sentinel);
   }
 
   function showStatus(info) {
@@ -259,6 +338,92 @@ export function mountGallery(root, ctx) {
       ctx.toast(err.message, true);
     }
   }
+
+  // ---- The scrubber: years and months down the side, to jump through the timeline ----
+
+  let scrubberFrame = 0;
+  function scheduleScrubber() {
+    cancelAnimationFrame(scrubberFrame);
+    scrubberFrame = requestAnimationFrame(buildScrubber);
+  }
+
+  function buildScrubber() {
+    const show = route.tab === "photos" && months.length > 1 && scroller.scrollHeight > scroller.clientHeight * 1.5;
+    scrubber.hidden = !show;
+    if (!show) return;
+    const scrollable = Math.max(1, scroller.scrollHeight - scroller.clientHeight);
+    const height = scrubber.clientHeight;
+    const marks = [];
+    let lastYear = null;
+    let lastLabel = -100;
+    let lastDot = -100;
+    for (const month of months) {
+      month.fraction = Math.min(1, month.section.offsetTop / scrollable);
+      const y = month.fraction * height;
+      if (month.year !== lastYear && y - lastLabel >= 18) {
+        marks.push(el("span", { class: "gallery-scrubber-year", style: `top:${y}px` }, String(month.year)));
+        lastLabel = y;
+        lastDot = y;
+      } else if (y - lastDot >= 6 && y - lastLabel >= 12) {
+        marks.push(el("span", { class: "gallery-scrubber-dot", style: `top:${y}px`, title: month.label }));
+        lastDot = y;
+      }
+      lastYear = month.year;
+    }
+    scrubber.replaceChildren(...marks, scrubberThumb, scrubberBubble);
+    moveThumb();
+  }
+
+  function moveThumb() {
+    if (scrubber.hidden) return;
+    const scrollable = Math.max(1, scroller.scrollHeight - scroller.clientHeight);
+    scrubberThumb.style.top = `${(scroller.scrollTop / scrollable) * scrubber.clientHeight}px`;
+  }
+
+  function monthAt(fraction) {
+    let found = months[0];
+    for (const month of months) {
+      if (month.fraction <= fraction + 1e-6) found = month;
+      else break;
+    }
+    return found;
+  }
+
+  function scrubTo(event, jump) {
+    const rect = scrubber.getBoundingClientRect();
+    const fraction = Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height));
+    const month = monthAt(fraction);
+    if (!month) return;
+    scrubberBubble.hidden = false;
+    scrubberBubble.textContent = month.label;
+    scrubberBubble.style.top = `${event.clientY - rect.top}px`;
+    if (jump) scroller.scrollTop = month.section.offsetTop;
+  }
+
+  let scrubbing = false;
+  scrubber.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    scrubbing = true;
+    scrubber.setPointerCapture(event.pointerId);
+    scrubber.classList.add("is-active");
+    scrubTo(event, true);
+  });
+  scrubber.addEventListener("pointermove", (event) => scrubTo(event, scrubbing));
+  const stopScrub = () => {
+    scrubbing = false;
+    scrubber.classList.remove("is-active");
+    scrubberBubble.hidden = true;
+  };
+  scrubber.addEventListener("pointerup", stopScrub);
+  scrubber.addEventListener("pointercancel", stopScrub);
+  scrubber.addEventListener("pointerleave", () => {
+    if (!scrubbing) scrubberBubble.hidden = true;
+  });
+  scroller.addEventListener("scroll", moveThumb, { passive: true });
+  new ResizeObserver(() => {
+    sizePlaceholders();
+    scheduleScrubber();
+  }).observe(scroller);
 
   // ---- Albums ----
 
@@ -396,7 +561,7 @@ export function mountGallery(root, ctx) {
     document.removeEventListener("pointerdown", onOutside, true);
     document.removeEventListener("keydown", onMenuKey, true);
     window.removeEventListener("blur", closeMenu);
-    root.removeEventListener("scroll", closeMenu);
+    scroller.removeEventListener("scroll", closeMenu);
   }
 
   function onOutside(event) {
@@ -431,7 +596,7 @@ export function mountGallery(root, ctx) {
     document.addEventListener("pointerdown", onOutside, true);
     document.addEventListener("keydown", onMenuKey, true);
     window.addEventListener("blur", closeMenu);
-    root.addEventListener("scroll", closeMenu, { once: true });
+    scroller.addEventListener("scroll", closeMenu, { once: true });
     menu.querySelector("button")?.focus();
   }
 
@@ -443,7 +608,7 @@ export function mountGallery(root, ctx) {
     const one = picked.length === 1 ? picked[0] : null;
     const write = ctx.canWrite();
     openMenu(event.clientX, event.clientY, one ? nameOf(one.path) : `${number(picked.length)} photos`, [
-      one && !one.missing && { label: "Open", icon: "open", run: () => ctx.openPreview(one, items.filter((entry) => !entry.missing)) },
+      one && !one.missing && { label: "Open", icon: "open", run: () => ctx.openPreview(one, ordered().filter((entry) => !entry.missing)) },
       write && paths.length && { label: "Add to album…", icon: "addToAlbum", run: () => pickAlbum(paths) },
       write && paths.length && { label: "Tag…", icon: "bulkTag", run: () => ctx.tag(paths) },
       paths.length && { label: "Download", icon: "download", run: () => ctx.download(paths) },
@@ -469,7 +634,7 @@ export function mountGallery(root, ctx) {
     const write = ctx.canWrite();
     openMenu(event.clientX, event.clientY, current ? current.name : "Albums", [
       write && { label: current ? "New album inside…" : "New album…", icon: "newAlbum", run: () => newAlbum(current ? current.id : null) },
-      items.length && { label: "Select all", icon: "check", run: () => { selected = new Set(items.map((item) => item.path)); paintSelection(); } },
+      ordered().length && { label: "Select all", icon: "check", run: () => { selected = new Set(ordered().map((item) => item.path)); paintSelection(); } },
       write && current && { label: "Rename…", icon: "rename", run: () => renameAlbum() },
       write && current && { label: "Move…", icon: "move", run: () => moveAlbum() },
       current && current.parentId !== null && { label: "Open the album above", icon: "open", run: () => { location.hash = `#gallery/albums/${current.parentId}`; } },
@@ -482,7 +647,7 @@ export function mountGallery(root, ctx) {
     const tileNode = event.target.closest(".gallery-tile");
     const card = event.target.closest(".gallery-album");
     if (tileNode) {
-      const item = items[Number(tileNode.dataset.index)];
+      const item = byPath.get(tileNode.dataset.path);
       if (!item) return;
       event.preventDefault();
       photoMenu(event, item);
@@ -666,14 +831,19 @@ export function mountGallery(root, ctx) {
     route = parse(hash);
     current = null;
     selected = new Set();
-    anchor = -1;
+    anchor = "";
+    byPath = new Map();
+    months = [];
+    closeMenu();
     root.classList.remove("is-selecting");
     selectionBar.hidden = true;
-    observer?.disconnect();
+    monthObserver?.disconnect();
     clearTimeout(statusTimer);
     status.textContent = "";
+    scrubber.hidden = true;
+    applySize(Number(size.value));
     for (const link of tabs.children) link.setAttribute("aria-current", link.dataset.tab === route.tab ? "page" : "false");
-    root.scrollTop = 0;
+    scroller.scrollTop = 0;
     if (route.tab === "albums") showAlbums(route.id);
     else if (route.tab === "tags") showTags(route.tag);
     else showPhotos();
@@ -683,7 +853,7 @@ export function mountGallery(root, ctx) {
     closeMenu();
     root.hidden = true;
     generation++;
-    observer?.disconnect();
+    monthObserver?.disconnect();
     clearTimeout(statusTimer);
   }
 
@@ -695,9 +865,9 @@ export function mountGallery(root, ctx) {
       clearSelection();
       return true;
     }
-    if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === "a" && items.length) {
+    if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === "a" && ordered().length) {
       event.preventDefault();
-      selected = new Set(items.map((item) => item.path));
+      selected = new Set(ordered().map((item) => item.path));
       paintSelection();
       return true;
     }

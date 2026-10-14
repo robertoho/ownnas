@@ -3242,7 +3242,69 @@ button.linkish {
 body.is-gallery .app > .toolbar,
 body.is-gallery .app > .explorer-content,
 body.is-gallery .app > .explorer-status-bar { display: none; }
-.gallery { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; display: flex; flex-direction: column; }
+.gallery { flex: 1 1 auto; min-height: 0; overflow: hidden; display: flex; flex-direction: column; --gallery-tile: 150px; }
+.gallery-viewport { position: relative; flex: 1 1 auto; min-height: 0; }
+.gallery-scroller { position: absolute; inset: 0; overflow: auto; overscroll-behavior: contain; }
+.gallery-size-control { display: inline-flex; align-items: center; gap: 0.4rem; margin: 0; }
+.gallery-size { width: 7rem; accent-color: var(--accent); padding: 0; border: 0; background: transparent; box-shadow: none; }
+.gallery-size-small, .gallery-size-large { display: block; border: 1.5px solid var(--muted); border-radius: 2px; }
+.gallery-size-small { width: 8px; height: 8px; }
+.gallery-size-large { width: 14px; height: 14px; }
+.gallery-scrubber {
+  position: absolute;
+  top: 0.75rem;
+  bottom: 0.75rem;
+  right: 0.35rem;
+  width: 2.6rem;
+  z-index: 2;
+  cursor: ns-resize;
+  touch-action: none;
+  user-select: none;
+}
+.gallery-scrubber-year {
+  position: absolute;
+  right: 0.2rem;
+  transform: translateY(-50%);
+  color: var(--muted);
+  font: 600 0.68rem var(--sans);
+  pointer-events: none;
+}
+.gallery-scrubber-dot {
+  position: absolute;
+  right: 0.85rem;
+  width: 4px;
+  height: 4px;
+  margin-top: -2px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--muted) 60%, transparent);
+  pointer-events: none;
+}
+.gallery-scrubber-thumb {
+  position: absolute;
+  right: 0;
+  width: 2.6rem;
+  height: 2px;
+  margin-top: -1px;
+  background: var(--accent);
+  border-radius: 2px;
+  pointer-events: none;
+  opacity: 0.8;
+}
+.gallery-scrubber:hover .gallery-scrubber-year, .gallery-scrubber.is-active .gallery-scrubber-year { color: var(--text); }
+.gallery-scrubber-bubble {
+  position: absolute;
+  right: 3rem;
+  transform: translateY(-50%);
+  padding: 0.3rem 0.65rem;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font: 600 0.8rem var(--sans);
+  white-space: nowrap;
+  box-shadow: var(--shadow);
+  pointer-events: none;
+}
+.gallery-viewport:has(.gallery-scrubber:not([hidden])) .gallery-body { padding-right: 3.4rem; }
 .gallery-head {
   position: sticky;
   top: 0;
@@ -3285,7 +3347,7 @@ body.is-gallery .app > .explorer-status-bar { display: none; }
 .gallery-month { margin: 1.4rem 0 0.2rem; font-size: 1.25rem; }
 .gallery-day h3 { margin: 0.9rem 0 0.45rem; color: var(--muted); font-size: 0.85rem; font-weight: 600; }
 .gallery-subhead { margin: 1.2rem 0 0.5rem; color: var(--muted); font-size: 0.85rem; }
-.gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 4px; }
+.gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(var(--gallery-tile), 45vw), 1fr)); gap: 4px; }
 .gallery-tile {
   position: relative;
   aspect-ratio: 1;
@@ -3336,7 +3398,7 @@ body.is-gallery .app > .explorer-status-bar { display: none; }
 .gallery-crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; margin: 0.6rem 0 0.9rem; font-size: 1.05rem; }
 .gallery-crumbs a { color: var(--accent); text-decoration: none; }
 .gallery-crumbs span { color: var(--muted); }
-.gallery-albums { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 0.9rem; }
+.gallery-albums { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(calc(var(--gallery-tile) + 20px), 45vw), 1fr)); gap: 0.9rem; }
 .gallery-album { display: grid; gap: 0.2rem; color: var(--text); text-decoration: none; min-width: 0; }
 .gallery-album strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gallery-album .muted { font-size: 0.8rem; }
@@ -3372,8 +3434,8 @@ body.is-gallery .app > .explorer-status-bar { display: none; }
 .album-chip { text-decoration: none; color: var(--text); padding: 0.2rem 0.6rem; }
 .notes-add-album { margin-top: 0.4rem; }
 @media (max-width: 820px) {
-  .gallery-grid { grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 2px; }
-  .gallery-albums { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); }
+  .gallery-grid { gap: 2px; }
+  .gallery-size-control { display: none; }
   .gallery-actions { margin-left: 0; }
   .gallery-check { opacity: 1; }
 }
