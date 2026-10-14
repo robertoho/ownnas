@@ -14,6 +14,7 @@ let streamTimer = 0;
 const frames = new Map(); // id -> tile: a header and the terminal's iframe
 let tiled = false; // while showing on a wide screen: the files beside a grid of every terminal
 let focusOnLoad = ""; // a terminal to give the keyboard once its page has loaded
+let maximized = ""; // a terminal expanded to fill the whole grid, in the tiling layout
 const STASHED_KEY = "ownnas-terminals-hidden";
 // Terminals put away with ⇧⌘U: still running and in the tabs, but without a tile.
 const stashed = new Set(loadStashed());
@@ -401,6 +402,7 @@ function setView(next) {
 function activate(id) {
   active = id;
   if (id && stashed.delete(id)) saveStashed();
+  if (maximized && id) maximized = id;
   if (id) tileFor(id);
   syncFrames();
   const item = sessions.find((session) => session.id === id);
@@ -418,11 +420,24 @@ function tileFor(id) {
   let tile = frames.get(id);
   if (tile) return tile;
   tile = el("div", { class: "terminals-tile", "data-id": id });
-  const head = el("button", { type: "button", class: "terminals-tile-head", tabindex: "-1" });
-  head.addEventListener("click", () => {
+  const head = el("div", { class: "terminals-tile-head" });
+  const title = el("button", { type: "button", class: "terminals-tile-title", tabindex: "-1" });
+  title.addEventListener("click", () => {
     setView("terminal");
     activate(id);
   });
+  title.addEventListener("dblclick", () => toggleMaximized(id));
+  const expand = el("button", { type: "button", class: "terminals-tile-btn", "data-tile": "expand", tabindex: "-1" });
+  expand.addEventListener("click", () => toggleMaximized(id));
+  const close = el("button", {
+    type: "button",
+    class: "terminals-tile-btn",
+    tabindex: "-1",
+    title: `Hide (${ctx.shortcutLabel("U")}). It keeps running, and its tab brings it back; ${ctx.shortcutLabel("X")} closes it for good.`,
+    "aria-label": "Hide this terminal",
+  }, "✕");
+  close.addEventListener("click", () => stashTerminal(id));
+  head.append(title, expand, close);
   const frame = el("iframe", { src: `/terminal?id=${encodeURIComponent(id)}`, title: "Terminal", class: "terminals-frame is-loading", "data-id": id });
   // A page is white until its styles load; show the panel's background meanwhile.
   frame.addEventListener("load", () => {
@@ -448,26 +463,34 @@ function focusTerminal(id) {
 function syncFrames() {
   if (!panel) return;
   const body = panel.querySelector(".terminals-body");
-  const shown = sessions.filter((item) => !stashed.has(item.id));
+  if (maximized && (stashed.has(maximized) || !sessions.some((item) => item.id === maximized))) maximized = "";
+  // An expanded terminal has the grid to itself; the others keep running behind it.
+  const shown = sessions.filter((item) => !stashed.has(item.id) && (!maximized || item.id === maximized));
   if (tiled && view === "terminal") {
     for (const item of shown) tileFor(item.id);
     layoutTiles(shown.map((item) => frames.get(item.id)));
   }
   for (const [id, tile] of frames) {
-    tile.hidden = view !== "terminal" || (tiled ? stashed.has(id) : id !== active);
+    tile.hidden = view !== "terminal" || (tiled ? !shown.some((item) => item.id === id) : id !== active);
     // A hidden terminal would keep the keyboard and swallow every key.
     if (tile.hidden && tile.contains(document.activeElement)) document.activeElement.blur();
     tile.classList.toggle("is-active", id === active);
     const item = sessions.find((session) => session.id === id);
     if (!item) continue;
-    const head = tile.querySelector(".terminals-tile-head");
+    const title = tile.querySelector(".terminals-tile-title");
     const number = sessions.indexOf(item) + 1;
-    head.replaceChildren(
+    title.replaceChildren(
       el("span", { class: "agent-dot", "data-status": statusOf(item), "aria-hidden": "true" }),
-      el("span", {}, tabLabel(item)),
+      el("span", { class: "terminals-tile-name" }, tabLabel(item)),
       ...(number <= 9 ? [el("span", { class: "terminals-number", title: ctx.selectLabel(number) }, String(number))] : []),
     );
-    head.title = item.path || "/";
+    title.title = item.path || "/";
+    const expand = tile.querySelector('[data-tile="expand"]');
+    const big = id === maximized;
+    expand.textContent = big ? "⤡" : "⤢";
+    expand.title = `${big ? "Back to the grid" : "Fill the whole space"} (${ctx.shortcutLabel("↵")}, or double-click the title)`;
+    expand.setAttribute("aria-label", big ? "Back to the grid" : "Expand this terminal");
+    expand.setAttribute("aria-pressed", big ? "true" : "false");
   }
 }
 
@@ -757,6 +780,14 @@ async function runTabAction(action, id) {
   }
 }
 
+/// Expands a terminal to fill the grid, or puts it back among the others.
+function toggleMaximized(id) {
+  if (!tiled || !id) return;
+  maximized = maximized === id ? "" : id;
+  setView("terminal");
+  activate(id);
+}
+
 /// Puts a terminal away without stopping it, and moves on to the next one.
 function stashTerminal(id) {
   const index = sessions.findIndex((item) => item.id === id);
@@ -991,6 +1022,10 @@ export async function select(number) {
   view = "terminal";
   if (panel.hidden) showPanel();
   activate(item.id);
+}
+
+export function toggleExpanded() {
+  if (panel && !panel.hidden) toggleMaximized(active);
 }
 
 export function moveFocus(direction) {

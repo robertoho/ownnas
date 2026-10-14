@@ -1264,7 +1264,7 @@ function syncTerminalButton() {
 // Page-wide shortcuts: ⇧⌘ and a key on Macs, Ctrl+Shift elsewhere. Terminals forward them
 // too (terminal.js), so they work wherever the keyboard is.
 const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
-const PAGE_SHORTCUTS = { KeyK: "shortcuts", KeyL: "terminals", KeyE: "new-terminal", KeyU: "hide-terminal", KeyX: "close-terminal" };
+const PAGE_SHORTCUTS = { KeyK: "shortcuts", KeyL: "terminals", KeyE: "new-terminal", KeyU: "hide-terminal", KeyX: "close-terminal", Enter: "expand-terminal" };
 const TILE_MOVES = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
 
 function shortcutLabel(key) {
@@ -1302,6 +1302,7 @@ function runShortcut(name) {
   }
   if (name === "terminals") terminalPanel().then((module) => module.toggle()).catch((err) => toast(err.message, true));
   if (name === "new-terminal") openTerminalAt(inTrashPath(state.path) ? "" : state.path);
+  if (name === "expand-terminal") terminalPanel().then((module) => module.toggleExpanded()).catch(() => {});
   if (name === "hide-terminal") terminalPanel().then((module) => module.hideActive()).catch(() => {});
   if (name === "close-terminal") terminalPanel().then((module) => module.closeActive()).catch((err) => toast(err.message, true));
   if (name.startsWith("select-")) terminalPanel().then((module) => module.select(Number(name.slice(7)))).catch((err) => toast(err.message, true));
@@ -1328,6 +1329,7 @@ function showShortcuts() {
       [shortcutLabel("K"), "Show these shortcuts"],
       terminal && [`${shortcutLabel("L")}, Ctrl+\``, "Show or hide the terminals, tiled beside the files"],
       terminal && [shortcutLabel("E"), "New terminal in this folder"],
+      terminal && [shortcutLabel("↵"), "Expand this terminal to fill the space, or put it back"],
       terminal && [shortcutLabel("U"), "Hide this terminal (it keeps running; its tab brings it back)"],
       terminal && [shortcutLabel("X"), "Close this terminal and stop what runs in it"],
       terminal && [IS_MAC ? "⇧⌘ ← ↑ ↓ →" : "Ctrl+Shift+arrows", "Move between the files and the terminals"],

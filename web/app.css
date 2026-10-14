@@ -2764,23 +2764,38 @@ dialog { color: var(--text); }
   .terminals.is-tiled .terminals-tile-head {
     display: flex;
     align-items: center;
-    gap: 0.4rem;
     flex: 0 0 auto;
     min-width: 0;
-    padding: 0.2rem 0.5rem;
-    border: 0;
     border-bottom: 1px solid var(--line);
-    border-radius: 0;
     background: var(--bg-2);
     color: var(--muted);
     font: 0.8rem var(--sans);
-    text-align: left;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    cursor: pointer;
   }
   .terminals.is-tiled .terminals-tile.is-focused .terminals-tile-head { color: var(--text); }
+  .terminals-tile-head button {
+    border: 0;
+    border-radius: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    min-height: 0;
+    cursor: pointer;
+  }
+  .terminals-tile-title {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.2rem 0.5rem;
+    text-align: left;
+    white-space: nowrap;
+  }
+  .terminals-tile-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .terminals-tile-btn { flex: 0 0 auto; width: 1.9rem; padding: 0.2rem 0; font-size: 0.85rem; line-height: 1; }
+  .terminals-tile-btn[data-tile="expand"] { font-size: 1.05rem; }
+  .terminals-tile-btn:hover { background: color-mix(in srgb, var(--text) 10%, transparent); color: var(--text); }
+  .terminals-tile-btn:last-child:hover { background: var(--danger); color: #fff; }
   .terminals.is-tiled .terminals-tile .terminals-frame { position: relative; inset: auto; flex: 1; height: auto; min-height: 0; }
 }
 #shortcuts-dialog { width: min(560px, calc(100vw - 2rem)); max-height: min(85vh, 44rem); overflow: auto; }

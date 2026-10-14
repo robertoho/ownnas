@@ -110,7 +110,9 @@ files. It is off by default: turn it on in **Settings → Terminal**.
   them to resize. **⇧⌘L** (Ctrl+Shift+L off a Mac) or **Ctrl+`** shows and hides it, **⇧⌘E**
   opens a terminal in the folder you are browsing, **⇧⌘ + arrows** move the keyboard between
   the files and the terminals, **⇧⌘U** hides a terminal (it keeps running; its tab brings it
-  back), **⇧⌘X** closes it, and **⇧⌘K** lists every keyboard shortcut. They work from
+  back), **⇧⌘X** closes it, **⇧⌘↵** expands it to fill the space (or the ⤢ on its tile; ✕
+  hides it), **⌃1…⌃9** (Alt+1… off a Mac) jump to a numbered terminal, and **⇧⌘K** lists
+  every keyboard shortcut. They work from
   inside a terminal too.
 - On phones the panel keeps one row of tabs, with everything else under **⋯**, and follows
   the on-screen keyboard. The key row has Esc, Tab, Shift+Tab, sticky Ctrl and Alt (they also
