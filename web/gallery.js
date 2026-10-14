@@ -642,6 +642,31 @@ export function mountGallery(root, ctx) {
     ]);
   }
 
+  /// A day in the timeline: everything taken that day at once.
+  function dayMenu(event, section) {
+    const write = ctx.canWrite();
+    const list = [...section.querySelectorAll(".gallery-tile")].map((node) => byPath.get(node.dataset.path)).filter((item) => item && !item.missing);
+    if (!list.length) return false;
+    const paths = list.map((item) => item.path);
+    const label = section.querySelector("h3")?.textContent || "This day";
+    openMenu(event.clientX, event.clientY, `${label} · ${plural(list.length, "photo")}`, [
+      { label: "Select this day", icon: "check", run: () => { for (const path of paths) selected.add(path); paintSelection(); } },
+      write && { label: "Add this day to album…", icon: "addToAlbum", run: () => pickAlbum(paths) },
+      write && { label: "Tag this day…", icon: "bulkTag", run: () => ctx.tag(paths) },
+      { label: "Download this day", icon: "download", run: () => ctx.download(paths) },
+    ]);
+    return true;
+  }
+
+  function photosMenu(event) {
+    const shown = ordered();
+    openMenu(event.clientX, event.clientY, "Photos", [
+      shown.length && { label: "Select all shown", icon: "check", run: () => { selected = new Set(shown.map((item) => item.path)); paintSelection(); } },
+      selected.size && { label: "Clear selection", icon: "close", run: clearSelection },
+      { label: "Rescan the library", icon: "restore", run: rescan },
+    ]);
+  }
+
   root.addEventListener("contextmenu", (event) => {
     if (event.target.closest(".gallery-head, .gallery-selection, input, textarea")) return;
     const tileNode = event.target.closest(".gallery-tile");
@@ -659,6 +684,10 @@ export function mountGallery(root, ctx) {
     } else if (route.tab === "albums") {
       event.preventDefault();
       spaceMenu(event);
+    } else if (route.tab === "photos") {
+      const day = event.target.closest(".gallery-day");
+      event.preventDefault();
+      if (!day || !dayMenu(event, day)) photosMenu(event);
     }
   });
 
