@@ -325,6 +325,15 @@ export function mountGallery(root, ctx) {
           else showStatus(next);
         } catch {}
       }, 2000);
+    } else if (info.thumbnailing && info.thumbsDone < info.thumbsTotal) {
+      status.textContent = `${plural(info.total, "photo or video", "photos and videos")} · making thumbnails ${number(info.thumbsDone)} of ${number(info.thumbsTotal)}`;
+      const mine = generation;
+      statusTimer = setTimeout(async () => {
+        try {
+          const next = await ctx.api("/api/gallery/status");
+          if (!stale(mine)) showStatus(next);
+        } catch {}
+      }, 3000);
     } else {
       status.textContent = info.error ? `Could not finish looking for photos: ${info.error}` : plural(info.total, "photo or video", "photos and videos");
     }

@@ -1180,10 +1180,14 @@ pub fn kind_of(name: &str) -> &'static str {
 
 pub fn can_thumb(name: &str, ffmpeg: bool) -> bool {
     match kind_of(name) {
-        "image" => !matches!(
-            extension(&name.to_ascii_lowercase()).as_str(),
-            "svg" | "svgz" | "heic" | "heif" | "avif" | "jxl"
-        ),
+        "image" => {
+            let ext = extension(&name.to_ascii_lowercase());
+            if crate::thumbs::needs_converter(&ext) {
+                crate::thumbs::converter_available()
+            } else {
+                !matches!(ext.as_str(), "svg" | "svgz" | "jxl")
+            }
+        }
         "video" => ffmpeg,
         _ => false,
     }

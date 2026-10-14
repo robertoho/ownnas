@@ -224,7 +224,7 @@ Easiest options:
 
 Point the task or service at the release binary with absolute paths. Prefer machine start only after the account already exists in `ownnas-data`.
 
-Video thumbnails use `ffmpeg` when it is on `PATH`. Content search OCR for images uses `tesseract` when it is on `PATH`. Pictures, SVG, PDF, audio, video playback, text, CSV, JSON, zip, and tar (including `.tar.gz`) preview without either.
+Thumbnails are small JPEGs (PNG for pictures with transparency) kept in the data folder; the Gallery makes them in the background after each scan, newest photos first, so scrolling does not wait. Video thumbnails use `ffmpeg` when it is on `PATH`. HEIC and AVIF photos (from iPhones, for example) get thumbnails through `sips` on macOS, or `heif-convert` or `ffmpeg` elsewhere. Content search OCR for images uses `tesseract` when it is on `PATH`. Pictures, SVG, PDF, audio, video playback, text, CSV, JSON, zip, and tar (including `.tar.gz`) preview without either.
 
 Put OwnNAS behind HTTPS and pass `--secure-cookie` if you terminate TLS with a reverse proxy. The login is the application boundary; the VPN is the network boundary.
 

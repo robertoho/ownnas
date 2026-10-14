@@ -91,7 +91,7 @@ pub struct AppState {
 impl AppState {
     /// Starts indexing the library's photos and videos for the Gallery timeline.
     pub fn start_media_index(&self) {
-        self.media.start(self.db_path.clone(), self.root.clone());
+        self.media.start(self.db_path.clone(), self.root.clone(), self.thumbs.clone(), self.ffmpeg);
     }
 }
 
@@ -120,8 +120,7 @@ pub fn new_state(
 ) -> Result<AppState, String> {
     let db_path = data_dir.join("ownnas.db");
     let conn = db::open(&db_path)?;
-    let thumbs = data_dir.join("thumbs");
-    std::fs::create_dir_all(&thumbs).map_err(|_| "Could not create the thumbnail cache".to_string())?;
+    let thumbs = crate::thumbs::prepare_cache(&data_dir.join("thumbs"))?;
     let text_cache = crate::content_index::ensure_cache_dir(&data_dir)?;
     // Pasted files belong to terminals, which do not survive a restart.
     let terminal_uploads = data_dir.join("terminal-uploads");
@@ -1964,7 +1963,7 @@ async fn thumb(
     let cache = state.thumbs.clone();
     let rel = rel_of(&query.path);
     let ffmpeg = state.ffmpeg;
-    let image = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+    let (content_type, image) = tokio::task::spawn_blocking(move || -> Result<(&'static str, Vec<u8>), String> {
         let resolved = files::resolve(&root, &rel).map_err(|_| "Not found".to_string())?;
         if resolved.full.is_dir() {
             return Err("Not found".into());
@@ -1979,14 +1978,14 @@ async fn thumb(
         }
         let video = files::kind_of(&name) == "video";
         let cached = thumbs::ensure(&resolved.full, &cache, video)?;
-        thumbs::read_cached(&cached)
+        Ok((thumbs::content_type(&cached), thumbs::read_cached(&cached)?))
     })
     .await
     .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not make a thumbnail"))?
     .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "No thumbnail"))?;
     Ok((
         [
-            (header::CONTENT_TYPE, "image/png"),
+            (header::CONTENT_TYPE, content_type),
             (header::CACHE_CONTROL, "private, max-age=86400"),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         ],

@@ -30,6 +30,10 @@ pub struct Status {
     /// Unix time the last scan finished.
     pub finished_at: Option<i64>,
     pub error: Option<String>,
+    /// Making thumbnails for what the scan found, after it.
+    pub thumbnailing: bool,
+    pub thumbs_done: u64,
+    pub thumbs_total: u64,
 }
 
 /// Runs scans in a background thread: at start, every half hour, and when asked to.
@@ -56,12 +60,13 @@ impl Indexer {
         self.signal.notify_all();
     }
 
-    pub fn start(self: &Arc<Self>, db_path: PathBuf, root: PathBuf) {
+    pub fn start(self: &Arc<Self>, db_path: PathBuf, root: PathBuf, thumbs: PathBuf, ffmpeg: bool) {
         let indexer = self.clone();
         std::thread::Builder::new()
             .name("ownnas-media-index".into())
             .spawn(move || loop {
                 indexer.run(&db_path, &root);
+                indexer.make_thumbnails(&db_path, &root, &thumbs, ffmpeg);
                 let wake = indexer.wake.lock().unwrap_or_else(|err| err.into_inner());
                 let (mut wake, _) = indexer
                     .signal
@@ -89,6 +94,52 @@ impl Indexer {
             Ok(total) => status.total = total,
             Err(err) => status.error = Some(err),
         }
+    }
+}
+
+impl Indexer {
+    /// Makes the thumbnails the Gallery will ask for, newest photos first, so scrolling
+    /// through it does not wait for them. Ones already made are skipped quickly.
+    fn make_thumbnails(&self, db_path: &Path, root: &Path, thumbs: &Path, ffmpeg: bool) {
+        let paths: Vec<(String, String)> = match open(db_path).and_then(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT path, kind FROM media_index ORDER BY taken_at DESC, path DESC")
+                .map_err(|err| err.to_string())?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))).map_err(|err| err.to_string())?;
+            Ok(rows.filter_map(Result::ok).collect())
+        }) {
+            Ok(paths) => paths,
+            Err(_) => return,
+        };
+        {
+            let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());
+            status.thumbnailing = true;
+            status.thumbs_done = 0;
+            status.thumbs_total = paths.len() as u64;
+        }
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        // A few at a time: fast, without taking the whole machine.
+        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(1, 4));
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((path, kind)) = paths.get(index) else { break };
+                    let name = path.rsplit('/').next().unwrap_or(path);
+                    // A new scan was asked for: stop here, it will start this again.
+                    if *self.wake.lock().unwrap_or_else(|err| err.into_inner()) {
+                        break;
+                    }
+                    if files::can_thumb(name, ffmpeg) {
+                        let _ = crate::thumbs::ensure(&root.join(path), thumbs, kind == "video");
+                    }
+                    let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());
+                    status.thumbs_done += 1;
+                });
+            }
+        });
+        let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());
+        status.thumbnailing = false;
     }
 }
 
