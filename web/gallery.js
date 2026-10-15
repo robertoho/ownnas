@@ -51,6 +51,44 @@ function dayLabel(day) {
 }
 
 const SIZE_KEY = "ownnas-gallery-size";
+const VIEW_KEY = "ownnas-gallery-view";
+const GAP = 4; // between photos, as in the CSS
+
+/// How photos are laid out: square crops, rows that keep each photo's shape, columns of
+/// different heights, or a list with the details.
+const VIEWS = [
+  { id: "grid", label: "Squares", icon: '<rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/>' },
+  { id: "justified", label: "Rows", icon: '<rect x="1.5" y="2" width="7" height="5" rx="1"/><rect x="10" y="2" width="4.5" height="5" rx="1"/><rect x="1.5" y="9" width="4" height="5" rx="1"/><rect x="7" y="9" width="7.5" height="5" rx="1"/>' },
+  { id: "masonry", label: "Masonry", icon: '<rect x="2" y="1.5" width="5" height="7" rx="1"/><rect x="9" y="1.5" width="5" height="4" rx="1"/><rect x="2" y="10" width="5" height="4.5" rx="1"/><rect x="9" y="7" width="5" height="7.5" rx="1"/>' },
+  { id: "list", label: "Details", icon: '<rect x="1.5" y="2" width="3.5" height="3" rx="0.8"/><rect x="1.5" y="6.5" width="3.5" height="3" rx="0.8"/><rect x="1.5" y="11" width="3.5" height="3" rx="0.8"/><path d="M7 3.5h7.5M7 8h7.5M7 12.5h7.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>' },
+];
+
+function storedView() {
+  try {
+    const value = localStorage.getItem(VIEW_KEY);
+    if (VIEWS.some((view) => view.id === value)) return value;
+  } catch {}
+  return "grid";
+}
+
+/// Width over height, as the photo shows; until it is known, a guess (thumbnails correct it).
+function aspectOf(item) {
+  if (item.aspect) return item.aspect;
+  if (item.width && item.height) return Math.min(4, Math.max(0.25, item.width / item.height));
+  return item.kind === "video" ? 16 / 9 : 1;
+}
+
+function sizeText(bytes) {
+  if (!Number.isFinite(bytes)) return "";
+  const units = ["bytes", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1000 && unit < units.length - 1) {
+    value /= 1000;
+    unit++;
+  }
+  return `${unit ? value.toFixed(value < 10 ? 1 : 0) : value} ${units[unit]}`;
+}
 
 function thumbUrl(item) {
   return `/api/thumb?path=${encodeURIComponent(item.path)}&v=${item.takenAt || 0}-${item.size || 0}`;
@@ -86,7 +124,15 @@ export function mountGallery(root, ctx) {
   const size = el("input", { type: "range", class: "gallery-size", min: "80", max: "320", step: "10", "aria-label": "Photo size", title: "Photo size" });
   const sizeControl = el("label", { class: "gallery-size-control", title: "Photo size" },
     el("span", { class: "gallery-size-small", "aria-hidden": "true" }), size, el("span", { class: "gallery-size-large", "aria-hidden": "true" }));
-  const head = el("div", { class: "gallery-head" }, tabs, searchBox, status, actions, sizeControl);
+  let view = storedView();
+  const viewSwitch = el("div", { class: "gallery-views", role: "radiogroup", "aria-label": "Layout" });
+  for (const option of VIEWS) {
+    const button = el("button", { type: "button", "data-view": option.id, role: "radio", title: option.label, "aria-label": option.label });
+    button.innerHTML = `<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true">${option.icon}</svg>`;
+    button.addEventListener("click", () => setView(option.id));
+    viewSwitch.append(button);
+  }
+  const head = el("div", { class: "gallery-head" }, tabs, searchBox, status, actions, viewSwitch, sizeControl);
   const selectionBar = el("div", { class: "gallery-selection", hidden: true });
   const body = el("div", { class: "gallery-body" });
   const scroller = el("div", { class: "gallery-scroller" }, body);
@@ -111,17 +157,36 @@ export function mountGallery(root, ctx) {
     if (item.missing) {
       node.classList.add("is-missing");
       node.append(el("span", { class: "gallery-missing" }, "Missing", el("small", {}, item.path)));
+      node.append(el("button", { type: "button", class: "gallery-check", "aria-label": "Select", tabindex: "-1" }));
     } else {
       const img = el("img", { src: thumbUrl(item), alt: nameOf(item.path), loading: "lazy", decoding: "async", draggable: "false" });
       img.addEventListener("error", () => node.classList.add("no-thumb"), { once: true });
-      node.append(img, el("span", { class: "gallery-fallback" }, nameOf(item.path)));
-      if (item.kind === "video") node.append(el("span", { class: "gallery-badge", "aria-label": "Video" }, "▶"));
+      // The thumbnail shows the photo's real shape: when the index had it wrong (or not at
+      // all, as for videos), lay its grid out again.
+      img.addEventListener("load", () => {
+        if (!img.naturalWidth || !img.naturalHeight) return;
+        const real = img.naturalWidth / img.naturalHeight;
+        if (Math.abs(real - aspectOf(item)) / real < 0.03) return;
+        item.aspect = real;
+        const owner = node.closest(".gallery-grid");
+        if (owner && (view === "justified" || view === "masonry")) scheduleLayout(owner);
+      }, { once: true });
+      const thumb = el("div", { class: "gallery-thumb" }, img, el("span", { class: "gallery-fallback" }, nameOf(item.path)));
+      if (item.kind === "video") thumb.append(el("span", { class: "gallery-badge", "aria-label": "Video" }, "▶"));
       if (item.hidden && route.tab !== "hidden") {
         node.classList.add("is-hidden");
-        node.append(el("span", { class: "gallery-hidden-badge", title: "Hidden from Photos: it still shows here and in its folder" }, "Hidden"));
+        thumb.append(el("span", { class: "gallery-hidden-badge", title: "Hidden from Photos: it still shows here and in its folder" }, "Hidden"));
       }
+      thumb.append(el("button", { type: "button", class: "gallery-check", "aria-label": "Select", tabindex: "-1" }));
+      const when = dateParts(item);
+      const folder = item.path.includes("/") ? item.path.slice(0, item.path.lastIndexOf("/")) : "";
+      node.append(thumb, el("span", { class: "gallery-info" },
+        el("span", { class: "gallery-info-name" }, nameOf(item.path)),
+        el("span", { class: "gallery-info-date" }, when ? when.full : ""),
+        el("span", { class: "gallery-info-dims" }, item.width && item.height ? `${item.width} × ${item.height}` : ""),
+        el("span", { class: "gallery-info-size" }, sizeText(item.size)),
+        el("span", { class: "gallery-info-folder", title: folder }, folder)));
     }
-    node.append(el("button", { type: "button", class: "gallery-check", "aria-label": "Select", tabindex: "-1" }));
     if (selected.has(item.path)) node.classList.add("is-selected");
     if (focusPath === item.path) node.classList.add("is-focused");
     return node;
@@ -288,19 +353,20 @@ export function mountGallery(root, ctx) {
     if (key === "ArrowRight") return nodes[Math.min(nodes.length - 1, index + 1)];
     const here = from.getBoundingClientRect();
     const down = key === "ArrowDown";
-    const centre = here.left + here.width / 2;
-    let row = null;
+    const x = here.left + here.width / 2;
+    const y = here.top + here.height / 2;
+    // The photo below (or above) that is nearest, favouring the same column.
     let best = null;
+    let bestScore = Infinity;
     for (const node of nodes) {
+      if (node === from) continue;
       const box = node.getBoundingClientRect();
-      if (down ? box.top <= here.top + 2 : box.top >= here.top - 2) continue;
-      // The nearest row in that direction, then the photo in it closest across.
-      if (row === null || (down ? box.top < row - 2 : box.top > row + 2)) {
-        row = box.top;
+      const dy = down ? box.top - (here.bottom - 2) : (here.top + 2) - box.bottom;
+      if (dy < 0) continue;
+      const score = dy + 2 * Math.abs(box.left + box.width / 2 - x) + Math.abs(box.top + box.height / 2 - y) * 0.01;
+      if (score < bestScore) {
+        bestScore = score;
         best = node;
-      } else if (Math.abs(box.top - row) <= 2) {
-        const gap = (n) => Math.abs(n.getBoundingClientRect().left + n.getBoundingClientRect().width / 2 - centre);
-        if (gap(node) < gap(best)) best = node;
       }
     }
     return best || from;
@@ -363,6 +429,116 @@ export function mountGallery(root, ctx) {
     ].filter(Boolean));
   }
 
+  // ---- Layouts: rows and masonry are placed here; squares and the list are plain CSS ----
+
+  const dirty = new Set();
+  let layoutFrame = 0;
+
+  function scheduleLayout(gridNode) {
+    if (gridNode) dirty.add(gridNode);
+    else for (const node of body.querySelectorAll(".gallery-grid:not(.is-placeholder)")) dirty.add(node);
+    cancelAnimationFrame(layoutFrame);
+    layoutFrame = requestAnimationFrame(() => {
+      const grids = [...dirty];
+      dirty.clear();
+      for (const node of grids) if (node.isConnected) layoutGrid(node);
+    });
+  }
+
+  function layoutGrid(gridNode) {
+    if (gridNode.classList.contains("is-placeholder")) return;
+    const tiles = [...gridNode.children].filter((node) => node.classList.contains("gallery-tile"));
+    if (view !== "justified" && view !== "masonry") {
+      gridNode.style.height = "";
+      for (const node of tiles) node.style.cssText = "";
+      return;
+    }
+    const width = gridNode.clientWidth;
+    if (!width) return;
+    const target = Number(size.value) || 150;
+    const aspect = (node) => {
+      const item = byPath.get(node.dataset.path);
+      return item && !item.missing ? aspectOf(item) : 1;
+    };
+    if (view === "justified") {
+      // Rows as tall as the size slider, then stretched (or shrunk) to fill the width exactly.
+      gridNode.style.height = "";
+      let row = [];
+      let sum = 0;
+      const place = (height, last) => {
+        row.forEach((node, index) => {
+          node.style.cssText = `width:${Math.floor(aspect(node) * height * 100) / 100}px;height:${Math.round(height)}px`;
+          node.classList.toggle("is-row-end", !last && index === row.length - 1);
+        });
+        row = [];
+        sum = 0;
+      };
+      for (const node of tiles) {
+        row.push(node);
+        sum += aspect(node);
+        const fill = (width - GAP * (row.length - 1)) / sum;
+        if (fill <= target) place(fill, false);
+      }
+      if (row.length) place(target, true);
+      return;
+    }
+    // Masonry: columns about as wide as the slider; each photo goes under the shortest column.
+    const columns = Math.max(1, Math.round((width + GAP) / (target + GAP)));
+    const columnWidth = (width - GAP * (columns - 1)) / columns;
+    const heights = new Array(columns).fill(0);
+    for (const node of tiles) {
+      let column = 0;
+      for (let i = 1; i < columns; i++) if (heights[i] < heights[column] - 1) column = i;
+      const height = columnWidth / aspect(node);
+      node.style.cssText = `left:${column * (columnWidth + GAP)}px;top:${heights[column]}px;width:${columnWidth}px;height:${height}px`;
+      heights[column] += height + GAP;
+    }
+    gridNode.style.height = `${Math.max(0, Math.max(...heights) - GAP)}px`;
+  }
+
+  // New tiles (a month of the timeline coming in, an album opening) are laid out as they arrive.
+  new MutationObserver((records) => {
+    if (view !== "justified" && view !== "masonry") return;
+    for (const record of records) {
+      const owner = record.target.closest?.(".gallery-grid");
+      if (owner) scheduleLayout(owner);
+      for (const added of record.addedNodes) {
+        if (added.nodeType !== 1) continue;
+        if (added.classList.contains("gallery-grid")) scheduleLayout(added);
+        for (const inner of added.querySelectorAll(".gallery-grid")) scheduleLayout(inner);
+      }
+    }
+  }).observe(body, { childList: true, subtree: true });
+
+  function setView(id) {
+    view = id;
+    try {
+      localStorage.setItem(VIEW_KEY, id);
+    } catch {}
+    // Stay with the photos that were on screen: the first one in view keeps its place.
+    const top = scroller.getBoundingClientRect().top;
+    const keep = scroller.scrollTop > 0 ? [...body.querySelectorAll(".gallery-tile")].find((node) => node.getBoundingClientRect().bottom > top) : null;
+    const before = keep ? keep.getBoundingClientRect().top - top : 0;
+    paintView();
+    scheduleLayout();
+    sizePlaceholders();
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (keep?.isConnected) scroller.scrollTop += keep.getBoundingClientRect().top - top - before;
+      scheduleScrubber();
+    }));
+  }
+
+  function paintView() {
+    body.dataset.view = view;
+    sizeControl.hidden = view === "list";
+    for (const button of viewSwitch.children) {
+      const on = button.dataset.view === view;
+      button.classList.toggle("is-active", on);
+      button.setAttribute("aria-checked", String(on));
+    }
+  }
+  paintView();
+
   // ---- Tile size ----
 
   function storedSize() {
@@ -379,6 +555,7 @@ export function mountGallery(root, ctx) {
       localStorage.setItem(SIZE_KEY, String(value));
     } catch {}
     sizePlaceholders();
+    scheduleLayout();
     scheduleScrubber();
   }
 
@@ -562,17 +739,37 @@ export function mountGallery(root, ctx) {
 
   /// Gives days not loaded yet the height their photos will take, so the page (and the
   /// scrubber) has its real length from the start.
+  /// Months not loaded yet get about the height they will have, so the scrollbar and the
+  /// scrubber are right from the start.
   function sizePlaceholders() {
     const sample = body.querySelector(".gallery-grid");
     if (!sample) return;
-    const style = getComputedStyle(sample);
-    const tracks = style.gridTemplateColumns.split(" ").filter(Boolean);
-    const columns = Math.max(1, tracks.length);
-    const size = parseFloat(tracks[0]) || 150;
-    const gap = parseFloat(style.rowGap) || 4;
+    const width = sample.clientWidth || body.clientWidth;
+    const target = Number(size.value) || 150;
+    let height;
+    if (view === "list") {
+      const row = 56 + 2;
+      height = (count) => count * row - 2;
+    } else if (view === "justified") {
+      // Photos are mostly 4:3 or 3:4; about 1.2 wide on average.
+      const perRow = Math.max(1, width / (target * 1.2 + GAP));
+      height = (count) => Math.ceil(count / perRow) * (target + GAP) - GAP;
+    } else if (view === "masonry") {
+      const columns = Math.max(1, Math.round((width + GAP) / (target + GAP)));
+      const columnWidth = (width - GAP * (columns - 1)) / columns;
+      height = (count) => Math.ceil(count / columns) * (columnWidth / 1.1 + GAP) - GAP;
+    } else {
+      const style = getComputedStyle(sample);
+      const tracks = style.gridTemplateColumns.split(" ").filter(Boolean);
+      const columns = Math.max(1, tracks.length);
+      const tileSize = parseFloat(tracks[0]) || target;
+      height = (count) => {
+        const rows = Math.ceil(count / columns);
+        return rows * tileSize + Math.max(0, rows - 1) * GAP;
+      };
+    }
     for (const placeholder of body.querySelectorAll(".gallery-grid.is-placeholder")) {
-      const rows = Math.ceil(Number(placeholder.dataset.count) / columns);
-      placeholder.style.height = `${rows * size + Math.max(0, rows - 1) * gap}px`;
+      placeholder.style.height = `${Math.max(0, height(Number(placeholder.dataset.count)))}px`;
     }
   }
 
@@ -695,8 +892,14 @@ export function mountGallery(root, ctx) {
     if (!scrubbing) scrubberBubble.hidden = true;
   });
   scroller.addEventListener("scroll", moveThumb, { passive: true });
+  let lastWidth = 0;
   new ResizeObserver(() => {
     sizePlaceholders();
+    // Rows and columns depend on the width only.
+    if (scroller.clientWidth !== lastWidth) {
+      lastWidth = scroller.clientWidth;
+      scheduleLayout();
+    }
     scheduleScrubber();
   }).observe(scroller);
 

@@ -207,8 +207,19 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|_| "Could not create the database schema".to_string())?;
     ensure_admin_column(conn)?;
+    let version: i64 = conn
+        .query_row("SELECT value FROM settings WHERE key = 'schema_version'", [], |row| row.get::<_, String>(0))
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    if version < 13 {
+        // Photo sizes now follow the camera's rotation (portrait photos were stored as landscape):
+        // have the next scan read every photo again.
+        conn.execute("UPDATE media_index SET mtime = -1 WHERE kind = 'image'", [])
+            .map_err(|_| "Could not update the photo index".to_string())?;
+    }
     conn.execute(
-        "INSERT INTO settings(key, value) VALUES('schema_version', '12')
+        "INSERT INTO settings(key, value) VALUES('schema_version', '13')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )

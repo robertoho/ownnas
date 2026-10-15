@@ -494,8 +494,10 @@ struct Taken {
     height: Option<i64>,
 }
 
+/// The date taken and the size the photo shows at (after the camera's rotation).
 fn read_photo(path: &Path) -> Taken {
     let mut taken = Taken::default();
+    let mut turned = false;
     if let Ok(file) = std::fs::File::open(path) {
         let mut reader = std::io::BufReader::new(file);
         if let Ok(exif) = exif::Reader::new().read_from_container(&mut reader) {
@@ -512,6 +514,8 @@ fn read_photo(path: &Path) -> Taken {
             let number = |tag| exif.get_field(tag, exif::In::PRIMARY).and_then(|field| field.value.get_uint(0)).map(i64::from);
             taken.width = number(exif::Tag::PixelXDimension);
             taken.height = number(exif::Tag::PixelYDimension);
+            // Orientations 5 to 8 turn the picture a quarter: it shows the other way round.
+            turned = matches!(number(exif::Tag::Orientation), Some(5..=8));
         }
     }
     if taken.width.is_none() {
@@ -519,6 +523,9 @@ fn read_photo(path: &Path) -> Taken {
             taken.width = Some(width.into());
             taken.height = Some(height.into());
         }
+    }
+    if turned {
+        std::mem::swap(&mut taken.width, &mut taken.height);
     }
     taken
 }
