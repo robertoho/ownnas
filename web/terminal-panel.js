@@ -83,12 +83,12 @@ function build() {
   const tabs = el("div", { class: "terminals-tabs", role: "tablist", "aria-label": "Open terminals" });
   const actions = el("div", { class: "terminals-actions" });
   const add = el("button", { type: "button", "data-action": "new", title: "New terminal in the folder you are browsing" }, "New");
-  const popout = el("button", { type: "button", "data-action": "popout", title: "Open this terminal in its own browser tab" }, "Pop out");
-  const end = el("button", { type: "button", "data-action": "end", class: "danger", title: "Stop the shell and everything running in it" }, "Close");
   const hide = el("button", { type: "button", "data-action": "hide", title: `Hide the panel (${ctx.shortcutLabel("L")} or Ctrl+\`). Terminals keep running.` }, "Hide");
   // On phones the other buttons move into this menu, leaving one row for the tabs.
   const more = el("button", { type: "button", "data-action": "more", class: "terminals-more-btn", "aria-label": "More terminal actions", "aria-haspopup": "menu" }, "⋯");
-  actions.append(add, popout, end, more, hide);
+  // Pop out, Git changes, and Show folder are on each terminal's own title bar (and in the menu
+  // on phones, where there are no tiles).
+  actions.append(add, more, hide);
   bar.append(overview, tabs, actions);
 
   const strip = el("div", { class: "terminals-agent", hidden: true });
@@ -103,10 +103,6 @@ function build() {
 
   overview.addEventListener("click", () => setView(view === "overview" ? "terminal" : "overview"));
   add.addEventListener("click", () => openTerminal(ctx.currentPath()).catch((err) => ctx.toast(err.message, true)));
-  popout.addEventListener("click", () => {
-    if (active) window.open(`/terminal?id=${encodeURIComponent(active)}`, "_blank", "noopener");
-  });
-  end.addEventListener("click", () => endTerminal(active).catch((err) => ctx.toast(err.message, true)));
   hide.addEventListener("click", hidePanel);
   more.addEventListener("click", () => {
     const rect = more.getBoundingClientRect();
@@ -240,10 +236,6 @@ function renderTabs() {
   empty.textContent = allStashed
     ? "Every terminal is hidden. They keep running: choose one in the tabs to show it again."
     : "No terminals are running. Choose New to open one in this folder, or right-click a folder and choose Open terminal here.";
-  // New works with no terminals open too: it starts one in the folder being browsed.
-  for (const action of ["popout", "end"]) {
-    panel.querySelector(`[data-action="${action}"]`).disabled = !has || view === "overview";
-  }
   panel.querySelector(".terminals-overview-btn").setAttribute("aria-pressed", view === "overview" ? "true" : "false");
 }
 
@@ -277,13 +269,15 @@ function renderStrip() {
     line.append(el("span", { class: "muted" }, `${item.shell} in ${item.path || "/"}`));
   }
   const tools = el("div", { class: "terminals-agent-tools" });
-  const files = el("button", { type: "button", "aria-pressed": drawer === "files" ? "true" : "false", hidden: !(agent.files && agent.files.length) }, `Edited (${(agent.files || []).length})`);
-  const changes = el("button", { type: "button", "aria-pressed": drawer === "changes" ? "true" : "false", title: "Uncommitted changes in this folder's Git repository" }, "Changes");
-  const folder = el("button", { type: "button", title: "Show the terminal's current folder in the file browser" }, "Show folder");
-  folder.addEventListener("click", () => showFolder(item.id).catch((err) => ctx.toast(err.message, true)));
+  const edited = (agent.files || []).length;
+  const files = el("button", { type: "button", "aria-pressed": drawer === "files" ? "true" : "false", hidden: !edited }, `Edited (${edited})`);
   files.addEventListener("click", () => toggleDrawer("files"));
-  changes.addEventListener("click", () => toggleDrawer("changes"));
-  tools.append(files, changes, folder);
+  tools.append(files);
+  // Nothing to say about a plain shell: its tile's title bar has the rest.
+  strip.classList.toggle("is-empty", item.running && !agent.name && !agent.attention && !edited);
+  for (const [id, tile] of frames) {
+    tile.querySelector('[data-tile="changes"]')?.setAttribute("aria-pressed", String(drawer === "changes" && id === active));
+  }
   const rows = [line];
   if (agent.attention) rows.push(el("p", { class: "agent-attention" }, agent.attention));
   else if (agent.status === "done" && agent.lastMessage) rows.push(el("p", { class: "agent-message muted" }, agent.lastMessage));
@@ -433,6 +427,25 @@ function tileFor(id) {
     activate(id);
   });
   title.addEventListener("dblclick", () => toggleMaximized(id));
+  const tool = (name, label, svg, run) => {
+    const button = el("button", { type: "button", class: "terminals-tile-btn", "data-tile": name, tabindex: "-1", title: label, "aria-label": label });
+    button.innerHTML = `<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${svg}</svg>`;
+    button.addEventListener("click", run);
+    return button;
+  };
+  const changes = tool("changes", "Git changes: what is not committed in this folder's repository",
+    '<circle cx="4.5" cy="3.5" r="1.5"/><circle cx="4.5" cy="12.5" r="1.5"/><circle cx="11.5" cy="4.5" r="1.5"/><path d="M4.5 5v6M11.5 6c0 3-3 3.5-6.2 5.3"/>',
+    () => {
+      setView("terminal");
+      activate(id);
+      toggleDrawer("changes");
+    });
+  const folder = tool("folder", "Show the terminal's current folder in the files",
+    '<path d="M2 4.5A1.5 1.5 0 0 1 3.5 3H7l1.2 1.5h4.3A1.5 1.5 0 0 1 14 6v6.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 12.5z"/>',
+    () => showFolder(id).catch((err) => ctx.toast(err.message, true)));
+  const popout = tool("popout", "Pop out: open this terminal in its own browser tab",
+    '<path d="M9.5 2.5h4v4M13.5 2.5 8 8M12 9.5v3a1 1 0 0 1-1 1H3.5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h3"/>',
+    () => window.open(`/terminal?id=${encodeURIComponent(id)}`, "_blank", "noopener"));
   const expand = el("button", { type: "button", class: "terminals-tile-btn", "data-tile": "expand", tabindex: "-1" });
   expand.addEventListener("click", () => toggleMaximized(id));
   const close = el("button", {
@@ -443,7 +456,7 @@ function tileFor(id) {
     "aria-label": "Hide this terminal",
   }, "✕");
   close.addEventListener("click", () => stashTerminal(id));
-  head.append(title, expand, close);
+  head.append(title, changes, folder, popout, expand, close);
   const frame = el("iframe", { src: `/terminal?id=${encodeURIComponent(id)}`, title: "Terminal", class: "terminals-frame is-loading", "data-id": id });
   // A page is white until its styles load; show the panel's background meanwhile.
   frame.addEventListener("load", () => {
@@ -765,7 +778,8 @@ function openTabMenu(id, x, y, { full = false } = {}) {
 async function showFolder(id) {
   const data = await ctx.api(`/api/terminals/cwd?id=${encodeURIComponent(id)}`);
   if (data.outside) ctx.toast(`The terminal is in ${data.current}, outside the library. Showing the folder it started in.`);
-  hidePanel();
+  // Tiled terminals sit beside the files, so they can stay.
+  if (!tiled) hidePanel();
   ctx.goToFolder(data.path);
 }
 

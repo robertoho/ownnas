@@ -2869,6 +2869,10 @@ dialog { color: var(--text); }
   .terminals-tile-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .terminals-tile-btn { flex: 0 0 auto; width: 1.9rem; padding: 0.2rem 0; font-size: 0.85rem; line-height: 1; }
   .terminals-tile-btn[data-tile="expand"] { font-size: 1.05rem; }
+  .terminals-tile-btn svg { display: block; margin: 0 auto; }
+  .terminals-tile-btn[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
+  /* A plain shell's line says nothing its tile does not. */
+  .terminals.is-tiled .terminals-agent.is-empty { display: none; }
   .terminals-tile-btn:hover { background: color-mix(in srgb, var(--text) 10%, transparent); color: var(--text); }
   .terminals-tile-btn:last-child:hover { background: var(--danger); color: #fff; }
   .terminals.is-tiled .terminals-tile .terminals-frame { position: relative; inset: auto; flex: 1; height: auto; min-height: 0; }
@@ -3048,9 +3052,7 @@ button.linkish {
   .terminals { width: 100vw; border-left: 0; }
   .terminals-bar { gap: 0.35rem; padding: 0.4rem 0.45rem; }
   .terminals-overview-btn,
-  .terminals-actions [data-action="new"],
-  .terminals-actions [data-action="popout"],
-  .terminals-actions [data-action="end"] { display: none; }
+  .terminals-actions [data-action="new"] { display: none; }
   .terminals-more-btn { display: inline-flex; min-width: 2.6rem; justify-content: center; font-size: 1.1rem; }
   .terminals-tabs { scrollbar-width: none; }
   .terminals-tabs::-webkit-scrollbar { display: none; }
