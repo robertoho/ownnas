@@ -2798,6 +2798,13 @@ dialog { color: var(--text); }
 .terminals-tile[hidden] { display: none; }
 @media (min-width: 821px) {
   body.is-tiled .app { margin-right: var(--tiles-width, 60vw); }
+  /* The preview opens on the files' side, beside the terminals rather than under them. */
+  body.is-tiled .preview:not(.is-fullscreen) {
+    right: var(--tiles-width, 60vw);
+    /* Most of the files' side, leaving some of the list in view (all of it when narrow). */
+    width: min(520px, max(min(320px, calc(100vw - var(--tiles-width, 60vw))), calc((100vw - var(--tiles-width, 60vw)) * 0.6)));
+    border-right: 1px solid var(--line);
+  }
   .terminals.is-tiled { width: var(--tiles-width, 60vw); border-left: 1px solid var(--line); box-shadow: none; z-index: 20; }
   .terminals.is-tiled .terminals-resize {
     display: block;
