@@ -2580,7 +2580,8 @@ dialog { color: var(--text); }
   }
   body:has(#preview:not([hidden])) .fab-menu,
   body:has(#library:not([hidden])) .fab-menu,
-  body:has(#settings:not([hidden])) .fab-menu {
+  body:has(#settings:not([hidden])) .fab-menu,
+  body:has(.gallery.is-selecting:not([hidden])) .fab-menu {
     display: none;
   }
   .menu {
@@ -3326,14 +3327,18 @@ body.is-gallery .app > .explorer-status-bar { display: none; }
 .gallery-status { color: var(--muted); font-size: 0.85rem; }
 .gallery-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-left: auto; }
 .gallery-selection {
-  position: sticky;
-  top: 3.6rem;
-  z-index: 3;
+  position: absolute;
+  left: 50%;
+  bottom: 1rem;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: calc(100% - 2rem);
+  box-sizing: border-box;
+  z-index: 5;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 0.45rem;
-  margin: 0.6rem 1rem 0;
   padding: 0.5rem 0.75rem;
   border: 1px solid var(--accent);
   border-radius: 14px;
@@ -3342,6 +3347,9 @@ body.is-gallery .app > .explorer-status-bar { display: none; }
 }
 .gallery-selection strong { margin-right: 0.4rem; }
 .gallery-selection .gallery-clear { margin-left: auto; }
+.gallery-selection[hidden] { display: none; }
+/* Room to scroll the last photos out from under the selection bar. */
+.gallery.is-selecting .gallery-body { padding-bottom: 7rem; }
 .gallery-body { padding: 0.5rem 1rem 2rem; }
 .gallery-message { margin: 2rem auto; max-width: 34rem; text-align: center; }
 .gallery-month { margin: 1.4rem 0 0.2rem; font-size: 1.25rem; }
@@ -3372,6 +3380,8 @@ body.is-gallery .app > .explorer-status-bar { display: none; }
 }
 .gallery-tile.is-selected img { transform: scale(0.88); border-radius: 6px; }
 .gallery-tile.is-selected { background: color-mix(in srgb, var(--accent) 22%, var(--thumb-bg)); }
+.gallery.is-keyboard .gallery-tile.is-focused { outline: 2px solid var(--accent); outline-offset: 1px; }
+.gallery.is-banding, .gallery.is-banding * { user-select: none !important; cursor: default; }
 .gallery-hidden-badge { position: absolute; left: 6px; bottom: 6px; padding: 0.05rem 0.45rem; border-radius: 999px; background: rgba(0, 0, 0, 0.6); color: #fff; font-size: 0.68rem; }
 .gallery-tile.is-hidden img { opacity: 0.55; }
 .gallery-note { margin: 0 0 0.9rem; max-width: 46rem; }

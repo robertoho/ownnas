@@ -64,6 +64,7 @@ export function mountGallery(root, ctx) {
   let monthObserver = null;
   let selected = new Set();
   let anchor = ""; // the path a Shift-click selects from
+  let focusPath = ""; // the photo the arrow keys move from
   let hiddenCount = 0; // photos left out of the timeline
   let statusTimer = 0;
   let generation = 0;
@@ -92,8 +93,9 @@ export function mountGallery(root, ctx) {
   const scrubberThumb = el("span", { class: "gallery-scrubber-thumb", "aria-hidden": "true" });
   const scrubberBubble = el("span", { class: "gallery-scrubber-bubble", hidden: true });
   const scrubber = el("div", { class: "gallery-scrubber", hidden: true, title: "Drag to jump to a date" });
-  const viewport = el("div", { class: "gallery-viewport" }, scroller, scrubber);
-  root.replaceChildren(head, selectionBar, viewport);
+  // The selection bar floats over the photos, so showing it never moves them under the pointer.
+  const viewport = el("div", { class: "gallery-viewport" }, scroller, scrubber, selectionBar);
+  root.replaceChildren(head, viewport);
   size.value = String(storedSize());
   size.addEventListener("input", () => applySize(Number(size.value)));
 
@@ -121,6 +123,7 @@ export function mountGallery(root, ctx) {
     }
     node.append(el("button", { type: "button", class: "gallery-check", "aria-label": "Select", tabindex: "-1" }));
     if (selected.has(item.path)) node.classList.add("is-selected");
+    if (focusPath === item.path) node.classList.add("is-focused");
     return node;
   }
 
@@ -155,11 +158,15 @@ export function mountGallery(root, ctx) {
       selected.add(item.path);
     }
     anchor = item.path;
+    focusPath = item.path;
     paintSelection();
   });
 
   function paintSelection() {
-    for (const node of body.querySelectorAll(".gallery-tile")) node.classList.toggle("is-selected", selected.has(node.dataset.path));
+    for (const node of body.querySelectorAll(".gallery-tile")) {
+      node.classList.toggle("is-selected", selected.has(node.dataset.path));
+      node.classList.toggle("is-focused", node.dataset.path === focusPath);
+    }
     root.classList.toggle("is-selecting", selected.size > 0);
     renderSelectionBar();
   }
@@ -167,7 +174,164 @@ export function mountGallery(root, ctx) {
   function clearSelection() {
     selected = new Set();
     anchor = "";
+    focusPath = "";
     paintSelection();
+  }
+
+  // ---- Rubber-band selection, as in the file browser ----
+
+  // Kept in the scroller's content coordinates, so the band grows as the page scrolls under it.
+  let band = null;
+  let bandFrame = 0;
+  // The file browser's band; the two never draw at once.
+  const bandBox = document.getElementById("marquee") || document.body.appendChild(el("div", { class: "marquee", hidden: true }));
+
+  function contentPoint(x, y) {
+    const rect = scroller.getBoundingClientRect();
+    return { x: x - rect.left + scroller.scrollLeft, y: y - rect.top + scroller.scrollTop };
+  }
+
+  scroller.addEventListener("mousedown", (event) => {
+    root.classList.remove("is-keyboard");
+    if (event.button !== 0) return;
+    if (event.target.closest(".gallery-tile, .gallery-album, .gallery-person, button, a, input, textarea, select, label")) return;
+    // Not on the scrollbar.
+    const rect = scroller.getBoundingClientRect();
+    if (event.clientX >= rect.left + scroller.clientWidth || event.clientY >= rect.top + scroller.clientHeight) return;
+    event.preventDefault();
+    closeMenu();
+    const additive = event.ctrlKey || event.metaKey;
+    band = { start: contentPoint(event.clientX, event.clientY), x: event.clientX, y: event.clientY, additive, origin: additive ? new Set(selected) : new Set(), moved: false };
+    window.addEventListener("mousemove", onBandMove);
+    window.addEventListener("mouseup", endBand);
+  });
+
+  function onBandMove(event) {
+    if (!band) return;
+    band.x = event.clientX;
+    band.y = event.clientY;
+    if (!band.moved) {
+      const now = contentPoint(band.x, band.y);
+      if (Math.hypot(now.x - band.start.x, now.y - band.start.y) < 3) return;
+      band.moved = true;
+      root.classList.add("is-banding");
+      bandFrame = requestAnimationFrame(bandTick);
+    }
+  }
+
+  /// Each frame: scroll when the pointer is near the top or bottom edge, then draw and select.
+  function bandTick() {
+    if (!band) return;
+    const rect = scroller.getBoundingClientRect();
+    const edge = 40;
+    if (band.y < rect.top + edge) scroller.scrollTop -= Math.ceil((rect.top + edge - band.y) / 3);
+    else if (band.y > rect.bottom - edge) scroller.scrollTop += Math.ceil((band.y - (rect.bottom - edge)) / 3);
+    drawBand(rect);
+    bandFrame = requestAnimationFrame(bandTick);
+  }
+
+  function drawBand(rect) {
+    const now = contentPoint(band.x, band.y);
+    const area = {
+      left: Math.min(band.start.x, now.x),
+      right: Math.max(band.start.x, now.x),
+      top: Math.min(band.start.y, now.y),
+      bottom: Math.max(band.start.y, now.y),
+    };
+    // On screen, the band is cut to the visible part of the scroller.
+    const offsetX = rect.left - scroller.scrollLeft;
+    const offsetY = rect.top - scroller.scrollTop;
+    const left = Math.max(area.left + offsetX, rect.left);
+    const top = Math.max(area.top + offsetY, rect.top);
+    const right = Math.min(area.right + offsetX, rect.left + scroller.clientWidth);
+    const bottom = Math.min(area.bottom + offsetY, rect.top + scroller.clientHeight);
+    bandBox.hidden = false;
+    bandBox.style.left = `${left}px`;
+    bandBox.style.top = `${top}px`;
+    bandBox.style.width = `${Math.max(0, right - left)}px`;
+    bandBox.style.height = `${Math.max(0, bottom - top)}px`;
+
+    const next = new Set(band.origin);
+    let last = "";
+    for (const node of body.querySelectorAll(".gallery-tile")) {
+      const box = node.getBoundingClientRect();
+      const hit = !(box.right - offsetX < area.left || box.left - offsetX > area.right || box.bottom - offsetY < area.top || box.top - offsetY > area.bottom);
+      if (!hit) continue;
+      next.add(node.dataset.path);
+      last = node.dataset.path;
+    }
+    const changed = next.size !== selected.size || [...next].some((path) => !selected.has(path));
+    selected = next;
+    if (last) {
+      anchor = last;
+      focusPath = last;
+    }
+    if (changed) paintSelection();
+  }
+
+  function endBand() {
+    window.removeEventListener("mousemove", onBandMove);
+    window.removeEventListener("mouseup", endBand);
+    cancelAnimationFrame(bandFrame);
+    bandBox.hidden = true;
+    root.classList.remove("is-banding");
+    // A plain click on empty space clears the selection.
+    if (band && !band.moved && !band.additive && selected.size) clearSelection();
+    band = null;
+  }
+
+  // ---- Arrow keys: move between photos by where they sit on screen ----
+
+  function neighbour(nodes, from, key) {
+    const index = nodes.indexOf(from);
+    if (key === "ArrowLeft") return nodes[Math.max(0, index - 1)];
+    if (key === "ArrowRight") return nodes[Math.min(nodes.length - 1, index + 1)];
+    const here = from.getBoundingClientRect();
+    const down = key === "ArrowDown";
+    const centre = here.left + here.width / 2;
+    let row = null;
+    let best = null;
+    for (const node of nodes) {
+      const box = node.getBoundingClientRect();
+      if (down ? box.top <= here.top + 2 : box.top >= here.top - 2) continue;
+      // The nearest row in that direction, then the photo in it closest across.
+      if (row === null || (down ? box.top < row - 2 : box.top > row + 2)) {
+        row = box.top;
+        best = node;
+      } else if (Math.abs(box.top - row) <= 2) {
+        const gap = (n) => Math.abs(n.getBoundingClientRect().left + n.getBoundingClientRect().width / 2 - centre);
+        if (gap(node) < gap(best)) best = node;
+      }
+    }
+    return best || from;
+  }
+
+  function moveFocus(key, extend) {
+    const nodes = [...body.querySelectorAll(".gallery-tile")];
+    if (!nodes.length) return;
+    const from = nodes.find((node) => node.dataset.path === focusPath);
+    let to;
+    if (from) {
+      to = neighbour(nodes, from, key);
+    } else {
+      // Start from the first photo in view.
+      const top = scroller.getBoundingClientRect().top;
+      to = nodes.find((node) => node.getBoundingClientRect().bottom > top) || nodes[0];
+    }
+    const path = to.dataset.path;
+    if (extend && anchor) {
+      const list = nodes.map((node) => node.dataset.path);
+      const a = list.indexOf(anchor);
+      const b = list.indexOf(path);
+      selected = new Set(a < 0 ? [path] : list.slice(Math.min(a, b), Math.max(a, b) + 1));
+    } else {
+      selected = new Set([path]);
+      anchor = path;
+    }
+    focusPath = path;
+    root.classList.add("is-keyboard");
+    paintSelection();
+    to.scrollIntoView({ block: "nearest" });
   }
 
   function selectedItems() {
@@ -1268,6 +1432,7 @@ export function mountGallery(root, ctx) {
     current = null;
     selected = new Set();
     anchor = "";
+    focusPath = "";
     byPath = new Map();
     months = [];
     closeMenu();
@@ -1301,9 +1466,23 @@ export function mountGallery(root, ctx) {
     clearTimeout(statusTimer);
   }
 
-  /// Keys for the gallery (app.js passes them on while it shows): Esc clears the selection and
-  /// ⌘A selects everything shown. Returns whether the key was used.
+  /// Keys for the gallery (app.js passes them on while it shows): arrows move and select (Shift
+  /// extends), Enter opens, Esc clears the selection and ⌘A selects everything shown. Returns
+  /// whether the key was used.
   function handleKey(event) {
+    const plain = !event.metaKey && !event.ctrlKey && !event.altKey;
+    if (plain && ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key) && body.querySelector(".gallery-tile")) {
+      event.preventDefault();
+      moveFocus(event.key, event.shiftKey);
+      return true;
+    }
+    if (plain && !event.shiftKey && event.key === "Enter") {
+      const item = byPath.get(focusPath) || (selected.size === 1 ? byPath.get([...selected][0]) : null);
+      if (!item || item.missing) return false;
+      event.preventDefault();
+      ctx.openPreview(item, ordered().filter((entry) => !entry.missing));
+      return true;
+    }
     if (event.key === "Escape" && selected.size) {
       event.preventDefault();
       clearSelection();
