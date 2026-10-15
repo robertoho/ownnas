@@ -158,7 +158,7 @@ export function mountGallery(root, ctx) {
 
   function tile(item) {
     byPath.set(item.path, item);
-    const node = el("div", { class: "gallery-tile", "data-path": item.path, title: item.missing ? `${item.path} is missing` : nameOf(item.path) });
+    const node = el("div", { class: "gallery-tile", "data-path": item.path, title: item.missing ? `${item.path} is missing` : nameOf(item.path), draggable: item.missing ? false : "true" });
     if (item.missing) {
       node.classList.add("is-missing");
       node.append(el("span", { class: "gallery-missing" }, "Missing", el("small", {}, item.path)));
@@ -230,6 +230,21 @@ export function mountGallery(root, ctx) {
     anchor = item.path;
     focusPath = item.path;
     paintSelection();
+  });
+
+  // Photos dragged out (into a terminal, which types their paths) carry their library paths, as
+  // files dragged from the file list do. A selected photo brings the whole selection along.
+  body.addEventListener("dragstart", (event) => {
+    const node = event.target.closest(".gallery-tile");
+    const item = node && byPath.get(node.dataset.path);
+    if (!item || item.missing) {
+      event.preventDefault();
+      return;
+    }
+    const paths = selected.has(item.path) ? selectedItems().filter((entry) => !entry.missing).map((entry) => entry.path) : [item.path];
+    event.dataTransfer.setData("application/x-ownnas-paths", JSON.stringify(paths));
+    event.dataTransfer.setData("text/plain", paths.join("\n"));
+    event.dataTransfer.effectAllowed = "copy";
   });
 
   function paintSelection() {
