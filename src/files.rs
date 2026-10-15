@@ -3025,9 +3025,12 @@ mod tests {
     use super::*;
 
     fn scratch() -> PathBuf {
+        // The clock alone can repeat between tests running side by side (macOS has microseconds).
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
-            "ownnas-files-{}-{}",
+            "ownnas-files-{}-{}-{}",
             std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()

@@ -518,11 +518,10 @@ fn read_photo(path: &Path) -> Taken {
             turned = matches!(number(exif::Tag::Orientation), Some(5..=8));
         }
     }
-    if taken.width.is_none() {
-        if let Ok((width, height)) = image::image_dimensions(path) {
-            taken.width = Some(width.into());
-            taken.height = Some(height.into());
-        }
+    // The picture's own size first: the EXIF size is the camera's, and a resized copy keeps it.
+    if let Ok((width, height)) = image::image_dimensions(path) {
+        taken.width = Some(width.into());
+        taken.height = Some(height.into());
     }
     if turned {
         std::mem::swap(&mut taken.width, &mut taken.height);

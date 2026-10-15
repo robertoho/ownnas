@@ -93,10 +93,40 @@ pub fn details(db: &std::sync::Mutex<Connection>, rel: &str, full: &Path) -> Val
     }
     file.push(row("Path", rel));
     let hash: Option<String> = conn.query_row("SELECT sha256 FROM file_hashes WHERE path = ?1", [rel], |r| r.get(0)).ok();
-    if let Some(hash) = hash {
+    if let Some(hash) = &hash {
         file.push(row("SHA-256", hash));
     }
     sections.extend(section("File", file));
+
+    // Which photo this one was made from, and the smaller copies made from it.
+    if let Some(hash) = &hash {
+        let size = |w: Option<i64>, h: Option<i64>| match (w, h) {
+            (Some(w), Some(h)) => format!("{w} × {h}"),
+            _ => "?".into(),
+        };
+        let mut versions = Vec::new();
+        for step in crate::db::earlier_versions(conn, hash) {
+            versions.push(row(
+                &step.operation,
+                format!(
+                    "From {} ({}), {} UTC by {}",
+                    step.parent_path,
+                    size(step.parent_width, step.parent_height),
+                    wall_clock(step.created_at),
+                    if step.created_by.is_empty() { "someone" } else { &step.created_by }
+                ),
+            ));
+            versions.push(row("Made from SHA-256", &step.parent));
+        }
+        for copy in crate::db::later_versions(conn, hash) {
+            let now = crate::db::paths_with_hash(conn, &copy.sha256).into_iter().map(|(p, _, _)| p).find(|p| !crate::files::is_under_trash(p));
+            versions.push(row(
+                "Smaller copy",
+                format!("{} ({}, {}){}", now.as_deref().unwrap_or(&copy.path), size(copy.width, copy.height), copy.operation.to_lowercase(), if now.is_some() { "" } else { " · no longer in the library" }),
+            ));
+        }
+        sections.extend(section("Versions", versions));
+    }
 
     // The picture or video itself.
     let mut picture = Vec::new();

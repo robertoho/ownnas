@@ -913,6 +913,7 @@ const MENU_ICONS = {
   emptyTrash: ICON_TRASH,
   delete: ICON_TRASH,
   deleteBlock: `${ICON_TRASH} M10.5 10.5l4 4 M14.5 10.5l-4 4`,
+  resize: "M2.5 6.5v-4h4 M2.5 2.5l4.5 4.5 M13.5 9.5v4h-4 M13.5 13.5L9 9",
   paste: "M5.5 3h-1a1 1 0 0 0-1 1v9.5a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1V4a1 1 0 0 0-1-1h-1 M6 2h4v2H6z",
   restore: "M3 8a5 5 0 1 0 1.5-3.55 M2.5 2.5v2.5H5",
   copy: ICON_COPY,
@@ -1232,6 +1233,9 @@ function openSelectionMenu(x, y, pasteInto) {
     const convertibles = entries.filter((entry) => entry.kind === "image");
     if (write && convertibles.length && convertibles.length === entries.length && !allInTrash) {
       buttons.push(`<button type="button" class="menu-has-sub" data-menu="convertMenu">Convert to…</button>`);
+    }
+    if (write && entries.length && entries.every(isResizable) && !allInTrash) {
+      buttons.push(`<button type="button" data-menu="resize">Resize…</button>`);
     }
     const pdfs = entries.filter((entry) => entry.kind === "pdf");
     if (write && pdfs.length && pdfs.length === entries.length && !allInTrash) {
@@ -1794,6 +1798,7 @@ async function gallery() {
       showInFolder: (path) => openFileByPath(path).catch((err) => toast(err.message, true)),
       decorateMenu: (menu) => decorateMenu(menu),
       deleteAndBlock,
+      resize: (paths) => resizeImages(paths),
     });
   }
   return galleryApi;
@@ -2431,6 +2436,7 @@ function renderAnnotations(data) {
     `<a class="tag-chip album-chip" href="#gallery/albums/${album.id}">${esc(album.name)}</a>`).join("")
     || `<span class="notes-empty">Not in any album</span>`;
   $("preview-add-album").hidden = !write || !["image", "video", "svg"].includes(state.current && state.current.kind);
+  renderVersions(data.versions);
   $("preview-comments").innerHTML = comments.length
     ? comments.map((item) => `<article class="comment-item" data-comment-id="${item.id}">
         <div class="comment-head">
@@ -2441,6 +2447,33 @@ function renderAnnotations(data) {
       </article>`).join("")
     : `<span class="notes-empty">No comments yet</span>`;
 }
+
+/// Which photo this one was made from, and the smaller copies made from it (by SHA-256).
+function renderVersions(versions) {
+  const earlier = (versions && versions.earlier) || [];
+  const later = (versions && versions.later) || [];
+  $("preview-versions-block").hidden = !earlier.length && !later.length;
+  const size = (w, h) => (w && h ? `${w} × ${h}` : "");
+  const link = (path) => `<a href="#/${path.split("/").map(encodeURIComponent).join("/")}" data-open-version="${esc(path)}">${esc(path.split("/").pop())}</a>`;
+  const when = (v) => `${esc(formatDate(v.createdAt))}${v.createdBy ? ` · ${esc(v.createdBy)}` : ""}`;
+  $("preview-versions").innerHTML = [
+    ...earlier.map(({ version: v, parentNow }) => `<div class="version">
+        <span>${esc(v.operation)} from ${parentNow ? link(parentNow) : `<span title="${esc(v.parentPath)}">${esc(v.parentPath.split("/").pop())}</span> <span class="muted">(no longer in the library)</span>`} ${esc(size(v.parentWidth, v.parentHeight))}</span>
+        <span class="muted">${when(v)}</span>
+      </div>`),
+    ...later.map(({ version: v, now }) => `<div class="version">
+        <span>Smaller copy: ${now ? link(now) : `${esc(v.path.split("/").pop())} <span class="muted">(no longer in the library)</span>`} ${esc(size(v.width, v.height))}</span>
+        <span class="muted">${esc(v.operation)} · ${when(v)}</span>
+      </div>`),
+  ].join("");
+}
+
+$("preview-versions").addEventListener("click", (event) => {
+  const link = event.target.closest("[data-open-version]");
+  if (!link) return;
+  event.preventDefault();
+  openFileByPath(link.dataset.openVersion).catch((err) => toast(err.message, true));
+});
 
 function renderMeta(body, entry, meta) {
   if (meta.text && !meta.text.binary) {
@@ -3038,6 +3071,157 @@ async function deleteEntries(entries) {
 
 /// Deletes photos (into the Trash) and remembers their contents (SHA-256), so phones never back
 /// them up again, even while they are still on a phone. Returns how many, or 0 when cancelled.
+const RESIZABLE = /\.(jpe?g|png|webp|bmp|tiff?)$/i;
+
+function isResizable(entry) {
+  return !!entry && !entry.dir && entry.kind === "image" && RESIZABLE.test(entry.name || entry.path || "");
+}
+
+const RESIZE_PRESETS = [
+  ["Small", { mode: "long", long: 1280 }],
+  ["Medium", { mode: "long", long: 1920 }],
+  ["Large", { mode: "long", long: 2560 }],
+  ["4K", { mode: "long", long: 3840 }],
+  ["Half", { mode: "percent", percent: 50 }],
+  ["Quarter", { mode: "percent", percent: 25 }],
+];
+
+/// Asks how to make photos smaller, then does it one photo at a time (in the jobs panel), as
+/// copies beside them or in their place. Resolves with how many were resized.
+async function resizeImages(paths) {
+  paths = (paths || []).filter((path) => RESIZABLE.test(path));
+  if (!paths.length) {
+    toast("Only JPEG, PNG, WebP, BMP, and TIFF photos can be resized", true);
+    return 0;
+  }
+  const dialog = $("resize-dialog");
+  const one = paths.length === 1;
+  const field = (id) => $(id);
+  const mode = () => dialog.querySelector('input[name="resize-mode"]:checked').value;
+  let shown = null;
+  $("resize-title").textContent = one ? `Resize “${paths[0].split("/").pop()}”` : `Resize ${paths.length} photos`;
+  $("resize-current").textContent = one ? "Reading the photo…" : "Each keeps its shape. Photos already that small are left as they are.";
+  $("resize-presets").innerHTML = RESIZE_PRESETS.map(([label, preset], index) =>
+    `<button type="button" data-resize-preset="${index}">${label}${preset.long ? ` · ${preset.long}` : ` · ${preset.percent}%`}</button>`).join("");
+
+  // What the choice asks for, and (for one photo) the size it makes.
+  const choice = () => {
+    const number = (id) => Math.round(Number(field(id).value));
+    if (mode() === "percent") return { percent: number("resize-percent") };
+    if (mode() === "long") return { width: number("resize-long"), height: number("resize-long") };
+    return { width: number("resize-width"), height: number("resize-height") };
+  };
+  const paint = () => {
+    const wanted = choice();
+    const result = $("resize-result");
+    result.classList.remove("is-error");
+    const presetIndex = RESIZE_PRESETS.findIndex(([, preset]) => preset.mode === mode()
+      && (preset.mode === "percent" ? Number(field("resize-percent").value) === preset.percent : Number(field("resize-long").value) === preset.long));
+    dialog.querySelectorAll("[data-resize-preset]").forEach((button) => button.setAttribute("aria-pressed", String(Number(button.dataset.resizePreset) === presetIndex)));
+    $("resize-quality-value").value = field("resize-quality").value;
+    const valid = wanted.percent !== undefined ? wanted.percent >= 1 && wanted.percent <= 99 : wanted.width >= 16 && wanted.height >= 16;
+    $("resize-ok").disabled = !valid;
+    if (!valid) {
+      result.textContent = wanted.percent !== undefined ? "Choose 1% to 99%" : "Choose at least 16 pixels";
+      result.classList.add("is-error");
+      return;
+    }
+    if (!shown) {
+      result.textContent = "";
+      return;
+    }
+    const [w, h] = shown;
+    const scale = wanted.percent !== undefined ? wanted.percent / 100 : Math.min(wanted.width / w, wanted.height / h);
+    if (scale >= 1) {
+      result.textContent = "It is that small already: choose a smaller size";
+      result.classList.add("is-error");
+      $("resize-ok").disabled = true;
+      return;
+    }
+    result.textContent = `${w} × ${h} → ${Math.max(1, Math.round(w * scale))} × ${Math.max(1, Math.round(h * scale))}`;
+  };
+  if (one) {
+    api(`/api/meta?path=${encodeURIComponent(paths[0])}`).then((meta) => {
+      if (meta.width && meta.height) {
+        shown = [meta.width, meta.height];
+        $("resize-current").textContent = `Now ${meta.width} × ${meta.height}, ${formatSize(meta.size)}`;
+      } else {
+        $("resize-current").textContent = formatSize(meta.size);
+      }
+      paint();
+    }).catch(() => { $("resize-current").textContent = ""; });
+  }
+  paint();
+  dialog.returnValue = "";
+  dialog.showModal();
+  const ok = await new Promise((resolve) => {
+    const click = (event) => {
+      const preset = event.target.closest("[data-resize-preset]");
+      if (!preset) return;
+      const [, chosen] = RESIZE_PRESETS[Number(preset.dataset.resizePreset)];
+      dialog.querySelector(`input[name="resize-mode"][value="${chosen.mode}"]`).checked = true;
+      if (chosen.long) field("resize-long").value = chosen.long;
+      if (chosen.percent) field("resize-percent").value = chosen.percent;
+      paint();
+    };
+    // Typing a size picks its line.
+    const input = (event) => {
+      const row = event.target.closest(".resize-row");
+      if (row && event.target.type === "number") row.querySelector('input[type="radio"]').checked = true;
+      paint();
+    };
+    dialog.addEventListener("click", click);
+    dialog.addEventListener("input", input);
+    dialog.addEventListener("close", () => {
+      dialog.removeEventListener("click", click);
+      dialog.removeEventListener("input", input);
+      resolve(dialog.returnValue === "ok");
+    }, { once: true });
+  });
+  if (!ok) return 0;
+  const wanted = choice();
+  const replace = dialog.querySelector('input[name="resize-output"]:checked').value === "replace";
+  const quality = Number(field("resize-quality").value);
+
+  const id = `resize-${++jobState.seq}`;
+  let cancelled = false;
+  const job = (done) => upsertJob(id, {
+    title: replace ? "Resize photos" : "Make smaller copies",
+    detail: one ? paths[0].split("/").pop() : `${Math.min(done + 1, paths.length)} of ${paths.length}`,
+    percent: (done / paths.length) * 100,
+    cancelable: true,
+    onCancel: () => { cancelled = true; },
+  });
+  let resized = 0;
+  const problems = [];
+  try {
+    for (const [index, path] of paths.entries()) {
+      if (cancelled) break;
+      job(index);
+      try {
+        const data = await api("/api/images/resize", { method: "POST", json: { paths: [path], ...wanted, quality, replace } });
+        resized += (data.resized || []).length;
+        problems.push(...(data.problems || []));
+      } catch (err) {
+        problems.push({ path, error: err.message });
+      }
+    }
+  } finally {
+    removeJob(id);
+  }
+  if (resized) toast(`${replace ? "Resized" : "Made smaller copies of"} ${resized === 1 ? "1 photo" : `${resized} photos`}`);
+  if (problems.length) {
+    const first = problems[0];
+    toast(`${problems.length === 1 ? first.path.split("/").pop() : `${problems.length} photos`}: ${first.error}`, true);
+  }
+  if (resized) {
+    if (state.me && !location.hash.startsWith("#gallery")) await load(state.path, { keepPreview: true }).catch(() => {});
+    galleryApi?.refresh();
+    if (state.current && paths.includes(state.current.path)) loadAnnotations(state.current.path).catch(() => {});
+  }
+  return resized;
+}
+
 async function deleteAndBlock(paths) {
   if (!paths.length) return 0;
   const what = paths.length === 1 ? `“${paths[0].split("/").pop()}”` : `${paths.length} photos and videos`;
@@ -4278,6 +4462,7 @@ function runMenuAction(button, entries, pasteInto) {
   if (action === "duplicate") duplicateEntries(entries).catch((err) => toast(err.message, true));
   if (action === "move") moveEntries(entries).catch((err) => toast(err.message, true));
   if (action === "convert") convertImages(entries, format).catch((err) => toast(err.message, true));
+  if (action === "resize") resizeImages(entries.map((entry) => entry.path)).catch((err) => toast(err.message, true));
   if (action === "compress") compressEntries(entries, format).catch((err) => toast(err.message, true));
   if (action === "pdfExtract") pdfExtractPages(entries).catch((err) => toast(err.message, true));
   if (action === "pdfSplit") pdfSplitPages(entries).catch((err) => toast(err.message, true));

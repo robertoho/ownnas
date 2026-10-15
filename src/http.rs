@@ -287,6 +287,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/backup", get(backup_config).post(set_backup_config))
         .route("/api/backup/upload", post(backup_upload).layer(DefaultBodyLimit::disable()))
         .route("/api/backup/has", get(backup_has))
+        .route("/api/images/resize", post(resize_images))
         .route("/api/backup/blocked", get(blocked_backups).post(block_backups).delete(unblock_backup))
         .route("/api/backup/blocked/preview", get(blocked_preview))
         .route("/api/ml/forget-faces", post(forget_faces))
@@ -1315,7 +1316,12 @@ async fn meta(
             .unwrap_or_else(|| "file".to_string());
         let file_meta = std::fs::metadata(&resolved.full).map_err(|_| FileError::NotFound)?;
         let inspection = preview::inspect(&resolved.full, &name);
+        let resizable = crate::image_edit::resizable(&name);
+        let shown = if files::kind_of(&name) == "image" { crate::image_edit::shown_size(&resolved.full) } else { None };
         Ok(json!({
+            "width": shown.map(|(w, _)| w),
+            "height": shown.map(|(_, h)| h),
+            "resizable": resizable,
             "name": name,
             "path": resolved.rel,
             "size": file_meta.len(),
@@ -2150,6 +2156,24 @@ fn find_backup_copy(state: &AppState, target: &str, size: Option<u64>, sha256: O
     None
 }
 
+/// A smaller copy of the photo with this hash (or a copy of a copy) that is still in the library:
+/// a phone with the original need not send it again.
+fn find_resized_copy(state: &AppState, sha256: &str) -> Option<String> {
+    let candidates: Vec<(String, u64, i64)> = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        db::later_versions(&conn, sha256).iter().flat_map(|version| db::paths_with_hash(&conn, &version.sha256)).collect()
+    };
+    candidates.into_iter().find_map(|(path, size, mtime)| {
+        if files::is_under_trash(&path) {
+            return None;
+        }
+        let found = files::resolve(&state.root, &path).ok()?;
+        let meta = std::fs::metadata(&found.full).ok()?;
+        let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as i64;
+        (meta.is_file() && meta.len() == size && modified == mtime).then_some(path)
+    })
+}
+
 fn backup_blocked(state: &AppState, sha256: &str) -> bool {
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     db::is_backup_blocked(&conn, sha256)
@@ -2304,9 +2328,12 @@ async fn backup_has(
     if query.sha256.as_deref().is_some_and(|hash| backup_blocked(&state, hash)) {
         return Ok(Json(json!({ "path": null, "blocked": true })));
     }
-    let found = tokio::task::spawn_blocking(move || find_backup_copy(&state, &target, query.size, query.sha256.as_deref()))
-        .await
-        .unwrap_or(None);
+    let found = tokio::task::spawn_blocking(move || {
+        find_backup_copy(&state, &target, query.size, query.sha256.as_deref())
+            .or_else(|| query.sha256.as_deref().and_then(|hash| find_resized_copy(&state, hash)))
+    })
+    .await
+    .unwrap_or(None);
     Ok(Json(json!({ "path": found })))
 }
 
@@ -2340,9 +2367,12 @@ async fn backup_upload(
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "The photo's hash is not valid"));
     }
     let probe = (state.clone(), rel.clone(), query.size, sha256.clone());
-    let already = tokio::task::spawn_blocking(move || find_backup_copy(&probe.0, &probe.1, probe.2, probe.3.as_deref()))
-        .await
-        .unwrap_or(None);
+    let already = tokio::task::spawn_blocking(move || {
+        find_backup_copy(&probe.0, &probe.1, probe.2, probe.3.as_deref())
+            .or_else(|| probe.3.as_deref().and_then(|hash| find_resized_copy(&probe.0, hash)))
+    })
+    .await
+    .unwrap_or(None);
     if let Some(path) = already {
         return Ok(Json(json!({ "path": path, "skipped": true })));
     }
@@ -4649,6 +4679,191 @@ async fn set_agent_integration(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// Where a photo came from and the smaller copies made from it (by SHA-256), with where each copy
+/// is now, for the preview.
+fn versions_of(conn: &rusqlite::Connection, state: &AppState, path: &str) -> serde_json::Value {
+    let Ok(hash) = conn.query_row("SELECT sha256 FROM file_hashes WHERE path = ?1", [path], |r| r.get::<_, String>(0)) else {
+        return json!({ "earlier": [], "later": [] });
+    };
+    // Where a photo with that hash is now: where it was made, if it is still there, or else any
+    // other file with the same contents.
+    let here = |sha: &str, made_at: &str| -> Option<String> {
+        let mut paths: Vec<String> = db::paths_with_hash(conn, sha).into_iter().map(|(p, _, _)| p).collect();
+        paths.sort_by_key(|p| p != made_at);
+        paths.into_iter().find(|p| !files::is_under_trash(p) && files::resolve(&state.root, p).is_ok_and(|f| f.full.is_file()))
+    };
+    let earlier: Vec<serde_json::Value> = db::earlier_versions(conn, &hash)
+        .into_iter()
+        .map(|v| {
+            let now = here(&v.parent, &v.parent_path);
+            json!({ "version": v, "parentNow": now })
+        })
+        .collect();
+    let later: Vec<serde_json::Value> = db::later_versions(conn, &hash)
+        .into_iter()
+        .map(|v| {
+            let now = here(&v.sha256, &v.path);
+            json!({ "version": v, "now": now })
+        })
+        .collect();
+    json!({ "sha256": hash, "earlier": earlier, "later": later })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResizeBody {
+    paths: Vec<String>,
+    /// A share of the size (1–99), or a box to fit in (either side alone is fine).
+    percent: Option<u32>,
+    width: Option<u32>,
+    height: Option<u32>,
+    #[serde(default = "default_quality")]
+    quality: u8,
+    /// Put the smaller photo in place of the original (which goes to the Trash), instead of
+    /// beside it. Albums, tags, and comments then stay with it.
+    #[serde(default)]
+    replace: bool,
+}
+
+fn default_quality() -> u8 {
+    88
+}
+
+/// Makes photos smaller, and remembers which photo each one came from.
+async fn resize_images(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<ResizeBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    use crate::image_edit::{self, Size};
+    use sha2::Digest;
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    const ANY: u32 = 1_000_000;
+    let size = match (body.percent, body.width, body.height) {
+        (Some(percent), _, _) => Size::Percent(percent),
+        (None, Some(width), height) => Size::Fit { width, height: height.unwrap_or(ANY) },
+        (None, None, Some(height)) => Size::Fit { width: ANY, height },
+        (None, None, None) => return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose a size")),
+    };
+    if body.paths.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose photos to resize"));
+    }
+    let worker = state.clone();
+    let (done, problems) = tokio::task::spawn_blocking(move || {
+        let state = worker;
+        let mut done = Vec::new();
+        let mut problems = Vec::new();
+        for raw in body.paths {
+            let rel = rel_of(&Some(raw.clone()));
+            let outcome = (|| -> Result<serde_json::Value, ApiError> {
+                let found = files::resolve(&state.root, &rel)?;
+                if files::is_under_trash(&found.rel) {
+                    return Err(ApiError::new(StatusCode::BAD_REQUEST, "Restore it from the Trash first"));
+                }
+                let meta = std::fs::metadata(&found.full).map_err(|_| ApiError::from(FileError::NotFound))?;
+                let name = found.full.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                if !meta.is_file() || !image_edit::resizable(&name) {
+                    return Err(ApiError::new(StatusCode::BAD_REQUEST, "Only JPEG, PNG, WebP, BMP, and TIFF photos can be resized"));
+                }
+                let original = std::fs::read(&found.full).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the photo"))?;
+                let resized = image_edit::resize(&original, &name, size, body.quality).map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+                let parent_sha = hex::encode(sha2::Sha256::digest(&original));
+                let sha = hex::encode(sha2::Sha256::digest(&resized.bytes));
+                let modified = meta.modified().ok();
+                let millis = |time: Option<std::time::SystemTime>| time.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis() as i64);
+                let dir = found.full.parent().ok_or_else(|| ApiError::from(FileError::NotFound))?.to_path_buf();
+                // Written beside it first, so a full disk or a crash never leaves half a photo.
+                let partial = dir.join(format!(".{name}.resize.part"));
+                let write = || -> Result<(), ApiError> {
+                    std::fs::write(&partial, &resized.bytes).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not save the smaller photo"))?;
+                    // The original's time, so it sorts with it (photos without a camera date).
+                    if let (Some(time), Ok(file)) = (modified, std::fs::File::options().write(true).open(&partial)) {
+                        let _ = file.set_modified(time);
+                    }
+                    Ok(())
+                };
+                write()?;
+                let (dest, dest_rel, trashed) = if body.replace {
+                    let trashed = match files::trash_entry(&state.root, &found.rel) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            let _ = std::fs::remove_file(&partial);
+                            return Err(err.into());
+                        }
+                    };
+                    (found.full.clone(), found.rel.clone(), Some(trashed))
+                } else {
+                    let dest = files::unique_path(dir.join(image_edit::copy_name(&name, resized.to)));
+                    let dest_name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let parent = parent_rel_path(&found.rel);
+                    (dest, if parent.is_empty() { dest_name } else { format!("{parent}/{dest_name}") }, None)
+                };
+                if std::fs::rename(&partial, &dest).is_err() {
+                    let _ = std::fs::remove_file(&partial);
+                    return Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not save the smaller photo"));
+                }
+                let written = std::fs::metadata(&dest).ok();
+                {
+                    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+                    if let Some(trashed) = &trashed {
+                        let _ = db::store_hash(&conn, trashed, meta.len(), millis(modified), &parent_sha);
+                    } else {
+                        let _ = db::store_hash(&conn, &found.rel, meta.len(), millis(modified), &parent_sha);
+                    }
+                    if let Some(written) = &written {
+                        let _ = db::store_hash(&conn, &dest_rel, written.len(), millis(written.modified().ok()), &sha);
+                    }
+                    let version = db::ImageVersion {
+                        sha256: sha.clone(),
+                        parent: parent_sha.clone(),
+                        operation: size.describe(),
+                        width: Some(resized.to.0.into()),
+                        height: Some(resized.to.1.into()),
+                        parent_width: Some(resized.from.0.into()),
+                        parent_height: Some(resized.from.1.into()),
+                        path: dest_rel.clone(),
+                        parent_path: found.rel.clone(),
+                        created_at: db::now_secs(),
+                        created_by: user.username.clone(),
+                    };
+                    db::record_version(&conn, &version).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+                }
+                if let Some(trashed) = &trashed {
+                    record(&state, &user, "trashed", &found.rel);
+                    let _ = trashed;
+                }
+                record(&state, &user, "resize", &dest_rel);
+                invalidate_sizes(&state, &parent_rel_path(&found.rel));
+                Ok(json!({
+                    "path": found.rel,
+                    "saved": dest_rel,
+                    "trashed": trashed,
+                    "width": resized.to.0,
+                    "height": resized.to.1,
+                    "fromWidth": resized.from.0,
+                    "fromHeight": resized.from.1,
+                    "size": resized.bytes.len(),
+                    "fromSize": meta.len(),
+                    "sha256": sha,
+                }))
+            })();
+            match outcome {
+                Ok(item) => done.push(item),
+                Err(err) => problems.push(json!({ "path": raw, "error": err.body.get("error").cloned().unwrap_or_default() })),
+            }
+        }
+        (done, problems)
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not resize the photos"))?;
+    if !done.is_empty() {
+        state.media.rescan_soon();
+    }
+    Ok(Json(json!({ "resized": done, "problems": problems })))
+}
+
 fn record(state: &AppState, user: &User, action: &str, detail: &str) {
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     let _ = db::log_event(&conn, Some(user.id), &user.username, action, detail);
@@ -5236,6 +5451,7 @@ async fn get_annotations(
         .into_iter()
         .map(|(id, name)| json!({ "id": id, "name": name }))
         .collect::<Vec<_>>());
+    notes["versions"] = versions_of(&conn, &state, &path);
     Ok(Json(notes))
 }
 

@@ -22,6 +22,8 @@ function el(tag, attrs = {}, ...children) {
 }
 
 const number = (n) => Number(n).toLocaleString();
+/// Photos the server can make smaller (not GIFs, HEIC, or videos).
+const resizable = (path) => /\.(jpe?g|png|webp|bmp|tiff?)$/i.test(path);
 const nameOf = (path) => path.split("/").pop();
 const plural = (n, one, many = `${one}s`) => `${number(n)} ${n === 1 ? one : many}`;
 
@@ -418,6 +420,7 @@ export function mountGallery(root, ctx) {
       el("strong", {}, `${number(selected.size)} selected`),
       write && present.length ? button("Add to album…", () => pickAlbum(present)) : null,
       write && present.length ? button("Tag…", () => ctx.tag(present)) : null,
+      write && present.length && present.every(resizable) ? button("Resize…", () => ctx.resize(present)) : null,
       present.length ? button("Download", () => ctx.download(present)) : null,
       present.length === 1 ? button("Show in folder", () => ctx.showInFolder(present[0])) : null,
       write && picked.some((item) => !item.hidden) && route.tab !== "hidden" ? button("Hide from Photos", () => setHidden(picked.filter((item) => !item.hidden).map((item) => item.path), true)) : null,
@@ -1090,6 +1093,7 @@ export function mountGallery(root, ctx) {
       one && !one.missing && { label: "Open", icon: "open", run: () => ctx.openPreview(one, ordered().filter((entry) => !entry.missing)) },
       write && paths.length && { label: "Add to album…", icon: "addToAlbum", run: () => pickAlbum(paths) },
       write && paths.length && { label: "Tag…", icon: "bulkTag", run: () => ctx.tag(paths) },
+      write && paths.length && paths.every(resizable) && { label: "Resize…", icon: "resize", run: () => ctx.resize(paths) },
       paths.length && { label: "Download", icon: "download", run: () => ctx.download(paths) },
       one && !one.missing && { label: "Show in folder", icon: "folder", run: () => ctx.showInFolder(one.path) },
       one && !one.missing && searchOn() && { label: "Find similar photos", icon: "search", run: () => { location.hash = `#gallery/similar/${encodeURIComponent(one.path)}`; } },

@@ -441,6 +441,10 @@
           <div id="preview-albums" class="tag-list"></div>
           <button id="preview-add-album" type="button" class="notes-add-album" hidden>Add to album…</button>
         </div>
+        <div id="preview-versions-block" class="notes-block" hidden>
+          <h3>Versions</h3>
+          <div id="preview-versions" class="preview-versions"></div>
+        </div>
         <div class="notes-block">
           <h3>Comments</h3>
           <div id="preview-comments" class="comment-list"></div>
@@ -695,6 +699,31 @@
         <button id="folder-appearance-reset" type="button">Reset to default</button>
         <button value="cancel" type="submit">Cancel</button>
         <button value="save" type="submit">Save</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="resize-dialog" class="resize-dialog" aria-labelledby="resize-title">
+    <form method="dialog">
+      <h3 id="resize-title">Resize photo</h3>
+      <p id="resize-current" class="muted"></p>
+      <div id="resize-presets" class="resize-presets" role="group" aria-label="Common sizes"></div>
+      <fieldset>
+        <legend>New size</legend>
+        <label class="resize-row"><input type="radio" name="resize-mode" value="long" checked><span>Longest side</span><input id="resize-long" type="number" min="16" max="30000" value="1920" aria-label="Longest side in pixels"><span>px</span></label>
+        <label class="resize-row"><input type="radio" name="resize-mode" value="box"><span>Fit inside</span><input id="resize-width" type="number" min="16" max="30000" value="1920" aria-label="Width in pixels"><span>×</span><input id="resize-height" type="number" min="16" max="30000" value="1080" aria-label="Height in pixels"><span>px</span></label>
+        <label class="resize-row"><input type="radio" name="resize-mode" value="percent"><span>Scale to</span><input id="resize-percent" type="number" min="1" max="99" value="50" aria-label="Percent of the size"><span>%</span></label>
+      </fieldset>
+      <label class="resize-quality"><span>JPEG quality</span><input id="resize-quality" type="range" min="50" max="100" value="88"><output id="resize-quality-value" for="resize-quality">88</output></label>
+      <fieldset>
+        <legend>Save</legend>
+        <label class="resize-choice"><input type="radio" name="resize-output" value="copy" checked><span>As a copy beside the original</span></label>
+        <label class="resize-choice"><input type="radio" name="resize-output" value="replace"><span>In place of the original<small>The original goes to the Trash. Albums, tags, and comments stay with the photo.</small></span></label>
+      </fieldset>
+      <p id="resize-result" class="resize-result"></p>
+      <p class="muted resize-note">Photos keep their date, place, and camera details. OwnNAS remembers which photo each smaller copy came from, so phones don't back the original up again.</p>
+      <div class="dialog-actions">
+        <button value="cancel" type="submit">Cancel</button>
+        <button id="resize-ok" value="ok" type="submit" class="primary">Resize</button>
       </div>
     </form>
   </dialog>

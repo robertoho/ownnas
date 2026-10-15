@@ -2744,6 +2744,27 @@ dialog { color: var(--text); }
 .glyph > .folder-custom-icon { width: 100%; height: 100%; }
 .column-glyph > .folder-custom-icon { width: 20px; height: 20px; }
 .folder-appearance-dialog { width: min(480px, calc(100vw - 32px)); }
+.resize-dialog { width: min(500px, calc(100vw - 32px)); }
+.resize-dialog fieldset { border: 1px solid var(--line); border-radius: 10px; margin: 12px 0; padding: 10px 12px; display: grid; gap: 8px; }
+.resize-presets { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 4px; }
+.resize-presets button { padding: 0.3rem 0.7rem; font-size: 0.85rem; }
+.resize-presets button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+.resize-row { display: flex; align-items: center; gap: 8px; margin: 0; }
+.resize-row > span:first-of-type { min-width: 6.5rem; }
+.resize-row input[type="number"] { width: 6rem; }
+.resize-quality { display: flex; align-items: center; gap: 10px; margin: 4px 0; }
+.resize-quality input { flex: 1; accent-color: var(--accent); }
+.resize-quality output { min-width: 2.2rem; text-align: right; font-variant-numeric: tabular-nums; }
+.resize-choice { display: flex; align-items: flex-start; gap: 8px; margin: 0; }
+.resize-choice span { display: grid; gap: 2px; }
+.resize-choice small { color: var(--muted); }
+.resize-result { min-height: 1.3em; margin: 6px 0 0; font-weight: 600; }
+.resize-result.is-error { color: var(--danger); }
+.resize-note { font-size: 0.8rem; margin: 6px 0 0; }
+.preview-versions { display: grid; gap: 6px; font-size: 0.85rem; }
+.preview-versions .version { display: grid; gap: 1px; }
+.preview-versions .version a { color: var(--accent); text-decoration: none; overflow-wrap: anywhere; }
+.preview-versions .muted { font-size: 0.78rem; }
 .folder-appearance-dialog fieldset { border: 1px solid var(--line); border-radius: 10px; margin: 16px 0; padding: 12px; }
 .folder-appearance-preview { display: flex; align-items: center; gap: 14px; font-size: 18px; }
 .folder-appearance-preview .folder-custom-icon { width: 56px; height: 56px; }

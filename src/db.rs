@@ -184,6 +184,21 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             sha256 TEXT NOT NULL,
             hashed_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS image_versions (
+            sha256 TEXT NOT NULL,
+            parent TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            width INTEGER,
+            height INTEGER,
+            parent_width INTEGER,
+            parent_height INTEGER,
+            path TEXT NOT NULL,
+            parent_path TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            created_by TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (sha256, parent)
+        );
+        CREATE INDEX IF NOT EXISTS image_versions_parent ON image_versions(parent);
         CREATE TABLE IF NOT EXISTS backup_blocked (
             sha256 TEXT PRIMARY KEY,
             size INTEGER NOT NULL,
@@ -1092,6 +1107,112 @@ pub fn store_hash(conn: &Connection, path: &str, size: u64, mtime: i64, sha256: 
     Ok(())
 }
 
+/// One photo made from another (smaller, for now), both known by SHA-256. A photo's history is
+/// a chain of these, so a phone with the original knows the server has it, resized.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageVersion {
+    pub sha256: String,
+    pub parent: String,
+    /// What was done, as people read it: "Resized to 50%".
+    pub operation: String,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub parent_width: Option<i64>,
+    pub parent_height: Option<i64>,
+    /// Where each was when it was made.
+    pub path: String,
+    pub parent_path: String,
+    pub created_at: i64,
+    pub created_by: String,
+}
+
+pub fn record_version(conn: &Connection, version: &ImageVersion) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO image_versions(sha256, parent, operation, width, height, parent_width, parent_height, path, parent_path, created_at, created_by)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            version.sha256.to_ascii_lowercase(),
+            version.parent.to_ascii_lowercase(),
+            version.operation,
+            version.width,
+            version.height,
+            version.parent_width,
+            version.parent_height,
+            version.path,
+            version.parent_path,
+            version.created_at,
+            version.created_by
+        ],
+    )
+    .map_err(|_| "Could not remember where the photo came from".to_string())?;
+    Ok(())
+}
+
+fn version_rows(conn: &Connection, sql: &str, sha256: &str) -> Vec<ImageVersion> {
+    let Ok(mut stmt) = conn.prepare(sql) else { return Vec::new() };
+    stmt.query_map([sha256], |row| {
+        Ok(ImageVersion {
+            sha256: row.get(0)?,
+            parent: row.get(1)?,
+            operation: row.get(2)?,
+            width: row.get(3)?,
+            height: row.get(4)?,
+            parent_width: row.get(5)?,
+            parent_height: row.get(6)?,
+            path: row.get(7)?,
+            parent_path: row.get(8)?,
+            created_at: row.get(9)?,
+            created_by: row.get(10)?,
+        })
+    })
+    .map(|rows| rows.filter_map(Result::ok).collect())
+    .unwrap_or_default()
+}
+
+const VERSION_COLUMNS: &str = "sha256, parent, operation, width, height, parent_width, parent_height, path, parent_path, created_at, created_by";
+
+/// Where a photo came from: its parent, the parent's parent, and so on (newest step first).
+pub fn earlier_versions(conn: &Connection, sha256: &str) -> Vec<ImageVersion> {
+    let sql = format!("SELECT {VERSION_COLUMNS} FROM image_versions WHERE sha256 = ?1 ORDER BY created_at DESC LIMIT 1");
+    let mut chain: Vec<ImageVersion> = Vec::new();
+    let mut at = sha256.to_ascii_lowercase();
+    while chain.len() < 32 {
+        let Some(step) = version_rows(conn, &sql, &at).into_iter().next() else { break };
+        if step.parent == sha256 || chain.iter().any(|seen| seen.parent == step.parent) {
+            break;
+        }
+        at = step.parent.clone();
+        chain.push(step);
+    }
+    chain
+}
+
+/// Every photo made from this one, and from those (closest first).
+pub fn later_versions(conn: &Connection, sha256: &str) -> Vec<ImageVersion> {
+    let sql = format!("SELECT {VERSION_COLUMNS} FROM image_versions WHERE parent = ?1 ORDER BY created_at");
+    let mut found: Vec<ImageVersion> = Vec::new();
+    let mut queue = vec![sha256.to_ascii_lowercase()];
+    while let Some(at) = queue.pop() {
+        for step in version_rows(conn, &sql, &at) {
+            if found.len() >= 200 || step.sha256 == sha256 || found.iter().any(|seen| seen.sha256 == step.sha256) {
+                continue;
+            }
+            queue.insert(0, step.sha256.clone());
+            found.push(step);
+        }
+    }
+    found
+}
+
+/// The library paths whose last known contents had this hash, with the size and time they had.
+pub fn paths_with_hash(conn: &Connection, sha256: &str) -> Vec<(String, u64, i64)> {
+    let Ok(mut stmt) = conn.prepare("SELECT path, size, mtime FROM file_hashes WHERE sha256 = ?1") else { return Vec::new() };
+    stmt.query_map([sha256.to_ascii_lowercase()], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64, row.get::<_, i64>(2)?)))
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+}
+
 /// A photo deleted from the server that phones must not back up again.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1118,8 +1239,11 @@ pub fn block_backup(conn: &Connection, photo: &BlockedPhoto, preview: Option<&[u
     Ok(())
 }
 
+/// Whether phones must not back this photo up: it was deleted on the server, or a photo made
+/// from it (resized) was.
 pub fn is_backup_blocked(conn: &Connection, sha256: &str) -> bool {
-    conn.query_row("SELECT 1 FROM backup_blocked WHERE sha256 = ?1", [sha256.to_ascii_lowercase()], |_| Ok(())).is_ok()
+    let blocked = |hash: &str| conn.query_row("SELECT 1 FROM backup_blocked WHERE sha256 = ?1", [hash.to_ascii_lowercase()], |_| Ok(())).is_ok();
+    blocked(sha256) || later_versions(conn, sha256).iter().any(|version| blocked(&version.sha256))
 }
 
 pub fn blocked_backups(conn: &Connection) -> Result<Vec<BlockedPhoto>, String> {
@@ -1340,9 +1464,12 @@ mod tests {
     use std::path::PathBuf;
 
     fn scratch_db() -> (PathBuf, Connection) {
+        // The clock alone can repeat between tests running side by side (macOS has microseconds).
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
-            "ownnas-db-{}-{}.sqlite",
+            "ownnas-db-{}-{}-{}.sqlite",
             std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
