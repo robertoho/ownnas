@@ -2976,7 +2976,36 @@ dialog { color: var(--text); }
 .terminals-drawer p { margin: 0; }
 .terminals-drawer-head { display: flex; align-items: center; gap: 0.75rem; width: 100%; justify-self: stretch; }
 .terminals-drawer-head > p { flex: 1; min-width: 0; }
-.terminals-drawer-head .terminals-drawer-refresh { flex: 0 0 auto; padding: 0.2rem 0.65rem; font-size: 0.8rem; }
+.terminals-drawer-head .terminals-drawer-btn { flex: 0 0 auto; padding: 0.2rem 0.65rem; font-size: 0.8rem; }
+.terminals-drawer.is-tall { max-height: 78%; }
+/* Git changes: colours that read on every theme. */
+.git-files { width: 100%; justify-self: stretch; }
+.git-file { display: grid !important; gap: 0.25rem; }
+.git-row { display: flex; align-items: baseline; gap: 0.6rem; min-width: 0; }
+.git-row .linkish, .git-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.git-toggle { flex: 0 0 auto; width: 1.4rem; min-height: 0; padding: 0; border: 0; background: transparent; box-shadow: none; color: var(--muted); font-size: 0.8rem; }
+.git-toggle:hover { color: var(--text); }
+.git-status { flex: 0 0 auto; padding: 0 0.35rem; border-radius: 4px; font-size: 0.75rem; text-align: center; color: var(--muted); }
+.git-status.git-added { color: #3fb950; background: rgba(63, 185, 80, 0.14); }
+.git-status.git-deleted { color: #f85149; background: rgba(248, 81, 73, 0.14); }
+.git-status.git-modified { color: #d29922; background: rgba(210, 153, 34, 0.16); }
+.git-status.git-renamed { color: #58a6ff; background: rgba(88, 166, 255, 0.14); }
+.git-status.git-conflict { color: #ff7b72; background: rgba(255, 123, 114, 0.2); font-weight: 700; }
+.git-stats { flex: 0 0 auto; display: flex; gap: 0.4rem; margin-left: auto; cursor: pointer; font-variant-numeric: tabular-nums; }
+.git-add, .diff-add { color: #3fb950; }
+.git-del, .diff-del { color: #f85149; }
+.git-diff { margin: 0 0 0.4rem 2rem; padding: 0.5rem 0.75rem; max-height: 28rem; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-deep); font: 0.8rem/1.45 var(--mono); white-space: pre; tab-size: 4; }
+.git-diff[hidden] { display: none; }
+.git-diff .diff-add { display: inline-block; min-width: 100%; background: rgba(63, 185, 80, 0.12); }
+.git-diff .diff-del { display: inline-block; min-width: 100%; background: rgba(248, 81, 73, 0.12); }
+.git-diff .diff-hunk { color: #58a6ff; }
+.git-diff .diff-meta { color: var(--muted); }
+[data-theme="catppuccin-latte"] .git-add, [data-theme="catppuccin-latte"] .diff-add, [data-theme="windows-11"] .git-add, [data-theme="windows-11"] .diff-add, [data-theme="liquid-glass"] .git-add, [data-theme="liquid-glass"] .diff-add { color: #1a7f37; }
+[data-theme="catppuccin-latte"] .git-del, [data-theme="catppuccin-latte"] .diff-del, [data-theme="windows-11"] .git-del, [data-theme="windows-11"] .diff-del, [data-theme="liquid-glass"] .git-del, [data-theme="liquid-glass"] .diff-del { color: #cf222e; }
+/* Popped out: the changes fill their own window. */
+body.changes-window { margin: 0; min-height: 100vh; background: var(--bg); color: var(--text); font-family: var(--sans); }
+.terminals-drawer.is-window { max-height: none; min-height: 100vh; box-sizing: border-box; border: 0; padding: 0.9rem 1.1rem; align-content: start; }
+.terminals-drawer.is-window .git-diff { max-height: none; }
 .terminals-files[hidden] { display: none; }
 .terminals-files { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.2rem; font-family: var(--mono); font-size: 0.85rem; }
 .terminals-files li { display: flex; gap: 0.6rem; }

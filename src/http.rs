@@ -331,6 +331,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
             post(terminal_upload).layer(DefaultBodyLimit::disable()),
         )
         .route("/api/terminals/changes", get(terminal_changes))
+        .route("/api/terminals/diff", get(terminal_diff))
         .route("/api/agents/stream", get(agent_stream))
         .route("/api/agents/integrations", get(agent_integrations).post(set_agent_integration))
         .route("/api/sync/tree", get(sync_tree))
@@ -4603,6 +4604,19 @@ fn git_changes(root: &std::path::Path, cwd: &std::path::Path) -> Result<serde_js
     if !status.status.success() {
         return Err("Git could not read this repository".into());
     }
+    // Lines added and removed per file, against the last commit (staged or not).
+    let mut counts: std::collections::HashMap<String, (Option<u64>, Option<u64>)> = std::collections::HashMap::new();
+    if let Ok(out) = git(&top, &["diff", "--numstat", "-z", "--no-renames", "HEAD"]) {
+        if out.status.success() {
+            for record in String::from_utf8_lossy(&out.stdout).split('\0').filter(|r| !r.is_empty()) {
+                let mut fields = record.splitn(3, '\t');
+                if let (Some(added), Some(deleted), Some(path)) = (fields.next(), fields.next(), fields.next()) {
+                    // Binary files count as "-".
+                    counts.insert(path.to_string(), (added.parse().ok(), deleted.parse().ok()));
+                }
+            }
+        }
+    }
     let raw = String::from_utf8_lossy(&status.stdout).to_string();
     let mut parts = raw.split('\0').filter(|part| !part.is_empty());
     let mut files = Vec::new();
@@ -4619,10 +4633,26 @@ fn git_changes(root: &std::path::Path, cwd: &std::path::Path) -> Result<serde_js
         total += 1;
         if files.len() < 300 {
             let full = top.join(&path);
+            let (added, deleted) = match counts.get(&path) {
+                Some(&(added, deleted)) => (added, deleted),
+                // A new file: all its lines are added (if it is text and not huge).
+                None if code == "??" => (
+                    std::fs::metadata(&full)
+                        .ok()
+                        .filter(|meta| meta.is_file() && meta.len() <= 2 * 1024 * 1024)
+                        .and_then(|_| std::fs::read(&full).ok())
+                        .filter(|bytes| !bytes.contains(&0))
+                        .map(|bytes| bytecount_lines(&bytes)),
+                    Some(0),
+                ),
+                None => (None, None),
+            };
             files.push(json!({
                 "status": if code == "??" { "new".to_string() } else { code },
                 "name": path,
                 "path": library_path(root, &top, &full.to_string_lossy()),
+                "added": added,
+                "deleted": deleted,
             }));
         }
     }
@@ -4634,6 +4664,71 @@ fn git_changes(root: &std::path::Path, cwd: &std::path::Path) -> Result<serde_js
         "total": total,
         "files": files,
     }))
+}
+
+fn bytecount_lines(bytes: &[u8]) -> u64 {
+    let breaks = bytes.iter().filter(|&&b| b == b'\n').count() as u64;
+    breaks + u64::from(!bytes.is_empty() && !bytes.ends_with(b"\n"))
+}
+
+#[derive(Deserialize)]
+struct TerminalDiffQuery {
+    id: String,
+    /// A path inside the repository, as the changes list gives it.
+    file: String,
+}
+
+/// What changed in one file of the repository a terminal is in: `git diff` against the last
+/// commit, or the whole file for one Git does not know yet.
+async fn terminal_diff(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    peer: Peer,
+    Query(query): Query<TerminalDiffQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    terminal_access(&state, &headers, &peer)?;
+    let session = state
+        .terminals
+        .get(&query.id)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That terminal is closed"))?;
+    let diff = tokio::task::spawn_blocking(move || git_diff(&session.current_dir(), &query.file))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the changes"))?
+        .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    Ok(Json(diff))
+}
+
+fn git_diff(cwd: &std::path::Path, file: &str) -> Result<serde_json::Value, String> {
+    const LIMIT: usize = 512 * 1024;
+    let inside = !file.is_empty() && std::path::Path::new(file).components().all(|part| matches!(part, std::path::Component::Normal(_)));
+    if !inside {
+        return Err("Choose a file in the repository".into());
+    }
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .output()
+            .map_err(|_| "Git is not installed on the server".to_string())
+    };
+    let top = git(cwd, &["rev-parse", "--show-toplevel"])?;
+    if !top.status.success() {
+        return Err("The terminal is no longer in a Git repository".into());
+    }
+    let top = std::path::PathBuf::from(String::from_utf8_lossy(&top.stdout).trim().to_string());
+    let mut out = git(&top, &["diff", "--no-color", "--no-ext-diff", "HEAD", "--", file])?.stdout;
+    if out.is_empty() {
+        // Not tracked yet (or no commit yet): the whole file, as added.
+        out = git(&top, &["diff", "--no-color", "--no-ext-diff", "--no-index", "--", "/dev/null", file])?.stdout;
+    }
+    let truncated = out.len() > LIMIT;
+    if truncated {
+        let cut = out[..LIMIT].iter().rposition(|&b| b == b'\n').map_or(LIMIT, |at| at + 1);
+        out.truncate(cut);
+    }
+    Ok(json!({ "diff": String::from_utf8_lossy(&out), "truncated": truncated }))
 }
 
 #[derive(Deserialize)]

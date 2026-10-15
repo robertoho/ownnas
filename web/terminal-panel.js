@@ -305,8 +305,39 @@ function renderFiles(item) {
 }
 
 async function renderChanges(item) {
-  const box = panel.querySelector(".terminals-drawer");
-  box.hidden = false;
+  await fillChanges(panel.querySelector(".terminals-drawer"), item);
+}
+
+let drawerTall = false;
+
+/// What a status code from `git status` means, for its colour and its words.
+function gitKind(status) {
+  if (status === "new" || status.includes("A")) return ["added", status === "new" ? "new" : "added"];
+  if (status.includes("D")) return ["deleted", "deleted"];
+  if (status.includes("R") || status.includes("C")) return ["renamed", "renamed"];
+  if (status.includes("U")) return ["conflict", "conflict"];
+  return ["modified", "changed"];
+}
+
+/// A diff with its lines coloured: added, removed, where each change is, and Git's own lines.
+function paintDiff(pre, text, truncated) {
+  pre.replaceChildren();
+  for (const line of text.replace(/\n$/, "").split("\n")) {
+    let kind = "";
+    if (line.startsWith("+++") || line.startsWith("---") || /^(diff --git|index |new file|deleted file|similarity|rename |old mode|new mode|Binary files)/.test(line)) kind = "diff-meta";
+    else if (line.startsWith("@@")) kind = "diff-hunk";
+    else if (line.startsWith("+")) kind = "diff-add";
+    else if (line.startsWith("-")) kind = "diff-del";
+    else if (line.startsWith("\\")) kind = "diff-meta";
+    pre.append(el("span", kind ? { class: kind } : {}, line || " "), "\n");
+  }
+  if (truncated) pre.append(el("span", { class: "diff-meta" }, "… (too long to show it all)"));
+}
+
+/// Fills `box` with the Git changes of terminal `item`: a summary with its buttons, then each
+/// changed file with its added and removed lines, which opens to show its diff in colour. `popup`
+/// is the window it is in when popped out.
+async function fillChanges(box, item, popup = null) {
   box.replaceChildren(el("p", { class: "muted" }, "Reading Git status…"));
   let data;
   try {
@@ -315,16 +346,29 @@ async function renderChanges(item) {
     box.replaceChildren(el("p", { class: "form-error" }, err.message));
     return;
   }
-  if (drawer !== "changes" || active !== item.id) return;
-  // The summary, with Refresh at its right, on one line.
+  if (!popup && (drawer !== "changes" || active !== item.id)) return;
+  const tool = (label, title, run) => {
+    const button = el("button", { type: "button", class: "terminals-drawer-btn", title }, label);
+    button.addEventListener("click", run);
+    return button;
+  };
+  // The summary, with the buttons at its right, on one line.
   const headed = (text) => {
-    const refresh = el("button", { type: "button", class: "terminals-drawer-refresh", title: "Read the changes again" }, "Refresh");
-    refresh.addEventListener("click", () => renderChanges(item));
-    // `el` takes text only: the parts go in with append.
     const row = el("div", { class: "terminals-drawer-head" });
-    row.append(el("p", { class: "muted" }, text), refresh);
+    row.append(el("p", { class: "muted" }, text));
+    if (!popup) {
+      const grow = tool(drawerTall ? "Smaller" : "Expand", drawerTall ? "Make the changes take less room" : "Give the changes more room", () => {
+        drawerTall = !drawerTall;
+        box.classList.toggle("is-tall", drawerTall);
+        grow.textContent = drawerTall ? "Smaller" : "Expand";
+      });
+      row.append(grow, tool("Pop out", "Open the changes in a window of their own", () => popOutChanges(item)));
+    }
+    row.append(tool("Refresh", "Read the changes again", () => fillChanges(box, item, popup)));
     return row;
   };
+  box.classList.toggle("is-tall", !popup && drawerTall);
+  if (popup) popup.document.title = `Git changes · ${data.repoName || tabLabel(item)}`;
   if (!data.repo) {
     box.replaceChildren(headed("The folder this terminal is in is not in a Git repository."));
     return;
@@ -333,14 +377,74 @@ async function renderChanges(item) {
     data.repoName ? `${data.repoName}${data.branch ? `, on ${data.branch}.` : "."}` : data.branch ? `On ${data.branch}.` : "",
     data.total ? `${data.total} changed ${data.total === 1 ? "file" : "files"}${data.summary ? ` (${data.summary})` : ""}.` : "No uncommitted changes.",
   ].join(" ").trim());
-  const list = el("ul", { class: "terminals-files", hidden: !data.files.length });
+  const list = el("ul", { class: "terminals-files git-files", hidden: !data.files.length });
   for (const file of data.files) {
-    const row = el("li");
-    row.append(el("span", { class: "git-status" }, file.status));
-    row.append(file.path ? fileButton(file.path, file.name) : el("span", {}, file.name));
+    const [kind, words] = gitKind(file.status);
+    const row = el("li", { class: "git-file" });
+    const line = el("div", { class: "git-row" });
+    const toggle = el("button", { type: "button", class: "git-toggle", "aria-expanded": "false", title: "Show what changed", "aria-label": `Show what changed in ${file.name}` }, "▸");
+    line.append(toggle, el("span", { class: `git-status git-${kind}`, title: words }, file.status === "new" ? "new" : file.status));
+    // A deleted file has nothing to open.
+    line.append(file.path && kind !== "deleted" ? fileButton(file.path, file.name) : el("span", { class: "git-name" }, file.name));
+    const stats = el("span", { class: "git-stats" });
+    if (file.added !== null && file.added !== undefined && !(kind === "deleted" && !file.added)) stats.append(el("span", { class: "git-add" }, `+${file.added}`));
+    if (file.deleted !== null && file.deleted !== undefined && file.deleted > 0) stats.append(el("span", { class: "git-del" }, `−${file.deleted}`));
+    if ((file.added === null || file.added === undefined) && kind !== "deleted") stats.append(el("span", { class: "muted" }, "binary"));
+    line.append(stats);
+    const pre = el("pre", { class: "git-diff", hidden: true });
+    let loaded = false;
+    const open = async () => {
+      const show = pre.hidden;
+      pre.hidden = !show;
+      toggle.textContent = show ? "▾" : "▸";
+      toggle.setAttribute("aria-expanded", String(show));
+      if (!show || loaded) return;
+      pre.replaceChildren(el("span", { class: "muted" }, "Reading…"));
+      try {
+        const diff = await ctx.api(`/api/terminals/diff?id=${encodeURIComponent(item.id)}&file=${encodeURIComponent(file.name)}`);
+        paintDiff(pre, diff.diff || "(no differences)", diff.truncated);
+        loaded = true;
+      } catch (err) {
+        pre.replaceChildren(el("span", { class: "form-error" }, err.message));
+      }
+    };
+    toggle.addEventListener("click", open);
+    stats.addEventListener("click", open);
+    row.append(line, pre);
     list.append(row);
   }
   box.replaceChildren(head, list);
+}
+
+/// The changes in a window of their own, kept up to date by this page (Refresh, file links).
+function popOutChanges(item) {
+  const win = window.open("", `ownnas-changes-${item.id}`, "popup,width=980,height=780");
+  if (!win) {
+    ctx.toast("The browser blocked the new window", true);
+    return;
+  }
+  const doc = win.document;
+  let root = doc.getElementById("changes-root");
+  if (!root) {
+    doc.documentElement.setAttribute("data-theme", document.documentElement.getAttribute("data-theme") || "ownnas");
+    const style = doc.createElement("link");
+    style.rel = "stylesheet";
+    style.href = new URL("/assets/app.css", location.href).href;
+    doc.head.append(style);
+    doc.body.className = "changes-window";
+    root = doc.createElement("div");
+    root.id = "changes-root";
+    root.className = "terminals-drawer is-window";
+    doc.body.append(root);
+    root.addEventListener("click", (event) => {
+      const file = event.target.closest("[data-open-file]");
+      if (!file) return;
+      ctx.openFile(file.dataset.openFile);
+      window.focus();
+    });
+  }
+  fillChanges(root, item, win);
+  win.focus();
 }
 
 function toggleDrawer(kind) {
