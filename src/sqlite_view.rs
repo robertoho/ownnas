@@ -518,7 +518,8 @@ mod tests {
     #[test]
     fn opens_paths_with_unusual_characters() {
         let dir = Scratch::new();
-        let odd = dir.path().join("100% café #1?");
+        // Windows does not allow `?` in names.
+        let odd = dir.path().join(if cfg!(windows) { "100% café #1" } else { "100% café #1?" });
         std::fs::create_dir(&odd).unwrap();
         let path = sample(&odd);
         let conn = open(&path).unwrap();
