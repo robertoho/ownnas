@@ -15,13 +15,7 @@
   <title>OwnNAS</title>
   <link rel="stylesheet" href="/assets/app.css">
   <link rel="stylesheet" href="/assets/docx-editor.css">
-  <script>
-    (() => {
-      const allowed = ["ownnas","tokyo-night","catppuccin","catppuccin-latte","everforest","gruvbox","kanagawa","osaka-jade","matte-black","rose-pine","liquid-glass","windows-11"];
-      const theme = localStorage.getItem("ownnas-theme");
-      document.documentElement.setAttribute("data-theme", allowed.includes(theme) ? theme : "ownnas");
-    })();
-  </script>
+  <script src="/assets/theme.js"></script>
 </head>
 <body>
   <div id="boot" class="boot" hidden>Opening OwnNAS…</div>

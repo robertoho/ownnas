@@ -220,7 +220,7 @@ export function mountSqliteViewer(container, { path, api }) {
   function renderSql() {
     body.replaceChildren(
       el("div", { class: "sqlite-query" }, editor, el("div", { class: "sqlite-query-actions" },
-        el("span", { class: "muted" }, "Read-only: SELECT, WITH, VALUES, or EXPLAIN. Up to 1,000 rows. ⌘↵ runs it."),
+        el("span", { class: "muted" }, `Read-only: SELECT, WITH, VALUES, or EXPLAIN. Up to 1,000 rows. ${document.documentElement.dataset.platform === "mac" ? "⌘↵" : "Ctrl+Enter"} runs it.`),
         run)),
       results,
     );

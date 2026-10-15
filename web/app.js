@@ -1,3 +1,25 @@
+// Macs show ⌘, ⌥ and ⇧ in shortcuts; Windows and Linux say Ctrl, Alt and Shift.
+const IS_MAC = /mac|iphone|ipad/i.test(navigator.userAgentData?.platform || navigator.platform || navigator.userAgent);
+document.documentElement.dataset.platform = IS_MAC ? "mac" : "other";
+
+// The page's security policy blocks style="…" in markup, so colors and widths that come from
+// data are written as data-css="…" and applied here, through the CSSOM (which it allows).
+function applyDataCss(node) {
+  if (node.nodeType !== 1) return;
+  const found = node.hasAttribute("data-css") ? [node] : [];
+  if (node.firstElementChild) found.push(...node.querySelectorAll("[data-css]"));
+  for (const target of found) {
+    target.style.cssText = target.getAttribute("data-css");
+    target.removeAttribute("data-css");
+  }
+}
+new MutationObserver((records) => {
+  for (const record of records) {
+    if (record.type === "attributes") applyDataCss(record.target);
+    else for (const added of record.addedNodes) applyDataCss(added);
+  }
+}).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["data-css"] });
+
 const state = {
   me: null,
   path: "",
@@ -161,7 +183,7 @@ function syncUndo() {
   const button = $("undo-btn");
   if (!button) return;
   button.disabled = undoBusy || !undoHistory.length || !state.me || state.me.readonly;
-  button.title = undoHistory.length ? `Undo ${undoHistory.at(-1).label} (Ctrl/Cmd+Z)` : "Nothing to undo";
+  button.title = undoHistory.length ? `Undo ${undoHistory.at(-1).label} (${commandLabel("Z")})` : "Nothing to undo";
 }
 async function undoFileOperation() {
   if (undoBusy || !undoHistory.length || !state.me || state.me.readonly) return;
@@ -414,7 +436,7 @@ function folderIcon(icon) {
 function entryIcon(entry) {
   if (!entry.dir || !entry.folderAppearance || ['archive-folder', 'trash-folder'].includes(entry.kind)) return typeIcon(entry.kind);
   const { color, icon } = entry.folderAppearance;
-  const style = /^#[0-9a-f]{6}$/i.test(color || '') ? ` style="color:${color}"` : '';
+  const style = /^#[0-9a-f]{6}$/i.test(color || '') ? ` data-css="color:${color}"` : '';
   return `<span class="folder-custom-icon"${style}>${folderIcon(icon)}</span>`;
 }
 function customizableFolder(entry) {
@@ -429,9 +451,9 @@ async function customizeFolders(entries) {
   $('folder-appearance-title').textContent = folders.length === 1 ? `Customize ${folders[0].name}` : `Customize ${folders.length} folders`;
   $('folder-appearance-icons').innerHTML = Object.entries(FOLDER_ICONS).map(([id, definition]) => `<button type="button" data-folder-icon="${id}" aria-label="${definition.label}" title="${definition.label}">${folderIcon(id)}<span>${definition.label}</span></button>`).join('');
   const colors = ['', '#eab308', '#f97316', '#ef4444', '#ec4899', '#a855f7', '#3b82f6', '#06b6d4', '#22c55e', '#94a3b8'];
-  $('folder-appearance-colors').innerHTML = colors.map(value => `<button type="button" data-folder-color="${value}" aria-label="${value || 'Default color'}" title="${value || 'Default color'}"${value ? ` style="background:${value}"` : ''}>${value ? '' : '↺'}</button>`).join('');
+  $('folder-appearance-colors').innerHTML = colors.map(value => `<button type="button" data-folder-color="${value}" aria-label="${value || 'Default color'}" title="${value || 'Default color'}"${value ? ` data-css="background:${value}"` : ''}>${value ? '' : '↺'}</button>`).join('');
   const paint = () => {
-    $('folder-appearance-preview').innerHTML = `<span class="folder-custom-icon"${color ? ` style="color:${color}"` : ''}>${folderIcon(icon)}</span><span>${esc(folders.length === 1 ? folders[0].name : `${folders.length} folders`)}</span>`;
+    $('folder-appearance-preview').innerHTML = `<span class="folder-custom-icon"${color ? ` data-css="color:${color}"` : ''}>${folderIcon(icon)}</span><span>${esc(folders.length === 1 ? folders[0].name : `${folders.length} folders`)}</span>`;
     $('folder-appearance-color').value = color || '#3b82f6';
     dialog.querySelectorAll('[data-folder-icon]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.folderIcon === icon)));
     dialog.querySelectorAll('[data-folder-color]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.folderColor === color)));
@@ -639,7 +661,7 @@ function renderFiles() {
     const tagStack = shownTags.length
       ? `<div class="tag-stack">${shownTags.map((tag) => {
           const color = tagColor(tag);
-          return `<button type="button" class="tag-badge" data-filter-tag="${esc(tag)}" title="${esc(tag)}" style="--tag-bg:${color}">${esc(tagInitials(tag))}</button>`;
+          return `<button type="button" class="tag-badge" data-filter-tag="${esc(tag)}" title="${esc(tag)}" data-css="--tag-bg:${color}">${esc(tagInitials(tag))}</button>`;
         }).join("")}${tags.length > 3 ? `<span class="tag-badge more-tags" title="${esc(tags.slice(3).join(", "))}">+${tags.length - 3}</span>` : ""}</div>`
       : "";
     if (state.view === "list") {
@@ -1619,7 +1641,6 @@ function syncTerminalButton() {
 
 // Page-wide shortcuts: ⇧⌘ and a key on Macs, Ctrl+Shift elsewhere. Terminals forward them
 // too (terminal.js), so they work wherever the keyboard is.
-const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
 const PAGE_SHORTCUTS = { KeyK: "shortcuts", KeyL: "terminals", KeyE: "new-terminal", KeyU: "hide-terminal", KeyX: "close-terminal", Enter: "expand-terminal" };
 const TILE_MOVES = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
 
@@ -1704,10 +1725,19 @@ function showShortcuts() {
       [commandLabel("↑"), "Go to the parent folder"],
       [commandLabel("A"), "Select everything"],
       [`${commandLabel("C")}, ${commandLabel("X")}, ${commandLabel("V")}`, "Copy, cut, paste"],
-      ["Delete", "Delete the selection"],
+      [IS_MAC ? "⌘⌫, Delete" : "Delete", "Delete the selection"],
       [commandLabel("Z"), "Undo the last file change"],
       [commandLabel("S"), "Save in the editor"],
       ["Esc", "Close, or clear the selection"],
+    ]],
+    ["Gallery", [
+      ["← ↑ ↓ →", "Move between photos (with Shift to select a range)"],
+      ["Enter", "Open the photo"],
+      [IS_MAC ? "⌘ click" : "Ctrl+click", "Add a photo to the selection, or take it out"],
+      ["Shift+click", "Select a range of photos"],
+      [IS_MAC ? "Drag, ⌘ drag" : "Drag, Ctrl+drag", "Select with a rubber band (adding to the selection)"],
+      [commandLabel("A"), "Select every photo shown"],
+      ["Esc", "Clear the selection"],
     ]],
   ];
   const list = $("shortcuts-list");
@@ -2385,7 +2415,7 @@ function renderAnnotations(data) {
   $("notes-summary-tags").innerHTML = tags.length
     ? tags.slice(0, 6).map((tag) => {
         const color = tagColor(tag);
-        return `<span class="tag-badge" title="${esc(tag)}" style="--tag-bg:${color}">${esc(tagInitials(tag))}</span>`;
+        return `<span class="tag-badge" title="${esc(tag)}" data-css="--tag-bg:${color}">${esc(tagInitials(tag))}</span>`;
       }).join("") + (tags.length > 6 ? `<span class="notes-empty-inline">+${tags.length - 6}</span>` : "")
     : `<span class="notes-empty-inline">No tags</span>`;
 
@@ -3172,7 +3202,7 @@ function renderJobsPanel(show) {
   list.innerHTML = items.map((job) => {
     const pct = job.percent;
     const barClass = pct == null ? "status-bar indeterminate" : "status-bar";
-    const width = pct == null ? "" : ` style="width:${Math.max(0, Math.min(100, Math.round(pct)))}%"`;
+    const width = pct == null ? "" : ` data-css="width:${Math.max(0, Math.min(100, Math.round(pct)))}%"`;
     const cancel = job.cancelable
       ? `<button type="button" data-job-cancel="${esc(job.id)}">Cancel</button>`
       : "";
@@ -4716,7 +4746,9 @@ window.addEventListener("keydown", (event) => {
     event.preventDefault();
     setClipboard("cut", entries);
   }
-  if (event.key === "Delete" && state.me && !state.me.readonly) {
+  // Mac keyboards have no Delete key (theirs is Backspace): ⌘⌫ there, as in the Finder.
+  const deleteKey = event.key === "Delete" || (IS_MAC && event.metaKey && event.key === "Backspace");
+  if (deleteKey && state.me && !state.me.readonly) {
     const entries = selectedEntries();
     if (!entries.length) return;
     event.preventDefault();
