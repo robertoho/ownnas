@@ -4254,7 +4254,7 @@ pub async fn start_agent_services(state: std::sync::Arc<AppState>) {
     }
     let poller = state.clone();
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             tick.tick().await;
             let state = poller.clone();

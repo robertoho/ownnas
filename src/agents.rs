@@ -303,6 +303,16 @@ impl Agent {
         changed
     }
 
+    /// The terminal has been silent for a while. An agent that works keeps redrawing (its
+    /// spinner moves), so one still marked as working has stopped without saying so, as Claude
+    /// does when interrupted with Esc (no Stop hook runs then).
+    pub fn went_quiet(&mut self) {
+        if self.hooked && self.status.as_deref() == Some("working") && now_ms() - self.updated > 10_000 {
+            self.set("idle", Some("Stopped".into()));
+            self.updated = now_ms();
+        }
+    }
+
     /// The terminal rang its bell or sent a desktop notification.
     pub fn notified(&mut self, message: Option<String>) {
         let message = message.map(|m| clip(&m, 160)).unwrap_or_else(|| match &self.label {

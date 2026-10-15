@@ -53,6 +53,11 @@ struct Screen {
     escapes: Escapes,
     title: Option<String>,
     last_output: Option<Instant>,
+    /// When the program drew on its own (not just echoing typing or redrawing after a resize),
+    /// for telling a busy agent from one that only redraws now and then.
+    drawn: VecDeque<Instant>,
+    /// Typing or resizing, after which the program's output is only an answer to that.
+    last_poke: Option<Instant>,
 }
 
 /// Something worth surfacing that a program wrote to the terminal.
@@ -264,6 +269,7 @@ impl Session {
     }
 
     pub fn write(&self, bytes: Vec<u8>) {
+        self.poked();
         let _ = self.input.send(bytes);
         // Typing in a terminal means the user has seen whatever it wanted.
         if self.agent.lock().unwrap_or_else(|err| err.into_inner()).attention.is_some() {
@@ -272,6 +278,7 @@ impl Session {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
+        self.poked();
         #[cfg(not(target_os = "android"))]
         {
             let size = pty_size(cols, rows);
@@ -295,7 +302,14 @@ impl Session {
         let mut signals = Vec::new();
         match &event {
             Event::Output(bytes) => {
-                screen.last_output = Some(Instant::now());
+                let now = Instant::now();
+                screen.last_output = Some(now);
+                if !screen.last_poke.is_some_and(|at| now.duration_since(at) < Duration::from_millis(300)) {
+                    if screen.drawn.len() >= 64 {
+                        screen.drawn.pop_front();
+                    }
+                    screen.drawn.push_back(now);
+                }
                 screen.escapes.feed(bytes, &mut signals);
                 screen.scrollback.extend(bytes.iter());
                 if screen.scrollback.len() > SCROLLBACK_BYTES {
@@ -335,9 +349,28 @@ impl Session {
         }
     }
 
-    fn recently_active(&self, within: Duration) -> bool {
+    /// Whether the program keeps drawing on its own, as an agent does while it works (its
+    /// spinner moves several times a second). One redraw now and then is not enough.
+    fn busy(&self) -> bool {
         let screen = self.screen.lock().unwrap_or_else(|err| err.into_inner());
-        screen.last_output.is_some_and(|at| at.elapsed() < within)
+        let mut slots: Vec<u128> = screen
+            .drawn
+            .iter()
+            .filter(|at| at.elapsed() < Duration::from_millis(1500))
+            .map(|at| at.elapsed().as_millis() / 250)
+            .collect();
+        slots.dedup();
+        slots.len() >= 3
+    }
+
+    /// Nothing at all has been written for this long.
+    fn silent_for(&self, quiet: Duration) -> bool {
+        let screen = self.screen.lock().unwrap_or_else(|err| err.into_inner());
+        screen.last_output.is_none_or(|at| at.elapsed() >= quiet)
+    }
+
+    fn poked(&self) {
+        self.screen.lock().unwrap_or_else(|err| err.into_inner()).last_poke = Some(Instant::now());
     }
 
     /// The program in the foreground of this terminal, if it is a known agent.
@@ -405,9 +438,13 @@ impl Terminals {
         let sessions: Vec<_> = self.sessions.lock().unwrap_or_else(|err| err.into_inner()).values().cloned().collect();
         for session in sessions {
             let Some(name) = session.foreground_agent() else { continue };
-            let active = session.recently_active(Duration::from_millis(2500));
+            let busy = session.busy();
+            let silent = session.silent_for(Duration::from_secs(10));
             session.update_agent(|agent| {
-                agent.detected(name, active);
+                agent.detected(name, busy);
+                if silent {
+                    agent.went_quiet();
+                }
             });
         }
     }
@@ -638,6 +675,8 @@ fn spawn_session(
             escapes: Escapes::default(),
             title: None,
             last_output: None,
+            drawn: VecDeque::new(),
+            last_poke: None,
         }),
         events,
         input,
