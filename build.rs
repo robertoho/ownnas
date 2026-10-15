@@ -4,6 +4,12 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let target = std::env::var("TARGET").unwrap_or_default();
+    // Smart search and faces need ONNX Runtime, which has no prebuilt library for Android or
+    // Intel Macs; those builds leave the features out (keep in step with Cargo.toml).
+    println!("cargo::rustc-check-cfg=cfg(ownnas_ml)");
+    if !target.contains("android") && target != "x86_64-apple-darwin" {
+        println!("cargo:rustc-cfg=ownnas_ml");
+    }
     if !target.ends_with("apple-darwin") {
         return;
     }

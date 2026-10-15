@@ -86,7 +86,7 @@ pub struct AppState {
     /// The Gallery's photo index, kept up to date in the background once started.
     pub media: std::sync::Arc<crate::media_index::Indexer>,
     /// The Gallery's machine-learning models (downloaded when switched on).
-    #[cfg(not(target_os = "android"))]
+    #[cfg(ownnas_ml)]
     pub models: std::sync::Arc<crate::ml::Models>,
     pub db_path: PathBuf,
 }
@@ -98,7 +98,7 @@ impl AppState {
             .and_then(|value| crate::media_index::Speed::parse(&value))
             .unwrap_or(crate::media_index::Speed::Medium);
         self.media.set_speed(speed);
-        #[cfg(not(target_os = "android"))]
+        #[cfg(ownnas_ml)]
         let _ = self.media.models.set(self.models.clone());
         self.media.start(self.db_path.clone(), self.root.clone(), self.thumbs.clone(), self.ffmpeg);
     }
@@ -154,7 +154,7 @@ pub fn new_state(
         terminals: crate::terminal::Terminals::default(),
         agent_url: std::sync::OnceLock::new(),
         media: std::sync::Arc::default(),
-        #[cfg(not(target_os = "android"))]
+        #[cfg(ownnas_ml)]
         models: std::sync::Arc::new(crate::ml::Models::new(&data_dir)),
         db_path,
     })
@@ -1593,7 +1593,7 @@ async fn set_gallery_settings(
 
 // ---- Smart search and people (on-device machine learning) ----
 
-#[cfg(not(target_os = "android"))]
+#[cfg(ownnas_ml)]
 fn ml_feature_on(state: &AppState, feature: crate::ml::Feature) -> bool {
     setting(state, feature.setting()).as_deref() == Some("1")
 }
@@ -1601,11 +1601,11 @@ fn ml_feature_on(state: &AppState, feature: crate::ml::Feature) -> bool {
 /// What the smart features are doing, for Settings and the Gallery.
 async fn ml_status(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
-    #[cfg(target_os = "android")]
+    #[cfg(not(ownnas_ml))]
     {
         return Ok(Json(json!({ "available": false })));
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(ownnas_ml)]
     {
         use crate::ml::Feature;
         let progress = {
@@ -1648,12 +1648,12 @@ async fn set_ml_settings(
     check_csrf(&headers)?;
     let (user, _) = require_user(&state, &headers)?;
     require_admin(&user)?;
-    #[cfg(target_os = "android")]
+    #[cfg(not(ownnas_ml))]
     {
         let _ = body;
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "Smart search is not available on this device"));
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(ownnas_ml)]
     {
         use crate::ml::Feature;
         for (feature, on) in [(Feature::Search, body.search), (Feature::Faces, body.faces)] {
@@ -1685,17 +1685,17 @@ async fn forget_faces(State(state): State<std::sync::Arc<AppState>>, headers: He
     {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
         crate::smart::forget_faces(&conn).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
-        #[cfg(not(target_os = "android"))]
+        #[cfg(ownnas_ml)]
         db::set_setting(&conn, crate::ml::Feature::Faces.setting(), Some("0")).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(ownnas_ml)]
     state.models.remove(crate::ml::Feature::Faces);
     let _ = std::fs::remove_dir_all(state.thumbs.join("faces"));
     record(&state, &user, "faces-forget", "all faces and people");
     Ok(Json(json!({ "ok": true })))
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(ownnas_ml)]
 fn search_ready(state: &AppState) -> Result<(), ApiError> {
     if !ml_feature_on(state, crate::ml::Feature::Search) || !state.models.ready(crate::ml::Feature::Search) {
         return Err(ApiError::new(StatusCode::CONFLICT, "Smart search is off. An administrator can turn it on in Settings → Gallery."));
@@ -1732,12 +1732,12 @@ async fn gallery_search(
     Query(query): Query<SmartSearchQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
-    #[cfg(target_os = "android")]
+    #[cfg(not(ownnas_ml))]
     {
         let _ = query;
         return Err::<Json<serde_json::Value>, _>(ApiError::new(StatusCode::BAD_REQUEST, "Smart search is not available on this device"));
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(ownnas_ml)]
     {
         search_ready(&state)?;
         let text = query.q.trim().chars().take(300).collect::<String>();
@@ -1774,12 +1774,12 @@ async fn gallery_similar(
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
-    #[cfg(target_os = "android")]
+    #[cfg(not(ownnas_ml))]
     {
         let _ = (query, body);
         return Err::<Json<serde_json::Value>, _>(ApiError::new(StatusCode::BAD_REQUEST, "Smart search is not available on this device"));
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(ownnas_ml)]
     {
         search_ready(&state)?;
         let sample = match &query.path {

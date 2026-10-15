@@ -44,6 +44,9 @@ jni = "0.21"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 portable-pty = "0.9"
+
+# Not on Intel Macs, where ONNX Runtime has no prebuilt library (see build.rs).
+[target.'cfg(not(any(target_os = "android", all(target_os = "macos", target_arch = "x86_64"))))'.dependencies]
 # Smart photo search and faces (models are downloaded when switched on). Linked statically,
 # so the server stays one file.
 ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-native", "api-31"] }

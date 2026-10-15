@@ -112,7 +112,7 @@ pub struct Indexer {
     soon: std::sync::atomic::AtomicBool,
     /// The photos' search descriptions, as searched in memory.
     pub descriptions: crate::smart::DescriptionCache,
-    #[cfg(not(target_os = "android"))]
+    #[cfg(ownnas_ml)]
     pub models: std::sync::OnceLock<Arc<crate::ml::Models>>,
 }
 
@@ -125,7 +125,7 @@ impl Default for Indexer {
             speed: std::sync::atomic::AtomicU8::new(1),
             soon: std::sync::atomic::AtomicBool::new(false),
             descriptions: crate::smart::DescriptionCache::default(),
-            #[cfg(not(target_os = "android"))]
+            #[cfg(ownnas_ml)]
             models: std::sync::OnceLock::new(),
         }
     }
@@ -182,7 +182,7 @@ impl Indexer {
             .spawn(move || loop {
                 indexer.run(&db_path, &root);
                 indexer.make_thumbnails(&db_path, &root, &thumbs, ffmpeg);
-                #[cfg(not(target_os = "android"))]
+                #[cfg(ownnas_ml)]
                 indexer.analyze(&db_path, &root, &thumbs, ffmpeg);
                 let wake = indexer.wake.lock().unwrap_or_else(|err| err.into_inner());
                 let (mut wake, _) = indexer
@@ -271,7 +271,7 @@ impl Indexer {
     }
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(ownnas_ml)]
 impl Indexer {
     fn asked_to_stop(&self) -> bool {
         *self.wake.lock().unwrap_or_else(|err| err.into_inner())

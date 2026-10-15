@@ -12,7 +12,7 @@ pub mod db;
 pub mod files;
 pub mod media_index;
 pub mod smart;
-#[cfg(not(target_os = "android"))]
+#[cfg(ownnas_ml)]
 pub mod ml;
 pub mod http;
 pub mod pdf_ops;

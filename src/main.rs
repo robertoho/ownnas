@@ -6,7 +6,7 @@ mod db;
 mod files;
 mod media_index;
 mod smart;
-#[cfg(not(target_os = "android"))]
+#[cfg(ownnas_ml)]
 mod ml;
 mod http;
 mod pdf_ops;
