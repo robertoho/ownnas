@@ -531,7 +531,9 @@ mod tests {
 
     #[test]
     fn tilde_expands_to_the_home_directory() {
-        let home = std::env::var_os("HOME").expect("home");
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .expect("home");
         assert_eq!(expand_home("~"), std::path::PathBuf::from(&home));
         assert_eq!(
             expand_home("~/Pictures"),
