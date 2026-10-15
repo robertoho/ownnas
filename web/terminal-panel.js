@@ -316,24 +316,31 @@ async function renderChanges(item) {
     return;
   }
   if (drawer !== "changes" || active !== item.id) return;
+  // The summary, with Refresh at its right, on one line.
+  const headed = (text) => {
+    const refresh = el("button", { type: "button", class: "terminals-drawer-refresh", title: "Read the changes again" }, "Refresh");
+    refresh.addEventListener("click", () => renderChanges(item));
+    // `el` takes text only: the parts go in with append.
+    const row = el("div", { class: "terminals-drawer-head" });
+    row.append(el("p", { class: "muted" }, text), refresh);
+    return row;
+  };
   if (!data.repo) {
-    box.replaceChildren(el("p", { class: "muted" }, "The folder this terminal is in is not in a Git repository."));
+    box.replaceChildren(headed("The folder this terminal is in is not in a Git repository."));
     return;
   }
-  const head = el("p", { class: "muted" }, [
+  const head = headed([
     data.repoName ? `${data.repoName}${data.branch ? `, on ${data.branch}.` : "."}` : data.branch ? `On ${data.branch}.` : "",
     data.total ? `${data.total} changed ${data.total === 1 ? "file" : "files"}${data.summary ? ` (${data.summary})` : ""}.` : "No uncommitted changes.",
   ].join(" ").trim());
-  const list = el("ul", { class: "terminals-files" });
+  const list = el("ul", { class: "terminals-files", hidden: !data.files.length });
   for (const file of data.files) {
     const row = el("li");
     row.append(el("span", { class: "git-status" }, file.status));
     row.append(file.path ? fileButton(file.path, file.name) : el("span", {}, file.name));
     list.append(row);
   }
-  const refresh = el("button", { type: "button" }, "Refresh");
-  refresh.addEventListener("click", () => renderChanges(item));
-  box.replaceChildren(head, list, refresh);
+  box.replaceChildren(head, list);
 }
 
 function toggleDrawer(kind) {

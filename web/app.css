@@ -2974,6 +2974,10 @@ dialog { color: var(--text); }
   justify-items: start;
 }
 .terminals-drawer p { margin: 0; }
+.terminals-drawer-head { display: flex; align-items: center; gap: 0.75rem; width: 100%; justify-self: stretch; }
+.terminals-drawer-head > p { flex: 1; min-width: 0; }
+.terminals-drawer-head .terminals-drawer-refresh { flex: 0 0 auto; padding: 0.2rem 0.65rem; font-size: 0.8rem; }
+.terminals-files[hidden] { display: none; }
 .terminals-files { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.2rem; font-family: var(--mono); font-size: 0.85rem; }
 .terminals-files li { display: flex; gap: 0.6rem; }
 .git-status { color: var(--muted); min-width: 2.4rem; }
