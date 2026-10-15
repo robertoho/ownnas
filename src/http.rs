@@ -4976,6 +4976,7 @@ struct ConvertVideoBody {
     #[serde(default = "normal_speed")]
     speed: f64,
     height: Option<u32>,
+    fps: Option<u32>,
     #[serde(default = "default_true")]
     audio: bool,
 }
@@ -5001,7 +5002,7 @@ async fn convert_video(
     if !state.ffmpeg {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "Converting videos needs ffmpeg on the server"));
     }
-    let plan = crate::video_edit::Plan { format: body.format.to_ascii_lowercase(), speed: body.speed, height: body.height, audio: body.audio };
+    let plan = crate::video_edit::Plan { format: body.format.to_ascii_lowercase(), speed: body.speed, height: body.height, fps: body.fps, audio: body.audio };
     plan.check().map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
     let found = files::resolve(&state.root, &rel_of(&Some(body.path.clone())))?;
     let name = found.full.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();

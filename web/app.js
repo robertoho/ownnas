@@ -3252,12 +3252,14 @@ async function convertVideos(paths, focus = "format") {
   $("video-speed").value = focus === "speed" ? "2" : "1";
   $("video-format").value = focus === "speed" ? "same" : "mp4";
   $("video-height").value = "";
+  $("video-fps").value = "";
   $("video-audio").checked = true;
   $("video-speeds").innerHTML = VIDEO_SPEEDS.map((speed) => `<button type="button" data-video-speed="${speed}">${speed}×</button>`).join("");
   const plan = () => ({
     speed: Number($("video-speed").value) || 1,
     format: $("video-format").value,
     height: $("video-height").value ? Number($("video-height").value) : null,
+    fps: $("video-fps").value ? Number($("video-fps").value) : null,
     audio: $("video-audio").checked,
   });
   const paint = () => {
@@ -3267,11 +3269,12 @@ async function convertVideos(paths, focus = "format") {
     const soundOnly = wanted.format === "mp3" || wanted.format === "m4a";
     $("video-audio").disabled = soundless || soundOnly || (info && info.hasAudio === false);
     $("video-height").disabled = soundOnly;
+    $("video-fps").disabled = soundOnly;
     const result = $("video-result");
     result.classList.remove("is-error");
     let problem = "";
     if (!(wanted.speed >= 0.25 && wanted.speed <= 16)) problem = "Choose a speed from 0.25× to 16×";
-    else if (wanted.format === "same" && wanted.speed === 1 && !wanted.height && wanted.audio) problem = "Choose a speed, a format, or a size";
+    else if (wanted.format === "same" && wanted.speed === 1 && !wanted.height && !wanted.fps && wanted.audio) problem = "Choose a speed, a format, a size, or a frame rate";
     else if (soundOnly && info && info.hasAudio === false) problem = "This video has no sound to keep";
     $("video-ok").disabled = !!problem;
     if (problem) {
@@ -3314,6 +3317,7 @@ async function convertVideos(paths, focus = "format") {
   if (!ok) return 0;
   const wanted = plan();
   if (wanted.format === "gif" || wanted.format === "mp3" || wanted.format === "m4a") wanted.audio = wanted.format !== "gif";
+  if (wanted.format === "mp3" || wanted.format === "m4a") wanted.fps = null;
   let made = 0;
   const problems = [];
   for (const [index, path] of paths.entries()) {

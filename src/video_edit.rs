@@ -20,6 +20,8 @@ pub struct Plan {
     pub speed: f64,
     /// At most this tall (keeping the shape); none keeps the size.
     pub height: Option<u32>,
+    /// Frames per second; none keeps the video's own.
+    pub fps: Option<u32>,
     pub audio: bool,
 }
 
@@ -42,8 +44,11 @@ impl Plan {
         if self.format != "same" && !FORMATS.iter().any(|(ext, _)| *ext == self.format) {
             return Err("That format is not one OwnNAS can make".into());
         }
-        if self.format == "same" && (self.speed - 1.0).abs() < 0.001 && self.height.is_none() {
-            return Err("Choose a format, a speed, or a size".into());
+        if self.format == "same" && (self.speed - 1.0).abs() < 0.001 && self.height.is_none() && self.fps.is_none() && self.audio {
+            return Err("Choose a format, a speed, a size, or a frame rate".into());
+        }
+        if self.fps.is_some_and(|fps| !(1..=120).contains(&fps)) {
+            return Err("Choose a frame rate from 1 to 120 frames a second".into());
         }
         if self.height.is_some_and(|h| !(120..=4320).contains(&h)) {
             return Err("Choose a size from 120 to 4320 pixels tall".into());
@@ -72,6 +77,9 @@ impl Plan {
         if let Some(height) = self.height {
             parts.push(format!("made {height}p"));
         }
+        if let Some(fps) = self.fps {
+            parts.push(format!("at {fps} fps"));
+        }
         if self.format != "same" {
             parts.push(format!("converted to {}", ext.to_uppercase()));
         }
@@ -91,6 +99,9 @@ impl Plan {
         }
         if let Some(height) = self.height {
             parts.push(format!("{height}p"));
+        }
+        if let Some(fps) = self.fps {
+            parts.push(format!("{fps}fps"));
         }
         if !self.audio {
             parts.push("no sound".into());
@@ -131,7 +142,7 @@ pub fn arguments(plan: &Plan, ext: &str, has_audio: bool) -> Vec<String> {
         if sped {
             chain.push(format!("setpts=PTS/{}", plan.speed));
         }
-        chain.push("fps=12".into());
+        chain.push(format!("fps={}", plan.fps.unwrap_or(12)));
         chain.push(format!("scale=-2:'min(ih,{})':flags=lanczos", plan.height.unwrap_or(480)));
         args.extend(["-filter_complex".into(), format!("[0:v]{},split[a][b];[a]palettegen[p];[b][p]paletteuse", chain.join(","))]);
         args.extend(["-an".into(), "-loop".into(), "0".into()]);
@@ -144,6 +155,10 @@ pub fn arguments(plan: &Plan, ext: &str, has_audio: bool) -> Vec<String> {
         }
         if let Some(scale) = scale {
             video.push(scale);
+        }
+        // After the speed change, so it is the rate the new video plays at.
+        if let Some(fps) = plan.fps {
+            video.push(format!("fps={fps}"));
         }
         if !video.is_empty() {
             args.extend(["-filter:v".into(), video.join(",")]);
@@ -347,7 +362,7 @@ mod tests {
     use super::*;
 
     fn plan(format: &str, speed: f64, height: Option<u32>, audio: bool) -> Plan {
-        Plan { format: format.into(), speed, height, audio }
+        Plan { format: format.into(), speed, height, fps: None, audio }
     }
 
     #[test]
@@ -375,5 +390,10 @@ mod tests {
         let sound = arguments(&plan("mp3", 1.0, None, true), "mp3", true).join(" ");
         assert!(sound.contains("-vn") && sound.contains("libmp3lame"), "{sound}");
         assert!(arguments(&plan("gif", 1.0, None, true), "gif", true).join(" ").contains("palettegen"));
+        let smooth = Plan { fps: Some(60), ..plan("mp4", 4.0, None, true) };
+        assert!(arguments(&smooth, "mp4", true).join(" ").contains("setpts=PTS/4,fps=60"));
+        assert_eq!(smooth.tag(), "4x, 60fps");
+        assert!(Plan { fps: Some(24), ..plan("same", 1.0, None, true) }.check().is_ok());
+        assert!(Plan { fps: Some(500), ..plan("mp4", 1.0, None, true) }.check().is_err());
     }
 }
