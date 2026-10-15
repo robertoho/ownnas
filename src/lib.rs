@@ -11,6 +11,7 @@ pub mod content_index;
 pub mod db;
 pub mod files;
 pub mod image_edit;
+pub mod video_edit;
 pub mod media_index;
 pub mod smart;
 #[cfg(ownnas_ml)]

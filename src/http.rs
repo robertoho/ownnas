@@ -288,6 +288,8 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/backup/upload", post(backup_upload).layer(DefaultBodyLimit::disable()))
         .route("/api/backup/has", get(backup_has))
         .route("/api/images/resize", post(resize_images))
+        .route("/api/videos/convert", post(convert_video))
+        .route("/api/videos/job", get(video_job).delete(cancel_video_job))
         .route("/api/backup/blocked", get(blocked_backups).post(block_backups).delete(unblock_backup))
         .route("/api/backup/blocked/preview", get(blocked_preview))
         .route("/api/ml/forget-faces", post(forget_faces))
@@ -1305,6 +1307,7 @@ async fn meta(
     require_user(&state, &headers)?;
     let root = state.root.clone();
     let rel = rel_of(&query.path);
+    let ffmpeg = state.ffmpeg;
     let payload = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, FileError> {
         let resolved = files::resolve(&root, &rel)?;
         if resolved.full.is_dir() {
@@ -1319,7 +1322,10 @@ async fn meta(
         let inspection = preview::inspect(&resolved.full, &name);
         let resizable = crate::image_edit::resizable(&name);
         let shown = if files::kind_of(&name) == "image" { crate::image_edit::shown_size(&resolved.full) } else { None };
+        let video = if ffmpeg && files::kind_of(&name) == "video" { crate::video_edit::probe(&resolved.full) } else { None };
         Ok(json!({
+            "duration": video.map(|(seconds, _)| seconds),
+            "hasAudio": video.map(|(_, audio)| audio),
             "width": shown.map(|(w, _)| w),
             "height": shown.map(|(_, h)| h),
             "resizable": resizable,
@@ -4958,6 +4964,120 @@ async fn resize_images(
         state.media.rescan_soon();
     }
     Ok(Json(json!({ "resized": done, "problems": problems })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConvertVideoBody {
+    path: String,
+    /// "same" keeps the format.
+    #[serde(default = "same_format")]
+    format: String,
+    #[serde(default = "normal_speed")]
+    speed: f64,
+    height: Option<u32>,
+    #[serde(default = "default_true")]
+    audio: bool,
+}
+
+fn same_format() -> String {
+    "same".into()
+}
+
+fn normal_speed() -> f64 {
+    1.0
+}
+
+/// Starts converting a video (another format, smaller, faster or slower) into a new file beside
+/// it; `/api/videos/job` follows it.
+async fn convert_video(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<ConvertVideoBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    if !state.ffmpeg {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Converting videos needs ffmpeg on the server"));
+    }
+    let plan = crate::video_edit::Plan { format: body.format.to_ascii_lowercase(), speed: body.speed, height: body.height, audio: body.audio };
+    plan.check().map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    let found = files::resolve(&state.root, &rel_of(&Some(body.path.clone())))?;
+    let name = found.full.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if !found.full.is_file() || files::kind_of(&name) != "video" {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose a video"));
+    }
+    if files::is_under_trash(&found.rel) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Restore it from the Trash first"));
+    }
+    let (stem, original_ext) = name.rsplit_once('.').unwrap_or((&name, ""));
+    let ext = plan.extension(original_ext);
+    let tag = plan.tag();
+    let wanted = if tag.is_empty() { format!("{stem}.{ext}") } else { format!("{stem} ({tag}).{ext}") };
+    let dir = found.full.parent().ok_or_else(|| ApiError::from(FileError::NotFound))?;
+    let output_full = files::unique_path(dir.join(wanted));
+    let output_name = output_full.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let parent = parent_rel_path(&found.rel);
+    let output = if parent.is_empty() { output_name } else { format!("{parent}/{output_name}") };
+    let operation = plan.describe(&ext);
+    let worker = state.clone();
+    let (source, made) = (found.rel.clone(), output.clone());
+    let source_full = found.full.clone();
+    let job = crate::video_edit::start(found.rel.clone(), found.full.clone(), output.clone(), output_full, plan, move |written| {
+        // Which video this one came from, by SHA-256, as for resized photos.
+        let hash = |path: &std::path::Path| -> Option<(String, u64, i64)> {
+            use sha2::Digest;
+            let meta = std::fs::metadata(path).ok()?;
+            let mut file = std::fs::File::open(path).ok()?;
+            let mut hasher = sha2::Sha256::new();
+            std::io::copy(&mut file, &mut hasher).ok()?;
+            let mtime = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as i64;
+            Some((hex::encode(hasher.finalize()), meta.len(), mtime))
+        };
+        if let (Some((parent_sha, parent_size, parent_mtime)), Some((sha, size, mtime))) = (hash(&source_full), hash(written)) {
+            let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
+            let _ = db::store_hash(&conn, &source, parent_size, parent_mtime, &parent_sha);
+            let _ = db::store_hash(&conn, &made, size, mtime, &sha);
+            let _ = db::record_version(&conn, &db::ImageVersion {
+                sha256: sha,
+                parent: parent_sha,
+                operation,
+                width: None,
+                height: None,
+                parent_width: None,
+                parent_height: None,
+                path: made.clone(),
+                parent_path: source.clone(),
+                created_at: db::now_secs(),
+                created_by: user.username.clone(),
+            });
+        }
+        record(&worker, &user, "convert-video", &format!("{source} → {made}"));
+        invalidate_sizes(&worker, &parent_rel_path(&made));
+        worker.media.rescan_soon();
+    });
+    Ok(Json(json!({ "job": job.status() })))
+}
+
+#[derive(Deserialize)]
+struct JobQuery {
+    id: String,
+}
+
+async fn video_job(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, Query(query): Query<JobQuery>) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let job = crate::video_edit::job(&query.id).ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That conversion is over"))?;
+    Ok(Json(json!({ "job": job.status() })))
+}
+
+async fn cancel_video_job(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, Query(query): Query<JobQuery>) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    require_user(&state, &headers)?;
+    if let Some(job) = crate::video_edit::job(&query.id) {
+        job.cancel();
+    }
+    Ok(Json(json!({ "ok": true })))
 }
 
 fn record(state: &AppState, user: &User, action: &str, detail: &str) {

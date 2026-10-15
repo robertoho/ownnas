@@ -5,6 +5,7 @@ mod content_index;
 mod db;
 mod files;
 mod image_edit;
+mod video_edit;
 mod media_index;
 mod smart;
 #[cfg(ownnas_ml)]

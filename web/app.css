@@ -2752,6 +2752,7 @@ dialog { color: var(--text); }
 .resize-row { display: flex; align-items: center; gap: 8px; margin: 0; }
 .resize-row > span:first-of-type { min-width: 6.5rem; }
 .resize-row input[type="number"] { width: 6rem; }
+.resize-row select { flex: 1; min-width: 0; }
 .resize-quality { display: flex; align-items: center; gap: 10px; margin: 4px 0; }
 .resize-quality input { flex: 1; accent-color: var(--accent); }
 .resize-quality output { min-width: 2.2rem; text-align: right; font-variant-numeric: tabular-nums; }

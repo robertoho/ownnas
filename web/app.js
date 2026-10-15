@@ -914,6 +914,8 @@ const MENU_ICONS = {
   delete: ICON_TRASH,
   deleteBlock: `${ICON_TRASH} M10.5 10.5l4 4 M14.5 10.5l-4 4`,
   resize: "M2.5 6.5v-4h4 M2.5 2.5l4.5 4.5 M13.5 9.5v4h-4 M13.5 13.5L9 9",
+  convertVideo: "M2.5 4h7a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z M10.5 7l4-2v6l-4-2",
+  speedVideo: "M2.5 4.5l5 3.5-5 3.5z M8.5 4.5l5 3.5-5 3.5z",
   paste: "M5.5 3h-1a1 1 0 0 0-1 1v9.5a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1V4a1 1 0 0 0-1-1h-1 M6 2h4v2H6z",
   restore: "M3 8a5 5 0 1 0 1.5-3.55 M2.5 2.5v2.5H5",
   copy: ICON_COPY,
@@ -1236,6 +1238,10 @@ function openSelectionMenu(x, y, pasteInto) {
     }
     if (write && entries.length && entries.every(isResizable) && !allInTrash) {
       buttons.push(`<button type="button" data-menu="resize">Resize…</button>`);
+    }
+    if (write && state.me && state.me.ffmpeg && entries.length && entries.every((entry) => !entry.dir && entry.kind === "video") && !allInTrash) {
+      buttons.push(`<button type="button" data-menu="convertVideo">Convert video…</button>`);
+      buttons.push(`<button type="button" data-menu="speedVideo">Change speed…</button>`);
     }
     const pdfs = entries.filter((entry) => entry.kind === "pdf");
     if (write && pdfs.length && pdfs.length === entries.length && !allInTrash) {
@@ -1799,6 +1805,8 @@ async function gallery() {
       decorateMenu: (menu) => decorateMenu(menu),
       deleteAndBlock,
       resize: (paths) => resizeImages(paths),
+      convertVideos: (paths, focus) => convertVideos(paths, focus),
+      canConvertVideos: () => !!(state.me && state.me.ffmpeg),
     });
   }
   return galleryApi;
@@ -3222,6 +3230,140 @@ async function resizeImages(paths) {
   return resized;
 }
 
+const VIDEO_SPEEDS = [0.5, 1, 1.5, 2, 4, 8, 16];
+
+function clock(seconds) {
+  const total = Math.max(0, Math.round(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = String(total % 60).padStart(2, "0");
+  return h ? `${h}:${String(m).padStart(2, "0")}:${s}` : `${m}:${s}`;
+}
+
+/// Asks how to convert videos (format, size, speed, sound), then has the server make each one
+/// beside its original, following them in the jobs panel. `focus` is "speed" or "format".
+async function convertVideos(paths, focus = "format") {
+  if (!paths.length) return 0;
+  const dialog = $("video-dialog");
+  const one = paths.length === 1;
+  let info = null;
+  $("video-title").textContent = focus === "speed"
+    ? (one ? `Change the speed of “${paths[0].split("/").pop()}”` : `Change the speed of ${paths.length} videos`)
+    : (one ? `Convert “${paths[0].split("/").pop()}”` : `Convert ${paths.length} videos`);
+  $("video-current").textContent = one ? "Reading the video…" : "Each one becomes a new file beside it.";
+  $("video-speed").value = focus === "speed" ? "2" : "1";
+  $("video-format").value = focus === "speed" ? "same" : "mp4";
+  $("video-height").value = "";
+  $("video-audio").checked = true;
+  $("video-speeds").innerHTML = VIDEO_SPEEDS.map((speed) => `<button type="button" data-video-speed="${speed}">${speed}×</button>`).join("");
+  const plan = () => ({
+    speed: Number($("video-speed").value) || 1,
+    format: $("video-format").value,
+    height: $("video-height").value ? Number($("video-height").value) : null,
+    audio: $("video-audio").checked,
+  });
+  const paint = () => {
+    const wanted = plan();
+    dialog.querySelectorAll("[data-video-speed]").forEach((button) => button.setAttribute("aria-pressed", String(Number(button.dataset.videoSpeed) === wanted.speed)));
+    const soundless = wanted.format === "gif";
+    const soundOnly = wanted.format === "mp3" || wanted.format === "m4a";
+    $("video-audio").disabled = soundless || soundOnly || (info && info.hasAudio === false);
+    $("video-height").disabled = soundOnly;
+    const result = $("video-result");
+    result.classList.remove("is-error");
+    let problem = "";
+    if (!(wanted.speed >= 0.25 && wanted.speed <= 16)) problem = "Choose a speed from 0.25× to 16×";
+    else if (wanted.format === "same" && wanted.speed === 1 && !wanted.height && wanted.audio) problem = "Choose a speed, a format, or a size";
+    else if (soundOnly && info && info.hasAudio === false) problem = "This video has no sound to keep";
+    $("video-ok").disabled = !!problem;
+    if (problem) {
+      result.textContent = problem;
+      result.classList.add("is-error");
+    } else if (info && info.duration) {
+      result.textContent = wanted.speed === 1 ? `${clock(info.duration)} long` : `${clock(info.duration)} → ${clock(info.duration / wanted.speed)}`;
+    } else {
+      result.textContent = "";
+    }
+  };
+  if (one) {
+    api(`/api/meta?path=${encodeURIComponent(paths[0])}`).then((meta) => {
+      info = meta;
+      $("video-current").textContent = [meta.duration ? `${clock(meta.duration)} long` : "", formatSize(meta.size), meta.hasAudio === false ? "no sound" : ""].filter(Boolean).join(", ");
+      paint();
+    }).catch(() => { $("video-current").textContent = ""; });
+  }
+  paint();
+  dialog.returnValue = "";
+  dialog.showModal();
+  if (focus === "speed") $("video-speed").focus();
+  const ok = await new Promise((resolve) => {
+    const click = (event) => {
+      const speed = event.target.closest("[data-video-speed]");
+      if (!speed) return;
+      $("video-speed").value = speed.dataset.videoSpeed;
+      paint();
+    };
+    dialog.addEventListener("click", click);
+    dialog.addEventListener("input", paint);
+    dialog.addEventListener("change", paint);
+    dialog.addEventListener("close", () => {
+      dialog.removeEventListener("click", click);
+      dialog.removeEventListener("input", paint);
+      dialog.removeEventListener("change", paint);
+      resolve(dialog.returnValue === "ok");
+    }, { once: true });
+  });
+  if (!ok) return 0;
+  const wanted = plan();
+  if (wanted.format === "gif" || wanted.format === "mp3" || wanted.format === "m4a") wanted.audio = wanted.format !== "gif";
+  let made = 0;
+  const problems = [];
+  for (const [index, path] of paths.entries()) {
+    const id = `video-${++jobState.seq}`;
+    const name = path.split("/").pop();
+    let job;
+    try {
+      job = (await api("/api/videos/convert", { method: "POST", json: { path, ...wanted } })).job;
+    } catch (err) {
+      problems.push({ path, error: err.message });
+      continue;
+    }
+    let cancelled = false;
+    const show = (progress) => upsertJob(id, {
+      title: paths.length > 1 ? `Convert videos (${index + 1} of ${paths.length})` : "Convert video",
+      detail: `${name} → ${job.output.split("/").pop()}`,
+      percent: progress * 100,
+      cancelable: true,
+      onCancel: () => {
+        cancelled = true;
+        api(`/api/videos/job?id=${encodeURIComponent(job.id)}`, { method: "DELETE" }).catch(() => {});
+      },
+    });
+    show(0);
+    try {
+      while (!job.done) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        job = (await api(`/api/videos/job?id=${encodeURIComponent(job.id)}`)).job;
+        show(job.progress || 0);
+      }
+    } catch (err) {
+      job = { ...job, error: err.message };
+    } finally {
+      removeJob(id);
+    }
+    if (cancelled) break;
+    if (job.error) problems.push({ path, error: job.error });
+    else made += 1;
+  }
+  if (made) toast(made === 1 ? "The video is ready" : `${made} videos are ready`);
+  if (problems.length) toast(`${problems.length === 1 ? problems[0].path.split("/").pop() : `${problems.length} videos`}: ${problems[0].error}`, true);
+  if (made) {
+    if (state.me && !location.hash.startsWith("#gallery")) await load(state.path, { keepPreview: true }).catch(() => {});
+    galleryApi?.refresh();
+  }
+  return made;
+}
+
 async function deleteAndBlock(paths) {
   if (!paths.length) return 0;
   const what = paths.length === 1 ? `“${paths[0].split("/").pop()}”` : `${paths.length} photos and videos`;
@@ -4463,6 +4605,9 @@ function runMenuAction(button, entries, pasteInto) {
   if (action === "move") moveEntries(entries).catch((err) => toast(err.message, true));
   if (action === "convert") convertImages(entries, format).catch((err) => toast(err.message, true));
   if (action === "resize") resizeImages(entries.map((entry) => entry.path)).catch((err) => toast(err.message, true));
+  if (action === "convertVideo" || action === "speedVideo") {
+    convertVideos(entries.map((entry) => entry.path), action === "speedVideo" ? "speed" : "format").catch((err) => toast(err.message, true));
+  }
   if (action === "compress") compressEntries(entries, format).catch((err) => toast(err.message, true));
   if (action === "pdfExtract") pdfExtractPages(entries).catch((err) => toast(err.message, true));
   if (action === "pdfSplit") pdfSplitPages(entries).catch((err) => toast(err.message, true));

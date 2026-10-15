@@ -702,6 +702,45 @@
       </div>
     </form>
   </dialog>
+  <dialog id="video-dialog" class="resize-dialog video-dialog" aria-labelledby="video-title">
+    <form method="dialog">
+      <h3 id="video-title">Convert video</h3>
+      <p id="video-current" class="muted"></p>
+      <fieldset>
+        <legend>Speed</legend>
+        <div id="video-speeds" class="resize-presets" role="group" aria-label="Speed"></div>
+        <label class="resize-row"><span>Or exactly</span><input id="video-speed" type="number" min="0.25" max="16" step="0.05" value="1" aria-label="Speed"><span>× as fast</span></label>
+      </fieldset>
+      <fieldset>
+        <legend>Make it</legend>
+        <label class="resize-row"><span>Format</span><select id="video-format">
+          <option value="same">The same format</option>
+          <option value="mp4">MP4 (plays everywhere)</option>
+          <option value="webm">WebM (smaller, for the web)</option>
+          <option value="mov">MOV (QuickTime)</option>
+          <option value="mkv">MKV</option>
+          <option value="gif">GIF animation (no sound)</option>
+          <option value="mp3">MP3 (only the sound)</option>
+          <option value="m4a">M4A (only the sound)</option>
+        </select></label>
+        <label class="resize-row"><span>Size</span><select id="video-height">
+          <option value="">As it is</option>
+          <option value="2160">4K (2160p)</option>
+          <option value="1080">Full HD (1080p)</option>
+          <option value="720">HD (720p)</option>
+          <option value="480">Small (480p)</option>
+          <option value="360">Smaller (360p)</option>
+        </select></label>
+        <label class="resize-choice"><input id="video-audio" type="checkbox" checked><span>Keep the sound<small>When it plays faster or slower, voices keep their pitch.</small></span></label>
+      </fieldset>
+      <p id="video-result" class="resize-result"></p>
+      <p class="muted resize-note">A new file is made beside the original, which is not changed. Long videos take a while; it carries on in the background (see the jobs at the bottom).</p>
+      <div class="dialog-actions">
+        <button value="cancel" type="submit">Cancel</button>
+        <button id="video-ok" value="ok" type="submit" class="primary">Convert</button>
+      </div>
+    </form>
+  </dialog>
   <dialog id="resize-dialog" class="resize-dialog" aria-labelledby="resize-title">
     <form method="dialog">
       <h3 id="resize-title">Resize photo</h3>
