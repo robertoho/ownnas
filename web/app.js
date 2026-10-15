@@ -5244,14 +5244,17 @@ window.addEventListener("drop", async (event) => {
   hideDrop();
   if (!state.me || state.me.readonly || !draggingFiles(event)) return;
   event.preventDefault();
+  // Outside the try: the folder is shown again after the upload, also when it failed part way.
+  const destination = state.path;
   try {
-    const destination = state.path;
     const transfer = await readDrop(event.dataTransfer);
     await pasteExternalTransfer(transfer, destination);
   } catch (err) {
     toast(err.cancel ? "Upload cancelled" : err.message, !err.cancel);
   }
-  if (state.me && state.path === destination) load(destination).catch((err) => toast(err.message, true));
+  if (!state.me) return;
+  invalidateFolderSizes();
+  if (state.path === destination) load(destination, { keepPreview: true }).catch((err) => toast(err.message, true));
 });
 
 async function refreshLibrary() {
