@@ -57,10 +57,10 @@ const GAP = 4; // between photos, as in the CSS
 /// How photos are laid out: square crops, rows that keep each photo's shape, columns of
 /// different heights, or a list with the details.
 const VIEWS = [
-  { id: "grid", label: "Squares", icon: '<rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/>' },
-  { id: "justified", label: "Rows", icon: '<rect x="1.5" y="2" width="7" height="5" rx="1"/><rect x="10" y="2" width="4.5" height="5" rx="1"/><rect x="1.5" y="9" width="4" height="5" rx="1"/><rect x="7" y="9" width="7.5" height="5" rx="1"/>' },
-  { id: "masonry", label: "Masonry", icon: '<rect x="2" y="1.5" width="5" height="7" rx="1"/><rect x="9" y="1.5" width="5" height="4" rx="1"/><rect x="2" y="10" width="5" height="4.5" rx="1"/><rect x="9" y="7" width="5" height="7.5" rx="1"/>' },
-  { id: "list", label: "Details", icon: '<rect x="1.5" y="2" width="3.5" height="3" rx="0.8"/><rect x="1.5" y="6.5" width="3.5" height="3" rx="0.8"/><rect x="1.5" y="11" width="3.5" height="3" rx="0.8"/><path d="M7 3.5h7.5M7 8h7.5M7 12.5h7.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>' },
+  { id: "grid", label: "Squares", icon: '<rect x="1" y="1" width="6" height="6" rx="1"/><rect x="9" y="1" width="6" height="6" rx="1"/><rect x="1" y="9" width="6" height="6" rx="1"/><rect x="9" y="9" width="6" height="6" rx="1"/>' },
+  { id: "justified", label: "Rows", icon: '<rect x="1" y="1" width="8" height="6" rx="1"/><rect x="11" y="1" width="4" height="6" rx="1"/><rect x="1" y="9" width="4" height="6" rx="1"/><rect x="7" y="9" width="8" height="6" rx="1"/>' },
+  { id: "masonry", label: "Masonry", icon: '<rect x="1" y="1" width="6" height="8" rx="1"/><rect x="9" y="1" width="6" height="4" rx="1"/><rect x="9" y="7" width="6" height="8" rx="1"/><rect x="1" y="11" width="6" height="4" rx="1"/>' },
+  { id: "list", label: "Details", icon: '<rect x="1" y="1.5" width="4" height="3.5" rx="0.8"/><rect x="1" y="6.25" width="4" height="3.5" rx="0.8"/><rect x="1" y="11" width="4" height="3.5" rx="0.8"/><path d="M7.5 3.25h7M7.5 8h7M7.5 12.75h7" stroke-linecap="round"/>' },
 ];
 
 function storedView() {
@@ -119,20 +119,23 @@ export function mountGallery(root, ctx) {
   let sample = null; // a picture dropped in, to find photos like it
   let people = [];
   let currentPerson = null;
-  const status = el("span", { class: "gallery-status", role: "status" });
+  const status = el("span", { class: "gallery-status" });
   const actions = el("div", { class: "gallery-actions" });
   const size = el("input", { type: "range", class: "gallery-size", min: "80", max: "320", step: "10", "aria-label": "Photo size", title: "Photo size" });
-  const sizeControl = el("label", { class: "gallery-size-control", title: "Photo size" },
-    el("span", { class: "gallery-size-small", "aria-hidden": "true" }), size, el("span", { class: "gallery-size-large", "aria-hidden": "true" }));
+  const sizeControl = el("label", { class: "tile-size-control gallery-size-control", title: "Photo size" }, el("span", {}, "Size"), size);
   let view = storedView();
-  const viewSwitch = el("div", { class: "gallery-views", role: "radiogroup", "aria-label": "Layout" });
+  const viewSwitch = el("div", { class: "view-switch gallery-views", role: "group", "aria-label": "Layout" });
   for (const option of VIEWS) {
-    const button = el("button", { type: "button", "data-view": option.id, role: "radio", title: option.label, "aria-label": option.label });
-    button.innerHTML = `<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true">${option.icon}</svg>`;
+    const button = el("button", { type: "button", "data-view": option.id, title: option.label, "aria-label": `${option.label} layout` });
+    button.innerHTML = `<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">${option.icon}</svg>`;
     button.addEventListener("click", () => setView(option.id));
     viewSwitch.append(button);
   }
-  const head = el("div", { class: "gallery-head" }, tabs, searchBox, status, actions, viewSwitch, sizeControl);
+  const head = el("div", { class: "gallery-head" }, tabs, searchBox, actions);
+  // At the bottom, as in the file browser: what is shown on the left, how it is shown on the right.
+  const footer = el("footer", { class: "explorer-status-bar gallery-status-bar", "aria-label": "Gallery status and layout" },
+    el("div", { class: "status-summary", role: "status", "aria-live": "polite" }, status),
+    el("div", { class: "gallery-status-tools" }, viewSwitch, el("span", { class: "gallery-status-divider", "aria-hidden": "true" }), sizeControl));
   const selectionBar = el("div", { class: "gallery-selection", hidden: true });
   const body = el("div", { class: "gallery-body" });
   const scroller = el("div", { class: "gallery-scroller" }, body);
@@ -141,7 +144,7 @@ export function mountGallery(root, ctx) {
   const scrubber = el("div", { class: "gallery-scrubber", hidden: true, title: "Drag to jump to a date" });
   // The selection bar floats over the photos, so showing it never moves them under the pointer.
   const viewport = el("div", { class: "gallery-viewport" }, scroller, scrubber, selectionBar);
-  root.replaceChildren(head, viewport);
+  root.replaceChildren(head, viewport, footer);
   size.value = String(storedSize());
   size.addEventListener("input", () => applySize(Number(size.value)));
 
@@ -530,12 +533,10 @@ export function mountGallery(root, ctx) {
 
   function paintView() {
     body.dataset.view = view;
-    sizeControl.hidden = view === "list";
-    for (const button of viewSwitch.children) {
-      const on = button.dataset.view === view;
-      button.classList.toggle("is-active", on);
-      button.setAttribute("aria-checked", String(on));
-    }
+    // The list has no photo size; the slider stays in place so nothing moves.
+    size.disabled = view === "list";
+    sizeControl.classList.toggle("is-disabled", view === "list");
+    for (const button of viewSwitch.children) button.setAttribute("aria-pressed", String(button.dataset.view === view));
   }
   paintView();
 
