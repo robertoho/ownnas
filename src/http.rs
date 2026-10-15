@@ -4566,9 +4566,9 @@ async fn terminal_changes(
         .terminals
         .get(&query.id)
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That terminal is closed"))?;
-    let cwd = session.cwd().to_path_buf();
     let root = state.root.clone();
-    let changes = tokio::task::spawn_blocking(move || git_changes(&root, &cwd))
+    // Where the terminal is now (after any `cd`), as Show folder does, not where it started.
+    let changes = tokio::task::spawn_blocking(move || git_changes(&root, &session.current_dir()))
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the changes"))?
         .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
@@ -4628,6 +4628,7 @@ fn git_changes(root: &std::path::Path, cwd: &std::path::Path) -> Result<serde_js
     }
     Ok(json!({
         "repo": true,
+        "repoName": top.file_name().map(|name| name.to_string_lossy().into_owned()),
         "branch": branch,
         "summary": summary,
         "total": total,

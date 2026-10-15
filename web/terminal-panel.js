@@ -317,11 +317,11 @@ async function renderChanges(item) {
   }
   if (drawer !== "changes" || active !== item.id) return;
   if (!data.repo) {
-    box.replaceChildren(el("p", { class: "muted" }, "This folder is not in a Git repository."));
+    box.replaceChildren(el("p", { class: "muted" }, "The folder this terminal is in is not in a Git repository."));
     return;
   }
   const head = el("p", { class: "muted" }, [
-    data.branch ? `On ${data.branch}.` : "",
+    data.repoName ? `${data.repoName}${data.branch ? `, on ${data.branch}.` : "."}` : data.branch ? `On ${data.branch}.` : "",
     data.total ? `${data.total} changed ${data.total === 1 ? "file" : "files"}${data.summary ? ` (${data.summary})` : ""}.` : "No uncommitted changes.",
   ].join(" ").trim());
   const list = el("ul", { class: "terminals-files" });
