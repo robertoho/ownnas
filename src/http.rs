@@ -285,6 +285,8 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/backup", get(backup_config).post(set_backup_config))
         .route("/api/backup/upload", post(backup_upload).layer(DefaultBodyLimit::disable()))
         .route("/api/backup/has", get(backup_has))
+        .route("/api/backup/blocked", get(blocked_backups).post(block_backups).delete(unblock_backup))
+        .route("/api/backup/blocked/preview", get(blocked_preview))
         .route("/api/ml/forget-faces", post(forget_faces))
         .route("/api/gallery/search", get(gallery_search))
         .route("/api/gallery/similar", get(gallery_similar).post(gallery_similar).layer(DefaultBodyLimit::max(60 * 1024 * 1024)))
@@ -2142,6 +2144,149 @@ fn find_backup_copy(state: &AppState, target: &str, size: Option<u64>, sha256: O
     None
 }
 
+fn backup_blocked(state: &AppState, sha256: &str) -> bool {
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    db::is_backup_blocked(&conn, sha256)
+}
+
+/// A small JPEG of a photo or video, kept with a deleted photo so people can see what it was.
+fn small_preview(state: &AppState, full: &std::path::Path, name: &str) -> Option<Vec<u8>> {
+    if !files::can_thumb(name, state.ffmpeg) {
+        return None;
+    }
+    let cached = thumbs::ensure(full, &state.thumbs, files::kind_of(name) == "video").ok()?;
+    let bytes = thumbs::read_cached(&cached).ok()?;
+    let picture = image::load_from_memory(&bytes).ok()?.thumbnail(192, 192).to_rgb8();
+    let mut out = Vec::new();
+    picture.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Jpeg).ok()?;
+    Some(out)
+}
+
+#[derive(Deserialize)]
+struct BlockBody {
+    paths: Vec<String>,
+    /// Also delete the files (into Trash, or for good when already there). On by default.
+    #[serde(default = "default_true")]
+    delete: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Remembers photos (by SHA-256) so phones never back them up again, and deletes them.
+async fn block_backups(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<BlockBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let worker = state.clone();
+    let (blocked, problems) = tokio::task::spawn_blocking(move || {
+        let state = worker;
+        let mut blocked = 0;
+        let mut problems = Vec::new();
+        for raw in body.paths {
+            let rel = rel_of(&Some(raw.clone()));
+            let outcome = (|| -> Result<(), ApiError> {
+                let resolved = files::resolve(&state.root, &rel)?;
+                let meta = std::fs::metadata(&resolved.full).map_err(|_| ApiError::from(FileError::NotFound))?;
+                if !meta.is_file() {
+                    return Err(ApiError::new(StatusCode::BAD_REQUEST, "Only photos and videos can be blocked, not folders"));
+                }
+                let name = resolved.full.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let sha256 = file_sha256(&state, &resolved.rel, &resolved.full, &meta)
+                    .ok_or_else(|| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the file"))?;
+                let preview = small_preview(&state, &resolved.full, &name);
+                {
+                    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+                    let taken_at = conn
+                        .query_row("SELECT taken_at FROM media_index WHERE path = ?1", [&resolved.rel], |r| r.get::<_, Option<i64>>(0))
+                        .ok()
+                        .flatten()
+                        .or_else(|| meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() as i64));
+                    let photo = db::BlockedPhoto {
+                        sha256,
+                        size: meta.len() as i64,
+                        name,
+                        path: resolved.rel.clone(),
+                        taken_at,
+                        blocked_at: db::now_secs(),
+                        blocked_by: user.username.clone(),
+                    };
+                    db::block_backup(&conn, &photo, preview.as_deref()).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+                }
+                if body.delete {
+                    let (action, new_path) = files::trash_or_delete(&state.root, &resolved.rel)?;
+                    match new_path {
+                        Some(to) => rewrite_meta(&state, &resolved.rel, &to),
+                        None => delete_meta(&state, &resolved.rel),
+                    }
+                    record(&state, &user, action, &resolved.rel);
+                }
+                record(&state, &user, "backup-block", &resolved.rel);
+                Ok(())
+            })();
+            match outcome {
+                Ok(()) => blocked += 1,
+                Err(err) => problems.push(json!({ "path": raw, "error": err.body.get("error").cloned().unwrap_or_default() })),
+            }
+        }
+        (blocked, problems)
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not delete the photos"))?;
+    if blocked > 0 {
+        state.media.rescan_soon();
+    }
+    Ok(Json(json!({ "blocked": blocked, "problems": problems })))
+}
+
+/// Photos deleted from the server that phones will not back up again.
+async fn blocked_backups(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let photos = db::blocked_backups(&conn).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(Json(json!({ "photos": photos })))
+}
+
+#[derive(Deserialize)]
+struct ShaQuery {
+    sha256: String,
+}
+
+async fn blocked_preview(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ShaQuery>,
+) -> Result<Response, ApiError> {
+    require_user(&state, &headers)?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let bytes = db::blocked_preview(&conn, &query.sha256).ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "No preview"))?;
+    Ok(([(header::CONTENT_TYPE, "image/jpeg"), (header::CACHE_CONTROL, "private, max-age=86400")], bytes).into_response())
+}
+
+/// Lets phones back a deleted photo up again.
+async fn unblock_backup(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ShaQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let found = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        db::unblock_backup(&conn, &query.sha256).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?
+    };
+    if found {
+        record(&state, &user, "backup-unblock", &query.sha256);
+    }
+    Ok(Json(json!({ "ok": found })))
+}
+
 /// Whether a phone's photo is on the server already, so it need not be sent.
 async fn backup_has(
     State(state): State<std::sync::Arc<AppState>>,
@@ -2150,6 +2295,9 @@ async fn backup_has(
 ) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     let target = backup_target(&state, &query)?;
+    if query.sha256.as_deref().is_some_and(|hash| backup_blocked(&state, hash)) {
+        return Ok(Json(json!({ "path": null, "blocked": true })));
+    }
     let found = tokio::task::spawn_blocking(move || find_backup_copy(&state, &target, query.size, query.sha256.as_deref()))
         .await
         .unwrap_or(None);
@@ -2192,6 +2340,9 @@ async fn backup_upload(
     if let Some(path) = already {
         return Ok(Json(json!({ "path": path, "skipped": true })));
     }
+    if sha256.as_deref().is_some_and(|hash| backup_blocked(&state, hash)) {
+        return Ok(Json(json!({ "path": "", "skipped": true, "blocked": true })));
+    }
     let root = state.root.clone();
     let target = rel.clone();
     let prepared = tokio::task::spawn_blocking(move || files::prepare_upload(&root, "", &target, Some(files::UploadChoice::KeepBoth)))
@@ -2228,6 +2379,11 @@ async fn backup_upload(
         (None, _) => false,
     };
     let damaged = matches!((&written, &sha256), (Some((_, got)), Some(want)) if got != want);
+    // Older apps send no hash: a deleted photo is only recognised once it has arrived.
+    if complete && !damaged && matches!(&written, Some((_, got)) if backup_blocked(&state, got)) {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Ok(Json(json!({ "path": "", "skipped": true, "blocked": true })));
+    }
     if !complete || damaged || tokio::fs::rename(&partial, &dest).await.is_err() {
         let _ = tokio::fs::remove_file(&partial).await;
         let message = if damaged { "The photo arrived damaged or changed while it was sent" } else { "The upload was interrupted" };

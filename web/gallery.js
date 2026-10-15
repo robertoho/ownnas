@@ -191,6 +191,7 @@ export function mountGallery(root, ctx) {
       write && picked.some((item) => item.hidden) ? button("Show in Photos", () => setHidden(picked.filter((item) => item.hidden).map((item) => item.path), false)) : null,
       write && current && picked.length === 1 && !picked[0].missing ? button("Use as cover", () => setCover(picked[0].path)) : null,
       write && current ? button("Remove from album", () => removeFromAlbum(picked.map((item) => item.path)), { class: "danger" }) : null,
+      write && present.length ? button("Delete, never back up again…", () => deleteAndBlock(present), { class: "danger" }) : null,
       write && route.tab === "person" && picked.every((item) => item.faceId)
         ? button(`Not ${currentPerson && currentPerson.name ? currentPerson.name : "this person"}`, () => moveFaces(picked.map((item) => item.faceId), null), { class: "danger" })
         : null,
@@ -288,6 +289,23 @@ export function mountGallery(root, ctx) {
   }
 
   /// Hides photos from the timeline (or shows them again). The files are not touched.
+  /// Deletes photos on the server for good, so phones don't back them up again.
+  async function deleteAndBlock(paths) {
+    try {
+      const done = await ctx.deleteAndBlock(paths);
+      if (!done) return;
+      for (const path of paths) selected.delete(path);
+      if (route.tab === "photos") {
+        removeFromTimeline(paths);
+        paintSelection();
+      } else {
+        show(location.hash);
+      }
+    } catch (err) {
+      ctx.toast(err.message, true);
+    }
+  }
+
   async function setHidden(paths, hidden) {
     if (!paths.length) return;
     try {
@@ -734,6 +752,7 @@ export function mountGallery(root, ctx) {
       !one || selected.has(one.path) ? { label: "Clear selection", icon: "close", run: clearSelection } : { label: "Select", icon: "check", run: () => { selected.add(one.path); paintSelection(); } },
       write && current && one && !one.missing && { label: "Use as album cover", icon: "cover", run: () => setCover(one.path) },
       write && current && { label: picked.length === 1 ? "Remove from album" : `Remove ${number(picked.length)} from album`, icon: "removeFromAlbum", danger: true, run: () => removeFromAlbum(picked.map((entry) => entry.path)) },
+      write && paths.length && { label: "Delete, never back up again…", icon: "deleteBlock", danger: true, run: () => deleteAndBlock(paths) },
     ]);
   }
 

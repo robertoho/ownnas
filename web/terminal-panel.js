@@ -825,7 +825,9 @@ export async function openWindow(id, title, element, onClose) {
   if (!windows.has(id)) {
     const tile = el("div", { class: "terminals-tile is-window", "data-window": id });
     const head = el("div", { class: "terminals-tile-head" });
-    const name = el("button", { type: "button", class: "terminals-tile-title", tabindex: "-1" }, el("span", { class: "terminals-tile-name" }, title));
+    // `el` takes text only: the name goes in as a child.
+    const name = el("button", { type: "button", class: "terminals-tile-title", tabindex: "-1" });
+    name.append(el("span", { class: "terminals-tile-name" }, title));
     name.addEventListener("dblclick", () => toggleMaximized(`w:${id}`));
     const expand = el("button", { type: "button", class: "terminals-tile-btn", "data-tile": "expand", tabindex: "-1" });
     expand.addEventListener("click", () => toggleMaximized(`w:${id}`));

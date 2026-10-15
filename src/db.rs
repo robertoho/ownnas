@@ -184,6 +184,16 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             sha256 TEXT NOT NULL,
             hashed_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS backup_blocked (
+            sha256 TEXT PRIMARY KEY,
+            size INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            path TEXT NOT NULL,
+            taken_at INTEGER,
+            preview BLOB,
+            blocked_at INTEGER NOT NULL,
+            blocked_by TEXT NOT NULL DEFAULT ''
+        );
         CREATE TABLE IF NOT EXISTS folder_sizes (
             path TEXT PRIMARY KEY,
             bytes INTEGER NOT NULL,
@@ -198,7 +208,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     .map_err(|_| "Could not create the database schema".to_string())?;
     ensure_admin_column(conn)?;
     conn.execute(
-        "INSERT INTO settings(key, value) VALUES('schema_version', '11')
+        "INSERT INTO settings(key, value) VALUES('schema_version', '12')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )
@@ -1069,6 +1079,67 @@ pub fn store_hash(conn: &Connection, path: &str, size: u64, mtime: i64, sha256: 
     )
     .map_err(|_| "Could not store the file hash".to_string())?;
     Ok(())
+}
+
+/// A photo deleted from the server that phones must not back up again.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedPhoto {
+    pub sha256: String,
+    pub size: i64,
+    pub name: String,
+    /// Where it was when it was deleted.
+    pub path: String,
+    pub taken_at: Option<i64>,
+    pub blocked_at: i64,
+    pub blocked_by: String,
+}
+
+pub fn block_backup(conn: &Connection, photo: &BlockedPhoto, preview: Option<&[u8]>) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO backup_blocked(sha256, size, name, path, taken_at, preview, blocked_at, blocked_by)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(sha256) DO UPDATE SET name = excluded.name, path = excluded.path, taken_at = excluded.taken_at,
+           preview = COALESCE(excluded.preview, backup_blocked.preview), blocked_at = excluded.blocked_at, blocked_by = excluded.blocked_by",
+        params![photo.sha256, photo.size, photo.name, photo.path, photo.taken_at, preview, photo.blocked_at, photo.blocked_by],
+    )
+    .map_err(|_| "Could not remember the deleted photo".to_string())?;
+    Ok(())
+}
+
+pub fn is_backup_blocked(conn: &Connection, sha256: &str) -> bool {
+    conn.query_row("SELECT 1 FROM backup_blocked WHERE sha256 = ?1", [sha256.to_ascii_lowercase()], |_| Ok(())).is_ok()
+}
+
+pub fn blocked_backups(conn: &Connection) -> Result<Vec<BlockedPhoto>, String> {
+    let mut stmt = conn
+        .prepare("SELECT sha256, size, name, path, taken_at, blocked_at, blocked_by FROM backup_blocked ORDER BY blocked_at DESC")
+        .map_err(|_| "Could not read the deleted photos".to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(BlockedPhoto {
+                sha256: row.get(0)?,
+                size: row.get(1)?,
+                name: row.get(2)?,
+                path: row.get(3)?,
+                taken_at: row.get(4)?,
+                blocked_at: row.get(5)?,
+                blocked_by: row.get(6)?,
+            })
+        })
+        .map_err(|_| "Could not read the deleted photos".to_string())?;
+    rows.collect::<Result<_, _>>().map_err(|_| "Could not read the deleted photos".to_string())
+}
+
+pub fn blocked_preview(conn: &Connection, sha256: &str) -> Option<Vec<u8>> {
+    conn.query_row("SELECT preview FROM backup_blocked WHERE sha256 = ?1", [sha256], |row| row.get::<_, Option<Vec<u8>>>(0)).ok().flatten()
+}
+
+/// Lets phones back the photo up again. Returns whether it was blocked.
+pub fn unblock_backup(conn: &Connection, sha256: &str) -> Result<bool, String> {
+    conn.execute("DELETE FROM backup_blocked WHERE sha256 = ?1", [sha256])
+        .map(|n| n > 0)
+        .map_err(|_| "Could not change the deleted photos".to_string())
 }
 
 pub fn delete_path_meta(conn: &Connection, path: &str) -> Result<(), String> {

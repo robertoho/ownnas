@@ -76,12 +76,14 @@ data class BackupState(
 )
 
 /** A photo or video a run sent, or found on the server already. */
-data class BackedUpItem(val uri: Uri, val name: String, val size: Long, val at: Long, val skipped: Boolean)
+data class BackedUpItem(val uri: Uri, val name: String, val size: Long, val at: Long, val skipped: Boolean, val blocked: Boolean = false)
 
 class Backup(private val context: Context) {
     private val prefs = context.getSharedPreferences("backup", Context.MODE_PRIVATE)
     private val doneFile = File(context.filesDir, "backup-done.txt")
     private val recentFile = File(context.filesDir, "backup-recent.tsv")
+    /** Photos the server said were deleted there: not sent, and not counted as backed up. */
+    private val blockedFile = File(context.filesDir, "backup-blocked.txt")
     private val settingsFlow = MutableStateFlow(loadSettings())
     val settings: StateFlow<BackupSettings> = settingsFlow.asStateFlow()
     private val stateFlow = MutableStateFlow(
@@ -119,6 +121,7 @@ class Backup(private val context: Context) {
         if (next.serverId != settingsFlow.value.serverId) {
             doneFile.delete()
             recentFile.delete()
+            blockedFile.delete()
             prefs.edit {
                 for (key in listOf("left", "lastSent", "totalSent")) remove(key)
                 for (key in listOf("lastRun", "runStarted", "lastDuration", "lastBytes", "totalBytes")) remove(key)
@@ -240,12 +243,18 @@ class Backup(private val context: Context) {
     fun recent(): List<BackedUpItem> = if (!recentFile.isFile) emptyList() else recentFile.readLines().mapNotNull { line ->
         val parts = line.split('\t')
         if (parts.size < 5) return@mapNotNull null
-        BackedUpItem(Uri.parse(parts[0]), parts[1], parts[2].toLongOrNull() ?: 0, parts[3].toLongOrNull() ?: 0, parts[4] == "1")
+        BackedUpItem(Uri.parse(parts[0]), parts[1], parts[2].toLongOrNull() ?: 0, parts[3].toLongOrNull() ?: 0, parts[4] != "0", parts[4] == "2")
     }.asReversed()
 
-    internal fun noteRecent(uri: Uri, name: String, size: Long, skipped: Boolean) {
+    /** `blocked`: deleted on the server, so it is not backed up again. */
+    internal fun noteRecent(uri: Uri, name: String, size: Long, skipped: Boolean, blocked: Boolean) {
         val clean = name.replace('\t', ' ').replace('\n', ' ')
-        recentFile.appendText("$uri\t$clean\t$size\t${System.currentTimeMillis()}\t${if (skipped) 1 else 0}\n")
+        val status = when {
+            blocked -> 2
+            skipped -> 1
+            else -> 0
+        }
+        recentFile.appendText("$uri\t$clean\t$size\t${System.currentTimeMillis()}\t$status\n")
     }
 
     private fun trimRecent() {
@@ -258,6 +267,25 @@ class Backup(private val context: Context) {
     internal fun doneKeys(): MutableSet<String> = if (doneFile.isFile) doneFile.readLines().filter { it.isNotBlank() }.toMutableSet() else mutableSetOf()
 
     private fun countDone(): Int = doneKeys().size
+
+    internal fun blockedKeys(): Set<String> = if (blockedFile.isFile) blockedFile.readLines().filter { it.isNotBlank() }.toSet() else emptySet()
+
+    internal fun markBlocked(key: String) {
+        blockedFile.appendText("$key\n")
+        setState { it.copy(left = (it.left - 1).coerceAtLeast(0)) }
+    }
+
+    /** Photos were allowed again on the server: ask about every blocked one on the next run. */
+    fun forgetBlocked() {
+        blockedFile.delete()
+        prefs.edit { remove("blockedOnServer") }
+    }
+
+    /** Notices photos allowed again on the server (the web app, or another phone). */
+    internal fun checkBlocked(onServer: Int) {
+        if (onServer < prefs.getInt("blockedOnServer", 0)) blockedFile.delete()
+        prefs.edit { putInt("blockedOnServer", onServer) }
+    }
 
     internal fun markDone(key: String) {
         doneFile.appendText("$key\n")
@@ -328,7 +356,8 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
             backup.finish("The server has no media upload folder yet. An administrator can set one in the web app: Settings → Gallery → Phone backups.")
             return Result.success()
         }
-        val done = backup.doneKeys()
+        runCatching { app.servers.call(serverId) { it.blockedPhotos().size } }.onSuccess { backup.checkBlocked(it) }
+        val done = backup.doneKeys() + backup.blockedKeys()
         val pending = media(settings.videos).filterNot { it.key in done }
         if (pending.isEmpty()) {
             backup.finish("Up to date", 0)
@@ -341,6 +370,7 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         var failed = 0
         var firstProblem: String? = null
         var sent = 0
+        var blocked = 0
         var bytes = 0L
         for ((index, item) in pending.withIndex()) {
             if (isStopped || backup.settings.value.paused) break
@@ -363,9 +393,10 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                 }
             }
             outcome.onSuccess {
-                backup.markDone(item.key)
-                backup.noteRecent(item.uri, item.name, item.size, it.skipped)
+                if (it.blocked) backup.markBlocked(item.key) else backup.markDone(item.key)
+                backup.noteRecent(item.uri, item.name, item.size, it.skipped, it.blocked)
                 sent++
+                if (it.blocked) blocked++
                 if (!it.skipped) {
                     added++
                     bytes += item.size
@@ -390,7 +421,7 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
             isStopped -> "Interrupted; it carries on later"
             failed > 0 -> "Backed up ${added} new; ${failed} could not be sent (${firstProblem})"
             else -> "Backed up ${added} new photo${if (added == 1) "" else "s"}"
-        }
+        } + if (blocked > 0) "; skipped ${blocked} deleted on the server" else ""
         backup.finish(result, pending.size - sent, added, bytes)
         return Result.success()
     }

@@ -198,6 +198,7 @@ fun SelectionBar(
     var picking by remember { mutableStateOf(false) }
     var tagging by remember { mutableStateOf(false) }
     var someoneElse by remember { mutableStateOf(false) }
+    var deleting by remember { mutableStateOf(false) }
     val picked = selection.items.values.toList()
     val paths = picked.filterNot { it.missing }.map { it.path }
     fun act(done: String, block: suspend () -> Unit) {
@@ -250,6 +251,9 @@ fun SelectionBar(
                     })
                     DropdownMenuItem(text = { Text("This is someone else…") }, onClick = { menu = false; someoneElse = true })
                 }
+                if (paths.isNotEmpty()) {
+                    DropdownMenuItem(text = { Text("Delete from server…") }, onClick = { menu = false; deleting = true })
+                }
             }
         },
     )
@@ -264,6 +268,12 @@ fun SelectionBar(
             tagging = false
             act("Tagged “$tag”") { vm.call(serverId) { it.tagPhotos(paths, tag, true) } }
         })
+    }
+    if (deleting) {
+        DeleteFromServerDialog(paths.size, onDismiss = { deleting = false }) {
+            deleting = false
+            act("Deleted; phones won't back ${if (paths.size == 1) "it" else "them"} up again") { vm.call(serverId) { it.deleteAndBlock(paths) } }
+        }
     }
     if (someoneElse && inPerson != null) {
         PersonPicker(vm, serverId, "Who is it?", exclude = inPerson.id, onDismiss = { someoneElse = false }) { to ->

@@ -170,6 +170,25 @@ pub struct BackupResult {
     pub path: String,
     /// It was already there; nothing was sent.
     pub skipped: bool,
+    /// It was deleted on the server and is never backed up again (`path` is empty).
+    #[serde(default)]
+    pub blocked: bool,
+}
+
+/// A photo deleted on the server that phones don't back up again.
+#[derive(uniffi::Record, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedPhoto {
+    pub sha256: String,
+    pub size: i64,
+    pub name: String,
+    /// Where it was on the server.
+    pub path: String,
+    #[serde(default)]
+    pub taken_at: Option<i64>,
+    pub blocked_at: i64,
+    #[serde(default)]
+    pub blocked_by: String,
 }
 
 #[derive(Deserialize)]
@@ -328,6 +347,45 @@ impl Server {
         Ok(self.api.get_bytes("/api/faces/crop", &[("id", &id)], 4 * 1024 * 1024)?)
     }
 
+    /// Deletes photos from the server (into the Trash) and remembers their contents, so no phone
+    /// backs them up again. Returns how many were done.
+    pub fn delete_and_block(&self, paths: Vec<String>) -> Result<u32, ClientError> {
+        #[derive(Deserialize)]
+        struct Done {
+            blocked: u32,
+            #[serde(default)]
+            problems: Vec<Value>,
+        }
+        let done: Done = self.api.send_json("POST", "/api/backup/blocked", &[], json!({ "paths": paths, "delete": true }))?;
+        if done.blocked == 0 {
+            if let Some(problem) = done.problems.first() {
+                return Err(failed(problem["error"].as_str().unwrap_or("Could not delete the photo").to_string()));
+            }
+        }
+        Ok(done.blocked)
+    }
+
+    /// Photos deleted on the server that phones don't back up again, newest first.
+    pub fn blocked_photos(&self) -> Result<Vec<BlockedPhoto>, ClientError> {
+        #[derive(Deserialize)]
+        struct Page {
+            photos: Vec<BlockedPhoto>,
+        }
+        let page: Page = self.api.get_json("/api/backup/blocked", &[])?;
+        Ok(page.photos)
+    }
+
+    /// The small picture kept with a blocked photo (JPEG).
+    pub fn blocked_preview(&self, sha256: String) -> Result<Vec<u8>, ClientError> {
+        Ok(self.api.get_bytes("/api/backup/blocked/preview", &[("sha256", &sha256)], 1024 * 1024)?)
+    }
+
+    /// Lets phones back a deleted photo up again.
+    pub fn unblock_photo(&self, sha256: String) -> Result<(), ClientError> {
+        let _: Value = self.api.send_json("DELETE", "/api/backup/blocked", &[("sha256", &sha256)], json!({}))?;
+        Ok(())
+    }
+
     /// Where phones back up to, or `None` when phone backups are off on the server.
     pub fn backup_folder(&self) -> Result<Option<String>, ClientError> {
         let config: Value = self.api.get_json("/api/backup", &[])?;
@@ -375,9 +433,13 @@ impl Server {
         #[derive(Deserialize)]
         struct Found {
             path: Option<String>,
+            #[serde(default)]
+            blocked: bool,
         }
-        if let Ok(Found { path: Some(path) }) = self.api.get_json::<Found>("/api/backup/has", &query) {
-            return Ok(BackupResult { path, skipped: true });
+        match self.api.get_json::<Found>("/api/backup/has", &query) {
+            Ok(Found { blocked: true, .. }) => return Ok(BackupResult { path: String::new(), skipped: true, blocked: true }),
+            Ok(Found { path: Some(path), .. }) => return Ok(BackupResult { path, skipped: true, blocked: false }),
+            _ => {}
         }
         Ok(self.api.post_stream("/api/backup/upload", &query, file, Some(size), &|done| transfer.keep_going(done))?)
     }

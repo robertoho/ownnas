@@ -1,6 +1,13 @@
 package app.ownnas.android.ui
 
 import android.Manifest
+import android.graphics.BitmapFactory
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.rememberCoroutineScope
+import app.ownnas.core.BlockedPhoto
+import kotlinx.coroutines.launch
 import android.content.Context
 import android.util.Size
 import androidx.compose.foundation.Image
@@ -149,6 +156,7 @@ fun BackupScreen(vm: AppViewModel) {
                     else -> {
                         StatusCard(vm, settings.paused, state, folder)
                         StatsCard(state)
+                        settings.serverId?.let { BlockedCard(vm, it) }
                         RecentCard(vm, state.lastRun, state.backedUp)
                     }
                 }
@@ -274,7 +282,11 @@ private fun RecentCard(vm: AppViewModel, lastRun: Long, backedUp: Int) {
                     Column(Modifier.weight(1f).padding(start = 12.dp)) {
                         Text(item.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Text(
-                            "${bytes(item.size)} · ${DateUtils.getRelativeTimeSpanString(item.at)}${if (item.skipped) " · already on the server" else ""}",
+                            "${bytes(item.size)} · ${DateUtils.getRelativeTimeSpanString(item.at)}${when {
+                                item.blocked -> " · deleted on the server, not backed up"
+                                item.skipped -> " · already on the server"
+                                else -> ""
+                            }}",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -319,3 +331,72 @@ private fun duration(ms: Long): String {
 }
 
 private fun speed(bytes: Long, ms: Long): String = "${bytes(bytes * 1000 / ms.coerceAtLeast(1))}/s"
+
+/** Photos deleted on the server that this phone won't back up again, with a way to allow them. */
+@Composable
+private fun BlockedCard(vm: AppViewModel, serverId: String) {
+    val scope = rememberCoroutineScope()
+    var photos by remember { mutableStateOf<List<BlockedPhoto>>(emptyList()) }
+    var open by remember { mutableStateOf(false) }
+    var problem by remember { mutableStateOf<String?>(null) }
+    var reload by remember { mutableIntStateOf(0) }
+    LaunchedEffect(serverId, reload) {
+        runCatching { vm.call(serverId) { it.blockedPhotos() } }.onSuccess { photos = it }
+    }
+    if (photos.isEmpty()) return
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(vertical = 10.dp)) {
+            Row(Modifier.fillMaxWidth().clickable { open = !open }.padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Deleted on the server", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        "${photos.size} photo${if (photos.size == 1) "" else "s"} not backed up again, even if still on a phone",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Icon(if (open) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore, contentDescription = if (open) "Hide" else "Show")
+            }
+            problem?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(horizontal = 16.dp)) }
+            if (open) {
+                for (photo in photos.take(200)) {
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                        BlockedThumb(vm, serverId, photo.sha256)
+                        Column(Modifier.weight(1f).padding(start = 12.dp)) {
+                            Text(photo.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(
+                                "${bytes(photo.size)} · deleted ${DateUtils.getRelativeTimeSpanString(photo.blockedAt * 1000)}${if (photo.blockedBy.isNotEmpty()) " by ${photo.blockedBy}" else ""}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        TextButton(onClick = {
+                            scope.launch {
+                                runCatching { vm.call(serverId) { it.unblockPhoto(photo.sha256) } }
+                                    .onSuccess {
+                                        problem = null
+                                        // This phone sends it again on its next run.
+                                        vm.backup.forgetBlocked()
+                                        reload++
+                                    }
+                                    .onFailure { problem = it.userMessage() }
+                            }
+                        }) { Text("Allow again") }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BlockedThumb(vm: AppViewModel, serverId: String, sha256: String) {
+    var bitmap by remember(sha256) { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(sha256) {
+        bitmap = runCatching { vm.call(serverId) { it.blockedPreview(sha256) } }.getOrNull()?.let { bytes ->
+            withContext(Dispatchers.Default) { BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap() }
+        }
+    }
+    val modifier = Modifier.size(48.dp).clip(RoundedCornerShape(6.dp)).background(MaterialTheme.colorScheme.surfaceVariant)
+    bitmap?.let { Image(it, contentDescription = null, modifier = modifier, contentScale = ContentScale.Crop) } ?: Box(modifier)
+}

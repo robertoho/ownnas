@@ -312,3 +312,21 @@ fun CoroutineScope.launchCatching(onError: (Throwable) -> Unit, block: suspend (
         onError(err)
     }
 }
+
+/** Asks before deleting photos from the server for good, so phones won't back them up again. */
+@Composable
+fun DeleteFromServerDialog(count: Int, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    val what = if (count == 1) "this photo" else "these $count photos"
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Delete from the server?") },
+        text = {
+            Text(
+                "Moves $what to the server's Trash and remembers ${if (count == 1) "it" else "them"}, so no phone backs ${if (count == 1) "it" else "them"} up again, " +
+                    "even if still on a phone. You can allow it again in Back up this phone → Deleted on the server.",
+            )
+        },
+        confirmButton = { TextButton(onClick = onConfirm) { Text("Delete") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}

@@ -890,6 +890,7 @@ const MENU_ICONS = {
   overview: ICON_GRID,
   emptyTrash: ICON_TRASH,
   delete: ICON_TRASH,
+  deleteBlock: `${ICON_TRASH} M10.5 10.5l4 4 M14.5 10.5l-4 4`,
   paste: "M5.5 3h-1a1 1 0 0 0-1 1v9.5a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1V4a1 1 0 0 0-1-1h-1 M6 2h4v2H6z",
   restore: "M3 8a5 5 0 1 0 1.5-3.55 M2.5 2.5v2.5H5",
   copy: ICON_COPY,
@@ -1230,6 +1231,9 @@ function openSelectionMenu(x, y, pasteInto) {
     if (write && entries.length && !allInTrash) {
       buttons.push(`<button type="button" data-menu="rename">Rename</button>`);
     }
+    if (write && entries.length && entries.every((entry) => !entry.dir && ["image", "video"].includes(entry.kind))) {
+      buttons.push(`<button type="button" data-menu="deleteBlock" class="danger">Delete, never back up again…</button>`);
+    }
     if (write && entries.length) {
       buttons.push(`<button type="button" data-menu="delete" class="danger">${allInTrash ? "Delete forever" : "Move to Trash"}</button>`);
     }
@@ -1379,6 +1383,7 @@ async function refreshIndexSettings() {
   ]);
   renderSmartSettings(smart);
   renderBackupFolder(backup.folder);
+  refreshBlocked().catch(() => {});
   for (const input of document.querySelectorAll('input[name="index-speed"]')) input.checked = input.value === data.speed;
   $("index-status").textContent = describeIndexStatus(data.status);
   clearTimeout(indexStatusTimer);
@@ -1758,6 +1763,7 @@ async function gallery() {
       tag: (paths) => bulkTagEntries(paths.map((path) => toEntry({ path }))).catch((err) => toast(err.message, true)),
       showInFolder: (path) => openFileByPath(path).catch((err) => toast(err.message, true)),
       decorateMenu: (menu) => decorateMenu(menu),
+      deleteAndBlock,
     });
   }
   return galleryApi;
@@ -3000,6 +3006,82 @@ async function deleteEntries(entries) {
   await load(state.path);
 }
 
+/// Deletes photos (into the Trash) and remembers their contents (SHA-256), so phones never back
+/// them up again, even while they are still on a phone. Returns how many, or 0 when cancelled.
+async function deleteAndBlock(paths) {
+  if (!paths.length) return 0;
+  const what = paths.length === 1 ? `“${paths[0].split("/").pop()}”` : `${paths.length} photos and videos`;
+  const ok = await askConfirm(
+    `Delete ${what} and never back ${paths.length === 1 ? "it" : "them"} up again? ${paths.length === 1 ? "It goes" : "They go"} to the Trash, and phones skip ${paths.length === 1 ? "it" : "them"} even if still on the phone. You can allow ${paths.length === 1 ? "it" : "them"} again in Settings → Gallery → Phone backups.`,
+    "Delete",
+  );
+  if (!ok) return 0;
+  const data = await api("/api/backup/blocked", { method: "POST", json: { paths, delete: true } });
+  const problems = data.problems || [];
+  if (data.blocked) toast(`Deleted ${data.blocked === 1 ? "1 photo" : `${data.blocked} photos`}; phones won't back ${data.blocked === 1 ? "it" : "them"} up again`);
+  if (problems.length) toast(`${problems[0].path}: ${problems[0].error}`, true);
+  refreshBlocked(true).catch(() => {});
+  return data.blocked;
+}
+
+let blockedLoadedAt = 0;
+
+/// Settings → Gallery → Phone backups: photos deleted on the server that phones skip.
+async function refreshBlocked(force = false) {
+  if (!force && Date.now() - blockedLoadedAt < 30_000) return;
+  blockedLoadedAt = Date.now();
+  const data = await api("/api/backup/blocked");
+  const photos = data.photos || [];
+  const box = $("backup-blocked");
+  box.hidden = photos.length === 0;
+  $("backup-blocked-count").textContent = photos.length === 1
+    ? "1 photo or video deleted here is not backed up again, even while it is still on a phone."
+    : `${photos.length} photos and videos deleted here are not backed up again, even while they are still on a phone.`;
+  const write = !!(state.me && !state.me.readonly);
+  $("backup-blocked-list").replaceChildren(...photos.map((photo) => {
+    const row = document.createElement("li");
+    const img = document.createElement("img");
+    img.alt = "";
+    img.loading = "lazy";
+    img.src = `/api/backup/blocked/preview?sha256=${encodeURIComponent(photo.sha256)}`;
+    img.addEventListener("error", () => img.classList.add("missing"), { once: true });
+    const text = document.createElement("div");
+    text.className = "backup-blocked-text";
+    const name = document.createElement("strong");
+    name.textContent = photo.name;
+    const detail = document.createElement("span");
+    detail.className = "muted";
+    detail.textContent = [
+      formatSize(photo.size, false),
+      photo.takenAt ? `taken ${new Date(photo.takenAt * 1000).toLocaleDateString(undefined, { timeZone: "UTC" })}` : "",
+      `deleted ${formatDate(photo.blockedAt)}${photo.blockedBy ? ` by ${photo.blockedBy}` : ""}`,
+    ].filter(Boolean).join(" · ");
+    const where = document.createElement("span");
+    where.className = "muted backup-blocked-path";
+    where.textContent = photo.path;
+    where.title = `SHA-256 ${photo.sha256}`;
+    text.append(name, detail, where);
+    row.append(img, text);
+    if (write) {
+      const allow = document.createElement("button");
+      allow.type = "button";
+      allow.textContent = "Allow again";
+      allow.title = "Phones that still have it back it up again";
+      allow.addEventListener("click", async () => {
+        try {
+          await api(`/api/backup/blocked?sha256=${encodeURIComponent(photo.sha256)}`, { method: "DELETE" });
+          toast(`Phones can back up “${photo.name}” again`);
+          refreshBlocked(true).catch(() => {});
+        } catch (err) {
+          toast(err.message, true);
+        }
+      });
+      row.append(allow);
+    }
+    return row;
+  }));
+}
+
 async function downloadEntries(entries) {
   if (!entries.length) {
     toast("Select a file or folder to download", true);
@@ -4154,6 +4236,15 @@ function runMenuAction(button, entries, pasteInto) {
   if (action === "rename") renameEntries(entries).catch((err) => toast(err.message, true));
   if (action === "restore") restoreEntries(entries).catch((err) => toast(err.message, true));
   if (action === "delete") deleteEntries(entries).catch((err) => toast(err.message, true));
+  if (action === "deleteBlock") {
+    deleteAndBlock(entries.map((entry) => entry.path))
+      .then((done) => {
+        if (!done) return;
+        invalidateFolderSizes();
+        return load(state.path);
+      })
+      .catch((err) => toast(err.message, true));
+  }
   if (action === "duplicate") duplicateEntries(entries).catch((err) => toast(err.message, true));
   if (action === "move") moveEntries(entries).catch((err) => toast(err.message, true));
   if (action === "convert") convertImages(entries, format).catch((err) => toast(err.message, true));

@@ -73,6 +73,7 @@ fun PhotoViewer(vm: AppViewModel, serverId: String, start: Int, list: Long) {
     var menu by remember { mutableStateOf(false) }
     var picking by remember { mutableStateOf(false) }
     var details by remember { mutableStateOf(false) }
+    var deleting by remember { mutableStateOf(false) }
     var smart by remember { mutableStateOf(SmartFeatures(search = false, faces = false)) }
     LaunchedEffect(serverId) { runCatching { vm.call(serverId) { it.smartFeatures() } }.onSuccess { smart = it } }
     val snackbar = remember { SnackbarHostState() }
@@ -113,6 +114,7 @@ fun PhotoViewer(vm: AppViewModel, serverId: String, start: Int, list: Long) {
                         DropdownMenuItem(text = { Text("Show in folder") }, onClick = { menu = false; vm.push(Screen.Browse(serverId, current.path.parentPath())) })
                         DropdownMenuItem(text = { Text("Open with another app") }, onClick = { menu = false; withFile(false) })
                         DropdownMenuItem(text = { Text("Share") }, onClick = { menu = false; withFile(true) })
+                        DropdownMenuItem(text = { Text("Delete from server…") }, onClick = { menu = false; deleting = true })
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -124,6 +126,15 @@ fun PhotoViewer(vm: AppViewModel, serverId: String, start: Int, list: Long) {
             )
         }
         SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter))
+    }
+    if (deleting) {
+        DeleteFromServerDialog(1, onDismiss = { deleting = false }) {
+            deleting = false
+            scope.launchCatching(onError = { scope.launch { snackbar.showSnackbar(it.userMessage()) } }) {
+                vm.call(serverId) { it.deleteAndBlock(listOf(current.path)) }
+                vm.pop()
+            }
+        }
     }
     if (details) {
         PhotoDetailsSheet(vm, serverId, current, onDismiss = { details = false })

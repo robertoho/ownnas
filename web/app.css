@@ -3485,6 +3485,14 @@ body.is-gallery .app > .explorer-status-bar { display: none; }
 .person-picker-row .gallery-person-face { width: 72px; }
 .person-picker .spacer { flex: 1; }
 
+.backup-blocked h4 { margin: 1rem 0 0.25rem; }
+.backup-blocked-list { list-style: none; margin: 0.4rem 0 0; padding: 0; display: grid; gap: 0.4rem; max-height: 22rem; overflow: auto; }
+.backup-blocked-list li { display: flex; align-items: center; gap: 0.6rem; padding: 0.4rem 0.5rem; border: 1px solid var(--line); border-radius: 10px; background: var(--bg-2); }
+.backup-blocked-list img { width: 44px; height: 44px; object-fit: cover; border-radius: 6px; flex: none; background: var(--line); }
+.backup-blocked-list img.missing { visibility: hidden; }
+.backup-blocked-text { display: grid; gap: 0.1rem; min-width: 0; flex: 1; }
+.backup-blocked-text > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.backup-blocked-path { font-size: 0.8em; }
 .backup-choice { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin: 0.6rem 0; padding: 0.6rem 0.75rem; border: 1px solid var(--line); border-radius: 12px; background: var(--bg-2); }
 .backup-folder-icon { display: inline-flex; color: var(--accent); }
 .backup-folder-label { flex: 1 1 10rem; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
