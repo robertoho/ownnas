@@ -915,7 +915,6 @@ const MENU_ICONS = {
   deleteBlock: `${ICON_TRASH} M10.5 10.5l4 4 M14.5 10.5l-4 4`,
   resize: "M2.5 6.5v-4h4 M2.5 2.5l4.5 4.5 M13.5 9.5v4h-4 M13.5 13.5L9 9",
   convertVideo: "M2.5 4h7a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z M10.5 7l4-2v6l-4-2",
-  speedVideo: "M2.5 4.5l5 3.5-5 3.5z M8.5 4.5l5 3.5-5 3.5z",
   paste: "M5.5 3h-1a1 1 0 0 0-1 1v9.5a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1V4a1 1 0 0 0-1-1h-1 M6 2h4v2H6z",
   restore: "M3 8a5 5 0 1 0 1.5-3.55 M2.5 2.5v2.5H5",
   copy: ICON_COPY,
@@ -1241,7 +1240,6 @@ function openSelectionMenu(x, y, pasteInto) {
     }
     if (write && state.me && state.me.ffmpeg && entries.length && entries.every((entry) => !entry.dir && entry.kind === "video") && !allInTrash) {
       buttons.push(`<button type="button" data-menu="convertVideo">Convert video…</button>`);
-      buttons.push(`<button type="button" data-menu="speedVideo">Change speed…</button>`);
     }
     const pdfs = entries.filter((entry) => entry.kind === "pdf");
     if (write && pdfs.length && pdfs.length === entries.length && !allInTrash) {
@@ -4605,9 +4603,7 @@ function runMenuAction(button, entries, pasteInto) {
   if (action === "move") moveEntries(entries).catch((err) => toast(err.message, true));
   if (action === "convert") convertImages(entries, format).catch((err) => toast(err.message, true));
   if (action === "resize") resizeImages(entries.map((entry) => entry.path)).catch((err) => toast(err.message, true));
-  if (action === "convertVideo" || action === "speedVideo") {
-    convertVideos(entries.map((entry) => entry.path), action === "speedVideo" ? "speed" : "format").catch((err) => toast(err.message, true));
-  }
+  if (action === "convertVideo") convertVideos(entries.map((entry) => entry.path)).catch((err) => toast(err.message, true));
   if (action === "compress") compressEntries(entries, format).catch((err) => toast(err.message, true));
   if (action === "pdfExtract") pdfExtractPages(entries).catch((err) => toast(err.message, true));
   if (action === "pdfSplit") pdfSplitPages(entries).catch((err) => toast(err.message, true));
