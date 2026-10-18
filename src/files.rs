@@ -1581,6 +1581,16 @@ fn indexed_contains(
     content_snippet(&text, query)
 }
 
+/// Photo libraries kept as one package (Apple Photos, Aperture) hold hundreds of thousands of
+/// files of their own: searching them would use up the search before the rest of the library.
+/// Their own name still matches; searching from inside one still looks there.
+fn search_skips(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [".photoslibrary", ".photolibrary", ".aplibrary", ".migratedphotolibrary"].iter().any(|ext| lower.ends_with(ext))
+}
+
+/// Folder names, level by level, so a folder near the top is found even when a deep one is
+/// enormous. Only folders count towards the limit: files are passed over without a look.
 fn walk_folder_search(
     root: &Path,
     dir: &Path,
@@ -1589,57 +1599,55 @@ fn walk_folder_search(
     hits: &mut Vec<SearchHit>,
     seen: &mut usize,
 ) {
-    if hits.len() >= 100 || *seen >= 8_000 {
-        return;
-    }
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-    for item in entries {
-        if hits.len() >= 100 || *seen >= 8_000 {
-            return;
-        }
-        let Ok(item) = item else { continue };
-        *seen += 1;
-        let name = item.file_name().to_string_lossy().to_string();
-        let child = item.path();
-        let canon = match child.canonicalize() {
-            Ok(path) if path.starts_with(root) => path,
-            _ => continue,
-        };
-        if !canon.is_dir() {
-            continue;
-        }
-        let child_rel = if rel.is_empty() {
-            name.clone()
-        } else {
-            format!("{rel}/{name}")
-        };
-        if name.to_lowercase().contains(query) {
-            if let Ok(meta) = canon.metadata() {
-                hits.push(SearchHit {
-                    kind: if is_trash_folder(&canon) {
-                        "trash-folder".to_string()
-                    } else if is_archive_folder(&canon) {
-                        "archive-folder".to_string()
-                    } else {
-                        "folder".to_string()
-                    },
-                    name: name.clone(),
-                    path: child_rel.clone(),
-                    dir: true,
-                    size: 0,
-                    modified: modified_secs(&meta),
-                    matched_tag: None,
-                    matched_content: None,
-                });
+    let mut queue = std::collections::VecDeque::from([(dir.to_path_buf(), rel.to_string())]);
+    while let Some((dir, rel)) = queue.pop_front() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for item in entries {
+            if hits.len() >= 100 || *seen >= 8_000 {
+                return;
+            }
+            let Ok(item) = item else { continue };
+            if item.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let name = item.file_name().to_string_lossy().to_string();
+            let canon = match item.path().canonicalize() {
+                Ok(path) if path.starts_with(root) => path,
+                _ => continue,
+            };
+            if !canon.is_dir() {
+                continue;
+            }
+            *seen += 1;
+            let child_rel = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+            if name.to_lowercase().contains(query) {
+                if let Ok(meta) = canon.metadata() {
+                    hits.push(SearchHit {
+                        kind: if is_trash_folder(&canon) {
+                            "trash-folder".to_string()
+                        } else if is_archive_folder(&canon) {
+                            "archive-folder".to_string()
+                        } else {
+                            "folder".to_string()
+                        },
+                        name: name.clone(),
+                        path: child_rel.clone(),
+                        dir: true,
+                        size: 0,
+                        modified: modified_secs(&meta),
+                        matched_tag: None,
+                        matched_content: None,
+                    });
+                }
+            }
+            if !search_skips(&name) {
+                queue.push_back((canon, child_rel));
             }
         }
-        walk_folder_search(root, &canon, &child_rel, query, hits, seen);
     }
 }
 
+/// Files (and folders) by name and contents, level by level like `walk_folder_search`.
 fn walk_search(
     root: &Path,
     dir: &Path,
@@ -1651,70 +1659,52 @@ fn walk_search(
     phase: SearchPhase,
     ocr_budget: &mut usize,
 ) {
-    if hits.len() >= 100 || *seen >= 8_000 {
-        return;
-    }
-    if matches!(phase, SearchPhase::Ocr) && *ocr_budget == 0 {
-        return;
-    }
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-    for item in entries {
-        if hits.len() >= 100 || *seen >= 8_000 {
-            return;
-        }
-        if matches!(phase, SearchPhase::Ocr) && *ocr_budget == 0 {
-            return;
-        }
-        let Ok(item) = item else { continue };
-        *seen += 1;
-        let name = item.file_name().to_string_lossy().to_string();
-        let child = item.path();
-        let canon = match child.canonicalize() {
-            Ok(path) if path.starts_with(root) => path,
-            _ => continue,
-        };
-        let child_rel = if rel.is_empty() {
-            name.clone()
-        } else {
-            format!("{rel}/{name}")
-        };
-        let dir = canon.is_dir();
-        let kind = if dir {
-            if is_trash_folder(&canon) {
-                "trash-folder".to_string()
-            } else if is_archive_folder(&canon) {
-                "archive-folder".to_string()
+    let mut queue = std::collections::VecDeque::from([(dir.to_path_buf(), rel.to_string())]);
+    while let Some((dir, rel)) = queue.pop_front() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for item in entries {
+            if hits.len() >= 100 || *seen >= 8_000 {
+                return;
+            }
+            if matches!(phase, SearchPhase::Ocr) && *ocr_budget == 0 {
+                return;
+            }
+            let Ok(item) = item else { continue };
+            *seen += 1;
+            let name = item.file_name().to_string_lossy().to_string();
+            let canon = match item.path().canonicalize() {
+                Ok(path) if path.starts_with(root) => path,
+                _ => continue,
+            };
+            let child_rel = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+            let dir = canon.is_dir();
+            let kind = if dir {
+                if is_trash_folder(&canon) {
+                    "trash-folder".to_string()
+                } else if is_archive_folder(&canon) {
+                    "archive-folder".to_string()
+                } else {
+                    "folder".to_string()
+                }
             } else {
-                "folder".to_string()
-            }
-        } else {
-            kind_of(&name).to_string()
-        };
-        let name_hit = matches!(phase, SearchPhase::Fast) && name.to_lowercase().contains(query);
-        let content_hit = if !dir && !name_hit && query.chars().count() >= 2 {
-            match (phase, kind.as_str()) {
-                (SearchPhase::Fast, "text") => text_file_contains(&canon, query),
-                (SearchPhase::Fast, "pdf") => {
-                    indexed_contains(&canon, "pdf", query, options, ocr_budget)
+                kind_of(&name).to_string()
+            };
+            let name_hit = matches!(phase, SearchPhase::Fast) && name.to_lowercase().contains(query);
+            let content_hit = if !dir && !name_hit && query.chars().count() >= 2 {
+                match (phase, kind.as_str()) {
+                    (SearchPhase::Fast, "text") => text_file_contains(&canon, query),
+                    (SearchPhase::Fast, "pdf") => indexed_contains(&canon, "pdf", query, options, ocr_budget),
+                    (SearchPhase::Ocr, "image") => indexed_contains(&canon, "image", query, options, ocr_budget),
+                    _ => None,
                 }
-                (SearchPhase::Ocr, "image") => {
-                    indexed_contains(&canon, "image", query, options, ocr_budget)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        if name_hit || content_hit.is_some() {
-            // Avoid duplicate paths if OCR phase somehow overlaps (should not).
-            if !hits.iter().any(|hit| hit.path == child_rel) {
+            } else {
+                None
+            };
+            if (name_hit || content_hit.is_some()) && !hits.iter().any(|hit| hit.path == child_rel) {
                 let Ok(meta) = canon.metadata() else { continue };
                 hits.push(SearchHit {
                     kind,
-                    name,
+                    name: name.clone(),
                     path: child_rel.clone(),
                     dir,
                     size: if dir { 0 } else { meta.len() },
@@ -1723,19 +1713,9 @@ fn walk_search(
                     matched_content: content_hit,
                 });
             }
-        }
-        if dir {
-            walk_search(
-                root,
-                &canon,
-                &child_rel,
-                query,
-                hits,
-                seen,
-                options,
-                phase,
-                ocr_budget,
-            );
+            if dir && !search_skips(&name) {
+                queue.push_back((canon, child_rel));
+            }
         }
     }
 }
@@ -3133,6 +3113,27 @@ mod tests {
         let nested = list_dir(&root, "sub", false, false).unwrap();
         assert_eq!(nested.entries[0].kind, "text");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_finds_shallow_folders_past_big_photo_libraries() {
+        let root = scratch();
+        // Many files in a deep folder used to use up the search before a shallow folder came.
+        let deep = root.join("aaa/bbb/ccc");
+        fs::create_dir_all(&deep).unwrap();
+        for n in 0..9_000 {
+            fs::write(deep.join(format!("f{n}.txt")), b"").unwrap();
+        }
+        fs::create_dir_all(root.join("Photos Library.photoslibrary/resources/Photo Cache")).unwrap();
+        fs::create_dir_all(root.join("zzz/iPod/iPod Photo Cache")).unwrap();
+        let options = SearchOptions { ocr: false, cache_dir: root.join(".text-cache") };
+        let hits = search(&root, "", "photo cache", &options).unwrap();
+        let paths: Vec<_> = hits.iter().map(|hit| hit.path.as_str()).collect();
+        assert_eq!(paths, ["zzz/iPod/iPod Photo Cache"]);
+        // Inside the package it is searched as usual.
+        let inside = search(&root, "Photos Library.photoslibrary", "photo cache", &options).unwrap();
+        assert_eq!(inside[0].path, "Photos Library.photoslibrary/resources/Photo Cache");
+        assert!(search(&root, "", "photoslibrary", &options).unwrap().iter().any(|hit| hit.dir));
     }
 
     #[test]
