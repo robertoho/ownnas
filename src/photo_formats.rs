@@ -28,7 +28,7 @@ pub fn is_jxl(extension: &str) -> bool {
 /// Layered pictures from editing apps, shown flattened: Photoshop, GIMP, Krita, OpenRaster,
 /// Affinity, Sketch, Procreate, and CorelDRAW (most keep a flattened copy inside).
 pub fn is_layered(extension: &str) -> bool {
-    matches!(extension, "psd" | "psb" | "xcf" | "kra" | "ora" | "afphoto" | "afdesign" | "sketch" | "procreate" | "cdr")
+    matches!(extension, "psd" | "psb" | "eps" | "epsf" | "xcf" | "kra" | "ora" | "afphoto" | "afdesign" | "sketch" | "procreate" | "cdr")
 }
 
 /// Picture formats the image library reads but browsers do not show.
@@ -110,6 +110,10 @@ fn decode_other(path: &Path, extension: &str) -> Result<DynamicImage, String> {
             photoshop_composite(&bytes).or_else(|| photoshop_thumbnail(&bytes)).ok_or_else(|| "This Photoshop file could not be read".to_string())
         }
         "xcf" => std::panic::catch_unwind(|| flatten_xcf(path)).unwrap_or_else(|_| Err("This GIMP file could not be read".into())),
+        "eps" | "epsf" => {
+            let data = std::fs::read(path).map_err(|_| "Could not read the picture".to_string())?;
+            eps_preview(&data).ok_or_else(|| "This EPS file keeps no preview picture inside".to_string())
+        }
         // Zips with a flattened picture inside.
         "kra" | "ora" | "sketch" | "procreate" | "cdr" => {
             let names: &[&str] = match extension {
@@ -306,6 +310,80 @@ fn photoshop_thumbnail(data: &[u8]) -> Option<DynamicImage> {
         at = body + ((size + 1) & !1);
     }
     None
+}
+
+/// The preview an EPS file keeps for programs that cannot run PostScript: a TIFF in the binary
+/// header of "DOS EPS" files, or the hex bitmap of EPSI files.
+fn eps_preview(data: &[u8]) -> Option<DynamicImage> {
+    if data.starts_with(&[0xC5, 0xD0, 0xD3, 0xC6]) {
+        let le = |at: usize| data.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize);
+        let (start, length) = (le(20)?, le(24)?);
+        if length > 0 {
+            let tiff = data.get(start..start + length)?;
+            if let Ok(picture) = image::load_from_memory_with_format(tiff, image::ImageFormat::Tiff) {
+                return Some(picture);
+            }
+            return palette_tiff(tiff);
+        }
+        return None;
+    }
+    // EPSI: "%%BeginPreview: width height depth lines", then hex rows in comment lines.
+    let text = String::from_utf8_lossy(&data[..data.len().min(16 * 1024 * 1024)]);
+    let begin = text.find("%%BeginPreview:")?;
+    let header: Vec<usize> = text[begin + 15..].lines().next()?.split_whitespace().filter_map(|n| n.parse().ok()).collect();
+    let (width, height, depth) = (*header.first()?, *header.get(1)?, *header.get(2)?);
+    if width == 0 || height == 0 || width * height > 50_000_000 || !matches!(depth, 1 | 2 | 4 | 8) {
+        return None;
+    }
+    let end = text[begin..].find("%%EndPreview")? + begin;
+    let hex: Vec<u8> = text[begin..end].lines().skip(1).flat_map(|line| line.trim_start_matches('%').trim().bytes().collect::<Vec<_>>()).collect();
+    let bytes: Vec<u8> = hex.chunks_exact(2).filter_map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()).collect();
+    let row_bytes = (width * depth).div_ceil(8);
+    let mut out = image::GrayImage::new(width as u32, height as u32);
+    let levels = (1u32 << depth) - 1;
+    for y in 0..height {
+        for x in 0..width {
+            let bit = x * depth;
+            let byte = *bytes.get(y * row_bytes + bit / 8).unwrap_or(&0);
+            let value = (u32::from(byte) >> (8 - depth - bit % 8)) & levels;
+            // In EPSI, 0 is white.
+            out.put_pixel(x as u32, y as u32, image::Luma([255 - (value * 255 / levels) as u8]));
+        }
+    }
+    Some(DynamicImage::ImageLuma8(out))
+}
+
+/// A TIFF whose pixels are colour numbers (an 8-bit palette, uncompressed), which the image
+/// library does not read: the strips of numbers are read as they are, each looked up in the
+/// colour map.
+fn palette_tiff(bytes: &[u8]) -> Option<DynamicImage> {
+    use tiff::tags::Tag;
+    let mut decoder = tiff::decoder::Decoder::new(std::io::Cursor::new(bytes)).ok()?;
+    let (width, height) = decoder.dimensions().ok()?;
+    let photometric = decoder.get_tag_u32(Tag::PhotometricInterpretation).ok()?;
+    let compression = decoder.get_tag_u32(Tag::Compression).unwrap_or(1);
+    let bits = decoder.get_tag_u32(Tag::BitsPerSample).unwrap_or(8);
+    if photometric != 3 || compression != 1 || bits != 8 || u64::from(width) * u64::from(height) > 50_000_000 {
+        return None;
+    }
+    let map = decoder.get_tag_u16_vec(Tag::ColorMap).ok()?;
+    let offsets = decoder.get_tag_u64_vec(Tag::StripOffsets).ok()?;
+    let counts = decoder.get_tag_u64_vec(Tag::StripByteCounts).ok()?;
+    let mut indices = Vec::with_capacity((width * height) as usize);
+    for (&offset, &count) in offsets.iter().zip(counts.iter()) {
+        indices.extend_from_slice(bytes.get(offset as usize..(offset + count) as usize)?);
+    }
+    let colours = map.len() / 3;
+    if colours == 0 {
+        return None;
+    }
+    let mut out = image::RgbImage::new(width, height);
+    for (pixel, &index) in out.pixels_mut().zip(indices.iter()) {
+        let i = usize::from(index).min(colours - 1);
+        // The map holds all reds, then all greens, then all blues, 16 bits each.
+        *pixel = image::Rgb([(map[i] >> 8) as u8, (map[colours + i] >> 8) as u8, (map[2 * colours + i] >> 8) as u8]);
+    }
+    Some(DynamicImage::ImageRgb8(out))
 }
 
 /// Linear light as the screen shows it: gamma-corrected, with values brighter than white
@@ -591,6 +669,14 @@ mod tests {
         let mut row = Vec::new();
         unpack_bits(&[0xFE, 7, 1, 9], &mut row, 4);
         assert_eq!(row, [7, 7, 7, 9]);
+    }
+
+    #[test]
+    fn reads_an_epsi_preview() {
+        let eps = "%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 8 2\n%%BeginPreview: 8 2 1 2\n% F0\n% 0F\n%%EndPreview\nshowpage\n";
+        let picture = eps_preview(eps.as_bytes()).unwrap().to_luma8();
+        assert_eq!((picture.width(), picture.height()), (8, 2));
+        assert_eq!((picture.get_pixel(0, 0)[0], picture.get_pixel(7, 0)[0], picture.get_pixel(7, 1)[0]), (0, 255, 0));
     }
 
     #[test]

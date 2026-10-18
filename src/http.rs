@@ -265,6 +265,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/subtitles", get(subtitles))
         .route("/api/document", get(document_view))
         .route("/api/document/picture", get(document_picture))
+        .route("/api/document/pdf", get(document_pdf))
         .route("/api/djvu/info", get(djvu_info))
         .route("/api/djvu/page", get(djvu_page))
         .route("/api/archive/entry", get(archive_entry))
@@ -3255,6 +3256,29 @@ async fn document_picture(
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the document"))?
         .map_err(|err| ApiError::new(StatusCode::NOT_FOUND, err))?;
     Ok(([(header::CONTENT_TYPE, media), (header::CACHE_CONTROL, "private, max-age=3600"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")], bytes).into_response())
+}
+
+/// An Illustrator file saved with PDF compatibility (most are), as the PDF it is inside.
+async fn document_pdf(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<Response, ApiError> {
+    require_user(&state, &headers)?;
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    let bytes = tokio::fs::read(&resolved.full).await.map_err(|_| ApiError::from(FileError::NotFound))?;
+    // The PDF part may follow a short header; it runs to the end of the file.
+    let start = bytes.windows(5).take(1024).position(|w| w == b"%PDF-").ok_or_else(|| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "This file was not saved with PDF compatibility, so it cannot be shown"))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/pdf"),
+            (header::CACHE_CONTROL, "private, max-age=300"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CONTENT_SECURITY_POLICY, "default-src 'none'; frame-ancestors 'self'"),
+        ],
+        bytes[start..].to_vec(),
+    )
+        .into_response())
 }
 
 /// How many pages a DjVu book has.

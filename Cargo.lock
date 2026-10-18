@@ -2941,6 +2941,7 @@ dependencies = [
  "sevenz-rust2",
  "sha2",
  "tar",
+ "tiff",
  "tokio",
  "tokio-util",
  "tower",

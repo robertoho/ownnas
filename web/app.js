@@ -2246,6 +2246,14 @@ async function openEntry(entry) {
     mountViewer(body, entry, (module) => module.mountShortcut(body, entry), () => openMetaPreview(body, entry));
   } else if (entry.kind === "pdf") {
     body.innerHTML = `<iframe title="${esc(entry.name)}" src="${raw}"></iframe>`;
+  } else if (/\.ai$/i.test(entry.name)) {
+    // Illustrator files are PDFs inside when saved with PDF compatibility (the default).
+    const pdf = `/api/document/pdf?path=${encodeURIComponent(entry.path)}`;
+    fetch(pdf, { method: "HEAD", credentials: "same-origin" }).then((response) => {
+      if (state.current !== entry) return;
+      if (response.ok) body.innerHTML = `<iframe title="${esc(entry.name)}" src="${pdf}"></iframe>`;
+      else openMetaPreview(body, entry);
+    }).catch(() => openMetaPreview(body, entry));
   } else if (/\.xlsx$/i.test(entry.name)) {
     body.innerHTML = '<p class="muted">Loading spreadsheet…</p>';
     try {
@@ -3358,7 +3366,7 @@ async function deleteEntries(entries) {
 const RESIZABLE = /\.(jpe?g|png|webp|bmp|tiff?)$/i;
 
 /// Photos the browser cannot show itself (camera RAW, JPEG XL, HEIC, AVIF): the server converts them.
-const NEEDS_DISPLAY = /\.(cr2|cr3|crw|nef|nrw|arw|srf|sr2|dng|raf|orf|rw2|rwl|pef|srw|x3f|3fr|iiq|erf|mef|mos|kdc|dcr|jxl|heic|heif|avif|psd|xcf|kra|ora|afphoto|afdesign|sketch|procreate|cdr|tga|dds|exr|hdr|qoi|pbm|pgm|ppm|pnm|pam|ff|icns)$/i;
+const NEEDS_DISPLAY = /\.(cr2|cr3|crw|nef|nrw|arw|srf|sr2|dng|raf|orf|rw2|rwl|pef|srw|x3f|3fr|iiq|erf|mef|mos|kdc|dcr|jxl|heic|heif|avif|psd|xcf|kra|ora|afphoto|afdesign|sketch|procreate|cdr|eps|epsf|tga|dds|exr|hdr|qoi|pbm|pgm|ppm|pnm|pam|ff|icns)$/i;
 
 /// Where the browser can load a photo from.
 function imageUrl(entry) {
