@@ -2324,6 +2324,8 @@ async function openEntry(entry) {
     } catch (err) {
       if (state.current === entry) body.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
     }
+  } else if (/\.mbox$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountMailbox(body, entry), () => openMetaPreview(body, entry));
   } else if (/\.(eml|msg)$/i.test(entry.name)) {
     mountViewer(body, entry, (module) => module.mountMail(body, entry), () => openMetaPreview(body, entry));
   } else if (/\.(gpx|kml|kmz|geojson)$/i.test(entry.name)) {

@@ -264,10 +264,12 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/video/stream", get(video_stream))
         .route("/api/subtitles", get(subtitles))
         .route("/api/document", get(document_view))
+        .route("/api/document/picture", get(document_picture))
         .route("/api/archive/entry", get(archive_entry))
         .route("/api/archive/list", get(archive_list))
         .route("/api/book/info", get(book_info))
         .route("/api/mail", get(mail_view))
+        .route("/api/mbox", get(mailbox_view))
         .route("/api/mail/html", get(mail_html))
         .route("/api/mail/attachment", get(mail_attachment))
         .route("/api/font/info", get(font_info))
@@ -3205,6 +3207,28 @@ async fn document_view(
 }
 
 #[derive(Deserialize)]
+struct IndexQuery {
+    path: Option<String>,
+    index: usize,
+}
+
+/// A picture from inside an older Word or PowerPoint file.
+async fn document_picture(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<IndexQuery>,
+) -> Result<Response, ApiError> {
+    require_user(&state, &headers)?;
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    let index = query.index;
+    let (bytes, media) = tokio::task::spawn_blocking(move || crate::documents::picture(&resolved.full, index))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the document"))?
+        .map_err(|err| ApiError::new(StatusCode::NOT_FOUND, err))?;
+    Ok(([(header::CONTENT_TYPE, media), (header::CACHE_CONTROL, "private, max-age=3600"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")], bytes).into_response())
+}
+
+#[derive(Deserialize)]
 struct ArchiveEntryQuery {
     path: Option<String>,
     entry: String,
@@ -3243,15 +3267,24 @@ async fn archive_entry(
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not send the file"))
 }
 
-/// A saved e-mail (.eml or .msg): its sender, recipients, date, text, and attachments.
+#[derive(Deserialize)]
+struct MailQuery {
+    path: Option<String>,
+    /// A message of a mailbox (.mbox).
+    message: Option<usize>,
+}
+
+/// A saved e-mail (.eml or .msg, or a message of a .mbox): its sender, recipients, date,
+/// text, and attachments.
 async fn mail_view(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<PathQuery>,
+    Query(query): Query<MailQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
-    let mail = tokio::task::spawn_blocking(move || crate::mail::read(&resolved.full))
+    let message = query.message;
+    let mail = tokio::task::spawn_blocking(move || crate::mail::read(&resolved.full, message))
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the mail"))?
         .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err))?;
@@ -3263,13 +3296,15 @@ async fn mail_view(
 async fn mail_html(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<PathQuery>,
+    Query(query): Query<MailQuery>,
 ) -> Result<Response, ApiError> {
     require_user(&state, &headers)?;
     let rel = rel_of(&query.path);
     let resolved = files::resolve(&state.root, &rel)?;
     let encoded: String = url_encode(&resolved.rel);
-    let html = tokio::task::spawn_blocking(move || crate::mail::html(&resolved.full, |index| format!("/api/mail/attachment?path={encoded}&index={index}")))
+    let message = query.message;
+    let in_mailbox = message.map(|m| format!("&message={m}")).unwrap_or_default();
+    let html = tokio::task::spawn_blocking(move || crate::mail::html(&resolved.full, message, |index| format!("/api/mail/attachment?path={encoded}&index={index}{in_mailbox}")))
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the mail"))?
         .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err))?;
@@ -3292,6 +3327,7 @@ async fn mail_html(
 struct MailAttachmentQuery {
     path: Option<String>,
     index: usize,
+    message: Option<usize>,
     download: Option<String>,
 }
 
@@ -3303,8 +3339,8 @@ async fn mail_attachment(
 ) -> Result<Response, ApiError> {
     require_user(&state, &headers)?;
     let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
-    let index = query.index;
-    let (name, mime, bytes) = tokio::task::spawn_blocking(move || crate::mail::attachment(&resolved.full, index))
+    let (index, message) = (query.index, query.message);
+    let (name, mime, bytes) = tokio::task::spawn_blocking(move || crate::mail::attachment(&resolved.full, message, index))
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the mail"))?
         .map_err(|err| ApiError::new(StatusCode::NOT_FOUND, err))?;
@@ -3343,6 +3379,29 @@ async fn map_tile(
         bytes,
     )
         .into_response())
+}
+
+#[derive(Deserialize)]
+struct MailboxQuery {
+    path: Option<String>,
+    from: Option<usize>,
+    count: Option<usize>,
+}
+
+/// A page of a mailbox's messages (sender, subject, date), and how many it holds.
+async fn mailbox_view(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<MailboxQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    let (from, count) = (query.from.unwrap_or(0), query.count.unwrap_or(100).min(500));
+    let (total, messages) = tokio::task::spawn_blocking(move || crate::mail::mailbox(&resolved.full, from, count))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the mailbox"))?
+        .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err))?;
+    Ok(Json(json!({ "total": total, "messages": messages })))
 }
 
 /// A font's family, style, version, and designer.

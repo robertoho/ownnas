@@ -1165,7 +1165,7 @@ pub fn kind_of(name: &str) -> &'static str {
         "mp3" | "wav" | "flac" | "ogg" | "opus" | "m4a" | "aac" | "wma" => "audio",
         "pdf" => "pdf",
         "xlsx" => "spreadsheet",
-        "zip" | "jar" | "cbz" | "cbr" | "cb7" | "apk" | "tar" | "gz" | "tgz" | "bz2" | "tbz2" | "xz" | "txz" | "7z" | "rar" => "archive",
+        "zip" | "jar" | "cbz" | "cbr" | "cb7" | "apk" | "tar" | "gz" | "tgz" | "bz2" | "tbz2" | "xz" | "txz" | "7z" | "rar" | "iso" => "archive",
         "txt" | "md" | "markdown" | "json" | "csv" | "tsv" | "log" | "xml" | "yaml" | "yml"
         | "toml" | "ini" | "conf" | "cfg" | "env" | "nfo" | "properties" | "html" | "htm"
         | "css" | "js" | "mjs" | "ts" | "tsx" | "jsx" | "py" | "rs" | "go" | "java" | "c"

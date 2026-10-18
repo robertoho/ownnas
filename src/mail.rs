@@ -40,7 +40,22 @@ fn is_msg(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("msg"))
 }
 
-fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
+/// A mail file's bytes, or message `message` of a mailbox (.mbox).
+fn read_bytes(path: &Path, message: Option<usize>) -> Result<Vec<u8>, String> {
+    if let Some(index) = message {
+        let spans = mbox_spans(path)?;
+        let (start, end) = *spans.get(index).ok_or("This mailbox has no such message")?;
+        if end - start > MAX_MAIL {
+            return Err("This mail is too large to preview".into());
+        }
+        let mut file = std::fs::File::open(path).map_err(|_| "Could not read the mailbox".to_string())?;
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start)).map_err(|_| "Could not read the mailbox".to_string())?;
+        let mut bytes = vec![0; (end - start) as usize];
+        file.read_exact(&mut bytes).map_err(|_| "Could not read the mailbox".to_string())?;
+        // The mailbox's own "From " line is not part of the message.
+        let body = bytes.iter().position(|&b| b == b'\n').map_or(0, |i| i + 1);
+        return Ok(bytes[body..].to_vec());
+    }
     let size = std::fs::metadata(path).map_err(|_| "Could not read the mail".to_string())?.len();
     if size > MAX_MAIL {
         return Err("This mail is too large to preview".into());
@@ -48,11 +63,81 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|_| "Could not read the mail".to_string())
 }
 
-pub fn read(path: &Path) -> Result<Mail, String> {
-    if is_msg(path) {
+/// Where each message of a mailbox starts and ends: each begins with a "From " line at the
+/// start of the file or after a blank line. Kept while the file is unchanged.
+fn mbox_spans(path: &Path) -> Result<std::sync::Arc<Vec<(u64, u64)>>, String> {
+    use std::collections::HashMap;
+    use std::io::BufRead;
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Cache = Mutex<HashMap<std::path::PathBuf, (std::time::SystemTime, u64, Arc<Vec<(u64, u64)>>)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let meta = std::fs::metadata(path).map_err(|_| "Could not read the mailbox".to_string())?;
+    let stamp = (meta.modified().unwrap_or(std::time::UNIX_EPOCH), meta.len());
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some((modified, len, spans)) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(path) {
+        if (*modified, *len) == stamp {
+            return Ok(spans.clone());
+        }
+    }
+    let mut reader = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(path).map_err(|_| "Could not read the mailbox".to_string())?);
+    let mut starts = Vec::new();
+    let mut line = Vec::new();
+    let mut at = 0u64;
+    let mut blank_before = true;
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line).map_err(|_| "Could not read the mailbox".to_string())?;
+        if read == 0 {
+            break;
+        }
+        if blank_before && is_separator(&line) {
+            starts.push(at);
+        }
+        blank_before = line.iter().all(|b| b.is_ascii_whitespace());
+        at += read as u64;
+    }
+    let spans: Vec<(u64, u64)> = starts.iter().enumerate().map(|(i, &start)| (start, starts.get(i + 1).copied().unwrap_or(at))).collect();
+    let spans = Arc::new(spans);
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() > 16 {
+        cache.clear();
+    }
+    cache.insert(path.to_path_buf(), (stamp.0, stamp.1, spans.clone()));
+    Ok(spans)
+}
+
+/// A mailbox's line between messages: "From sender Mon Jul 15 18:30:00 2024". A line of a
+/// message that merely starts with "From " has no time in it.
+fn is_separator(line: &[u8]) -> bool {
+    line.starts_with(b"From ") && line.windows(5).any(|w| w[0].is_ascii_digit() && w[1].is_ascii_digit() && w[2] == b':' && w[3].is_ascii_digit() && w[4].is_ascii_digit())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Summary {
+    pub index: usize,
+    pub from: Option<String>,
+    pub subject: Option<String>,
+    pub date: Option<i64>,
+    pub attachments: bool,
+}
+
+/// How many messages a mailbox holds, and a page of them (sender, subject, date).
+pub fn mailbox(path: &Path, from: usize, count: usize) -> Result<(usize, Vec<Summary>), String> {
+    let total = mbox_spans(path)?.len();
+    let mut page = Vec::new();
+    for index in from..(from + count).min(total) {
+        let Ok(mail) = read(path, Some(index)) else { continue };
+        page.push(Summary { index, from: mail.from, subject: mail.subject, date: mail.date, attachments: !mail.attachments.is_empty() });
+    }
+    Ok((total, page))
+}
+
+pub fn read(path: &Path, message: Option<usize>) -> Result<Mail, String> {
+    if is_msg(path) && message.is_none() {
         return Outlook::open(path)?.mail();
     }
-    let bytes = read_bytes(path)?;
+    let bytes = read_bytes(path, message)?;
     let message = MessageParser::default().parse(&bytes).ok_or("This file is not an e-mail")?;
     let people = |address: Option<&mail_parser::Address>| {
         address.map(|a| a.iter().map(|addr| match (addr.name(), addr.address()) {
@@ -94,13 +179,13 @@ fn eml_attachments(message: &mail_parser::Message) -> Vec<Attachment> {
 
 /// The HTML body, ready for the sandbox: links open in a new tab, and pictures sent with the
 /// mail ("cid:") point at the attachment address `attachment_url(index)`.
-pub fn html(path: &Path, attachment_url: impl Fn(usize) -> String) -> Result<String, String> {
-    let (html, attachments) = if is_msg(path) {
+pub fn html(path: &Path, message: Option<usize>, attachment_url: impl Fn(usize) -> String) -> Result<String, String> {
+    let (html, attachments) = if is_msg(path) && message.is_none() {
         let mut outlook = Outlook::open(path)?;
         let mail = outlook.mail()?;
         (outlook.html().ok_or("This mail has no HTML body")?, mail.attachments)
     } else {
-        let bytes = read_bytes(path)?;
+        let bytes = read_bytes(path, message)?;
         let message = MessageParser::default().parse(&bytes).ok_or("This file is not an e-mail")?;
         let html = message.body_html(0).ok_or("This mail has no HTML body")?.into_owned();
         (html, eml_attachments(&message))
@@ -115,11 +200,11 @@ pub fn html(path: &Path, attachment_url: impl Fn(usize) -> String) -> Result<Str
 }
 
 /// One attachment: its name, media type, and contents.
-pub fn attachment(path: &Path, index: usize) -> Result<(String, String, Vec<u8>), String> {
-    if is_msg(path) {
+pub fn attachment(path: &Path, message: Option<usize>, index: usize) -> Result<(String, String, Vec<u8>), String> {
+    if is_msg(path) && message.is_none() {
         return Outlook::open(path)?.attachment(index);
     }
-    let bytes = read_bytes(path)?;
+    let bytes = read_bytes(path, message)?;
     let message = MessageParser::default().parse(&bytes).ok_or("This file is not an e-mail")?;
     let part = message.attachments().nth(index).ok_or("This mail has no such attachment")?;
     let info = &eml_attachments(&message)[index];
@@ -222,7 +307,7 @@ mod tests {
         let path = dir.join("hello.eml");
         let eml = "From: Ana <ana@example.com>\r\nTo: bo@example.com, Cy <cy@example.com>\r\nSubject: =?UTF-8?Q?Caf=C3=A9_plans?=\r\nDate: Mon, 15 Jul 2024 18:30:00 +0000\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b1\"\r\n\r\n--b1\r\nContent-Type: multipart/alternative; boundary=\"b2\"\r\n\r\n--b2\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nSee you at 7.\r\n--b2\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>See you at <b>7</b>. <img src=\"cid:logo@x\"></p>\r\n--b2--\r\n--b1\r\nContent-Type: image/png\r\nContent-ID: <logo@x>\r\nContent-Disposition: attachment; filename=\"logo.png\"\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8=\r\n--b1--\r\n";
         std::fs::write(&path, eml).unwrap();
-        let mail = read(&path).unwrap();
+        let mail = read(&path, None).unwrap();
         assert_eq!(mail.subject.as_deref(), Some("Café plans"));
         assert_eq!(mail.from.as_deref(), Some("Ana <ana@example.com>"));
         assert_eq!(mail.to.as_deref(), Some("bo@example.com, Cy <cy@example.com>"));
@@ -230,9 +315,19 @@ mod tests {
         assert_eq!(mail.text.as_deref().map(str::trim), Some("See you at 7."));
         assert!(mail.has_html);
         assert_eq!((mail.attachments[0].name.as_str(), mail.attachments[0].mime.as_str(), mail.attachments[0].size), ("logo.png", "image/png", 5));
-        let html = html(&path, |index| format!("/a?i={index}")).unwrap();
+        let html = html(&path, None, |index| format!("/a?i={index}")).unwrap();
         assert!(html.contains("<img src=\"/a?i=0\">") && html.contains("<base target=\"_blank\">"));
-        assert_eq!(attachment(&path, 0).unwrap().2, b"hello");
+        assert_eq!(attachment(&path, None, 0).unwrap().2, b"hello");
+        // The same mail twice in a mailbox, after another.
+        let mbox = dir.join("box.mbox");
+        std::fs::write(&mbox, format!("From ana@example.com Mon Jul 15 18:30:00 2024\r\nFrom: Bo <bo@example.com>\r\nSubject: First\r\n\r\nFrom the start.\r\n\r\nFrom ana@example.com Mon Jul 15 18:30:00 2024\r\n{eml}")).unwrap();
+        let (total, page) = mailbox(&mbox, 0, 10).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(page[0].subject.as_deref(), Some("First"));
+        assert_eq!(page[1].subject.as_deref(), Some("Café plans"));
+        assert!(page[1].attachments);
+        assert_eq!(read(&mbox, Some(0)).unwrap().text.as_deref().map(str::trim), Some("From the start."));
+        assert_eq!(attachment(&mbox, Some(1), 0).unwrap().2, b"hello");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

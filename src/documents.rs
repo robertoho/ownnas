@@ -457,7 +457,13 @@ fn doc(path: &Path) -> Result<View, String> {
     let mut file = open_compound(path)?;
     let word = read_stream(&mut file, "WordDocument").ok_or("This is not a Word document")?;
     let text = word_text(&mut file, &word).ok_or("The text of this Word document could not be read")?;
-    Ok(View::Document { blocks: paragraphs(&text), note: Some("Text only: this older Word format is shown without its layout and pictures.".into()) })
+    let mut blocks = paragraphs(&text);
+    let pictures = read_stream(&mut file, "Data").map(|data| picture_spans(&data).len()).unwrap_or(0);
+    if pictures > 0 {
+        blocks.push(Block::Heading { level: 2, text: "Pictures".into() });
+        blocks.extend((0..pictures).map(|index| Block::Image { entry: format!("#picture/{index}") }));
+    }
+    Ok(View::Document { blocks, note: Some("This older Word format is shown without its layout; its pictures are at the end.".into()) })
 }
 
 /// The main text of a Word 97–2003 document, through its piece table.
@@ -561,7 +567,11 @@ fn ppt(path: &Path) -> Result<View, String> {
     let has_text = |slides: &Vec<Slide>| slides.iter().any(|slide| slide.title.is_some() || !slide.blocks.is_empty());
     let mut slides = if has_text(&found.listed) { found.listed } else { found.drawn };
     slides.retain(|slide| slide.title.is_some() || !slide.blocks.is_empty());
-    Ok(View::Slides { slides, note: Some("Text only: this older PowerPoint format is shown without its layout and pictures.".into()) })
+    let pictures = read_stream(&mut file, "Pictures").map(|data| picture_spans(&data).len()).unwrap_or(0);
+    if pictures > 0 {
+        slides.push(Slide { title: Some("Pictures in this presentation".into()), blocks: (0..pictures).map(|index| Block::Image { entry: format!("#picture/{index}") }).collect(), notes: None });
+    }
+    Ok(View::Slides { slides, note: Some("This older PowerPoint format is shown without its layout; its pictures are on the last slide.".into()) })
 }
 
 #[derive(Default)]
@@ -632,6 +642,44 @@ fn ppt_records(data: &[u8], start: usize, end: usize, found: &mut PptText, place
         }
         at = next;
     }
+}
+
+/// The JPEG and PNG pictures inside a Word "Data" or PowerPoint "Pictures" stream, in order
+/// (tiny ones, like bullets, left out): (start, end, media type).
+fn picture_spans(data: &[u8]) -> Vec<(usize, usize, &'static str)> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at + 8 < data.len() {
+        if data[at..].starts_with(&[0xFF, 0xD8, 0xFF]) {
+            if let Some((end, _)) = crate::photo_formats::jpeg_span(data, at) {
+                if end - at > 2048 {
+                    found.push((at, end, "image/jpeg"));
+                }
+                at = end;
+                continue;
+            }
+        } else if data[at..].starts_with(b"\x89PNG\r\n\x1a\n") {
+            if let Some(end) = data[at..].windows(8).position(|w| &w[4..] == b"IEND").map(|i| at + i + 12).filter(|&end| end <= data.len()) {
+                if end - at > 2048 {
+                    found.push((at, end, "image/png"));
+                }
+                at = end;
+                continue;
+            }
+        }
+        at += 1;
+    }
+    found
+}
+
+/// Picture `index` from an older Word or PowerPoint file.
+pub fn picture(path: &Path, index: usize) -> Result<(Vec<u8>, &'static str), String> {
+    let extension = path.extension().map(|ext| ext.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let stream = if extension == "doc" { "Data" } else { "Pictures" };
+    let mut file = open_compound(path)?;
+    let data = read_stream(&mut file, stream).ok_or("This file has no pictures")?;
+    let (start, end, media) = *picture_spans(&data).get(index).ok_or("This file has no such picture")?;
+    Ok((data[start..end].to_vec(), media))
 }
 
 // ---------------------------------------------------------------------------

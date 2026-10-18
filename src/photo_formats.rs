@@ -159,8 +159,7 @@ fn decode_other(path: &Path, extension: &str) -> Result<DynamicImage, String> {
 }
 
 /// The parts of a Photoshop file: where the flattened picture is, and how it is stored.
-struct Photoshop<'a> {
-    data: &'a [u8],
+struct Photoshop {
     big: bool,
     channels: usize,
     height: usize,
@@ -176,7 +175,7 @@ fn be(data: &[u8], at: usize, bytes: usize) -> Option<u64> {
     data.get(at..at + bytes).map(|b| b.iter().fold(0u64, |n, &x| (n << 8) | u64::from(x)))
 }
 
-fn photoshop(data: &[u8]) -> Option<Photoshop<'_>> {
+fn photoshop(data: &[u8]) -> Option<Photoshop> {
     if data.get(..4)? != b"8BPS" {
         return None;
     }
@@ -192,7 +191,7 @@ fn photoshop(data: &[u8]) -> Option<Photoshop<'_>> {
     at += 4 + be(data, at, 4)? as usize;
     let layer_len = if big { be(data, at, 8)? as usize + 8 } else { be(data, at, 4)? as usize + 4 };
     at += layer_len;
-    Some(Photoshop { data, big, channels, height, width, depth, mode, resources, image: at })
+    Some(Photoshop { big, channels, height, width, depth, mode, resources, image: at })
 }
 
 /// The flattened picture Photoshop saves after the layers ("maximize compatibility").
@@ -436,7 +435,7 @@ fn largest_jpeg(data: &[u8]) -> Option<(usize, usize)> {
 
 /// Where the JPEG starting at `start` ends, and its pixel count, if it is one the image
 /// library can decode (not the lossless kind RAW files keep their sensor data in).
-fn jpeg_span(data: &[u8], start: usize) -> Option<(usize, u64)> {
+pub(crate) fn jpeg_span(data: &[u8], start: usize) -> Option<(usize, u64)> {
     let mut at = start + 2;
     let mut pixels = 0u64;
     loop {

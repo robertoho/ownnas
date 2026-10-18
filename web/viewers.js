@@ -296,6 +296,8 @@ export async function mountSubtitles(body, entry) {
 // ---- Documents, presentations, and spreadsheets read by the server (see src/documents.rs) ----
 
 function partUrl(entry, part) {
+  // Pictures found inside older Word and PowerPoint files are numbered.
+  if (part.startsWith("#picture/")) return `/api/document/picture?path=${enc(entry.path)}&index=${part.slice(9)}`;
   return `/api/archive/entry?path=${enc(entry.path)}&entry=${enc(part)}`;
 }
 
@@ -542,14 +544,16 @@ function sizeLabel(bytes) {
   return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unit]}`;
 }
 
-export async function mountMail(body, entry) {
+export async function mountMail(body, entry, { message = null, onBack = null } = {}) {
   body.replaceChildren(h("p", "muted", "Opening the mail…"));
-  const mail = await getJson(`/api/mail?path=${enc(entry.path)}`);
+  // A message of a mailbox is named by its number.
+  const which = message == null ? "" : `&message=${message}`;
+  const mail = await getJson(`/api/mail?path=${enc(entry.path)}${which}`);
   const row = (label, value) => value ? h("div", "mail-row", h("span", "mail-label muted", label), h("span", "mail-value", value)) : null;
   const head = h("header", "mail-head",
     h("h3", "mail-subject", mail.subject || "(no subject)"),
     row("From", mail.from), row("To", mail.to), row("Cc", mail.cc), row("Date", formatWhen(mail.date)));
-  const attachmentUrl = (index) => `/api/mail/attachment?path=${enc(entry.path)}&index=${index}`;
+  const attachmentUrl = (index) => `/api/mail/attachment?path=${enc(entry.path)}&index=${index}${which}`;
   const attachments = mail.attachments.length ? h("ul", "mail-attachments", mail.attachments.map((item) => {
     const open = h("a", "mail-attachment-name", item.name);
     open.href = attachmentUrl(item.index);
@@ -566,7 +570,7 @@ export async function mountMail(body, entry) {
     frame.title = mail.subject || "Mail";
     // No scripts; links open in a new tab.
     frame.setAttribute("sandbox", "allow-same-origin allow-popups allow-popups-to-escape-sandbox");
-    frame.src = `/api/mail/html?path=${enc(entry.path)}`;
+    frame.src = `/api/mail/html?path=${enc(entry.path)}${which}`;
     const holder = h("div", "mail-body", frame);
     const toggle = h("button", "mail-toggle", "Show as plain text");
     toggle.type = "button";
@@ -580,7 +584,67 @@ export async function mountMail(body, entry) {
   } else {
     content = [h("div", "mail-body", textView())];
   }
-  body.replaceChildren(h("article", "mail-view", head, attachments, ...content));
+  let back = null;
+  if (onBack) {
+    back = h("button", "mail-back", "‹ Mailbox");
+    back.type = "button";
+    back.addEventListener("click", onBack);
+  }
+  body.replaceChildren(h("article", "mail-view", back, head, attachments, ...content));
+  return { destroy() {} };
+}
+
+// ---- Mailboxes (.mbox): the messages, newest last as stored, each opening as a mail ----
+
+export async function mountMailbox(body, entry) {
+  body.replaceChildren(h("p", "muted", "Reading the mailbox (a large one takes a moment)…"));
+  const loaded = [];
+  let total = 0;
+  const page = async () => {
+    const data = await getJson(`/api/mbox?path=${enc(entry.path)}&from=${loaded.length}&count=200`);
+    total = data.total;
+    loaded.push(...data.messages);
+  };
+  await page();
+  const search = h("input", "mailbox-search");
+  search.type = "search";
+  search.placeholder = "Search loaded messages";
+  const list = h("ul", "mailbox-list");
+  const more = h("button", "mailbox-more", "Load more");
+  more.type = "button";
+  const count = h("p", "muted mailbox-count");
+  const view = h("div", "mailbox-view", count, search, list, more);
+  let scroll = 0;
+  const showList = () => {
+    body.replaceChildren(view);
+    view.scrollTop = scroll;
+  };
+  const render = () => {
+    const query = search.value.trim().toLowerCase();
+    const shown = loaded.filter((m) => !query || `${m.from || ""} ${m.subject || ""}`.toLowerCase().includes(query));
+    list.replaceChildren(...shown.map((m) => {
+      const item = h("li", "mailbox-item",
+        h("div", "mailbox-line", h("strong", "", m.from || "(unknown sender)"), h("span", "muted", m.date ? new Date(m.date * 1000).toLocaleDateString() : "")),
+        h("div", "mailbox-subject", m.subject || "(no subject)", m.attachments ? h("span", "muted", " · attachments") : null));
+      item.tabIndex = 0;
+      const open = () => {
+        scroll = view.scrollTop;
+        mountMail(body, entry, { message: m.index, onBack: showList }).catch((err) => body.replaceChildren(h("p", "muted", err.message)));
+      };
+      item.addEventListener("click", open);
+      item.addEventListener("keydown", (event) => { if (event.key === "Enter") open(); });
+      return item;
+    }));
+    count.textContent = `${total.toLocaleString()} message${total === 1 ? "" : "s"}${loaded.length < total ? `, ${loaded.length.toLocaleString()} loaded` : ""}`;
+    more.hidden = loaded.length >= total;
+  };
+  search.addEventListener("input", render);
+  more.addEventListener("click", async () => {
+    more.disabled = true;
+    try { await page(); render(); } finally { more.disabled = false; }
+  });
+  render();
+  showList();
   return { destroy() {} };
 }
 
