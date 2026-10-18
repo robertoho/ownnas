@@ -25,9 +25,20 @@ pub fn is_jxl(extension: &str) -> bool {
     extension == "jxl"
 }
 
+/// Layered pictures from editing apps, shown flattened: Photoshop, GIMP, Krita, OpenRaster,
+/// Affinity, Sketch, Procreate, and CorelDRAW (most keep a flattened copy inside).
+pub fn is_layered(extension: &str) -> bool {
+    matches!(extension, "psd" | "psb" | "xcf" | "kra" | "ora" | "afphoto" | "afdesign" | "sketch" | "procreate" | "cdr")
+}
+
+/// Picture formats the image library reads but browsers do not show.
+pub fn is_other_raster(extension: &str) -> bool {
+    matches!(extension, "tga" | "dds" | "exr" | "hdr" | "qoi" | "pbm" | "pgm" | "ppm" | "pnm" | "pam" | "ff" | "icns")
+}
+
 /// Whether a photo with this extension is read here rather than by the image library.
 pub fn handles(extension: &str) -> bool {
-    is_raw(extension) || is_jxl(extension)
+    is_raw(extension) || is_jxl(extension) || is_layered(extension) || is_other_raster(extension)
 }
 
 fn extension_of(path: &Path) -> String {
@@ -41,8 +52,8 @@ pub fn displayable(path: &Path) -> Result<(Vec<u8>, &'static str), String> {
     if is_raw(&extension) {
         return Ok((raw_preview(path)?, "image/jpeg"));
     }
-    if is_jxl(&extension) {
-        let picture = decode_jxl(path)?;
+    if handles(&extension) {
+        let picture = decode(path)?;
         let mut out = Vec::new();
         if picture.color().has_alpha() {
             picture.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png).map_err(|_| "Could not convert the photo".to_string())?;
@@ -53,7 +64,7 @@ pub fn displayable(path: &Path) -> Result<(Vec<u8>, &'static str), String> {
             .map_err(|_| "Could not convert the photo".to_string())?;
         return Ok((out, "image/jpeg"));
     }
-    Err("This is not a RAW or JPEG XL photo".into())
+    Err("This picture format is not read here".into())
 }
 
 /// The photo decoded and turned upright.
@@ -61,6 +72,9 @@ pub fn decode(path: &Path) -> Result<DynamicImage, String> {
     let extension = extension_of(path);
     if is_jxl(&extension) {
         return decode_jxl(path);
+    }
+    if is_layered(&extension) || is_other_raster(&extension) {
+        return decode_other(path, &extension);
     }
     let jpeg = raw_preview(path)?;
     let picture = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg).map_err(|_| "Could not read the camera's preview".to_string())?;
@@ -74,9 +88,306 @@ pub fn shown_size(path: &Path) -> Option<(u32, u32)> {
         let image = jxl_oxide::JxlImage::builder().open(path).ok()?;
         return Some((image.width(), image.height()));
     }
+    if is_layered(&extension) || is_other_raster(&extension) {
+        return decode_other(path, &extension).ok().map(|picture| (picture.width(), picture.height()));
+    }
     let jpeg = raw_preview(path).ok()?;
     let (width, height) = image::ImageReader::with_format(Cursor::new(&jpeg), image::ImageFormat::Jpeg).into_dimensions().ok()?;
     Some(if matches!(jpeg_orientation(&jpeg), Some(5..=8)) { (height, width) } else { (width, height) })
+}
+
+/// The largest file read for a layered or other picture.
+const MAX_OTHER: u64 = 512 * 1024 * 1024;
+
+fn decode_other(path: &Path, extension: &str) -> Result<DynamicImage, String> {
+    let size = std::fs::metadata(path).map_err(|_| "Could not read the picture".to_string())?.len();
+    if size > MAX_OTHER {
+        return Err("This picture is too large to preview".into());
+    }
+    match extension {
+        "psd" | "psb" => {
+            let bytes = std::fs::read(path).map_err(|_| "Could not read the picture".to_string())?;
+            photoshop_composite(&bytes).or_else(|| photoshop_thumbnail(&bytes)).ok_or_else(|| "This Photoshop file could not be read".to_string())
+        }
+        "xcf" => std::panic::catch_unwind(|| flatten_xcf(path)).unwrap_or_else(|_| Err("This GIMP file could not be read".into())),
+        // Zips with a flattened picture inside.
+        "kra" | "ora" | "sketch" | "procreate" | "cdr" => {
+            let names: &[&str] = match extension {
+                "kra" | "ora" => &["mergedimage.png", "Thumbnails/thumbnail.png", "preview.png"],
+                "sketch" => &["previews/preview.png"],
+                "procreate" => &["QuickLook/Thumbnail.png"],
+                _ => &["previews/thumbnail.png", "metadata/thumbnails/thumbnail.png"],
+            };
+            let file = std::fs::File::open(path).map_err(|_| "Could not read the picture".to_string())?;
+            let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(|_| "This file could not be opened".to_string())?;
+            for name in names {
+                if let Ok(mut part) = zip.by_name(name) {
+                    let mut bytes = Vec::new();
+                    std::io::Read::read_to_end(&mut part, &mut bytes).map_err(|_| "Could not read the picture".to_string())?;
+                    return image::load_from_memory(&bytes).map_err(|_| "The picture inside could not be read".to_string());
+                }
+            }
+            Err("This file keeps no picture of itself inside".into())
+        }
+        // Affinity keeps PNG previews inside: the largest is shown.
+        "afphoto" | "afdesign" => {
+            let data = std::fs::read(path).map_err(|_| "Could not read the picture".to_string())?;
+            let png = largest_png(&data).ok_or("This Affinity file has no preview inside")?;
+            image::load_from_memory_with_format(png, image::ImageFormat::Png).map_err(|_| "The preview could not be read".to_string())
+        }
+        "icns" => {
+            let file = std::fs::File::open(path).map_err(|_| "Could not read the icon".to_string())?;
+            let family = icns::IconFamily::read(std::io::BufReader::new(file)).map_err(|_| "This icon file could not be read".to_string())?;
+            let biggest = family.available_icons().into_iter().max_by_key(|kind| kind.pixel_width()).ok_or("This icon file is empty")?;
+            let icon = family.get_icon_with_type(biggest).map_err(|_| "This icon could not be read".to_string())?;
+            let rgba = icon.convert_to(icns::PixelFormat::RGBA);
+            image::RgbaImage::from_raw(rgba.width(), rgba.height(), rgba.into_data().into_vec()).map(DynamicImage::ImageRgba8).ok_or_else(|| "This icon could not be read".to_string())
+        }
+        _ => {
+            let mut reader = image::ImageReader::open(path).map_err(|_| "Could not read the picture".to_string())?.with_guessed_format().map_err(|_| "Could not read the picture".to_string())?;
+            let mut limits = image::Limits::default();
+            limits.max_alloc = Some(512 * 1024 * 1024);
+            reader.limits(limits);
+            let picture = reader.decode().map_err(|_| "This picture could not be read".to_string())?;
+            // High dynamic range pictures (EXR, HDR) are brought down to what a screen shows.
+            Ok(match picture {
+                DynamicImage::ImageRgb32F(_) | DynamicImage::ImageRgba32F(_) => tone_map(&picture),
+                other => other,
+            })
+        }
+    }
+}
+
+/// The parts of a Photoshop file: where the flattened picture is, and how it is stored.
+struct Photoshop<'a> {
+    data: &'a [u8],
+    big: bool,
+    channels: usize,
+    height: usize,
+    width: usize,
+    depth: u16,
+    mode: u16,
+    /// Where the image resources start, and where the flattened picture starts.
+    resources: usize,
+    image: usize,
+}
+
+fn be(data: &[u8], at: usize, bytes: usize) -> Option<u64> {
+    data.get(at..at + bytes).map(|b| b.iter().fold(0u64, |n, &x| (n << 8) | u64::from(x)))
+}
+
+fn photoshop(data: &[u8]) -> Option<Photoshop<'_>> {
+    if data.get(..4)? != b"8BPS" {
+        return None;
+    }
+    let big = be(data, 4, 2)? == 2;
+    let channels = be(data, 12, 2)? as usize;
+    let height = be(data, 14, 4)? as usize;
+    let width = be(data, 18, 4)? as usize;
+    let depth = be(data, 22, 2)? as u16;
+    let mode = be(data, 24, 2)? as u16;
+    let mut at = 26;
+    at += 4 + be(data, at, 4)? as usize;
+    let resources = at;
+    at += 4 + be(data, at, 4)? as usize;
+    let layer_len = if big { be(data, at, 8)? as usize + 8 } else { be(data, at, 4)? as usize + 4 };
+    at += layer_len;
+    Some(Photoshop { data, big, channels, height, width, depth, mode, resources, image: at })
+}
+
+/// The flattened picture Photoshop saves after the layers ("maximize compatibility").
+fn photoshop_composite(data: &[u8]) -> Option<DynamicImage> {
+    let psd = photoshop(data)?;
+    let (width, height) = (psd.width, psd.height);
+    if width == 0 || height == 0 || width * height > 200_000_000 || !matches!(psd.depth, 8 | 16) {
+        return None;
+    }
+    // Grayscale, RGB, and CMYK; the first channels are the colours, the next the transparency.
+    let colours = match psd.mode {
+        1 => 1,
+        3 => 3,
+        4 => 4,
+        _ => return None,
+    };
+    if psd.channels < colours {
+        return None;
+    }
+    let bytes_per = usize::from(psd.depth / 8);
+    let row = width * bytes_per;
+    let compression = be(data, psd.image, 2)?;
+    let mut at = psd.image + 2;
+    let wanted = colours + usize::from(psd.channels > colours);
+    let mut planes: Vec<Vec<u8>> = Vec::with_capacity(wanted);
+    match compression {
+        0 => {
+            for _ in 0..wanted {
+                planes.push(data.get(at..at + row * height)?.to_vec());
+                at += row * height;
+            }
+        }
+        1 => {
+            // The length of every row of every channel comes first, then the rows (PackBits).
+            let count_size = if psd.big { 4 } else { 2 };
+            let counts: Vec<usize> = (0..psd.channels * height).map(|i| be(data, at + i * count_size, count_size).map(|n| n as usize)).collect::<Option<_>>()?;
+            at += psd.channels * height * count_size;
+            for channel in 0..wanted {
+                let mut plane = Vec::with_capacity(row * height);
+                for y in 0..height {
+                    let length = counts[channel * height + y];
+                    unpack_bits(data.get(at..at + length)?, &mut plane, row);
+                    at += length;
+                }
+                planes.push(plane);
+            }
+        }
+        _ => return None,
+    }
+    let sample = |plane: &Vec<u8>, i: usize| -> u8 { plane.get(i * bytes_per).copied().unwrap_or(0) };
+    let mut out = image::RgbaImage::new(width as u32, height as u32);
+    for (i, pixel) in out.pixels_mut().enumerate() {
+        let alpha = if wanted > colours { sample(&planes[colours], i) } else { 255 };
+        *pixel = match colours {
+            1 => {
+                let v = sample(&planes[0], i);
+                image::Rgba([v, v, v, alpha])
+            }
+            3 => image::Rgba([sample(&planes[0], i), sample(&planes[1], i), sample(&planes[2], i), alpha]),
+            _ => {
+                // Photoshop stores CMYK inverted (255 is no ink).
+                let k = f32::from(sample(&planes[3], i)) / 255.0;
+                let channel = |c: u8| (f32::from(c) * k).round() as u8;
+                image::Rgba([channel(sample(&planes[0], i)), channel(sample(&planes[1], i)), channel(sample(&planes[2], i)), alpha])
+            }
+        };
+    }
+    Some(DynamicImage::ImageRgba8(out))
+}
+
+/// PackBits run-length decoding of one row, `row` bytes long.
+fn unpack_bits(input: &[u8], out: &mut Vec<u8>, row: usize) {
+    let end = out.len() + row;
+    let mut at = 0;
+    while at < input.len() && out.len() < end {
+        let header = input[at] as i8;
+        at += 1;
+        if header >= 0 {
+            let count = header as usize + 1;
+            out.extend_from_slice(&input[at..(at + count).min(input.len())]);
+            at += count;
+        } else if header != -128 {
+            let count = (1 - i32::from(header)) as usize;
+            if let Some(&value) = input.get(at) {
+                out.extend(std::iter::repeat_n(value, count));
+            }
+            at += 1;
+        }
+    }
+    out.resize(end, 0);
+}
+
+/// The small JPEG thumbnail Photoshop keeps in its image resources (number 1036).
+fn photoshop_thumbnail(data: &[u8]) -> Option<DynamicImage> {
+    let psd = photoshop(data)?;
+    let end = psd.resources + 4 + be(data, psd.resources, 4)? as usize;
+    let mut at = psd.resources + 4;
+    while at + 12 <= end {
+        if data.get(at..at + 4)? != b"8BIM" {
+            return None;
+        }
+        let id = be(data, at + 4, 2)?;
+        let name_len = be(data, at + 6, 1)? as usize;
+        let name_total = (1 + name_len + 1) & !1;
+        let size_at = at + 6 + name_total;
+        let size = be(data, size_at, 4)? as usize;
+        let body = size_at + 4;
+        if id == 1036 || id == 1033 {
+            // A 28-byte header, then the JPEG.
+            return image::load_from_memory(data.get(body + 28..body + size)?).ok();
+        }
+        at = body + ((size + 1) & !1);
+    }
+    None
+}
+
+/// Linear light as the screen shows it: gamma-corrected, with values brighter than white
+/// squeezed into range (Reinhard) only when the picture has any.
+fn tone_map(picture: &DynamicImage) -> DynamicImage {
+    let float = picture.to_rgba32f();
+    let brightest = float.pixels().flat_map(|p| [p[0], p[1], p[2]]).fold(0.0f32, f32::max);
+    let squeeze = brightest > 1.0;
+    let mut out = image::RgbaImage::new(float.width(), float.height());
+    for (source, target) in float.pixels().zip(out.pixels_mut()) {
+        let map = |v: f32| {
+            let v = v.max(0.0);
+            let v = if squeeze { v / (1.0 + v) } else { v };
+            (v.powf(1.0 / 2.2) * 255.0).round().min(255.0) as u8
+        };
+        *target = image::Rgba([map(source[0]), map(source[1]), map(source[2]), (source[3].clamp(0.0, 1.0) * 255.0) as u8]);
+    }
+    DynamicImage::ImageRgba8(out)
+}
+
+/// The largest whole PNG inside `data`.
+fn largest_png(data: &[u8]) -> Option<&[u8]> {
+    const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+    let mut best: Option<&[u8]> = None;
+    let mut at = 0;
+    while let Some(found) = data[at..].windows(8).position(|w| w == SIGNATURE) {
+        let start = at + found;
+        if let Some(end) = data[start..].windows(8).position(|w| &w[4..] == b"IEND").map(|i| start + i + 12) {
+            if end <= data.len() && best.is_none_or(|b| end - start > b.len()) {
+                best = Some(&data[start..end]);
+            }
+        }
+        at = start + 8;
+    }
+    best
+}
+
+/// A GIMP picture's visible layers, laid over each other (normal mode, with their opacity).
+fn flatten_xcf(path: &Path) -> Result<DynamicImage, String> {
+    let xcf = xcf::Xcf::open(path).map_err(|_| "This GIMP file could not be read".to_string())?;
+    let (width, height) = xcf.dimensions();
+    if u64::from(width) * u64::from(height) > 200_000_000 {
+        return Err("This picture is too large to preview".into());
+    }
+    let mut canvas = image::RgbaImage::new(width, height);
+    let property = |layer: &xcf::Layer, kind: xcf::PropertyIdentifier| {
+        layer.properties.iter().find(|p| p.kind == kind).and_then(|p| match &p.payload {
+            xcf::PropertyPayload::Unknown(bytes) => Some(bytes.clone()),
+            _ => None,
+        })
+    };
+    // The first layer is the top one.
+    for layer in xcf.layers.iter().rev() {
+        let visible = property(layer, xcf::PropertyIdentifier::PropVisible).and_then(|b| b.get(..4).map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]))).unwrap_or(1);
+        if visible == 0 {
+            continue;
+        }
+        let opacity = property(layer, xcf::PropertyIdentifier::PropOpacity).and_then(|b| b.get(..4).map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]))).unwrap_or(255).min(255) as f32 / 255.0;
+        let (dx, dy) = property(layer, xcf::PropertyIdentifier::PropOffsets)
+            .and_then(|b| (b.len() >= 8).then(|| (i32::from_be_bytes([b[0], b[1], b[2], b[3]]), i32::from_be_bytes([b[4], b[5], b[6], b[7]]))))
+            .unwrap_or((0, 0));
+        for y in 0..layer.height {
+            for x in 0..layer.width {
+                let (cx, cy) = (x as i64 + i64::from(dx), y as i64 + i64::from(dy));
+                if cx < 0 || cy < 0 || cx >= i64::from(width) || cy >= i64::from(height) {
+                    continue;
+                }
+                let Some(pixel) = layer.pixel(x, y) else { continue };
+                let alpha = f32::from(pixel.a()) / 255.0 * opacity;
+                if alpha <= 0.0 {
+                    continue;
+                }
+                let below = canvas.get_pixel_mut(cx as u32, cy as u32);
+                let under = f32::from(below[3]) / 255.0;
+                let out_alpha = alpha + under * (1.0 - alpha);
+                let mix = |top: u8, bottom: u8| ((f32::from(top) * alpha + f32::from(bottom) * under * (1.0 - alpha)) / out_alpha).round() as u8;
+                *below = image::Rgba([mix(pixel.r(), below[0]), mix(pixel.g(), below[1]), mix(pixel.b(), below[2]), (out_alpha * 255.0).round() as u8]);
+            }
+        }
+    }
+    Ok(DynamicImage::ImageRgba8(canvas))
 }
 
 fn decode_jxl(path: &Path) -> Result<DynamicImage, String> {
@@ -262,6 +573,25 @@ mod tests {
         assert_eq!(shown_size(&path), Some((64, 48)));
         assert_eq!(decode(&path).unwrap().width(), 64);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reads_photoshops_flattened_picture() {
+        // 2 × 1 RGB, RLE: red, then blue.
+        let mut psd = b"8BPS\x00\x01\x00\x00\x00\x00\x00\x00".to_vec();
+        psd.extend_from_slice(&[0, 3, 0, 0, 0, 1, 0, 0, 0, 2, 0, 8, 0, 3]);
+        psd.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        psd.extend_from_slice(&[0, 1]);
+        // Row lengths, then each channel's row: a literal run of two bytes.
+        psd.extend_from_slice(&[0, 3, 0, 3, 0, 3]);
+        psd.extend_from_slice(&[1, 255, 0, 1, 0, 0, 1, 0, 255]);
+        let picture = photoshop_composite(&psd).unwrap().to_rgba8();
+        assert_eq!((picture.width(), picture.height()), (2, 1));
+        assert_eq!(picture.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(picture.get_pixel(1, 0).0, [0, 0, 255, 255]);
+        let mut row = Vec::new();
+        unpack_bits(&[0xFE, 7, 1, 9], &mut row, 4);
+        assert_eq!(row, [7, 7, 7, 9]);
     }
 
     #[test]

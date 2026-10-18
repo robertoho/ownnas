@@ -3307,7 +3307,7 @@ async function deleteEntries(entries) {
 const RESIZABLE = /\.(jpe?g|png|webp|bmp|tiff?)$/i;
 
 /// Photos the browser cannot show itself (camera RAW, JPEG XL, HEIC, AVIF): the server converts them.
-const NEEDS_DISPLAY = /\.(cr2|cr3|crw|nef|nrw|arw|srf|sr2|dng|raf|orf|rw2|rwl|pef|srw|x3f|3fr|iiq|erf|mef|mos|kdc|dcr|jxl|heic|heif|avif)$/i;
+const NEEDS_DISPLAY = /\.(cr2|cr3|crw|nef|nrw|arw|srf|sr2|dng|raf|orf|rw2|rwl|pef|srw|x3f|3fr|iiq|erf|mef|mos|kdc|dcr|jxl|heic|heif|avif|psd|xcf|kra|ora|afphoto|afdesign|sketch|procreate|cdr|tga|dds|exr|hdr|qoi|pbm|pgm|ppm|pnm|pam|ff|icns)$/i;
 
 /// Where the browser can load a photo from.
 function imageUrl(entry) {
