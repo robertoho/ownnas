@@ -86,6 +86,8 @@ pub struct AppState {
     pub agent_url: std::sync::OnceLock<String>,
     /// The Gallery's photo index, kept up to date in the background once started.
     pub media: std::sync::Arc<crate::media_index::Indexer>,
+    /// How full the disk is, and how much the library and OwnNAS's data take.
+    pub storage: std::sync::Arc<crate::storage::Storage>,
     /// The Gallery's machine-learning models (downloaded when switched on).
     #[cfg(ownnas_ml)]
     pub models: std::sync::Arc<crate::ml::Models>,
@@ -155,6 +157,11 @@ pub fn new_state(
         terminals: crate::terminal::Terminals::default(),
         agent_url: std::sync::OnceLock::new(),
         media: std::sync::Arc::default(),
+        storage: {
+            let storage = std::sync::Arc::new(crate::storage::Storage::default());
+            storage.load(&db_path);
+            storage
+        },
         #[cfg(ownnas_ml)]
         models: std::sync::Arc::new(crate::ml::Models::new(&data_dir)),
         db_path,
@@ -288,6 +295,8 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/backup/upload", post(backup_upload).layer(DefaultBodyLimit::disable()))
         .route("/api/backup/has", get(backup_has))
         .route("/api/images/resize", post(resize_images))
+        .route("/api/storage", get(storage_status))
+        .route("/api/storage/measure", post(measure_storage))
         .route("/api/videos/convert", post(convert_video))
         .route("/api/videos/job", get(video_job).delete(cancel_video_job))
         .route("/api/backup/blocked", get(blocked_backups).post(block_backups).delete(unblock_backup))
@@ -5079,6 +5088,37 @@ async fn cancel_video_job(State(state): State<std::sync::Arc<AppState>>, headers
         job.cancel();
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+/// The library's disk (size, used, free) and what the library, its Trash, and OwnNAS's own data
+/// take. Starts measuring again when the last measurement is old.
+async fn storage_status(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let root = state.root.clone();
+    let disk = tokio::task::spawn_blocking(move || crate::storage::disk(&root)).await.ok().flatten();
+    if state.storage.stale() {
+        state.storage.measure(state.root.clone(), state.db_path.clone());
+    }
+    Ok(Json(storage_json(&state, disk)))
+}
+
+fn storage_json(state: &AppState, disk: Option<crate::storage::Disk>) -> serde_json::Value {
+    json!({
+        "disk": disk,
+        "library": state.storage.last(),
+        "measuring": state.storage.running(),
+        "measuredSoFar": state.storage.running().then(|| state.storage.seen()),
+    })
+}
+
+/// Measures the library again now.
+async fn measure_storage(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    require_user(&state, &headers)?;
+    state.storage.measure(state.root.clone(), state.db_path.clone());
+    let root = state.root.clone();
+    let disk = tokio::task::spawn_blocking(move || crate::storage::disk(&root)).await.ok().flatten();
+    Ok(Json(storage_json(&state, disk)))
 }
 
 fn record(state: &AppState, user: &User, action: &str, detail: &str) {

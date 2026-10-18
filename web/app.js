@@ -730,6 +730,7 @@ async function load(path, options = {}) {
   renderCrumbs();
   syncUndo();
   renderFiles();
+  refreshStorage().catch(() => {});
   if (changedFolder) document.querySelector(".explorer-content").scrollTop = 0;
   $("zip-link").href = `/api/zip?path=${encodeURIComponent(state.path)}`;
   syncBookmarkBtn();
@@ -1340,6 +1341,10 @@ function setSettingsTab(tab) {
   const users = tab === "users";
   const terminal = tab === "terminal";
   const galleryTab = tab === "gallery";
+  const storageTab = tab === "storage";
+  $("settings-tab-storage").setAttribute("aria-selected", storageTab ? "true" : "false");
+  $("settings-storage").hidden = !storageTab;
+  if (storageTab) refreshStorage(true).catch((err) => toast(err.message, true));
   $("settings-tab-gallery").setAttribute("aria-selected", galleryTab ? "true" : "false");
   $("settings-gallery").hidden = !galleryTab;
   clearTimeout(indexStatusTimer);
@@ -1593,6 +1598,74 @@ $("index-rescan").addEventListener("click", async () => {
 });
 
 $("settings-tab-gallery").addEventListener("click", () => setSettingsTab("gallery"));
+$("settings-tab-storage").addEventListener("click", () => setSettingsTab("storage"));
+$("storage-meter").addEventListener("click", () => openSettings("storage"));
+$("storage-measure").addEventListener("click", () => {
+  api("/api/storage/measure", { method: "POST" }).then(paintStorage).catch((err) => toast(err.message, true));
+});
+
+// ---- Disk space: how full the library's disk is, and what OwnNAS takes of it ----
+
+let storageFetched = 0;
+let storageTimer = 0;
+
+/// Asks the server about the disk (cheap: the folders are measured in the background). At most
+/// every 30 seconds unless `force`; again in a moment while a measurement is under way.
+async function refreshStorage(force = false) {
+  if (!state.me || (!force && Date.now() - storageFetched < 30000)) return;
+  storageFetched = Date.now();
+  paintStorage(await api("/api/storage"));
+}
+
+function paintStorage(data) {
+  clearTimeout(storageTimer);
+  if (data.measuring) storageTimer = setTimeout(() => refreshStorage(true).catch(() => {}), 2000);
+  const disk = data.disk;
+  const meter = $("storage-meter");
+  meter.hidden = !disk;
+  if (!disk) return;
+  const lib = data.library;
+  const share = (bytes) => `${Math.max(0, Math.min(100, (bytes / disk.total) * 100)).toFixed(2)}%`;
+  const libraryBytes = lib ? lib.bytes : 0;
+  const dataBytes = lib ? lib.dataBytes : 0;
+  const otherBytes = Math.max(0, disk.used - libraryBytes - dataBytes);
+  const low = disk.available / disk.total < 0.1;
+  meter.classList.toggle("is-low", low);
+  meter.querySelector(".storage-bar-library").dataset.css = `width:${share(libraryBytes + dataBytes)}`;
+  meter.querySelector(".storage-bar-other").dataset.css = `width:${share(otherBytes)}`;
+  $("storage-text").textContent = `${formatSize(disk.available)} free`;
+  meter.title = [
+    `Disk: ${formatSize(disk.total)}, ${formatSize(disk.used)} used, ${formatSize(disk.available)} free`,
+    lib ? `OwnNAS library: ${formatSize(lib.bytes)} (${lib.files.toLocaleString()} files)${lib.trashBytes ? `, of which Trash ${formatSize(lib.trashBytes)}` : ""}` : "OwnNAS library: measuring…",
+    lib && lib.dataBytes ? `OwnNAS data (database, thumbnails): ${formatSize(lib.dataBytes)}` : "",
+    "Click for details",
+  ].filter(Boolean).join("\n");
+
+  // Settings → Storage.
+  $("storage-disk-line").textContent = `${formatSize(disk.used)} of ${formatSize(disk.total)} used · ${formatSize(disk.available)} free${low ? " — the disk is almost full" : ""}`;
+  $("storage-disk-line").classList.toggle("form-error", low);
+  const bar = $("settings-storage");
+  bar.querySelector(".storage-seg-library").dataset.css = `width:${share(Math.max(0, libraryBytes - (lib ? lib.trashBytes : 0)))}`;
+  bar.querySelector(".storage-seg-trash").dataset.css = `width:${share(lib ? lib.trashBytes : 0)}`;
+  bar.querySelector(".storage-seg-data").dataset.css = `width:${share(dataBytes)}`;
+  bar.querySelector(".storage-seg-other").dataset.css = `width:${share(otherBytes)}`;
+  const row = (swatch, label, note, bytes) => `<dt><span class="swatch ${swatch}"></span><span class="label">${esc(label)}${note ? `<small>${esc(note)}</small>` : ""}</span></dt><dd>${bytes === null ? "…" : esc(formatSize(bytes))}</dd>`;
+  const pct = (bytes) => {
+    const share = (bytes / disk.total) * 100;
+    return share < 0.1 ? "under 0.1% of the disk" : `${share.toFixed(1)}% of the disk`;
+  };
+  $("storage-legend").innerHTML = [
+    row("storage-seg-library", "OwnNAS library", lib ? `${lib.files.toLocaleString()} files, ${pct(lib.bytes)}` : "Measuring…", lib ? Math.max(0, lib.bytes - lib.trashBytes) : null),
+    row("storage-seg-trash", "Trash", lib && lib.trashFiles ? `${lib.trashFiles.toLocaleString()} files; emptying it frees this` : "Empty", lib ? lib.trashBytes : null),
+    row("storage-seg-data", "OwnNAS data", "Database, thumbnails, and caches", lib ? lib.dataBytes : null),
+    row("storage-seg-other", "Everything else on the disk", "The system, apps, and other files", lib ? otherBytes : null),
+    row("swatch-free", "Free", "", disk.available),
+  ].join("");
+  $("storage-measured").textContent = data.measuring
+    ? `Measuring the library… ${formatSize(data.measuredSoFar || 0)} so far`
+    : lib ? `The library was measured ${formatDate(lib.measuredAt)} (it took ${(lib.tookMs / 1000).toFixed(1)} s). The disk numbers are live.` : "";
+  $("storage-measure").disabled = !!data.measuring;
+}
 
 let terminalModule = null;
 
@@ -3669,6 +3742,8 @@ async function restoreEntries(entries) {
 async function emptyTrash() {
   if (!await askConfirm("Empty the Trash? Every item in it will be permanently deleted.", "Empty Trash")) return;
   const result = await api("/api/trash/empty", { method: "POST" });
+  // The Trash's share of the disk changed: measure again.
+  api("/api/storage/measure", { method: "POST" }).then(paintStorage).catch(() => {});
   toast(result.removed ? `Emptied ${result.removed} item(s)` : "Trash was already empty");
   invalidateFolderSizes();
   await load(state.path);

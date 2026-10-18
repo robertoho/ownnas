@@ -18,6 +18,7 @@ clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 kamadak-exif = "0.6"
 flate2 = "1"
+fs4 = { version = "1", default-features = false, features = ["sync"] }
 futures-util = { version = "0.3", default-features = false }
 hex = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }

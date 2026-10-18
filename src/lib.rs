@@ -22,6 +22,7 @@ pub mod photo_details;
 pub mod terminal;
 pub mod preview;
 pub mod sqlite_view;
+pub mod storage;
 pub mod thumbs;
 pub mod tls;
 pub mod update;

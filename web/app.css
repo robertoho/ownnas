@@ -338,6 +338,37 @@ input, select, textarea {
   min-width: 0;
 }
 .explorer-status-bar .tile-size-control { flex: 0 0 auto; }
+.status-right { display: flex; align-items: center; gap: 1rem; flex: 0 1 auto; min-width: 0; }
+.storage-text { white-space: nowrap; }
+.explorer-status-bar .status-summary { flex: 1 1 auto; min-width: 0; }
+#storage-measure { justify-self: start; width: auto; }
+@media (max-width: 600px) {
+  .storage-meter .storage-bar { display: none; }
+  .status-right { gap: 0.4rem; }
+  .explorer-status-bar .tile-size-control > span { display: none; }
+}
+/* Disk space, in the status bar: the library, the rest of the disk, and what is free. */
+.storage-meter { display: inline-flex; align-items: center; gap: 0.5rem; min-height: 0; padding: 0.2rem 0.5rem; border: 0; background: transparent; box-shadow: none; color: var(--muted); font-size: 0.8rem; }
+.storage-meter:hover { color: var(--text); background: color-mix(in srgb, var(--text) 8%, transparent); }
+.storage-meter[hidden] { display: none; }
+.storage-bar { display: flex; width: 5.5rem; height: 0.45rem; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, var(--text) 14%, transparent); }
+.storage-bar > span { display: block; height: 100%; }
+.storage-bar-library, .storage-seg-library { background: var(--accent); }
+.storage-bar-other, .storage-seg-other { background: color-mix(in srgb, var(--text) 38%, transparent); }
+.storage-meter.is-low .storage-bar-other { background: var(--danger); }
+.storage-meter.is-low { color: var(--danger); }
+.storage-seg-trash { background: color-mix(in srgb, var(--accent) 45%, transparent); }
+.storage-seg-data { background: #58a6ff; }
+.storage-settings h3 { margin: 0 0 0.4rem; }
+.storage-headline { margin: 0 0 0.6rem; font-size: 1.05rem; }
+.storage-big-bar { display: flex; height: 0.9rem; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, var(--text) 12%, transparent); }
+.storage-big-bar > span { display: block; height: 100%; }
+.storage-legend { display: grid; grid-template-columns: auto 1fr auto; gap: 0.45rem 0.7rem; align-items: center; margin: 1rem 0; }
+.storage-legend dt { display: contents; }
+.storage-legend .swatch { width: 0.8rem; height: 0.8rem; border-radius: 3px; }
+.storage-legend .swatch-free { background: color-mix(in srgb, var(--text) 12%, transparent); }
+.storage-legend dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+.storage-legend .label small { display: block; color: var(--muted); font-size: 0.78rem; }
 .explorer-status-bar .selection-summary {
   padding: 0;
   border-radius: 0;

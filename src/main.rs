@@ -16,6 +16,7 @@ mod photo_details;
 mod terminal;
 mod preview;
 mod sqlite_view;
+mod storage;
 mod thumbs;
 mod tls;
 mod update;

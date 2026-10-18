@@ -267,10 +267,16 @@
         <span id="selection-summary" class="selection-summary" hidden></span>
       </div>
       <button id="undo-btn" type="button" disabled title="Nothing to undo">Undo</button>
-      <label id="tile-size-control" class="tile-size-control" for="tile-size">
-        <span>Size</span>
-        <input id="tile-size" type="range" min="96" max="360" step="12" value="180" aria-label="Tile size">
-      </label>
+      <div class="status-right">
+        <button id="storage-meter" class="storage-meter" type="button" hidden aria-label="Disk space">
+          <span class="storage-bar" aria-hidden="true"><span class="storage-bar-library"></span><span class="storage-bar-other"></span></span>
+          <span id="storage-text" class="storage-text"></span>
+        </button>
+        <label id="tile-size-control" class="tile-size-control" for="tile-size">
+          <span>Size</span>
+          <input id="tile-size" type="range" min="96" max="360" step="12" value="180" aria-label="Tile size">
+        </label>
+      </div>
     </footer>
     <button id="fab-menu" class="fab-menu" type="button" title="Actions" aria-label="Open actions menu" aria-haspopup="menu">
       <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true">
@@ -311,6 +317,7 @@
       <button id="settings-tab-users" type="button" role="tab" aria-selected="false" data-settings-tab="users" hidden>Users</button>
       <button id="settings-tab-terminal" type="button" role="tab" aria-selected="false" data-settings-tab="terminal" hidden>Terminal</button>
       <button id="settings-tab-gallery" type="button" role="tab" aria-selected="false" data-settings-tab="gallery" hidden>Gallery</button>
+      <button id="settings-tab-storage" type="button" role="tab" aria-selected="false" data-settings-tab="storage">Storage</button>
     </div>
     <section id="settings-theme" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-theme">
       <p class="muted">Themes inspired by Omarchy palettes. Choice is saved in this browser.</p>
@@ -369,6 +376,19 @@
         </label>
         <button id="smart-forget" type="button" class="danger">Delete all face data</button>
       </div>
+    </section>
+    <section id="settings-storage" class="settings-panel storage-settings" role="tabpanel" aria-labelledby="settings-tab-storage" hidden>
+      <h3>Disk space</h3>
+      <p id="storage-disk-line" class="storage-headline"></p>
+      <div class="storage-big-bar" aria-hidden="true">
+        <span class="storage-seg storage-seg-library"></span>
+        <span class="storage-seg storage-seg-trash"></span>
+        <span class="storage-seg storage-seg-data"></span>
+        <span class="storage-seg storage-seg-other"></span>
+      </div>
+      <dl id="storage-legend" class="storage-legend"></dl>
+      <p id="storage-measured" class="muted"></p>
+      <button id="storage-measure" type="button">Measure again</button>
     </section>
     <section id="settings-users" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-users" hidden>
       <p class="muted">Administrators can add accounts, reset passwords, and grant admin access.</p>
