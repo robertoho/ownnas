@@ -1233,6 +1233,7 @@ input, select, textarea {
 }
 .jobs-item-title { font-size: 0.88rem; font-weight: 600; }
 .jobs-item-detail { font-size: 0.78rem; color: var(--muted); }
+.jobs-item-stats { font-size: 0.78rem; font-variant-numeric: tabular-nums; }
 .jobs-item-head button {
   padding: 0.15rem 0.45rem;
   font-size: 0.74rem;

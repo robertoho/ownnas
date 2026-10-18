@@ -332,6 +332,41 @@ function formatSize(bytes, dir) {
   return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unit]}`;
 }
 
+/// A transfer speed in the unit that suits it: B/s, KB/s, MB/s, or GB/s.
+function formatSpeed(bytesPerSecond) {
+  if (bytesPerSecond < 1024) return `${Math.round(bytesPerSecond)} B/s`;
+  const units = ["KB/s", "MB/s", "GB/s"];
+  let value = bytesPerSecond / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[unit]}`;
+}
+
+/// Time left, roughly: "12 s left", "3 min left", "1 h 20 min left".
+function formatTimeLeft(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "";
+  if (seconds < 60) return `${Math.max(1, Math.round(seconds))} s left`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} min left`;
+  return `${Math.floor(minutes / 60)} h ${minutes % 60} min left`;
+}
+
+/// The speed over the last few seconds of a transfer, from how many bytes had gone at times.
+function transferMeter() {
+  const samples = [];
+  return (bytes) => {
+    const now = performance.now();
+    samples.push({ now, bytes });
+    while (samples.length > 2 && now - samples[0].now > 5000) samples.shift();
+    const first = samples[0];
+    const seconds = (now - first.now) / 1000;
+    return seconds >= 0.5 ? (bytes - first.bytes) / seconds : null;
+  };
+}
+
 function formatFolderSize(info) {
   if (!info) return "Folder";
   const label = formatSize(info.bytes || 0, false);
@@ -3616,12 +3651,13 @@ const jobState = {
   seq: 0,
 };
 
-function upsertJob(id, { title, detail = "", percent = null, cancelable = false, onCancel = null }) {
+function upsertJob(id, { title, detail = "", stats = "", percent = null, cancelable = false, onCancel = null }) {
   const existing = jobState.items.get(id) || {};
   jobState.items.set(id, {
     id,
     title,
     detail,
+    stats,
     percent,
     cancelable,
     onCancel: onCancel || existing.onCancel || null,
@@ -3671,6 +3707,7 @@ function renderJobsPanel(show) {
         ${cancel}
       </div>
       <span class="jobs-item-detail">${esc(job.detail || "")}</span>
+      ${job.stats ? `<span class="jobs-item-stats">${esc(job.stats)}</span>` : ""}
       <div class="status-track"><div class="${barClass}"${width}></div></div>
     </li>`;
   }).join("");
@@ -4035,13 +4072,40 @@ async function sendUploads(files, destination = state.path) {
   let skipped = 0;
   const totalBytes = files.reduce((sum, item) => sum + item.file.size, 0) || 1;
   let loadedBefore = 0;
+  // Bytes actually sent (skipped files do not count), for the speed.
+  let sentBefore = 0;
+  const meter = transferMeter();
+  let shownAt = 0;
+  let speed = null;
   uploadAbort = false;
   const updateProgress = (item, index, loaded) => {
-    const overall = ((loadedBefore + loaded) / totalBytes) * 100;
+    const done = loadedBefore + loaded;
+    const overall = (done / totalBytes) * 100;
+    const measured = meter(sentBefore + loaded);
+    // The numbers change at most twice a second, so they can be read.
+    const now = performance.now();
+    if (measured != null && (now - shownAt > 500 || speed == null)) {
+      speed = measured;
+      shownAt = now;
+    }
     const label = files.length === 1
       ? item.name
       : `${index + 1} of ${files.length} · ${item.name}`;
-    showStatus("Uploading…", `${label} · ${Math.round(overall)}%`, overall);
+    const parts = [`${Math.round(overall)}%`, `${formatSize(Math.min(done, totalBytes), false)} of ${formatSize(totalBytes, false)}`];
+    if (speed != null) {
+      parts.push(formatSpeed(speed));
+      if (speed > 0) parts.push(formatTimeLeft((totalBytes - done) / speed));
+    } else {
+      parts.push("Measuring speed…");
+    }
+    upsertJob("transfer", {
+      title: "Uploading…",
+      detail: label,
+      stats: parts.filter(Boolean).join(" · "),
+      percent: overall,
+      cancelable: true,
+      onCancel: () => cancelActiveTransfer(),
+    });
   };
   try {
     for (let index = 0; index < files.length; index += 1) {
@@ -4093,6 +4157,7 @@ async function sendUploads(files, destination = state.path) {
         if (posted && posted.exists) throw new Error("An item with that name already exists");
       }
       loadedBefore += item.file.size;
+      sentBefore += item.file.size;
       saved += 1;
     }
   } finally {
