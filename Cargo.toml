@@ -57,6 +57,7 @@ arrow-ipc = "60"
 arrow-cast = "60"
 arrow-array = "60"
 apache-avro = { version = "0.22", default-features = false }
+djvu-rs = { version = "0.43", default-features = false, features = ["std"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"

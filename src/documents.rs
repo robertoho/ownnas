@@ -85,6 +85,7 @@ pub fn view(path: &Path) -> Result<View, String> {
         }
         "xls" | "xlsb" | "ods" => spreadsheet(path),
         "pages" | "numbers" | "key" => iwork(path),
+        "mobi" | "azw" | "azw3" | "prc" | "fb2" => crate::books::view(path),
         "parquet" | "pq" | "arrow" | "feather" | "ipc" | "arrows" | "avro" | "jsonl" | "ndjson" => crate::data_tables::view(path),
         _ => Err("This format is not previewed".into()),
     }
@@ -679,6 +680,9 @@ fn picture_spans(data: &[u8]) -> Vec<(usize, usize, &'static str)> {
 /// Picture `index` from an older Word or PowerPoint file.
 pub fn picture(path: &Path, index: usize) -> Result<(Vec<u8>, &'static str), String> {
     let extension = path.extension().map(|ext| ext.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    if crate::books::is_kindle(&extension) || extension == "fb2" {
+        return crate::books::picture(path, index);
+    }
     let stream = if extension == "doc" { "Data" } else { "Pictures" };
     let mut file = open_compound(path)?;
     let data = read_stream(&mut file, stream).ok_or("This file has no pictures")?;

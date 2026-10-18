@@ -2352,6 +2352,8 @@ async function openEntry(entry) {
     mountViewer(body, entry, (module) => module.mountFont(body, entry));
   } else if (/\.epub$/i.test(entry.name)) {
     mountViewer(body, entry, (module) => module.mountBook(body, entry), () => openMetaPreview(body, entry));
+  } else if (/\.(djvu|djv)$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountDjvu(body, entry), () => openMetaPreview(body, entry));
   } else if (/\.(cbz|cbr|cb7)$/i.test(entry.name)) {
     mountViewer(body, entry, (module) => module.mountComic(body, entry), () => openMetaPreview(body, entry));
   } else if (DOCUMENT_VIEW.test(entry.name)) {
@@ -2434,7 +2436,7 @@ async function showPhotoMotion(body, entry, photo) {
 }
 
 /// Documents, presentations, and spreadsheets the server reads for the preview.
-const DOCUMENT_VIEW = /\.(pptx|ppsx|odp|doc|ppt|pps|rtf|xls|xlsb|ods|pages|numbers|key|parquet|pq|arrow|feather|arrows|avro|jsonl|ndjson)$/i;
+const DOCUMENT_VIEW = /\.(pptx|ppsx|odp|doc|ppt|pps|rtf|xls|xlsb|ods|pages|numbers|key|parquet|pq|arrow|feather|arrows|avro|jsonl|ndjson|mobi|azw|azw3|prc|fb2)$/i;
 
 /// Opens a preview from the viewers module (formats the browser does not show by itself).
 async function mountViewer(body, entry, mount, fallback = null) {

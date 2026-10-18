@@ -9,6 +9,7 @@ pub mod archives;
 pub mod audio_info;
 pub mod albums;
 pub mod auth;
+pub mod books;
 pub mod content_index;
 pub mod data_tables;
 pub mod db;

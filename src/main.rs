@@ -3,6 +3,7 @@ mod archives;
 mod audio_info;
 mod albums;
 mod auth;
+mod books;
 mod content_index;
 mod data_tables;
 mod db;

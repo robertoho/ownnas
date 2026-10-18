@@ -529,6 +529,22 @@ export async function mountComic(body, entry) {
     .map((item) => item.name)
     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
   if (!pages.length) throw new Error("This comic has no pages inside");
+  return mountPager(body, `ownnas-comic:${entry.path}`, pages.length, (index) => `/api/archive/entry?path=${enc(entry.path)}&entry=${enc(pages[index])}`);
+}
+
+/// DjVu books: each page drawn by the server, at the width it shows.
+export async function mountDjvu(body, entry) {
+  body.replaceChildren(h("p", "muted", "Opening the book…"));
+  const info = await getJson(`/api/djvu/info?path=${enc(entry.path)}`);
+  if (!info.pages) throw new Error("This book has no pages");
+  // Sharp enough for the expanded preview too.
+  const width = Math.min(2000, Math.max(1200, Math.round((body.clientWidth || 800) * (window.devicePixelRatio || 1) * 1.5)));
+  return mountPager(body, `ownnas-djvu:${entry.path}`, info.pages, (index) => `/api/djvu/page?path=${enc(entry.path)}&page=${index}&width=${width}`);
+}
+
+/// Pages one at a time: a slider, the arrow keys, clicks on either side, and the next one loaded ahead.
+function mountPager(body, key, count, url) {
+  const pages = { length: count };
   const img = h("img", "comic-page");
   img.alt = "";
   const prev = h("button", "comic-step", "‹");
@@ -544,9 +560,7 @@ export async function mountComic(body, entry) {
   const stage = h("div", "comic-stage", img);
   body.replaceChildren(h("div", "comic-view", stage, h("div", "comic-tools", prev, slider, next, counter)));
 
-  const key = `ownnas-comic:${entry.path}`;
   let page = Math.min(Math.max(0, Number(remember(key)) || 0), pages.length - 1);
-  const url = (index) => `/api/archive/entry?path=${enc(entry.path)}&entry=${enc(pages[index])}`;
   const show = (index) => {
     page = Math.min(Math.max(0, index), pages.length - 1);
     img.src = url(page);

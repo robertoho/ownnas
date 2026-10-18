@@ -265,6 +265,8 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/subtitles", get(subtitles))
         .route("/api/document", get(document_view))
         .route("/api/document/picture", get(document_picture))
+        .route("/api/djvu/info", get(djvu_info))
+        .route("/api/djvu/page", get(djvu_page))
         .route("/api/archive/entry", get(archive_entry))
         .route("/api/archive/list", get(archive_list))
         .route("/api/book/info", get(book_info))
@@ -3253,6 +3255,44 @@ async fn document_picture(
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the document"))?
         .map_err(|err| ApiError::new(StatusCode::NOT_FOUND, err))?;
     Ok(([(header::CONTENT_TYPE, media), (header::CACHE_CONTROL, "private, max-age=3600"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")], bytes).into_response())
+}
+
+/// How many pages a DjVu book has.
+async fn djvu_info(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    let pages = tokio::task::spawn_blocking(move || crate::books::djvu_pages(&resolved.full))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the book"))?
+        .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err))?;
+    Ok(Json(json!({ "pages": pages })))
+}
+
+#[derive(Deserialize)]
+struct DjvuPageQuery {
+    path: Option<String>,
+    page: usize,
+    width: Option<u32>,
+}
+
+/// One page of a DjVu book, drawn as a PNG.
+async fn djvu_page(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<DjvuPageQuery>,
+) -> Result<Response, ApiError> {
+    require_user(&state, &headers)?;
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    let (page, width) = (query.page, query.width.unwrap_or(1200));
+    let png = tokio::task::spawn_blocking(move || crate::books::djvu_page(&resolved.full, page, width))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not draw the page"))?
+        .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err))?;
+    Ok(([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "private, max-age=86400"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")], png).into_response())
 }
 
 #[derive(Deserialize)]
