@@ -4058,11 +4058,12 @@ async fn upload(
                 .await
                 .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload"))?;
         }
+        // Written out before answering: a dropped tokio file may still be writing its last bytes.
+        tokio::io::AsyncWriteExt::flush(&mut out)
+            .await
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload"))?;
         // Keep the file's original modification time when the client sends it.
         if let Some(mtime) = query.mtime.filter(|mtime| *mtime > 0) {
-            tokio::io::AsyncWriteExt::flush(&mut out)
-                .await
-                .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload"))?;
             let file = out.into_std().await;
             let _ = file.set_modified(std::time::UNIX_EPOCH + Duration::from_millis(mtime as u64));
         } else {
