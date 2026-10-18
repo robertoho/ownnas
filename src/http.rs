@@ -273,6 +273,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/mail/html", get(mail_html))
         .route("/api/mail/attachment", get(mail_attachment))
         .route("/api/font/info", get(font_info))
+        .route("/api/plist", get(plist_view))
         .route("/api/map/tile/{z}/{x}/{y}", get(map_tile))
         .route("/api/book/{book}/{*entry}", get(book_part))
         .route("/api/mkdir", post(mkdir))
@@ -3046,9 +3047,12 @@ async fn audio_info(
 ) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
-    let info = tokio::task::spawn_blocking(move || crate::audio_info::info(&resolved.full))
+    let dir = resolved.rel.rsplit_once('/').map_or(String::new(), |(dir, _)| format!("{dir}/"));
+    let mut info = tokio::task::spawn_blocking(move || crate::audio_info::info(&resolved.full))
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the song"))?;
+    // The lyrics file as a library path, for the page to read.
+    info.lrc = info.lrc.map(|name| format!("{dir}{name}"));
     Ok(Json(info))
 }
 
@@ -3159,6 +3163,8 @@ async fn video_stream(
 struct SubtitleQuery {
     path: Option<String>,
     shift: Option<f64>,
+    /// A subtitle track inside the video at `path`.
+    track: Option<usize>,
 }
 
 /// A subtitle file (.srt or .vtt) as WebVTT, moved earlier by `shift` seconds.
@@ -3169,9 +3175,30 @@ async fn subtitles(
 ) -> Result<Response, ApiError> {
     require_user(&state, &headers)?;
     let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    if let Some(track) = query.track {
+        if !state.ffmpeg {
+            return Err(ApiError::new(StatusCode::NOT_IMPLEMENTED, "Install ffmpeg to show subtitles kept inside videos"));
+        }
+        let output = tokio::time::timeout(
+            Duration::from_secs(120),
+            tokio::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
+                .arg(&resolved.full)
+                .args(["-map", &format!("0:s:{track}"), "-f", "webvtt", "pipe:1"])
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| ApiError::new(StatusCode::GATEWAY_TIMEOUT, "Reading the subtitles took too long"))?
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not start ffmpeg"))?;
+        let text = crate::media_stream::to_webvtt(&output.stdout, query.shift.unwrap_or(0.0));
+        return Ok(([(header::CONTENT_TYPE, "text/vtt; charset=utf-8"), (header::CACHE_CONTROL, "private, max-age=600"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")], text).into_response());
+    }
     let extension = extension_of(&resolved.rel);
-    if !matches!(extension.as_str(), "srt" | "vtt") {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Only .srt and .vtt subtitles are read"));
+    if !matches!(extension.as_str(), "srt" | "vtt" | "ass" | "ssa") {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Only .srt, .vtt, .ass, and .ssa subtitles are read"));
     }
     let meta = tokio::fs::metadata(&resolved.full).await.map_err(|_| ApiError::from(FileError::NotFound))?;
     if meta.len() > 10 * 1024 * 1024 {
@@ -3402,6 +3429,43 @@ async fn mailbox_view(
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the mailbox"))?
         .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err))?;
     Ok(Json(json!({ "total": total, "messages": messages })))
+}
+
+/// An Apple property list (XML or binary) as JSON, for the page to show as a tree.
+async fn plist_view(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    let value = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, String> {
+        if std::fs::metadata(&resolved.full).map(|m| m.len()).unwrap_or(0) > 50 * 1024 * 1024 {
+            return Err("This property list is too large to show".into());
+        }
+        let value = plist::Value::from_file(&resolved.full).map_err(|_| "This property list could not be read".to_string())?;
+        Ok(plist_json(value))
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the file"))?
+    .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err))?;
+    Ok(Json(value))
+}
+
+/// A property list value as JSON: dates as text, data as its size and first bytes in hex.
+fn plist_json(value: plist::Value) -> serde_json::Value {
+    match value {
+        plist::Value::Array(items) => serde_json::Value::Array(items.into_iter().map(plist_json).collect()),
+        plist::Value::Dictionary(dict) => serde_json::Value::Object(dict.into_iter().map(|(k, v)| (k, plist_json(v))).collect()),
+        plist::Value::Boolean(b) => json!(b),
+        plist::Value::Data(bytes) => json!(format!("<{} bytes: {}{}>", bytes.len(), hex::encode(&bytes[..bytes.len().min(16)]), if bytes.len() > 16 { "…" } else { "" })),
+        plist::Value::Date(date) => json!(date.to_xml_format()),
+        plist::Value::Real(n) => json!(n),
+        plist::Value::Integer(n) => n.as_signed().map(|n| json!(n)).or_else(|| n.as_unsigned().map(|n| json!(n))).unwrap_or(serde_json::Value::Null),
+        plist::Value::String(s) => json!(s),
+        plist::Value::Uid(uid) => json!(format!("UID {}", uid.get())),
+        _ => serde_json::Value::Null,
+    }
 }
 
 /// A font's family, style, version, and designer.

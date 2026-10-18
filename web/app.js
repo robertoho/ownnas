@@ -2230,8 +2230,20 @@ async function openEntry(entry) {
     mountViewer(body, entry, (module) => module.mountVideo(body, entry, { poster }));
   } else if (entry.kind === "audio") {
     mountViewer(body, entry, (module) => module.mountAudio(body, entry));
-  } else if (/\.(srt|vtt)$/i.test(entry.name)) {
-    mountViewer(body, entry, (module) => module.mountSubtitles(body, entry));
+  } else if (/\.(srt|vtt|ass|ssa)$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountSubtitles(body, entry), () => openMetaPreview(body, entry));
+  } else if (/\.lrc$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountLyrics(body, entry), () => openMetaPreview(body, entry));
+  } else if (/\.(m3u8?|pls|xspf)$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountPlaylist(body, entry, { openPath: (path) => openFileByPath(path) }), () => openMetaPreview(body, entry));
+  } else if (/\.cue$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountCue(body, entry), () => openMetaPreview(body, entry));
+  } else if (/\.torrent$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountTorrent(body, entry), () => openMetaPreview(body, entry));
+  } else if (/\.plist$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountPlist(body, entry), () => openMetaPreview(body, entry));
+  } else if (/\.(url|webloc|desktop)$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountShortcut(body, entry), () => openMetaPreview(body, entry));
   } else if (entry.kind === "pdf") {
     body.innerHTML = `<iframe title="${esc(entry.name)}" src="${raw}"></iframe>`;
   } else if (/\.xlsx$/i.test(entry.name)) {

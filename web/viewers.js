@@ -77,7 +77,24 @@ export function mountAudio(body, entry) {
   const canvas = h("canvas", "audio-wave");
   const waveNote = h("p", "audio-wave-note muted", "Drawing the waveform…");
   const wave = h("div", "audio-wave-box", canvas, waveNote);
-  body.replaceChildren(h("div", "audio-view", h("div", "audio-head", cover, h("div", "audio-text", title, artist, album, details)), wave, audio));
+  const lyrics = h("div", "audio-lyrics");
+  lyrics.hidden = true;
+  body.replaceChildren(h("div", "audio-view", h("div", "audio-head", cover, h("div", "audio-text", title, artist, album, details)), wave, audio, lyrics));
+  let timedLines = null;
+  const followLyrics = () => {
+    if (!timedLines) return;
+    const now = audio.currentTime;
+    let current = -1;
+    timedLines.forEach((line, i) => { if (line.time <= now + 0.15) current = i; });
+    timedLines.forEach((line, i) => line.node.classList.toggle("is-now", i === current));
+    const node = timedLines[current]?.node;
+    if (node && node.dataset.shown !== "1") {
+      for (const line of timedLines) line.node.dataset.shown = "";
+      node.dataset.shown = "1";
+      node.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+  };
+  audio.addEventListener("timeupdate", followLyrics);
 
   let peaks = null;
   let stopped = false;
@@ -130,6 +147,22 @@ export function mountAudio(body, entry) {
       info.bitDepth ? `${info.bitDepth}-bit` : "",
       info.channels === 1 ? "Mono" : info.channels === 2 ? "Stereo" : info.channels ? `${info.channels} channels` : "",
     ].filter(Boolean).join(" · ");
+    if (info.lrc) {
+      fetch(`/api/raw?path=${enc(info.lrc)}`, { credentials: "same-origin" }).then((r) => (r.ok ? r.text() : "")).then((text) => {
+        const lines = parseLrc(text);
+        if (!lines.length || stopped) return;
+        timedLines = lines.map((line) => {
+          const node = h("p", "lyric-line", line.text || "♪");
+          node.addEventListener("click", () => { audio.currentTime = line.time; audio.play().catch(() => {}); });
+          return { time: line.time, node };
+        });
+        lyrics.replaceChildren(h("h4", "muted", "Lyrics"), ...timedLines.map((l) => l.node));
+        lyrics.hidden = false;
+      }).catch(() => {});
+    } else if (info.lyrics) {
+      lyrics.replaceChildren(h("h4", "muted", "Lyrics"), h("p", "lyric-text", info.lyrics));
+      lyrics.hidden = false;
+    }
     if (info.hasCover) {
       const img = h("img", "audio-cover-img");
       img.alt = "";
@@ -204,13 +237,18 @@ export function mountVideo(body, entry, { poster = "" } = {}) {
     // Switched off first, or the browser may keep showing a line from the old one.
     for (const track of [...video.textTracks]) track.mode = "disabled";
     for (const track of [...video.querySelectorAll("track")]) track.remove();
-    if (!info || !info.subtitles) return;
-    info.subtitles.forEach((subtitle, index) => {
+    if (!info) return;
+    // Subtitle files beside the video, then the tracks inside it.
+    const sources = [
+      ...(info.subtitles || []).map((s) => ({ label: s.label, language: s.language, url: `/api/subtitles?path=${enc(s.path)}` })),
+      ...((info.streams && info.streams.subtitles) || []).map((s) => ({ label: s.label, language: s.language, url: `/api/subtitles?path=${enc(entry.path)}&track=${s.track}` })),
+    ];
+    sources.forEach((source, index) => {
       const track = document.createElement("track");
       track.kind = "subtitles";
-      track.label = subtitle.label;
-      if (subtitle.language) track.srclang = subtitle.language;
-      track.src = `/api/subtitles?path=${enc(subtitle.path)}${shift ? `&shift=${shift}` : ""}`;
+      track.label = source.label;
+      if (source.language && /^[a-z]{2,3}$/i.test(source.language)) track.srclang = source.language;
+      track.src = `${source.url}${shift ? `&shift=${shift}` : ""}`;
       if (index === 0) track.default = true;
       video.append(track);
     });
@@ -1172,4 +1210,272 @@ export async function mountTrack(body, entry, { api } = {}) {
   fit();
   draw();
   return { destroy() { resize.disconnect(); } };
+}
+
+
+// ---- Lyrics (.lrc), playlists (.m3u, .pls, .xspf), and cue sheets (.cue) ----
+
+/// Timed lyrics: "[01:02.50]words" lines (one line may carry several times), in order.
+function parseLrc(text) {
+  const lines = [];
+  let offset = 0;
+  for (const raw of text.replace(/\r/g, "").split("\n")) {
+    const tag = /^\[offset:\s*([+-]?\d+)\]/i.exec(raw);
+    if (tag) offset = Number(tag[1]) / 1000;
+    const times = [...raw.matchAll(/\[(\d+):(\d+(?:[.:]\d+)?)\]/g)];
+    if (!times.length) continue;
+    const words = raw.replace(/\[[^\]]*\]/g, "").trim();
+    for (const t of times) lines.push({ time: Number(t[1]) * 60 + Number(t[2].replace(":", ".")) - offset, text: words });
+  }
+  return lines.sort((a, b) => a.time - b.time);
+}
+
+async function fetchText(entry) {
+  const response = await fetch(`/api/raw?path=${enc(entry.path)}`, { credentials: "same-origin" });
+  if (!response.ok) throw new Error("Could not read the file");
+  return response.text();
+}
+
+export async function mountLyrics(body, entry) {
+  const lines = parseLrc(await fetchText(entry));
+  body.replaceChildren(h("div", "subtitle-view", h("p", "muted", `${lines.length} timed lines`),
+    h("ol", "subtitle-list", lines.map((l) => h("li", "", h("span", "subtitle-time muted", clock(l.time)), h("span", "subtitle-text", l.text || "♪"))))));
+  return { destroy() {} };
+}
+
+/// A path in a playlist as a library path, when it is relative to the playlist's folder.
+function libraryTarget(entry, location) {
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(location)) return { url: location };
+  const clean = location.replace(/\\/g, "/");
+  if (/^([a-z]:)?\//i.test(clean)) return { foreign: clean };
+  const parts = entry.path.split("/").slice(0, -1);
+  for (const piece of decodeURIComponent(clean).split("/")) {
+    if (piece === "..") parts.pop();
+    else if (piece && piece !== ".") parts.push(piece);
+  }
+  return { path: parts.join("/") };
+}
+
+function parsePlaylist(name, text) {
+  const items = [];
+  if (/\.pls$/i.test(name)) {
+    const files = {};
+    const titles = {};
+    for (const line of text.split(/\r?\n/)) {
+      const m = /^(File|Title)(\d+)=(.*)$/i.exec(line.trim());
+      if (m) (m[1].toLowerCase() === "file" ? files : titles)[m[2]] = m[3];
+    }
+    for (const key of Object.keys(files).sort((a, b) => a - b)) items.push({ location: files[key], title: titles[key] || "" });
+  } else if (/\.xspf$/i.test(name)) {
+    const xml = new DOMParser().parseFromString(text, "application/xml");
+    for (const track of [...xml.getElementsByTagName("track")]) {
+      const get = (tag) => track.getElementsByTagName(tag)[0]?.textContent?.trim() || "";
+      items.push({ location: get("location").replace(/^file:\/\//, ""), title: [get("creator"), get("title")].filter(Boolean).join(" – ") });
+    }
+  } else {
+    let title = "";
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      if (trimmed.startsWith("#EXTINF:")) title = trimmed.split(",").slice(1).join(",").trim();
+      else if (!trimmed.startsWith("#")) { items.push({ location: trimmed, title }); title = ""; }
+    }
+  }
+  return items;
+}
+
+export async function mountPlaylist(body, entry, { openPath } = {}) {
+  const items = parsePlaylist(entry.name, await fetchText(entry)).map((item) => ({ ...item, ...libraryTarget(entry, item.location) }));
+  const audio = h("audio", "audio-player-element");
+  audio.controls = true;
+  const playable = items.filter((item) => item.path || item.url);
+  let current = -1;
+  const rows = items.map((item, index) => {
+    const name = item.title || item.location.split(/[\\/]/).pop();
+    const row = h("li", `playlist-item${item.foreign ? " muted" : ""}`, h("span", "playlist-number muted", String(index + 1)), h("span", "playlist-name", name));
+    if (item.path && openPath) {
+      const show = h("button", "playlist-open", "Open");
+      show.type = "button";
+      show.addEventListener("click", (event) => { event.stopPropagation(); openPath(item.path); });
+      row.append(show);
+    }
+    if (item.foreign) row.title = `Not in the library: ${item.foreign}`;
+    else row.addEventListener("click", () => play(playable.indexOf(item)));
+    item.row = row;
+    return row;
+  });
+  const play = (index) => {
+    if (index < 0 || index >= playable.length) return;
+    current = index;
+    const item = playable[index];
+    audio.src = item.path ? `/api/raw?path=${enc(item.path)}` : item.url;
+    audio.play().catch(() => {});
+    for (const i of items) i.row.classList.toggle("is-now", i === item);
+  };
+  audio.addEventListener("ended", () => play(current + 1));
+  audio.addEventListener("error", () => { if (current >= 0) play(current + 1); });
+  const playAll = h("button", "playlist-play", "▶ Play all");
+  playAll.type = "button";
+  playAll.disabled = !playable.length;
+  playAll.addEventListener("click", () => play(0));
+  const foreign = items.filter((i) => i.foreign).length;
+  body.replaceChildren(h("div", "subtitle-view",
+    h("p", "muted", `${items.length} item${items.length === 1 ? "" : "s"}${foreign ? `, ${foreign} outside the library` : ""}`),
+    h("div", "playlist-tools", playAll), audio, h("ol", "playlist-list", rows)));
+  return { destroy() { audio.pause(); audio.removeAttribute("src"); audio.load(); } };
+}
+
+/// A cue sheet: the tracks of a disc ripped into one file, which plays when it is beside it.
+export async function mountCue(body, entry) {
+  const text = await fetchText(entry);
+  let file = "";
+  let album = "";
+  let performer = "";
+  const tracks = [];
+  for (const line of text.split(/\r?\n/)) {
+    const t = line.trim();
+    const quoted = (s) => (/"([^"]*)"/.exec(s) || [, s.split(/\s+/).slice(1).join(" ")])[1];
+    if (/^FILE /i.test(t)) file = quoted(t.slice(5).replace(/\s+\w+$/, ""));
+    else if (/^TRACK /i.test(t)) tracks.push({ number: Number(t.split(/\s+/)[1]), title: "", performer: "", start: 0 });
+    else if (/^TITLE /i.test(t)) { if (tracks.length) tracks[tracks.length - 1].title = quoted(t); else album = quoted(t); }
+    else if (/^PERFORMER /i.test(t)) { if (tracks.length) tracks[tracks.length - 1].performer = quoted(t); else performer = quoted(t); }
+    else if (/^INDEX 01 /i.test(t) && tracks.length) {
+      const [m, s, f] = t.split(/\s+/)[2].split(":").map(Number);
+      tracks[tracks.length - 1].start = m * 60 + s + f / 75;
+    }
+  }
+  const target = file ? libraryTarget(entry, file) : {};
+  const audio = h("audio", "audio-player-element");
+  audio.controls = true;
+  if (target.path) audio.src = `/api/raw?path=${enc(target.path)}`;
+  const rows = tracks.map((track) => {
+    const row = h("li", "playlist-item", h("span", "playlist-number muted", String(track.number)),
+      h("span", "playlist-name", [track.title || `Track ${track.number}`, track.performer && track.performer !== performer ? ` – ${track.performer}` : ""].join("")),
+      h("span", "muted", clock(track.start)));
+    row.addEventListener("click", () => { audio.currentTime = track.start; audio.play().catch(() => {}); });
+    track.row = row;
+    return row;
+  });
+  audio.addEventListener("timeupdate", () => {
+    let now = null;
+    for (const track of tracks) if (track.start <= audio.currentTime + 0.2) now = track;
+    for (const track of tracks) track.row.classList.toggle("is-now", track === now);
+  });
+  body.replaceChildren(h("div", "subtitle-view",
+    h("h3", "audio-title", album || entry.name), performer ? h("p", "audio-artist", performer) : null,
+    target.path ? audio : h("p", "muted", file ? `The audio file “${file}” is not beside this cue sheet.` : "This cue sheet names no audio file."),
+    h("ol", "playlist-list", rows)));
+  return { destroy() { audio.pause(); audio.removeAttribute("src"); audio.load(); } };
+}
+
+// ---- Torrents, property lists, and shortcuts ----
+
+/// Bencode (torrent files): returns the value and, for the "info" dictionary, its raw bytes.
+function bdecode(bytes) {
+  let at = 0;
+  let infoSpan = null;
+  const text = (start, end) => new TextDecoder().decode(bytes.subarray(start, end));
+  const value = () => {
+    const c = bytes[at];
+    if (c === 0x69) { const end = bytes.indexOf(0x65, at); const n = Number(text(at + 1, end)); at = end + 1; return n; }
+    if (c === 0x6c) { at += 1; const list = []; while (bytes[at] !== 0x65) list.push(value()); at += 1; return list; }
+    if (c === 0x64) {
+      at += 1;
+      const dict = {};
+      while (bytes[at] !== 0x65) {
+        const key = new TextDecoder().decode(value());
+        const start = at;
+        dict[key] = value();
+        if (key === "info" && infoSpan === null) infoSpan = [start, at];
+      }
+      at += 1;
+      return dict;
+    }
+    const colon = bytes.indexOf(0x3a, at);
+    const length = Number(text(at, colon));
+    if (!Number.isFinite(length)) throw new Error("This torrent file is damaged");
+    const raw = bytes.subarray(colon + 1, colon + 1 + length);
+    at = colon + 1 + length;
+    return raw;
+  };
+  return { value: value(), info: infoSpan && bytes.subarray(infoSpan[0], infoSpan[1]) };
+}
+
+export async function mountTorrent(body, entry) {
+  const response = await fetch(`/api/raw?path=${enc(entry.path)}`, { credentials: "same-origin" });
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const { value, info: infoBytes } = bdecode(bytes);
+  const str = (b) => (b instanceof Uint8Array ? new TextDecoder().decode(b) : b == null ? "" : String(b));
+  const info = value.info || {};
+  const files = info.files
+    ? info.files.map((f) => ({ name: (f["path.utf-8"] || f.path).map(str).join("/"), size: f.length }))
+    : [{ name: str(info["name.utf-8"] || info.name), size: info.length }];
+  const total = files.reduce((sum, f) => sum + (f.size || 0), 0);
+  let hash = "";
+  if (infoBytes && crypto.subtle) {
+    const digest = await crypto.subtle.digest("SHA-1", infoBytes);
+    hash = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+  const trackers = [...new Set([str(value.announce), ...((value["announce-list"] || []).flat().map(str))].filter(Boolean))];
+  const magnet = hash ? `magnet:?xt=urn:btih:${hash}&dn=${encodeURIComponent(str(info.name))}${trackers.slice(0, 5).map((t) => `&tr=${encodeURIComponent(t)}`).join("")}` : "";
+  const facts = [
+    ["Name", str(info.name)], ["Size", `${sizeLabel(total)} in ${files.length} file${files.length === 1 ? "" : "s"}`],
+    ["Pieces", info["piece length"] ? `${sizeLabel(info["piece length"])} each` : ""],
+    ["Created", value["creation date"] ? new Date(value["creation date"] * 1000).toLocaleString() : ""],
+    ["Created by", str(value["created by"])], ["Comment", str(value.comment)], ["Private", info.private ? "Yes" : ""],
+    ["Info hash", hash],
+  ].filter(([, v]) => v);
+  const copy = h("button", "", "Copy magnet link");
+  copy.type = "button";
+  copy.hidden = !magnet;
+  copy.addEventListener("click", () => navigator.clipboard?.writeText(magnet).then(() => { copy.textContent = "Copied"; }).catch(() => {}));
+  body.replaceChildren(h("div", "subtitle-view",
+    h("dl", "font-facts", facts.map(([k, v]) => [h("dt", "muted", k), h("dd", "", v)])), copy,
+    trackers.length ? h("details", "", h("summary", "", `${trackers.length} tracker${trackers.length === 1 ? "" : "s"}`), h("ul", "", trackers.map((t) => h("li", "", t)))) : null,
+    h("ol", "subtitle-list", files.slice(0, 2000).map((f) => h("li", "", h("span", "subtitle-time muted", sizeLabel(f.size || 0)), h("span", "subtitle-text", f.name))))));
+  return { destroy() {} };
+}
+
+/// A JSON-like value as a tree that opens level by level.
+function tree(value, key = null, depth = 0) {
+  const label = key == null ? null : h("span", "tree-key", `${key}: `);
+  if (value && typeof value === "object") {
+    const entries = Array.isArray(value) ? value.map((v, i) => [i, v]) : Object.entries(value);
+    const details = h("details", "tree-node", h("summary", "", label, h("span", "muted", Array.isArray(value) ? `[${entries.length}]` : `{${entries.length}}`)),
+      entries.map(([k, v]) => tree(v, k, depth + 1)));
+    if (depth < 2) details.open = true;
+    return details;
+  }
+  return h("div", "tree-leaf", label, h("span", typeof value === "string" ? "tree-string" : "tree-value", JSON.stringify(value)));
+}
+
+export async function mountPlist(body, entry) {
+  const value = await getJson(`/api/plist?path=${enc(entry.path)}`);
+  body.replaceChildren(h("div", "subtitle-view tree-view", tree(value)));
+  return { destroy() {} };
+}
+
+/// Internet shortcuts (.url, .webloc) and desktop entries (.desktop): where they lead.
+export async function mountShortcut(body, entry) {
+  let target = "";
+  let name = entry.name.replace(/\.[^.]+$/, "");
+  let comment = "";
+  if (/\.webloc$/i.test(entry.name)) {
+    target = (await getJson(`/api/plist?path=${enc(entry.path)}`)).URL || "";
+  } else {
+    for (const line of (await fetchText(entry)).split(/\r?\n/)) {
+      const [k, ...rest] = line.split("=");
+      const v = rest.join("=").trim();
+      if (/^url$/i.test(k.trim())) target = v;
+      if (k.trim() === "Exec" && !target) target = v;
+      if (k.trim() === "Name") name = v;
+      if (k.trim() === "Comment") comment = v;
+    }
+  }
+  const web = /^https?:\/\//i.test(target);
+  const link = web ? h("a", "shortcut-link", target) : h("code", "shortcut-link", target || "(no target)");
+  if (web) { link.href = target; link.target = "_blank"; link.rel = "noopener noreferrer"; }
+  body.replaceChildren(h("div", "subtitle-view shortcut-view", h("h3", "audio-title", name), comment ? h("p", "muted", comment) : null,
+    h("p", "muted", web ? "This shortcut opens:" : "This shortcut runs or opens:"), link));
+  return { destroy() {} };
 }

@@ -19,6 +19,17 @@ pub struct Streams {
     pub duration: Option<f64>,
     pub width: Option<u64>,
     pub height: Option<u64>,
+    /// Text subtitle tracks inside the file.
+    pub subtitles: Vec<Track>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Track {
+    /// Its number among the file's subtitle tracks.
+    pub track: usize,
+    pub label: String,
+    pub language: Option<String>,
 }
 
 /// The codecs and length of a video, from `ffprobe`.
@@ -40,6 +51,18 @@ pub fn probe(path: &Path) -> Option<Streams> {
         duration: info["format"]["duration"].as_str().and_then(|d| d.parse().ok()),
         width: video.and_then(|s| s["width"].as_u64()),
         height: video.and_then(|s| s["height"].as_u64()),
+        subtitles: streams
+            .iter()
+            .filter(|s| s["codec_type"] == "subtitle")
+            .enumerate()
+            // Pictures of text (DVD and Blu-ray subtitles) cannot become WebVTT.
+            .filter(|(_, s)| matches!(s["codec_name"].as_str(), Some("subrip" | "ass" | "ssa" | "webvtt" | "mov_text" | "text")))
+            .map(|(track, s)| {
+                let language = s["tags"]["language"].as_str().filter(|l| *l != "und").map(str::to_string);
+                let title = s["tags"]["title"].as_str().map(str::to_string);
+                Track { track, label: title.or_else(|| language.clone()).unwrap_or_else(|| format!("Track {}", track + 1)), language }
+            })
+            .collect(),
     })
 }
 
@@ -61,14 +84,19 @@ pub fn subtitles_beside(video: &Path, rel: &str) -> Vec<Subtitle> {
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
             let (base, ext) = name.rsplit_once('.')?;
-            if !matches!(ext.to_ascii_lowercase().as_str(), "srt" | "vtt") {
+            if !matches!(ext.to_ascii_lowercase().as_str(), "srt" | "vtt" | "ass" | "ssa") {
                 return None;
             }
             let middle = if base == stem { "" } else { base.strip_prefix(&stem)?.strip_prefix('.')? };
             let language = (!middle.is_empty() && middle.len() <= 3 && middle.chars().all(|c| c.is_ascii_alphabetic())).then(|| middle.to_ascii_lowercase());
             Some(Subtitle {
                 path: if rel_dir.is_empty() { name.clone() } else { format!("{rel_dir}/{name}") },
-                label: if middle.is_empty() { "Subtitles".to_string() } else { middle.to_string() },
+                // Two files of one name are told apart by their kind.
+                label: match (middle.is_empty(), ext.to_ascii_lowercase().as_str()) {
+                    (true, "srt") => "Subtitles".to_string(),
+                    (true, other) => format!("Subtitles ({other})"),
+                    (false, _) => middle.to_string(),
+                },
                 language,
             })
         })
@@ -112,6 +140,9 @@ pub fn to_webvtt(bytes: &[u8], shift: f64) -> String {
         Err(_) => bytes.iter().map(|&b| windows_1252(b)).collect(),
     };
     let text = text.trim_start_matches('\u{feff}').replace("\r\n", "\n").replace('\r', "\n");
+    if text.trim_start().starts_with("[Script Info]") || text.contains("\nDialogue:") {
+        return ass_to_webvtt(&text, shift);
+    }
     let mut out = String::from("WEBVTT\n\n");
     for block in text.split("\n\n") {
         let lines: Vec<&str> = block.lines().filter(|line| !line.trim().is_empty()).collect();
@@ -136,6 +167,57 @@ pub fn to_webvtt(bytes: &[u8], shift: f64) -> String {
             out.push('\n');
         }
         out.push('\n');
+    }
+    out
+}
+
+/// SubStation Alpha (.ass, .ssa) as WebVTT: each "Dialogue" line's start, end, and text, without
+/// its styling codes ("{\\b1}") and with its line breaks ("\\N").
+fn ass_to_webvtt(text: &str, shift: f64) -> String {
+    let mut out = String::from("WEBVTT\n\n");
+    // Where the start, end, and text are among each line's fields.
+    let mut format: Vec<String> = ["Layer", "Start", "End", "Style", "Name", "MarginL", "MarginR", "MarginV", "Effect", "Text"].map(String::from).to_vec();
+    let mut cues: Vec<(f64, f64, String)> = Vec::new();
+    let mut in_events = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_events = line.eq_ignore_ascii_case("[Events]");
+            continue;
+        }
+        if !in_events {
+            continue;
+        }
+        if let Some(fields) = line.strip_prefix("Format:") {
+            format = fields.split(',').map(|f| f.trim().to_string()).collect();
+            continue;
+        }
+        let Some(fields) = line.strip_prefix("Dialogue:") else { continue };
+        let parts: Vec<&str> = fields.splitn(format.len(), ',').collect();
+        let field = |name: &str| format.iter().position(|f| f.eq_ignore_ascii_case(name)).and_then(|i| parts.get(i)).map(|v| v.trim());
+        let (Some(start), Some(end), Some(body)) = (field("Start").and_then(seconds), field("End").and_then(seconds), field("Text")) else { continue };
+        // Styling codes in braces go; "\N" and "\n" are line breaks, "\h" a space.
+        let mut plain = String::new();
+        let mut depth = 0;
+        for c in body.chars() {
+            match c {
+                '{' => depth += 1,
+                '}' if depth > 0 => depth -= 1,
+                _ if depth == 0 => plain.push(c),
+                _ => {}
+            }
+        }
+        let plain = plain.replace("\\N", "\n").replace("\\n", "\n").replace("\\h", " ");
+        if !plain.trim().is_empty() {
+            cues.push((start - shift, end - shift, plain.trim().to_string()));
+        }
+    }
+    cues.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (start, end, body) in cues {
+        if end <= 0.0 {
+            continue;
+        }
+        out.push_str(&format!("{} --> {}\n{body}\n\n", stamp(start.max(0.0)), stamp(end)));
     }
     out
 }
@@ -184,6 +266,12 @@ mod tests {
         assert!(shifted.contains("00:00:00.000 --> 00:00:01.000\nHello"));
         assert!(shifted.contains("00:00:08.000 --> 00:00:10.250"));
         assert_eq!(to_webvtt(b"1\n00:00:01,000 --> 00:00:02,000\nCaf\xe9 \x93ok\x94\n", 0.0).lines().nth(3), Some("Café “ok”"));
+    }
+
+    #[test]
+    fn substation_alpha_becomes_webvtt() {
+        let ass = "[Script Info]\nTitle: x\n\n[V4+ Styles]\nFormat: Name, Fontname\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:05.00,0:00:07.50,Default,,0,0,0,,Second, with a comma\nDialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\\i1}Hello{\\i0}\\Nthere\n";
+        assert_eq!(to_webvtt(ass.as_bytes(), 0.0), "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nHello\nthere\n\n00:00:05.000 --> 00:00:07.500\nSecond, with a comma\n\n");
     }
 
     #[test]

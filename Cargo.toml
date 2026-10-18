@@ -51,6 +51,7 @@ mail-parser = "0.11"
 ttf-parser = "0.25"
 icns = "0.5"
 xcf = "0.4"
+plist = { version = "1.10", default-features = false, features = ["serde"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"

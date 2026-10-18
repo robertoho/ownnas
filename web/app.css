@@ -3857,3 +3857,24 @@ a.archive-entry-name:hover { text-decoration: underline; }
 .mailbox-subject { font-size: 0.88rem; overflow-wrap: anywhere; }
 .mailbox-more { justify-self: center; }
 .mail-back { justify-self: start; align-self: flex-start; min-height: 0; padding: 0.25rem 0.7rem; font-size: 0.85rem; }
+
+.audio-lyrics { display: grid; gap: 0.15rem; max-height: 40vh; overflow: auto; padding: 0.4rem 0.2rem; border-top: 1px solid var(--line); }
+.audio-lyrics h4 { margin: 0 0 0.3rem; font-size: 0.8rem; }
+.lyric-line { margin: 0; padding: 0.15rem 0.4rem; border-radius: 6px; cursor: pointer; color: var(--muted); transition: color 0.2s; }
+.lyric-line.is-now { color: var(--text, inherit); font-weight: 650; background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.lyric-text { margin: 0; white-space: pre-wrap; line-height: 1.6; }
+.playlist-tools { display: flex; gap: 0.5rem; }
+.playlist-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.2rem; }
+.playlist-item { display: grid; grid-template-columns: 2rem 1fr auto; gap: 0.5rem; align-items: center; padding: 0.35rem 0.5rem; border-radius: 8px; background: var(--bg-2); cursor: pointer; font-size: 0.9rem; }
+.playlist-item.is-now { outline: 1px solid var(--accent); }
+.playlist-number { font-variant-numeric: tabular-nums; text-align: right; font-size: 0.8rem; }
+.playlist-name { overflow-wrap: anywhere; }
+.playlist-open { min-height: 0; padding: 0.15rem 0.6rem; font-size: 0.8rem; }
+.tree-view { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.82rem; }
+.tree-node { padding-left: 0.9rem; }
+.tree-node > summary { cursor: pointer; margin-left: -0.9rem; }
+.tree-leaf { padding-left: 0.9rem; overflow-wrap: anywhere; }
+.tree-key { color: var(--muted); }
+.tree-string { color: #86b98a; }
+.tree-value { color: #d19a66; }
+.shortcut-link { font-size: 1rem; overflow-wrap: anywhere; }

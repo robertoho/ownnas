@@ -26,6 +26,10 @@ pub struct AudioInfo {
     pub channels: Option<u8>,
     pub bit_depth: Option<u8>,
     pub has_cover: bool,
+    /// The words, from the song's own tags.
+    pub lyrics: Option<String>,
+    /// A timed lyrics file named after the song ("song.lrc"), beside it.
+    pub lrc: Option<String>,
 }
 
 /// Names music players look for beside the songs.
@@ -53,10 +57,15 @@ pub fn info(path: &Path) -> AudioInfo {
             info.track_total = tag.track_total();
             info.disc = tag.disk();
             info.has_cover = !tag.pictures().is_empty();
+            info.lyrics = tag.get_string(ItemKey::Lyrics).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         }
     }
     if !info.has_cover {
         info.has_cover = folder_cover(path).is_some();
+    }
+    if let (Some(dir), Some(stem)) = (path.parent(), path.file_stem()) {
+        let stem = stem.to_string_lossy();
+        info.lrc = ["lrc", "LRC"].iter().map(|ext| format!("{stem}.{ext}")).find(|name| dir.join(name).is_file());
     }
     info
 }
