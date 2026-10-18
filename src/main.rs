@@ -9,6 +9,7 @@ mod documents;
 mod ebook;
 mod file_index;
 mod files;
+mod font_info;
 mod image_edit;
 mod video_edit;
 mod media_index;
@@ -17,6 +18,7 @@ mod smart;
 #[cfg(ownnas_ml)]
 mod ml;
 mod http;
+mod mail;
 mod pdf_ops;
 mod photo_details;
 mod photo_formats;

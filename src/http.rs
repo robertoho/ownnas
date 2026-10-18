@@ -265,6 +265,10 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/archive/entry", get(archive_entry))
         .route("/api/archive/list", get(archive_list))
         .route("/api/book/info", get(book_info))
+        .route("/api/mail", get(mail_view))
+        .route("/api/mail/html", get(mail_html))
+        .route("/api/mail/attachment", get(mail_attachment))
+        .route("/api/font/info", get(font_info))
         .route("/api/book/{book}/{*entry}", get(book_part))
         .route("/api/mkdir", post(mkdir))
         .route("/api/create", post(create_entry))
@@ -849,7 +853,7 @@ async fn index() -> impl IntoResponse {
             (header::X_FRAME_OPTIONS, "SAMEORIGIN"),
             (
                 header::CONTENT_SECURITY_POLICY,
-                "default-src 'self'; img-src 'self'; media-src 'self'; frame-src 'self'; style-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; base-uri 'none'; form-action 'self'",
+                "default-src 'self'; img-src 'self' blob:; media-src 'self'; frame-src 'self'; style-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; base-uri 'none'; form-action 'self'",
             ),
             (header::REFERRER_POLICY, "no-referrer"),
         ],
@@ -3234,6 +3238,106 @@ async fn archive_entry(
         .header(header::CONTENT_SECURITY_POLICY, policy)
         .body(Body::from(bytes))
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not send the file"))
+}
+
+/// A saved e-mail (.eml or .msg): its sender, recipients, date, text, and attachments.
+async fn mail_view(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    let mail = tokio::task::spawn_blocking(move || crate::mail::read(&resolved.full))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the mail"))?
+        .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err))?;
+    Ok(Json(mail))
+}
+
+/// A mail's HTML body, for a sandboxed frame: no scripts, no forms, and no pictures from the
+/// internet (only those sent with the mail).
+async fn mail_html(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<Response, ApiError> {
+    require_user(&state, &headers)?;
+    let rel = rel_of(&query.path);
+    let resolved = files::resolve(&state.root, &rel)?;
+    let encoded: String = url_encode(&resolved.rel);
+    let html = tokio::task::spawn_blocking(move || crate::mail::html(&resolved.full, |index| format!("/api/mail/attachment?path={encoded}&index={index}")))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the mail"))?
+        .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "private, max-age=60"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "sandbox allow-same-origin allow-popups allow-popups-to-escape-sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; font-src data:; frame-ancestors 'self'; form-action 'none'",
+            ),
+        ],
+        html,
+    )
+        .into_response())
+}
+
+#[derive(Deserialize)]
+struct MailAttachmentQuery {
+    path: Option<String>,
+    index: usize,
+    download: Option<String>,
+}
+
+/// One attachment of a saved e-mail, shown (pictures, PDFs, text) or downloaded.
+async fn mail_attachment(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<MailAttachmentQuery>,
+) -> Result<Response, ApiError> {
+    require_user(&state, &headers)?;
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    let index = query.index;
+    let (name, mime, bytes) = tokio::task::spawn_blocking(move || crate::mail::attachment(&resolved.full, index))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the mail"))?
+        .map_err(|err| ApiError::new(StatusCode::NOT_FOUND, err))?;
+    let safe = matches!(mime.as_str(), "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "application/pdf" | "text/plain");
+    let mime = if safe { mime } else { "application/octet-stream".to_string() };
+    let policy = if mime == "application/pdf" { "default-src 'none'; frame-ancestors 'self'" } else { "sandbox; default-src 'none'" };
+    Response::builder()
+        .header(header::CONTENT_TYPE, &mime)
+        .header(header::CONTENT_DISPOSITION, files::content_disposition(&name, flag(&query.download) || !safe))
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CACHE_CONTROL, "private, max-age=300")
+        .header(header::CONTENT_SECURITY_POLICY, policy)
+        .body(Body::from(bytes))
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not send the attachment"))
+}
+
+/// A font's family, style, version, and designer.
+async fn font_info(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    let info = tokio::task::spawn_blocking(move || crate::font_info::read(&resolved.full))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the font"))?
+        .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err))?;
+    Ok(Json(info))
+}
+
+/// `text` for a URL's query: everything but letters, digits, and `-_.~` percent-encoded.
+fn url_encode(text: &str) -> String {
+    text.bytes()
+        .map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { char::from(b).to_string() } else { format!("%{b:02X}") })
+        .collect()
 }
 
 /// What an archive (or comic) holds.

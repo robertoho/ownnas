@@ -15,6 +15,7 @@ pub mod documents;
 pub mod ebook;
 pub mod file_index;
 pub mod files;
+pub mod font_info;
 pub mod image_edit;
 pub mod video_edit;
 pub mod media_index;
@@ -23,6 +24,7 @@ pub mod smart;
 #[cfg(ownnas_ml)]
 pub mod ml;
 pub mod http;
+pub mod mail;
 pub mod pdf_ops;
 pub mod photo_details;
 pub mod photo_formats;

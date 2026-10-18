@@ -8,7 +8,7 @@ const enc = encodeURIComponent;
 function h(tag, className, ...children) {
   const node = document.createElement(tag);
   if (className) node.className = className;
-  for (const child of children.flat()) {
+  for (const child of children.flat(Infinity)) {
     if (child == null || child === false) continue;
     node.append(child instanceof Node ? child : document.createTextNode(String(child)));
   }
@@ -524,4 +524,305 @@ export async function mountComic(body, entry) {
   const release = captureArrows(body, (step) => show(page + step));
   show(page);
   return { destroy: release };
+}
+
+// ---- E-mail (.eml, .msg) ----
+
+function formatWhen(seconds) {
+  if (!seconds) return "";
+  return new Date(seconds * 1000).toLocaleString(undefined, { dateStyle: "full", timeStyle: "short" });
+}
+
+function sizeLabel(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB"];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+  return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unit]}`;
+}
+
+export async function mountMail(body, entry) {
+  body.replaceChildren(h("p", "muted", "Opening the mail…"));
+  const mail = await getJson(`/api/mail?path=${enc(entry.path)}`);
+  const row = (label, value) => value ? h("div", "mail-row", h("span", "mail-label muted", label), h("span", "mail-value", value)) : null;
+  const head = h("header", "mail-head",
+    h("h3", "mail-subject", mail.subject || "(no subject)"),
+    row("From", mail.from), row("To", mail.to), row("Cc", mail.cc), row("Date", formatWhen(mail.date)));
+  const attachmentUrl = (index) => `/api/mail/attachment?path=${enc(entry.path)}&index=${index}`;
+  const attachments = mail.attachments.length ? h("ul", "mail-attachments", mail.attachments.map((item) => {
+    const open = h("a", "mail-attachment-name", item.name);
+    open.href = attachmentUrl(item.index);
+    open.target = "_blank";
+    open.rel = "noopener";
+    const save = h("a", "mail-attachment-save muted", "Download");
+    save.href = `${attachmentUrl(item.index)}&download=1`;
+    return h("li", "", open, h("span", "muted", sizeLabel(item.size)), save);
+  })) : null;
+  let content;
+  const textView = () => h("pre", "mail-text", mail.text || "This mail has no text.");
+  if (mail.hasHtml) {
+    const frame = h("iframe", "mail-frame");
+    frame.title = mail.subject || "Mail";
+    // No scripts; links open in a new tab.
+    frame.setAttribute("sandbox", "allow-same-origin allow-popups allow-popups-to-escape-sandbox");
+    frame.src = `/api/mail/html?path=${enc(entry.path)}`;
+    const holder = h("div", "mail-body", frame);
+    const toggle = h("button", "mail-toggle", "Show as plain text");
+    toggle.type = "button";
+    let plain = false;
+    toggle.addEventListener("click", () => {
+      plain = !plain;
+      holder.replaceChildren(plain ? textView() : frame);
+      toggle.textContent = plain ? "Show as sent" : "Show as plain text";
+    });
+    content = [h("div", "mail-tools", toggle, h("span", "muted", "Pictures from the internet are not loaded.")), holder];
+  } else {
+    content = [h("div", "mail-body", textView())];
+  }
+  body.replaceChildren(h("article", "mail-view", head, attachments, ...content));
+  return { destroy() {} };
+}
+
+// ---- iCalendar (.ics) and vCard (.vcf), read in the browser ----
+
+/// The lines of an iCalendar or vCard file, folded lines joined, as { name, params, value }.
+function contentLines(text) {
+  const unfolded = text.replace(/\r\n/g, "\n").replace(/\n[ \t]/g, "");
+  return unfolded.split("\n").filter(Boolean).map((line) => {
+    // The name and parameters end at the first colon outside quotes.
+    let quoted = false;
+    let split = -1;
+    for (let i = 0; i < line.length; i += 1) {
+      if (line[i] === '"') quoted = !quoted;
+      else if (line[i] === ":" && !quoted) { split = i; break; }
+    }
+    if (split < 0) return null;
+    const [name, ...rawParams] = line.slice(0, split).split(";");
+    const params = {};
+    for (const param of rawParams) {
+      const [key, value = ""] = param.split("=");
+      params[key.toUpperCase()] = value.replace(/^"|"$/g, "");
+    }
+    return { name: name.toUpperCase().replace(/^ITEM\d+\./, ""), params, value: line.slice(split + 1) };
+  }).filter(Boolean);
+}
+
+function unescapeValue(value) {
+  return value.replace(/\\n/gi, "\n").replace(/\\([,;\\])/g, "$1");
+}
+
+/// "20240715T183000Z", "20240715T183000", or "20240715" as a Date, and whether it has a time.
+function icsDate(value) {
+  const match = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})?(Z)?)?/.exec(value || "");
+  if (!match) return null;
+  const [, y, mo, d, hh, mm, ss, utc] = match;
+  if (!hh) return { date: new Date(Number(y), Number(mo) - 1, Number(d)), allDay: true };
+  const parts = [Number(y), Number(mo) - 1, Number(d), Number(hh), Number(mm), Number(ss || 0)];
+  return { date: utc ? new Date(Date.UTC(...parts)) : new Date(...parts), allDay: false };
+}
+
+export async function mountCalendar(body, entry) {
+  body.replaceChildren(h("p", "muted", "Reading the calendar…"));
+  const response = await fetch(`/api/raw?path=${enc(entry.path)}`, { credentials: "same-origin" });
+  if (!response.ok) throw new Error("Could not read the calendar");
+  const lines = contentLines(await response.text());
+  const events = [];
+  let current = null;
+  let calendarName = "";
+  for (const line of lines) {
+    if (line.name === "BEGIN" && (line.value === "VEVENT" || line.value === "VTODO")) current = { kind: line.value };
+    else if (line.name === "END" && current && (line.value === "VEVENT" || line.value === "VTODO")) { events.push(current); current = null; }
+    else if (!current && line.name === "X-WR-CALNAME") calendarName = unescapeValue(line.value);
+    else if (current) {
+      if (line.name === "SUMMARY") current.summary = unescapeValue(line.value);
+      if (line.name === "LOCATION") current.location = unescapeValue(line.value);
+      if (line.name === "DESCRIPTION") current.description = unescapeValue(line.value);
+      if (line.name === "DTSTART" || line.name === "DUE") current.start = icsDate(line.value);
+      if (line.name === "DTEND") current.end = icsDate(line.value);
+      if (line.name === "RRULE") current.repeats = line.value;
+      if (line.name === "STATUS") current.status = line.value;
+    }
+  }
+  events.sort((a, b) => (a.start?.date ?? 0) - (b.start?.date ?? 0));
+  const when = (event) => {
+    if (!event.start) return "No date";
+    const day = { dateStyle: "medium" };
+    const time = { timeStyle: "short" };
+    const start = event.start.allDay ? event.start.date.toLocaleDateString(undefined, day) : event.start.date.toLocaleString(undefined, { ...day, ...time });
+    if (!event.end) return start;
+    const sameDay = event.end.date.toDateString() === event.start.date.toDateString();
+    if (event.start.allDay) return start;
+    return `${start} – ${sameDay ? event.end.date.toLocaleTimeString(undefined, time) : event.end.date.toLocaleString(undefined, { ...day, ...time })}`;
+  };
+  const repeatLabel = (rule) => {
+    const freq = /FREQ=(\w+)/.exec(rule)?.[1];
+    return { DAILY: "Every day", WEEKLY: "Every week", MONTHLY: "Every month", YEARLY: "Every year" }[freq] || "Repeats";
+  };
+  let lastMonth = "";
+  const items = [];
+  for (const event of events) {
+    const month = event.start ? event.start.date.toLocaleDateString(undefined, { month: "long", year: "numeric" }) : "";
+    if (month !== lastMonth) { items.push(h("h4", "cal-month", month || "Undated")); lastMonth = month; }
+    items.push(h("div", `cal-event${event.status === "CANCELLED" ? " cal-cancelled" : ""}`,
+      h("div", "cal-when muted", when(event), event.repeats ? ` · ${repeatLabel(event.repeats)}` : "", event.kind === "VTODO" ? " · To do" : ""),
+      h("div", "cal-summary", event.summary || "(no title)"),
+      event.location ? h("div", "cal-location muted", event.location) : null,
+      event.description ? h("details", "cal-description", h("summary", "", "Details"), h("p", "", event.description)) : null));
+  }
+  body.replaceChildren(h("div", "cal-view",
+    h("p", "muted", `${calendarName ? `${calendarName} · ` : ""}${events.length.toLocaleString()} event${events.length === 1 ? "" : "s"}`),
+    items.length ? items : h("p", "muted", "This calendar has no events.")));
+  return { destroy() {} };
+}
+
+export async function mountContacts(body, entry) {
+  body.replaceChildren(h("p", "muted", "Reading the contacts…"));
+  const response = await fetch(`/api/raw?path=${enc(entry.path)}`, { credentials: "same-origin" });
+  if (!response.ok) throw new Error("Could not read the contacts");
+  const cards = [];
+  let card = null;
+  for (const line of contentLines(await response.text())) {
+    if (line.name === "BEGIN" && line.value.toUpperCase() === "VCARD") card = { phones: [], emails: [], addresses: [], urls: [] };
+    else if (line.name === "END" && card) { cards.push(card); card = null; }
+    else if (card) {
+      const value = unescapeValue(line.value);
+      const type = (line.params.TYPE || "").toLowerCase().split(",").filter((t) => !["pref", "voice", "internet"].includes(t)).join(", ");
+      if (line.name === "FN") card.name = value;
+      if (line.name === "N" && !card.name) card.name = value.split(";").filter(Boolean).reverse().join(" ");
+      if (line.name === "ORG") card.org = value.split(";").filter(Boolean).join(", ");
+      if (line.name === "TITLE") card.title = value;
+      if (line.name === "TEL") card.phones.push({ value, type });
+      if (line.name === "EMAIL") card.emails.push({ value, type });
+      if (line.name === "ADR") card.addresses.push({ value: value.split(";").filter(Boolean).join(", "), type });
+      if (line.name === "URL") card.urls.push({ value, type });
+      if (line.name === "BDAY") card.birthday = value;
+      if (line.name === "NOTE") card.note = value;
+    }
+  }
+  cards.sort((a, b) => (a.name || "").localeCompare(b.name || "", undefined, { sensitivity: "base" }));
+  const search = h("input", "contacts-search");
+  search.type = "search";
+  search.placeholder = `Search ${cards.length.toLocaleString()} contact${cards.length === 1 ? "" : "s"}`;
+  const list = h("div", "contacts-list");
+  const line = (label, items) => items.map((item) => h("div", "contact-line", h("span", "muted", item.type || label), " ", item.value));
+  const render = () => {
+    const query = search.value.trim().toLowerCase();
+    const shown = cards.filter((c) => !query || JSON.stringify(c).toLowerCase().includes(query));
+    list.replaceChildren(...shown.slice(0, 500).map((c) => h("div", "contact-card",
+      h("div", "contact-avatar", (c.name || "?").trim().charAt(0).toUpperCase()),
+      h("div", "contact-text",
+        h("strong", "", c.name || "(no name)"),
+        c.org || c.title ? h("div", "muted", [c.title, c.org].filter(Boolean).join(", ")) : null,
+        line("phone", c.phones), line("email", c.emails), line("address", c.addresses), line("web", c.urls),
+        c.birthday ? h("div", "contact-line", h("span", "muted", "birthday"), " ", c.birthday) : null,
+        c.note ? h("div", "contact-line muted", c.note) : null))));
+    if (shown.length > 500) list.append(h("p", "muted", `Showing 500 of ${shown.length.toLocaleString()}. Search to find the others.`));
+    if (!shown.length) list.append(h("p", "muted", "No contacts match."));
+  };
+  search.addEventListener("input", render);
+  render();
+  body.replaceChildren(h("div", "contacts-view", cards.length > 6 ? search : h("p", "muted", `${cards.length} contact${cards.length === 1 ? "" : "s"}`), list));
+  return { destroy() {} };
+}
+
+// ---- Jupyter notebooks (.ipynb) ----
+
+/// Terminal colour codes left in error tracebacks.
+const ANSI = /\u001b\[[0-9;]*[A-Za-z]/g;
+
+export async function mountNotebook(body, entry, { renderMarkdown } = {}) {
+  body.replaceChildren(h("p", "muted", "Opening the notebook…"));
+  if (entry.size > 50 * 1024 * 1024) throw new Error("This notebook is too large to preview");
+  const response = await fetch(`/api/raw?path=${enc(entry.path)}`, { credentials: "same-origin" });
+  if (!response.ok) throw new Error("Could not read the notebook");
+  let notebook;
+  try { notebook = JSON.parse(await response.text()); } catch { throw new Error("This notebook is not valid JSON"); }
+  const urls = [];
+  const text = (value) => Array.isArray(value) ? value.join("") : String(value ?? "");
+  const language = notebook.metadata?.kernelspec?.display_name || notebook.metadata?.language_info?.name || "";
+  const picture = (data, type) => {
+    const bytes = Uint8Array.from(atob(text(data).replace(/\s/g, "")), (c) => c.charCodeAt(0));
+    const url = URL.createObjectURL(new Blob([bytes], { type }));
+    urls.push(url);
+    const img = h("img", "nb-image");
+    img.alt = "";
+    img.src = url;
+    return img;
+  };
+  const output = (out) => {
+    if (out.output_type === "stream") return h("pre", `nb-output${out.name === "stderr" ? " nb-stderr" : ""}`, text(out.text));
+    if (out.output_type === "error") return h("pre", "nb-output nb-stderr", text(out.traceback).replace(ANSI, "") || `${out.ename}: ${out.evalue}`);
+    const data = out.data || {};
+    if (data["image/png"]) return picture(data["image/png"], "image/png");
+    if (data["image/jpeg"]) return picture(data["image/jpeg"], "image/jpeg");
+    if (data["text/markdown"] && renderMarkdown) {
+      const div = h("div", "nb-markdown");
+      div.innerHTML = renderMarkdown(text(data["text/markdown"]));
+      return div;
+    }
+    if (data["text/plain"]) return h("pre", "nb-output", text(data["text/plain"]));
+    if (data["text/html"]) return h("pre", "nb-output muted", "(HTML output, not shown)");
+    return null;
+  };
+  const cells = (notebook.cells || []).map((cell) => {
+    const source = text(cell.source);
+    if (cell.cell_type === "markdown") {
+      const div = h("div", "nb-cell nb-markdown");
+      if (renderMarkdown) div.innerHTML = renderMarkdown(source);
+      else div.textContent = source;
+      return div;
+    }
+    if (cell.cell_type === "code") {
+      const count = cell.execution_count != null ? `[${cell.execution_count}]` : "[ ]";
+      return h("div", "nb-cell nb-code",
+        h("div", "nb-prompt muted", count),
+        h("div", "nb-io", h("pre", "nb-source", source), (cell.outputs || []).map(output)));
+    }
+    return h("pre", "nb-cell nb-raw", source);
+  });
+  body.replaceChildren(h("div", "nb-view",
+    h("p", "muted", `${(notebook.cells || []).length} cells${language ? ` · ${language}` : ""}`),
+    cells));
+  return { destroy() { for (const url of urls) URL.revokeObjectURL(url); } };
+}
+
+// ---- Fonts (.ttf, .otf, .woff, .woff2) ----
+
+let fontCount = 0;
+
+export async function mountFont(body, entry) {
+  body.replaceChildren(h("p", "muted", "Loading the font…"));
+  fontCount += 1;
+  const family = `ownnas-preview-font-${fontCount}`;
+  const face = new FontFace(family, `url(/api/raw?path=${enc(entry.path)}&v=${entry.modified || 0})`);
+  await face.load().catch(() => { throw new Error("This font could not be loaded by the browser"); });
+  document.fonts.add(face);
+  const info = /\.(ttf|otf)$/i.test(entry.name) ? await getJson(`/api/font/info?path=${enc(entry.path)}`).catch(() => null) : null;
+  const sample = h("input", "font-sample-input");
+  sample.type = "text";
+  sample.value = "The quick brown fox jumps over the lazy dog";
+  sample.setAttribute("aria-label", "Sample text");
+  const lines = h("div", "font-lines");
+  const paint = () => {
+    lines.replaceChildren(...[64, 40, 28, 20, 15, 12].map((size) => {
+      const line = h("div", "font-line", h("span", "font-size muted", `${size}`), h("span", "font-text", sample.value || " "));
+      const shown = line.querySelector(".font-text");
+      shown.style.fontFamily = `"${family}"`;
+      shown.style.fontSize = `${size}px`;
+      return line;
+    }));
+  };
+  sample.addEventListener("input", paint);
+  paint();
+  const charset = h("div", "font-charset", "ABCDEFGHIJKLMNOPQRSTUVWXYZ\nabcdefghijklmnopqrstuvwxyz\n0123456789 .,;:!?¿¡ & @ # $ € £ % ( ) [ ] { } “ ” ‘ ’ – —\nÁÉÍÓÚ áéíóú Ññ Çç Ää Öö Üü ß Ąą Ęę Łł Śś Żż");
+  charset.style.fontFamily = `"${family}"`;
+  const facts = info ? h("dl", "font-facts", [
+    ["Family", info.family], ["Style", info.style], ["Version", info.version], ["Designer", info.designer],
+    ["Characters", info.glyphs ? `${info.glyphs.toLocaleString()} glyphs` : ""],
+    ["Kind", [info.monospaced ? "Monospaced" : "", info.variable ? "Variable" : ""].filter(Boolean).join(", ")],
+    ["Copyright", info.copyright],
+  ].filter(([, value]) => value).map(([label, value]) => [h("dt", "muted", label), h("dd", "", value)])) : null;
+  body.replaceChildren(h("div", "font-view", h("h3", "font-title", info?.fullName || info?.family || entry.name), sample, lines, charset, facts));
+  return { destroy() { document.fonts.delete(face); } };
 }

@@ -2323,6 +2323,16 @@ async function openEntry(entry) {
     } catch (err) {
       if (state.current === entry) body.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
     }
+  } else if (/\.(eml|msg)$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountMail(body, entry), () => openMetaPreview(body, entry));
+  } else if (/\.ics$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountCalendar(body, entry), () => openMetaPreview(body, entry));
+  } else if (/\.(vcf|vcard)$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountContacts(body, entry), () => openMetaPreview(body, entry));
+  } else if (/\.ipynb$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountNotebook(body, entry, { renderMarkdown }), () => openMetaPreview(body, entry));
+  } else if (/\.(ttf|otf|woff2?)$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountFont(body, entry));
   } else if (/\.epub$/i.test(entry.name)) {
     mountViewer(body, entry, (module) => module.mountBook(body, entry), () => openMetaPreview(body, entry));
   } else if (/\.(cbz|cbr|cb7)$/i.test(entry.name)) {
