@@ -2225,10 +2225,12 @@ async function openEntry(entry) {
       if (state.current === entry) body.innerHTML = `<p class="muted">This photo could not be shown. It can still be downloaded.</p>`;
     }, { once: true });
   } else if (entry.kind === "video") {
-    const poster = entry.thumb ? ` poster="/api/thumb?path=${encodeURIComponent(entry.path)}&v=${entry.modified}"` : "";
-    body.innerHTML = `<video controls playsinline${poster} src="${raw}"></video>`;
+    const poster = entry.thumb ? `/api/thumb?path=${encodeURIComponent(entry.path)}&v=${entry.modified}` : "";
+    mountViewer(body, entry, (module) => module.mountVideo(body, entry, { poster }));
   } else if (entry.kind === "audio") {
-    body.innerHTML = `<audio controls src="${raw}"></audio>`;
+    mountViewer(body, entry, (module) => module.mountAudio(body, entry));
+  } else if (/\.(srt|vtt)$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountSubtitles(body, entry));
   } else if (entry.kind === "pdf") {
     body.innerHTML = `<iframe title="${esc(entry.name)}" src="${raw}"></iframe>`;
   } else if (/\.xlsx$/i.test(entry.name)) {
@@ -2354,6 +2356,22 @@ async function openEntry(entry) {
         body.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
       }
     }
+  }
+}
+
+/// Opens a preview from the viewers module (formats the browser does not show by itself).
+async function mountViewer(body, entry, mount) {
+  try {
+    const module = await import("/assets/viewers.js");
+    if (state.current !== entry) return;
+    const viewer = await mount(module);
+    if (state.current !== entry) {
+      if (viewer) viewer.destroy();
+      return;
+    }
+    state.editor = { dirty: false, destroy: () => viewer && viewer.destroy() };
+  } catch (err) {
+    if (state.current === entry) body.innerHTML = `<p class="muted">${esc(err.message || "Could not open the preview")}</p>`;
   }
 }
 

@@ -34,6 +34,7 @@ const XLSX_EDITOR_JS: &str = include_str!("../web/xlsx-editor.js");
 const SQLITE_VIEWER_JS: &str = include_str!("../web/sqlite-viewer.js");
 const THEME_JS: &str = include_str!("../web/theme.js");
 const GALLERY_JS: &str = include_str!("../web/gallery.js");
+const VIEWERS_JS: &str = include_str!("../web/viewers.js");
 const APP_JS: &str = include_str!("../web/app.js");
 const MODEL_VIEWER_JS: &str = include_str!("../web/model-viewer.js");
 const DXF_VIEWER_JS: &str = include_str!("../web/dxf-viewer.js");
@@ -185,6 +186,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/assets/sqlite-viewer.js", get(sqlite_viewer_javascript))
         .route("/assets/theme.js", get(theme_javascript))
         .route("/assets/gallery.js", get(gallery_javascript))
+        .route("/assets/viewers.js", get(viewers_javascript))
         .route("/assets/docx-editor.css", get(docx_editor_css))
         .route("/assets/model-viewer.js", get(model_viewer_javascript))
         .route("/assets/dxf-viewer.js", get(dxf_viewer_javascript))
@@ -254,6 +256,11 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/sqlite/value", get(sqlite_value))
         .route("/api/thumb", get(thumb))
         .route("/api/display", get(display_image))
+        .route("/api/audio/info", get(audio_info))
+        .route("/api/audio/cover", get(audio_cover))
+        .route("/api/video/probe", get(video_probe))
+        .route("/api/video/stream", get(video_stream))
+        .route("/api/subtitles", get(subtitles))
         .route("/api/mkdir", post(mkdir))
         .route("/api/create", post(create_entry))
         .route("/api/write", post(write_entry))
@@ -911,6 +918,10 @@ async fn theme_javascript() -> impl IntoResponse {
 
 async fn gallery_javascript() -> impl IntoResponse {
     app_module_javascript(GALLERY_JS)
+}
+
+async fn viewers_javascript() -> impl IntoResponse {
+    app_module_javascript(VIEWERS_JS)
 }
 
 async fn model_viewer_javascript() -> impl IntoResponse {
@@ -3009,6 +3020,158 @@ async fn thumb(
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         ],
         image,
+    )
+        .into_response())
+}
+
+/// A song's title, artist, album, length, and whether it has a cover picture.
+async fn audio_info(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    let info = tokio::task::spawn_blocking(move || crate::audio_info::info(&resolved.full))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the song"))?;
+    Ok(Json(info))
+}
+
+/// A song's cover picture (its own, or the folder's).
+async fn audio_cover(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<Response, ApiError> {
+    require_user(&state, &headers)?;
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    let (bytes, mime) = tokio::task::spawn_blocking(move || crate::audio_info::cover(&resolved.full))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the song"))?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "No cover picture"))?;
+    // Only pictures: anything else claimed by the file is sent as plain bytes.
+    let mime = if mime.starts_with("image/") && !mime.contains("svg") { mime } else { "application/octet-stream".to_string() };
+    Ok((
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CACHE_CONTROL, "private, max-age=3600".to_string()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// A video's subtitle files beside it, and (with ffmpeg) its codecs, size, and length, for
+/// playing it through the converter.
+async fn video_probe(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    let ffmpeg = state.ffmpeg;
+    let (streams, subtitles) = tokio::task::spawn_blocking(move || {
+        let streams = if ffmpeg { crate::media_stream::probe(&resolved.full) } else { None };
+        (streams, crate::media_stream::subtitles_beside(&resolved.full, &resolved.rel))
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the video"))?;
+    Ok(Json(json!({ "ffmpeg": ffmpeg, "streams": streams, "subtitles": subtitles })))
+}
+
+#[derive(Deserialize)]
+struct StreamQuery {
+    path: Option<String>,
+    start: Option<f64>,
+}
+
+/// `ffmpeg`'s output, ending it when the stream is dropped (the viewer moved on or closed it).
+struct ChildOutput {
+    _child: tokio::process::Child,
+    out: tokio::process::ChildStdout,
+}
+
+impl AsyncRead for ChildOutput {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.out).poll_read(cx, buf)
+    }
+}
+
+/// A video the browser cannot play, as a streaming MP4 from `start` seconds (see `media_stream`).
+async fn video_stream(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<StreamQuery>,
+) -> Result<Response, ApiError> {
+    require_user(&state, &headers)?;
+    if !state.ffmpeg {
+        return Err(ApiError::new(StatusCode::NOT_IMPLEMENTED, "Install ffmpeg to play this video"));
+    }
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    if resolved.full.is_dir() {
+        return Err(FileError::IsADirectory.into());
+    }
+    let full = resolved.full.clone();
+    let streams = tokio::task::spawn_blocking(move || crate::media_stream::probe(&full))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the video"))?
+        .ok_or_else(|| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "Could not read the video"))?;
+    if streams.video.is_none() {
+        return Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "This file has no video"));
+    }
+    let start = query.start.unwrap_or(0.0).max(0.0);
+    let mut child = tokio::process::Command::new("ffmpeg")
+        .args(crate::media_stream::stream_arguments(&resolved.full, start, &streams))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not start ffmpeg"))?;
+    let out = child.stdout.take().ok_or_else(|| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not start ffmpeg"))?;
+    let body = Body::from_stream(ReaderStream::new(ChildOutput { _child: child, out }));
+    Response::builder()
+        .header(header::CONTENT_TYPE, "video/mp4")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .body(body)
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not send the video"))
+}
+
+#[derive(Deserialize)]
+struct SubtitleQuery {
+    path: Option<String>,
+    shift: Option<f64>,
+}
+
+/// A subtitle file (.srt or .vtt) as WebVTT, moved earlier by `shift` seconds.
+async fn subtitles(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<SubtitleQuery>,
+) -> Result<Response, ApiError> {
+    require_user(&state, &headers)?;
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    let extension = extension_of(&resolved.rel);
+    if !matches!(extension.as_str(), "srt" | "vtt") {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Only .srt and .vtt subtitles are read"));
+    }
+    let meta = tokio::fs::metadata(&resolved.full).await.map_err(|_| ApiError::from(FileError::NotFound))?;
+    if meta.len() > 10 * 1024 * 1024 {
+        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "This subtitle file is too large"));
+    }
+    let bytes = tokio::fs::read(&resolved.full).await.map_err(|_| ApiError::from(FileError::NotFound))?;
+    let text = crate::media_stream::to_webvtt(&bytes, query.shift.unwrap_or(0.0));
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/vtt; charset=utf-8"),
+            (header::CACHE_CONTROL, "private, max-age=60"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        text,
     )
         .into_response())
 }

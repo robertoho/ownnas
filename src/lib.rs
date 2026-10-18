@@ -5,6 +5,7 @@
 //! for Android.
 
 pub mod agents;
+pub mod audio_info;
 pub mod albums;
 pub mod auth;
 pub mod content_index;
@@ -14,6 +15,7 @@ pub mod files;
 pub mod image_edit;
 pub mod video_edit;
 pub mod media_index;
+pub mod media_stream;
 pub mod smart;
 #[cfg(ownnas_ml)]
 pub mod ml;

@@ -3676,3 +3676,33 @@ body.is-gallery .app > .explorer-status-bar { display: none; }
 .terminals-window-body { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--bg-2); }
 .settings.is-window { position: static; inset: auto; z-index: auto; width: auto; height: auto; flex: 1; min-height: 0; border: 0; box-shadow: none; }
 .settings.is-window #settings-close { display: none; }
+
+/* ---- Viewers for more formats (web/viewers.js) ---- */
+.audio-view { display: grid; gap: 1rem; padding: 0.5rem 0; }
+.audio-head { display: flex; gap: 1rem; align-items: center; min-width: 0; }
+.audio-cover { flex: 0 0 auto; width: 128px; height: 128px; border-radius: 12px; overflow: hidden; background: var(--bg-2); border: 1px solid var(--line); display: grid; place-items: center; }
+.audio-cover-img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.audio-cover-empty { font-size: 3rem; color: var(--muted); }
+.audio-text { min-width: 0; display: grid; gap: 0.2rem; }
+.audio-title { margin: 0; font-size: 1.15rem; overflow-wrap: anywhere; }
+.audio-artist { margin: 0; font-weight: 600; }
+.audio-album, .audio-details { margin: 0; font-size: 0.85rem; }
+.audio-wave-box { position: relative; }
+.audio-wave { display: block; width: 100%; height: 96px; cursor: pointer; }
+.audio-wave-note { margin: 0; font-size: 0.85rem; }
+.audio-player-element { width: 100%; }
+.video-view { display: grid; gap: 0.5rem; }
+.video-view video { width: 100%; max-height: 70vh; background: #000; border-radius: 10px; }
+.video-seek-row { display: flex; gap: 0.6rem; align-items: center; }
+.video-seek { flex: 1; accent-color: var(--accent); }
+.video-seek-time { font-variant-numeric: tabular-nums; font-size: 0.85rem; white-space: nowrap; }
+.video-note { margin: 0; font-size: 0.85rem; }
+.subtitle-view { display: grid; gap: 0.5rem; }
+.subtitle-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 0.35rem; }
+.subtitle-list li { display: grid; grid-template-columns: max-content 1fr; gap: 0.8rem; padding: 0.35rem 0.5rem; border-radius: 8px; background: var(--bg-2); }
+.subtitle-time { font-variant-numeric: tabular-nums; font-size: 0.8rem; }
+.subtitle-text { white-space: pre-wrap; }
+@media (max-width: 600px) {
+  .audio-cover { width: 88px; height: 88px; }
+  .subtitle-list li { grid-template-columns: 1fr; gap: 0.15rem; }
+}

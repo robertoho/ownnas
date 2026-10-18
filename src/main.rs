@@ -1,4 +1,5 @@
 mod agents;
+mod audio_info;
 mod albums;
 mod auth;
 mod content_index;
@@ -8,6 +9,7 @@ mod files;
 mod image_edit;
 mod video_edit;
 mod media_index;
+mod media_stream;
 mod smart;
 #[cfg(ownnas_ml)]
 mod ml;
