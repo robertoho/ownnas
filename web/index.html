@@ -318,6 +318,7 @@
       <button id="settings-tab-terminal" type="button" role="tab" aria-selected="false" data-settings-tab="terminal" hidden>Terminal</button>
       <button id="settings-tab-gallery" type="button" role="tab" aria-selected="false" data-settings-tab="gallery" hidden>Gallery</button>
       <button id="settings-tab-storage" type="button" role="tab" aria-selected="false" data-settings-tab="storage">Storage</button>
+      <button id="settings-tab-indexing" type="button" role="tab" aria-selected="false" data-settings-tab="indexing">Indexing</button>
     </div>
     <section id="settings-theme" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-theme">
       <p class="muted">Themes inspired by Omarchy palettes. Choice is saved in this browser.</p>
@@ -339,15 +340,7 @@
     </section>
     <section id="settings-terminal" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-terminal" hidden></section>
     <section id="settings-gallery" class="settings-panel gallery-settings" role="tabpanel" aria-labelledby="settings-tab-gallery" hidden>
-      <h3>Indexing speed</h3>
-      <p class="muted">How hard OwnNAS may work the computer while it looks through the library for photos and makes their thumbnails. Thumbnails you are waiting for are always made right away.</p>
-      <div id="index-speed" class="index-speed" role="radiogroup" aria-label="Indexing speed">
-        <label class="index-speed-option"><input type="radio" name="index-speed" value="slow"><span><strong>Slow</strong><span class="muted">One task at a time, resting three times as long as it works, at low priority: about a quarter of one processor core. Barely noticeable, but the first scan of a big library can take many hours.</span></span></label>
-        <label class="index-speed-option"><input type="radio" name="index-speed" value="medium"><span><strong>Medium</strong><span class="muted">One task at a time, resting as long as it works, at low priority: about half of one core. A good balance for a computer that is also used for other things.</span></span></label>
-        <label class="index-speed-option"><input type="radio" name="index-speed" value="fast"><span><strong>Fast</strong><span class="muted">Up to four tasks at once without resting. Finishes soonest, but the fans may spin up.</span></span></label>
-      </div>
-      <p id="index-status" class="muted index-status"></p>
-      <button id="index-rescan" type="button">Rescan the library now</button>
+      <p id="gallery-index-line" class="muted">Indexing speed and progress are under <button id="gallery-index-link" type="button" class="link-button">Settings → Indexing</button>.</p>
       <div class="smart-settings">
         <h3>Phone backups</h3>
         <p class="muted">The OwnNAS phone app can back up a phone’s photos and videos to a folder here, each phone in its own folder, by year and month.</p>
@@ -367,7 +360,7 @@
       </div>
       <div id="smart-settings" class="smart-settings" hidden>
         <h3>Smart features</h3>
-        <p class="muted">These run entirely on this computer: no photo or face leaves it. Their models are downloaded once, when you switch them on, and they work at the indexing speed above.</p>
+        <p class="muted">These run entirely on this computer: no photo or face leaves it. Their models are downloaded once, when you switch them on, and they work at the indexing speed chosen under Indexing.</p>
         <label class="smart-option"><input type="checkbox" id="smart-search">
           <span><strong>Search by what photos show</strong><span class="muted">Search the Gallery in words (“dog on the beach”, “birthday cake”), and find photos that look like another one. English works best. <span id="smart-search-size"></span></span><span id="smart-search-state" class="smart-state"></span></span>
         </label>
@@ -389,6 +382,22 @@
       <dl id="storage-legend" class="storage-legend"></dl>
       <p id="storage-measured" class="muted"></p>
       <button id="storage-measure" type="button">Measure again</button>
+    </section>
+    <section id="settings-indexing" class="settings-panel indexing-settings" role="tabpanel" aria-labelledby="settings-tab-indexing" hidden>
+      <h3>Search index</h3>
+      <p class="muted">OwnNAS keeps a list of every file and folder name, so a search finds them at once however big the library is. It only reads folders that changed since it last looked: changes made through OwnNAS show within seconds, ones made in Finder, Explorer, or another program within five minutes. To read one folder again, right-click it and choose Reindex.</p>
+      <p id="files-index-status" class="index-status"></p>
+      <h3>Photos and videos</h3>
+      <p id="index-status" class="muted index-status"></p>
+      <button id="index-rescan" type="button">Reindex everything</button>
+      <h3>Indexing speed</h3>
+      <p class="muted">How hard OwnNAS may work the computer while it indexes the library, looks through it for photos, and makes their thumbnails. Searches and thumbnails you are waiting for always run at full speed.</p>
+      <div id="index-speed" class="index-speed" role="radiogroup" aria-label="Indexing speed">
+        <label class="index-speed-option"><input type="radio" name="index-speed" value="slow"><span><strong>Slow</strong><span class="muted">One task at a time, resting three times as long as it works, at low priority: about a quarter of one processor core. Barely noticeable, but the first scan of a big library can take many hours.</span></span></label>
+        <label class="index-speed-option"><input type="radio" name="index-speed" value="medium"><span><strong>Medium</strong><span class="muted">One task at a time, resting as long as it works, at low priority: about half of one core. A good balance for a computer that is also used for other things.</span></span></label>
+        <label class="index-speed-option"><input type="radio" name="index-speed" value="fast"><span><strong>Fast</strong><span class="muted">Up to four tasks at once without resting. Finishes soonest, but the fans may spin up.</span></span></label>
+      </div>
+      <p id="index-speed-admin" class="muted" hidden>Only an administrator can change the speed.</p>
     </section>
     <section id="settings-users" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-users" hidden>
       <p class="muted">Administrators can add accounts, reset passwords, and grant admin access.</p>

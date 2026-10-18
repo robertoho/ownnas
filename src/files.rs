@@ -1480,6 +1480,93 @@ pub fn search(
     Ok(hits)
 }
 
+/// A search using the name index: `names` are the files and folders whose names matched (as
+/// library paths, with whether each is a folder), `contents` the text files and PDFs, and
+/// `images` the photos, whose text is looked in. What has gone since it was indexed is left out.
+pub fn search_listed(
+    root: &Path,
+    query: &str,
+    names: Vec<(String, bool)>,
+    contents: Vec<String>,
+    images: Vec<String>,
+    options: &SearchOptions,
+) -> Result<Vec<SearchHit>, FileError> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Err(FileError::Rejected("Enter a search"));
+    }
+    let root = root.canonicalize().map_err(map_io)?;
+    let mut hits: Vec<SearchHit> = Vec::new();
+    let add = |rel: &str, matched_content: Option<String>, hits: &mut Vec<SearchHit>| {
+        let full = root.join(rel);
+        let Ok(meta) = full.symlink_metadata() else { return };
+        let name = rel.rsplit('/').next().unwrap_or(rel).to_string();
+        let dir = meta.is_dir();
+        hits.push(SearchHit {
+            kind: if !dir {
+                kind_of(&name).to_string()
+            } else if is_trash_folder(&full) {
+                "trash-folder".to_string()
+            } else if is_archive_folder(&full) {
+                "archive-folder".to_string()
+            } else {
+                "folder".to_string()
+            },
+            name,
+            path: rel.to_string(),
+            dir,
+            size: if dir { 0 } else { meta.len() },
+            modified: modified_secs(&meta),
+            matched_tag: None,
+            matched_content,
+        });
+    };
+    for (rel, _) in &names {
+        if hits.len() >= 100 {
+            return Ok(hits);
+        }
+        add(rel, None, &mut hits);
+    }
+    if query.chars().count() < 2 {
+        return Ok(hits);
+    }
+    let named: HashSet<String> = names.into_iter().map(|(rel, _)| rel).collect();
+    let mut ocr_budget = 12usize;
+    for rel in contents {
+        if hits.len() >= 100 {
+            return Ok(hits);
+        }
+        if named.contains(&rel) {
+            continue;
+        }
+        let full = root.join(&rel);
+        let found = match kind_of(&rel) {
+            "text" => text_file_contains(&full, &query),
+            "pdf" => indexed_contains(&full, "pdf", &query, options, &mut ocr_budget),
+            _ => None,
+        };
+        if found.is_some() {
+            add(&rel, found, &mut hits);
+        }
+    }
+    if options.ocr {
+        for rel in images {
+            // Out of budget, only text read before is looked in.
+            if hits.len() >= 100 {
+                break;
+            }
+            if named.contains(&rel) {
+                continue;
+            }
+            let full = root.join(&rel);
+            if let Some(found) = indexed_contains(&full, "image", &query, options, &mut ocr_budget) {
+                add(&rel, Some(found), &mut hits);
+            }
+        }
+    }
+    Ok(hits)
+}
+
 fn content_snippet(haystack: &str, needle: &str) -> Option<String> {
     if !crate::content_index::text_matches(haystack, needle) {
         return None;

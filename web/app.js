@@ -903,6 +903,7 @@ const MENU_ICONS = {
   check: "M3 8.5l3 3 7-7",
   bookmark: "M4 2.5h8v11l-4-2.5-4 2.5z",
   usage: `${ICON_FOLDER} M4.5 9.25h7v2.5h-7z M4.75 10.5h3.75`,
+  reindex: `${ICON_FOLDER} M10.5 9.5a2.25 2.25 0 1 1-.66-1.6 M10.5 7.25v1.5H9`,
   duplicates: "M2.5 3.5h6v6h-6z M7.5 6.5h6v6h-6z",
   activity: "M8 2.5a5.5 5.5 0 1 1 0 11a5.5 5.5 0 1 1 0-11z M8 5v3.25L10.25 10",
   toggleHidden: "M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8s-2.5 4.5-6.5 4.5S1.5 8 1.5 8z M8 6a2 2 0 1 1 0 4a2 2 0 1 1 0-4z",
@@ -1203,6 +1204,7 @@ function openSelectionMenu(x, y, pasteInto) {
       buttons.push(`<button type="button" data-menu="bookmark">${bookmarked ? "Remove bookmark" : "Bookmark this folder"}</button>`);
     }
     buttons.push(`<button type="button" data-menu="usage">Folder size</button>`);
+    buttons.push(`<button type="button" data-menu="reindex">Reindex this folder</button>`);
     buttons.push(`<button type="button" data-menu="duplicates">Find duplicates…</button>`);
     buttons.push(`<button type="button" data-menu="activity">Activity</button>`);
     buttons.push(`<button type="button" data-menu="toggleHidden">${state.hidden ? "Hide dotfiles" : "Show hidden files"}</button>`);
@@ -1219,6 +1221,7 @@ function openSelectionMenu(x, y, pasteInto) {
     if (one && one.dir && state.me && state.me.terminal && !allInTrash) {
       buttons.push(`<button type="button" data-menu="terminal">Open terminal here</button>`);
     }
+    if (one && one.dir) buttons.push(`<button type="button" data-menu="reindex">Reindex</button>`);
     if (write && entries.every(customizableFolder)) buttons.push(`<button type="button" data-menu="folderAppearance">${entries.length === 1 ? 'Customize folder…' : 'Customize folders…'}</button>`);
     if (entries.length) buttons.push(`<button type="button" data-menu="download">Download</button>`);
     if (write && allInTrash) buttons.push(`<button type="button" data-menu="restore">Restore</button>`);
@@ -1342,6 +1345,11 @@ function setSettingsTab(tab) {
   const terminal = tab === "terminal";
   const galleryTab = tab === "gallery";
   const storageTab = tab === "storage";
+  const indexingTab = tab === "indexing";
+  $("settings-tab-indexing").setAttribute("aria-selected", indexingTab ? "true" : "false");
+  $("settings-indexing").hidden = !indexingTab;
+  clearTimeout(indexingTimer);
+  if (indexingTab) refreshIndexing().catch((err) => toast(err.message, true));
   $("settings-tab-storage").setAttribute("aria-selected", storageTab ? "true" : "false");
   $("settings-storage").hidden = !storageTab;
   if (storageTab) refreshStorage(true).catch((err) => toast(err.message, true));
@@ -1419,8 +1427,6 @@ async function refreshIndexSettings() {
   renderSmartSettings(smart);
   renderBackupFolder(backup.folder);
   refreshBlocked().catch(() => {});
-  for (const input of document.querySelectorAll('input[name="index-speed"]')) input.checked = input.value === data.speed;
-  $("index-status").textContent = describeIndexStatus(data.status);
   clearTimeout(indexStatusTimer);
   if (!$("settings").hidden && !$("settings-gallery").hidden) {
     const busy = data.status.scanning || data.status.thumbnailing || data.status.analyzing
@@ -1432,14 +1438,70 @@ async function refreshIndexSettings() {
 $("index-speed").addEventListener("change", async (event) => {
   const speed = event.target.value;
   try {
-    const data = await api("/api/gallery/settings", { method: "POST", json: { speed } });
+    await api("/api/gallery/settings", { method: "POST", json: { speed } });
     toast(`Indexing speed: ${speed}`);
-    $("index-status").textContent = describeIndexStatus(data.status);
   } catch (err) {
     toast(err.message, true);
-    refreshIndexSettings().catch(() => {});
   }
+  refreshIndexing().catch(() => {});
 });
+
+// ---- The search index (Settings → Indexing, and Reindex on a folder) ----
+
+let indexingTimer = 0;
+
+function describeFilesIndex(files) {
+  const count = (n) => Number(n).toLocaleString();
+  if (files.scanning) {
+    const where = files.scope ? `“${libraryPath(files.scope)}”` : "the library";
+    if (!files.ready && !files.scope) return `Indexing the library for the first time… ${count(files.folders)} folders so far. Until it finishes, searches look through the folders directly, which is slower.`;
+    if (files.full) return `Reading ${where} again… ${count(files.folders)} folders so far.`;
+    return `${count(files.entries)} files and folders indexed. Looking for changes… ${count(files.folders)} folders checked.`;
+  }
+  if (files.error) return `The last indexing stopped: ${files.error}`;
+  if (!files.ready) return "Not indexed yet: searches look through the folders directly.";
+  const took = files.tookMs != null ? ` (took ${files.tookMs < 1000 ? "under a second" : `${Math.round(files.tookMs / 1000).toLocaleString()} s`})` : "";
+  return `${count(files.entries)} files and folders indexed. Last checked for changes ${formatDate(files.finishedAt)}${took}.`;
+}
+
+async function refreshIndexing() {
+  const data = await api("/api/index");
+  const admin = !!(state.me && state.me.admin);
+  for (const input of document.querySelectorAll('input[name="index-speed"]')) {
+    input.checked = input.value === data.speed;
+    input.disabled = !admin;
+  }
+  $("index-speed-admin").hidden = admin;
+  $("files-index-status").textContent = describeFilesIndex(data.files);
+  $("index-status").textContent = describeIndexStatus(data.media);
+  clearTimeout(indexingTimer);
+  if (!$("settings").hidden && !$("settings-indexing").hidden) {
+    const busy = data.files.scanning || data.media.scanning || data.media.thumbnailing;
+    indexingTimer = setTimeout(() => refreshIndexing().catch(() => {}), busy ? 1000 : 10000);
+  }
+}
+
+/// Reads a folder (`""` for the whole library) into the search index again, and says when done.
+async function reindexFolder(path) {
+  const where = path ? `“${libraryPath(path)}”` : "the library";
+  const first = await api("/api/index/reindex", { method: "POST", json: { path } });
+  if (!$("settings-indexing").hidden) refreshIndexing().catch(() => {});
+  toast(`Reindexing ${where}…`);
+  const before = first.files.finishedAt || 0;
+  const deadline = Date.now() + 30 * 60 * 1000;
+  // Done when a scan that covers it has finished after the request.
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const data = await api("/api/index").catch(() => null);
+    if (!data) continue;
+    const files = data.files;
+    const covers = files.full && (files.scope === "" || files.scope === path || path.startsWith(`${files.scope}/`));
+    if (!files.scanning && covers && (files.finishedAt || 0) >= before) {
+      toast(path ? `${where} reindexed` : "Library reindexed");
+      return;
+    }
+  }
+}
 
 for (const [id, key] of [["smart-search", "search"], ["smart-faces", "faces"]]) {
   $(id).addEventListener("change", async (event) => {
@@ -1587,15 +1649,11 @@ $("smart-forget").addEventListener("click", async () => {
   }
 });
 
-$("index-rescan").addEventListener("click", async () => {
-  try {
-    await api("/api/gallery/rescan", { method: "POST" });
-    toast("Looking through the library for photos");
-    refreshIndexSettings().catch(() => {});
-  } catch (err) {
-    toast(err.message, true);
-  }
+$("index-rescan").addEventListener("click", () => {
+  reindexFolder("").catch((err) => toast(err.message, true));
 });
+$("gallery-index-link").addEventListener("click", () => setSettingsTab("indexing"));
+$("settings-tab-indexing").addEventListener("click", () => setSettingsTab("indexing"));
 
 $("settings-tab-gallery").addEventListener("click", () => setSettingsTab("gallery"));
 $("settings-tab-storage").addEventListener("click", () => setSettingsTab("storage"));
@@ -4697,6 +4755,7 @@ function runMenuAction(button, entries, pasteInto) {
   if (action === "addToAlbum") gallery().then((api) => api.pickAlbum(entries.map((entry) => entry.path))).catch((err) => toast(err.message, true));
   if (action === "bookmark") $("bookmark-btn").click();
   if (action === "usage") $("usage-btn").click();
+  if (action === "reindex") reindexFolder(one && one.dir ? one.path : state.path).catch((err) => toast(err.message, true));
   if (action === "duplicates") openDuplicatesFinder().catch((err) => toast(err.message, true));
   if (action === "activity") $("activity-btn").click();
   if (action === "bulkTag") bulkTagEntries(entries).catch((err) => toast(err.message, true));

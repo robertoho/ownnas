@@ -3,6 +3,7 @@ mod albums;
 mod auth;
 mod content_index;
 mod db;
+mod file_index;
 mod files;
 mod image_edit;
 mod video_edit;

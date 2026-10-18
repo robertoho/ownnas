@@ -218,6 +218,16 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             fingerprint TEXT NOT NULL,
             scanned_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS file_index (
+            path TEXT PRIMARY KEY,
+            parent TEXT,
+            name_lower TEXT NOT NULL,
+            dir INTEGER NOT NULL,
+            size INTEGER NOT NULL,
+            mtime INTEGER NOT NULL,
+            kind TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS file_index_parent ON file_index(parent);
         ",
     )
     .map_err(|_| "Could not create the database schema".to_string())?;

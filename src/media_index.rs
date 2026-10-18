@@ -61,7 +61,7 @@ impl Speed {
     }
 
     /// How long to rest after working for `worked`.
-    fn rest(self, worked: Duration) -> Duration {
+    pub(crate) fn rest(self, worked: Duration) -> Duration {
         let rest = match self {
             Self::Slow => worked * 3,
             Self::Medium => worked,

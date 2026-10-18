@@ -86,6 +86,8 @@ pub struct AppState {
     pub agent_url: std::sync::OnceLock<String>,
     /// The Gallery's photo index, kept up to date in the background once started.
     pub media: std::sync::Arc<crate::media_index::Indexer>,
+    /// Every file and folder name, for search.
+    pub file_index: std::sync::Arc<crate::file_index::FileIndex>,
     /// How full the disk is, and how much the library and OwnNAS's data take.
     pub storage: std::sync::Arc<crate::storage::Storage>,
     /// The Gallery's machine-learning models (downloaded when switched on).
@@ -104,6 +106,9 @@ impl AppState {
         #[cfg(ownnas_ml)]
         let _ = self.media.models.set(self.models.clone());
         self.media.start(self.db_path.clone(), self.root.clone(), self.thumbs.clone(), self.ffmpeg);
+        // Search's name index works at the same speed.
+        let media = self.media.clone();
+        self.file_index.start(self.db_path.clone(), self.root.clone(), move || media.speed());
     }
 }
 
@@ -157,6 +162,7 @@ pub fn new_state(
         terminals: crate::terminal::Terminals::default(),
         agent_url: std::sync::OnceLock::new(),
         media: std::sync::Arc::default(),
+        file_index: std::sync::Arc::default(),
         storage: {
             let storage = std::sync::Arc::new(crate::storage::Storage::default());
             storage.load(&db_path);
@@ -297,6 +303,8 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/images/resize", post(resize_images))
         .route("/api/storage", get(storage_status))
         .route("/api/storage/measure", post(measure_storage))
+        .route("/api/index", get(index_status))
+        .route("/api/index/reindex", post(reindex))
         .route("/api/videos/convert", post(convert_video))
         .route("/api/videos/job", get(video_job).delete(cancel_video_job))
         .route("/api/backup/blocked", get(blocked_backups).post(block_backups).delete(unblock_backup))
@@ -354,7 +362,30 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         )
         .route("/api/sync/mkdir", post(sync_mkdir))
         .route("/api/sync/delete", post(sync_delete))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), note_changes))
         .with_state(state)
+}
+
+/// Requests that may add, move, or remove files have the search index look for changes (it
+/// waits a moment, so a burst of them is one look, and only reads folders that changed).
+async fn note_changes(
+    State(state): State<std::sync::Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    const QUIET: [&str; 9] = [
+        "/api/login", "/api/logout", "/api/terminals", "/api/index", "/api/ml", "/api/gallery", "/api/albums", "/api/storage", "/api/agent",
+    ];
+    let path = request.uri().path();
+    let changes = request.method() != axum::http::Method::GET
+        && request.method() != axum::http::Method::HEAD
+        && path.starts_with("/api/")
+        && !QUIET.iter().any(|quiet| path.starts_with(quiet));
+    let response = next.run(request).await;
+    if changes && response.status().is_success() {
+        state.file_index.changed();
+    }
+    response
 }
 
 pub async fn serve(state: std::sync::Arc<AppState>, addr: &str, open_browser: bool) -> Result<(), String> {
@@ -5111,6 +5142,49 @@ fn storage_json(state: &AppState, disk: Option<crate::storage::Disk>) -> serde_j
     })
 }
 
+/// The search index: how much it holds and what it is doing, and the indexing speed.
+async fn index_status(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    Ok(Json(json!({ "speed": state.media.speed(), "files": state.file_index.status(), "media": state.media.status() })))
+}
+
+#[derive(Deserialize)]
+struct ReindexBody {
+    /// A folder, or none for the whole library.
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// Reads a folder (and everything in it) again for the search index, changed or not. The whole
+/// library also has its photos and videos looked through again.
+async fn reindex(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<ReindexBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    let rel = rel_of(&body.path);
+    let rel = if rel.is_empty() {
+        rel
+    } else {
+        let resolved = files::resolve(&state.root, &rel).map_err(ApiError::from)?;
+        if !resolved.full.is_dir() {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose a folder to reindex"));
+        }
+        resolved.rel
+    };
+    if crate::file_index::inside_package(&rel) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Photo libraries are searched directly, not indexed"));
+    }
+    state.file_index.reindex(&rel);
+    if rel.is_empty() {
+        state.media.rescan();
+    }
+    record(&state, &user, "reindex", if rel.is_empty() { "/" } else { &rel });
+    Ok(Json(json!({ "speed": state.media.speed(), "files": state.file_index.status(), "media": state.media.status() })))
+}
+
 /// Measures the library again now.
 async fn measure_storage(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
     check_csrf(&headers)?;
@@ -5352,12 +5426,34 @@ async fn search(
         let needle = needle.clone();
         let ocr = state.ocr;
         let cache_dir = state.text_cache.clone();
+        let indexed = state.file_index.ready() && !crate::file_index::inside_package(&rel);
+        let db_path = state.db_path.clone();
         tokio::task::spawn_blocking(move || {
-            files::search(
+            let options = files::SearchOptions { ocr, cache_dir };
+            if !indexed {
+                // Until the whole library is indexed (and inside photo-library packages), walk it.
+                return files::search(&root, &rel, &needle, &options);
+            }
+            let start = files::resolve(&root, &rel)?;
+            if !start.full.is_dir() {
+                return Err(FileError::NotADirectory);
+            }
+            let lower = needle.trim().to_lowercase();
+            let listed = db::open(&db_path).map_err(|_| FileError::Rejected("Could not open the search index")).and_then(|conn| {
+                let names = crate::file_index::search_names(&conn, &start.rel, &lower, 100)
+                    .map_err(|_| FileError::Rejected("Could not read the search index"))?;
+                let contents = crate::file_index::files_of_kinds(&conn, &start.rel, &["text", "pdf"], 8_000).unwrap_or_default();
+                let images = if ocr { crate::file_index::files_of_kinds(&conn, &start.rel, &["image"], 8_000).unwrap_or_default() } else { Vec::new() };
+                Ok((names, contents, images))
+            });
+            let (names, contents, images) = listed?;
+            files::search_listed(
                 &root,
-                &rel,
                 &needle,
-                &files::SearchOptions { ocr, cache_dir },
+                names.into_iter().map(|hit| (hit.path, hit.dir)).collect(),
+                contents.into_iter().map(|(path, _)| path).collect(),
+                images.into_iter().map(|(path, _)| path).collect(),
+                &options,
             )
         })
             .await
