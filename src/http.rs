@@ -41,6 +41,19 @@ const DXF_VIEWER_JS: &str = include_str!("../web/dxf-viewer.js");
 const THREE_MODULE_JS: &str = include_str!("../web/vendor/three/three.module.min.js");
 const THREE_ORBIT_CONTROLS_JS: &str = include_str!("../web/vendor/three/addons/controls/OrbitControls.js");
 const THREE_OBJ_LOADER_JS: &str = include_str!("../web/vendor/three/addons/loaders/OBJLoader.js");
+/// More three.js add-ons (0.170.0), served by `three_addon`: loaders for FBX, COLLADA, 3DS, AMF,
+/// and USDZ models, and what they use.
+const THREE_ADDONS: [(&str, &str); 9] = [
+    ("loaders/FBXLoader.js", include_str!("../web/vendor/three/addons/loaders/FBXLoader.js")),
+    ("loaders/ColladaLoader.js", include_str!("../web/vendor/three/addons/loaders/ColladaLoader.js")),
+    ("loaders/TGALoader.js", include_str!("../web/vendor/three/addons/loaders/TGALoader.js")),
+    ("loaders/TDSLoader.js", include_str!("../web/vendor/three/addons/loaders/TDSLoader.js")),
+    ("loaders/AMFLoader.js", include_str!("../web/vendor/three/addons/loaders/AMFLoader.js")),
+    ("loaders/USDZLoader.js", include_str!("../web/vendor/three/addons/loaders/USDZLoader.js")),
+    ("curves/NURBSCurve.js", include_str!("../web/vendor/three/addons/curves/NURBSCurve.js")),
+    ("curves/NURBSUtils.js", include_str!("../web/vendor/three/addons/curves/NURBSUtils.js")),
+    ("libs/fflate.module.js", include_str!("../web/vendor/three/addons/libs/fflate.module.js")),
+];
 const THREE_STL_LOADER_JS: &str = include_str!("../web/vendor/three/addons/loaders/STLLoader.js");
 const THREE_GLTF_LOADER_JS: &str = include_str!("../web/vendor/three/addons/loaders/GLTFLoader.js");
 const THREE_PLY_LOADER_JS: &str = include_str!("../web/vendor/three/addons/loaders/PLYLoader.js");
@@ -187,6 +200,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/assets/theme.js", get(theme_javascript))
         .route("/assets/gallery.js", get(gallery_javascript))
         .route("/assets/viewers.js", get(viewers_javascript))
+        .route("/assets/vendor/three/addons/{*file}", get(three_addon))
         .route("/assets/docx-editor.css", get(docx_editor_css))
         .route("/assets/model-viewer.js", get(model_viewer_javascript))
         .route("/assets/dxf-viewer.js", get(dxf_viewer_javascript))
@@ -954,6 +968,13 @@ async fn three_module() -> impl IntoResponse {
 async fn three_orbit_controls() -> impl IntoResponse {
     module_javascript(THREE_ORBIT_CONTROLS_JS)
 }
+async fn three_addon(axum::extract::Path(file): axum::extract::Path<String>) -> Response {
+    match THREE_ADDONS.iter().find(|(name, _)| *name == file) {
+        Some((_, body)) => module_javascript(body).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn three_obj_loader() -> impl IntoResponse {
     module_javascript(THREE_OBJ_LOADER_JS)
 }

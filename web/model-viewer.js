@@ -24,7 +24,7 @@ export function isCadOnlyModel(name) {
 }
 
 export function isViewableModel(name) {
-  return ["obj", "stl", "gltf", "glb", "ply", "3mf", "stp", "step", "iges", "igs"].includes(
+  return ["obj", "stl", "gltf", "glb", "ply", "3mf", "fbx", "dae", "3ds", "amf", "usdz", "stp", "step", "iges", "igs"].includes(
     extensionOf(name),
   );
 }
@@ -241,12 +241,19 @@ async function loadModel(url, ext, colors, onStatus, timeoutMs = 120000) {
     glb: () => new GLTFLoader(manager),
     ply: () => new PLYLoader(manager),
     "3mf": () => new ThreeMFLoader(manager),
+    // Loaded when first needed: these are large and less common.
+    fbx: async () => new (await import("/assets/vendor/three/addons/loaders/FBXLoader.js")).FBXLoader(manager),
+    dae: async () => new (await import("/assets/vendor/three/addons/loaders/ColladaLoader.js")).ColladaLoader(manager),
+    "3ds": async () => new (await import("/assets/vendor/three/addons/loaders/TDSLoader.js")).TDSLoader(manager),
+    amf: async () => new (await import("/assets/vendor/three/addons/loaders/AMFLoader.js")).AMFLoader(manager),
+    usdz: async () => new (await import("/assets/vendor/three/addons/loaders/USDZLoader.js")).USDZLoader(manager),
   };
   const make = loaderFor[ext];
   if (!make) throw new Error(`Unsupported 3D format: .${ext}`);
   onStatus?.("Loading model…");
-  const loader = make();
-  if (ext === "gltf" || ext === "glb") loader.setResourcePath("ownnas-model-resource:/");
+  const loader = await make();
+  // Textures beside the model are found through the library.
+  if (["gltf", "glb", "fbx", "dae", "3ds"].includes(ext)) loader.setResourcePath("ownnas-model-resource:/");
   const result = await new Promise((resolve, reject) => {
     let finished = false;
     const timer = setTimeout(() => { finished = true; reject(new Error("Model loading timed out")); }, timeoutMs);
@@ -269,7 +276,7 @@ async function loadModel(url, ext, colors, onStatus, timeoutMs = 120000) {
     try { loader.load(url, loaded, undefined, failed); }
     catch (err) { failed(err); }
   });
-  if (ext === "gltf" || ext === "glb") {
+  if (ext === "gltf" || ext === "glb" || ext === "dae") {
     return prepareRoot(result.scene || result, colors);
   }
   if (ext === "stl" || ext === "ply") {

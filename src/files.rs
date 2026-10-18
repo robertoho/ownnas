@@ -1172,7 +1172,7 @@ pub fn kind_of(name: &str) -> &'static str {
         | "h" | "cpp" | "hpp" | "cs" | "sh" | "bash" | "zsh" | "ps1" | "sql" | "rb" | "php"
         | "lua" | "vue" | "svelte" => "text",
         "dxf" | "dwg" => "cad2d",
-        "obj" | "stl" | "gltf" | "glb" | "ply" | "3mf" | "stp" | "step" | "iges" | "igs" => {
+        "obj" | "stl" | "gltf" | "glb" | "ply" | "3mf" | "fbx" | "dae" | "3ds" | "amf" | "usdz" | "stp" | "step" | "iges" | "igs" => {
             "model3d"
         }
         _ => "file",
