@@ -2434,7 +2434,7 @@ async function showPhotoMotion(body, entry, photo) {
 }
 
 /// Documents, presentations, and spreadsheets the server reads for the preview.
-const DOCUMENT_VIEW = /\.(pptx|ppsx|odp|doc|ppt|pps|rtf|xls|xlsb|ods|pages|numbers|key)$/i;
+const DOCUMENT_VIEW = /\.(pptx|ppsx|odp|doc|ppt|pps|rtf|xls|xlsb|ods|pages|numbers|key|parquet|pq|arrow|feather|arrows|avro|jsonl|ndjson)$/i;
 
 /// Opens a preview from the viewers module (formats the browser does not show by itself).
 async function mountViewer(body, entry, mount, fallback = null) {

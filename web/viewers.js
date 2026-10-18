@@ -373,15 +373,20 @@ function renderSheets(sheets) {
     const sheet = sheets[index];
     for (const [i, tab] of [...tabs.children].entries()) tab.setAttribute("aria-selected", i === index ? "true" : "false");
     const columns = Math.max(0, ...sheet.rows.map((row) => row.length));
-    const head = h("tr", "", h("th", "sheet-corner", ""), Array.from({ length: columns }, (_, i) => h("th", "", columnName(i))));
-    const rows = sheet.rows.map((row, r) => h("tr", "", h("th", "", String(r + 1)), Array.from({ length: columns }, (_, c) => {
+    // Data files name their columns in the first row; spreadsheets get A, B, C.
+    const names = sheet.header ? sheet.rows[0] || [] : Array.from({ length: columns }, (_, i) => columnName(i));
+    const body = sheet.header ? sheet.rows.slice(1) : sheet.rows;
+    const head = h("tr", "", h("th", "sheet-corner", ""), Array.from({ length: columns }, (_, i) => h("th", "", names[i] ?? "")));
+    const rows = body.map((row, r) => h("tr", "", h("th", "", String(r + 1)), Array.from({ length: columns }, (_, c) => {
       const value = row[c] ?? "";
       return h("td", /^-?[\d.,]+%?$/.test(value) ? "sheet-number" : "", value);
     })));
     const cut = sheet.totalRows > sheet.rows.length || sheet.totalColumns > columns;
+    const shownRows = body.length;
+    const allRows = sheet.totalRows - (sheet.header ? 1 : 0);
     holder.replaceChildren(...[
-      sheet.rows.length ? h("div", "sheet-scroll", h("table", "sheet-table", h("thead", "", head), h("tbody", "", rows))) : h("p", "muted", "This sheet is empty."),
-      cut ? h("p", "muted sheet-note", `Showing ${sheet.rows.length.toLocaleString()} of ${sheet.totalRows.toLocaleString()} rows and ${columns} of ${sheet.totalColumns} columns. Download the file to see all of it.`) : null,
+      body.length || sheet.header ? h("div", "sheet-scroll", h("table", "sheet-table", h("thead", "", head), h("tbody", "", rows))) : h("p", "muted", "This sheet is empty."),
+      cut ? h("p", "muted sheet-note", `Showing ${shownRows.toLocaleString()} of ${allRows.toLocaleString()} rows and ${columns} of ${sheet.totalColumns} columns. Download the file to see all of it.`) : null,
     ].filter(Boolean));
   };
   sheets.forEach((sheet, index) => {

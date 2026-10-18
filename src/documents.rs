@@ -50,6 +50,9 @@ pub struct Sheet {
     pub rows: Vec<Vec<String>>,
     pub total_rows: usize,
     pub total_columns: usize,
+    /// Whether the first row names the columns (data files), rather than being a row of cells.
+    #[serde(default)]
+    pub header: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,6 +85,7 @@ pub fn view(path: &Path) -> Result<View, String> {
         }
         "xls" | "xlsb" | "ods" => spreadsheet(path),
         "pages" | "numbers" | "key" => iwork(path),
+        "parquet" | "pq" | "arrow" | "feather" | "ipc" | "arrows" | "avro" | "jsonl" | "ndjson" => crate::data_tables::view(path),
         _ => Err("This format is not previewed".into()),
     }
 }
@@ -380,7 +384,7 @@ fn spreadsheet(path: &Path) -> Result<View, String> {
             .take(MAX_ROWS)
             .map(|row| row.iter().take(MAX_COLUMNS).map(cell_text).collect::<Vec<_>>())
             .collect();
-        sheets.push(Sheet { name, rows, total_rows, total_columns });
+        sheets.push(Sheet { name, rows, total_rows, total_columns, header: false });
     }
     Ok(View::Sheets { sheets })
 }

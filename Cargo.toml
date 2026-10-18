@@ -52,6 +52,11 @@ ttf-parser = "0.25"
 icns = "0.5"
 xcf = "0.4"
 plist = { version = "1.10", default-features = false, features = ["serde"] }
+parquet = { version = "60", default-features = false, features = ["snap", "flate2", "flate2-rust_backend", "lz4", "zstd", "brotli", "arrow"] }
+arrow-ipc = "60"
+arrow-cast = "60"
+arrow-array = "60"
+apache-avro = { version = "0.22", default-features = false }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"

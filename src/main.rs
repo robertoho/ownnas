@@ -4,6 +4,7 @@ mod audio_info;
 mod albums;
 mod auth;
 mod content_index;
+mod data_tables;
 mod db;
 mod documents;
 mod ebook;
