@@ -3878,3 +3878,10 @@ a.archive-entry-name:hover { text-decoration: underline; }
 .tree-string { color: #86b98a; }
 .tree-value { color: #d19a66; }
 .shortcut-link { font-size: 1rem; overflow-wrap: anywhere; }
+
+.midi-roll { width: 100%; height: 140px; border-radius: 10px; background: var(--bg-2); }
+.midi-play { min-height: 0; padding: 0.3rem 0.8rem; white-space: nowrap; }
+.midi-note { margin: 0; font-size: 0.8rem; }
+.preview-body > .gcode-view { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 0.6rem; overflow: auto; }
+.gcode-canvas { flex: 1 0 auto; height: min(56vh, 30rem); min-height: 16rem; border-radius: 12px; overflow: hidden; border: 1px solid var(--line); }
+.gcode-toggle { display: flex; gap: 0.3rem; align-items: center; font-size: 0.85rem; white-space: nowrap; }

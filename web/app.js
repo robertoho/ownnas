@@ -2232,6 +2232,10 @@ async function openEntry(entry) {
     mountViewer(body, entry, (module) => module.mountAudio(body, entry));
   } else if (/\.(srt|vtt|ass|ssa)$/i.test(entry.name)) {
     mountViewer(body, entry, (module) => module.mountSubtitles(body, entry), () => openMetaPreview(body, entry));
+  } else if (/\.(mid|midi|kar)$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountMidi(body, entry), () => openMetaPreview(body, entry));
+  } else if (/\.(gcode|gco|g)$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountGcode(body, entry), () => openMetaPreview(body, entry));
   } else if (/\.lrc$/i.test(entry.name)) {
     mountViewer(body, entry, (module) => module.mountLyrics(body, entry), () => openMetaPreview(body, entry));
   } else if (/\.(m3u8?|pls|xspf)$/i.test(entry.name)) {

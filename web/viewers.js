@@ -1498,3 +1498,368 @@ export async function mountShortcut(body, entry) {
     h("p", "muted", web ? "This shortcut opens:" : "This shortcut runs or opens:"), link));
   return { destroy() {} };
 }
+
+// ---- MIDI: read the notes and play them on a small synthesizer (WebAudio) ----
+
+function parseMidi(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const text = (at, n) => String.fromCharCode(...bytes.subarray(at, at + n));
+  if (text(0, 4) !== "MThd") throw new Error("This is not a MIDI file");
+  const tracksCount = view.getUint16(10);
+  const division = view.getUint16(12);
+  if (division & 0x8000) throw new Error("MIDI files timed in SMPTE frames are not played here");
+  let at = 8 + view.getUint32(4);
+  const events = [];
+  const names = [];
+  for (let track = 0; track < tracksCount && at + 8 <= bytes.length; track += 1) {
+    if (text(at, 4) !== "MTrk") break;
+    const end = at + 8 + view.getUint32(at + 4);
+    let p = at + 8;
+    let tick = 0;
+    let status = 0;
+    const varLen = () => { let n = 0; let b; do { b = bytes[p++]; n = (n << 7) | (b & 0x7f); } while (b & 0x80 && p < end); return n; };
+    while (p < end) {
+      tick += varLen();
+      let byte = bytes[p];
+      if (byte & 0x80) { status = byte; p += 1; } else if (!status) break;
+      const kind = status & 0xf0;
+      const channel = status & 0x0f;
+      if (status === 0xff) {
+        const type = bytes[p++];
+        const length = varLen();
+        if (type === 0x51) events.push({ tick, tempo: (bytes[p] << 16) | (bytes[p + 1] << 8) | bytes[p + 2] });
+        if (type === 0x03 && length) names[track] = new TextDecoder().decode(bytes.subarray(p, p + length));
+        p += length;
+      } else if (status === 0xf0 || status === 0xf7) {
+        p += varLen();
+      } else if (kind === 0x90 || kind === 0x80) {
+        const note = bytes[p];
+        const velocity = bytes[p + 1];
+        p += 2;
+        events.push({ tick, on: kind === 0x90 && velocity > 0, note, velocity, channel, track });
+      } else if (kind === 0xc0) {
+        events.push({ tick, program: bytes[p], channel });
+        p += 1;
+      } else if (kind === 0xd0) {
+        p += 1;
+      } else {
+        p += 2;
+      }
+    }
+    at = end;
+  }
+  events.sort((a, b) => a.tick - b.tick);
+  // Ticks to seconds, through the tempo changes.
+  let tempo = 500000;
+  let lastTick = 0;
+  let seconds = 0;
+  const notes = [];
+  const open = new Map();
+  const programs = new Array(16).fill(0);
+  for (const event of events) {
+    seconds += ((event.tick - lastTick) * tempo) / division / 1e6;
+    lastTick = event.tick;
+    if (event.tempo) tempo = event.tempo;
+    else if (event.program !== undefined) programs[event.channel] = event.program;
+    else if (event.note !== undefined) {
+      const key = `${event.channel}:${event.note}`;
+      if (event.on) {
+        open.set(key, { start: seconds, note: event.note, velocity: event.velocity, channel: event.channel, program: programs[event.channel] });
+      } else if (open.has(key)) {
+        const started = open.get(key);
+        open.delete(key);
+        notes.push({ ...started, end: Math.max(seconds, started.start + 0.05) });
+      }
+    }
+  }
+  for (const started of open.values()) notes.push({ ...started, end: seconds + 0.5 });
+  notes.sort((a, b) => a.start - b.start);
+  return { notes, duration: notes.reduce((m, n) => Math.max(m, n.end), 0), names: names.filter(Boolean), channels: [...new Set(notes.map((n) => n.channel))] };
+}
+
+/// General MIDI instrument families, by program number / 8.
+const GM_FAMILIES = ["Piano", "Chromatic percussion", "Organ", "Guitar", "Bass", "Strings", "Ensemble", "Brass", "Reed", "Pipe", "Synth lead", "Synth pad", "Synth effects", "Ethnic", "Percussive", "Sound effects"];
+
+export async function mountMidi(body, entry) {
+  const response = await fetch(`/api/raw?path=${enc(entry.path)}`, { credentials: "same-origin" });
+  const song = parseMidi(new Uint8Array(await response.arrayBuffer()));
+  const play = h("button", "midi-play", "▶ Play");
+  play.type = "button";
+  const seek = h("input", "video-seek");
+  seek.type = "range";
+  seek.min = "0";
+  seek.max = String(Math.ceil(song.duration));
+  seek.step = "0.1";
+  seek.value = "0";
+  const time = h("span", "video-seek-time muted", `0:00 / ${clock(song.duration)}`);
+  const roll = h("canvas", "midi-roll");
+  const instruments = [...new Set(song.notes.map((n) => (n.channel === 9 ? "Drums" : GM_FAMILIES[Math.floor(n.program / 8)])))];
+  body.replaceChildren(h("div", "audio-view",
+    h("h3", "audio-title", entry.name.replace(/\.[^.]+$/, "")),
+    h("p", "audio-details muted", [clock(song.duration), `${song.notes.length.toLocaleString()} notes`, instruments.join(", ")].filter(Boolean).join(" · ")),
+    song.names.length ? h("p", "muted", song.names.join(" · ")) : null,
+    roll, h("div", "video-seek-row", play, seek, time),
+    h("p", "muted midi-note", "Played on a simple built-in synthesizer, so instruments sound alike.")));
+
+  let context = null;
+  let startedAt = 0;
+  let offset = 0;
+  let next = 0;
+  let timer = 0;
+  let voices = [];
+  const now = () => (context && timer ? context.currentTime - startedAt + offset : offset);
+  const frequency = (note) => 440 * 2 ** ((note - 69) / 12);
+  const voice = (n, when, length) => {
+    const gain = context.createGain();
+    const level = (n.velocity / 127) * 0.18;
+    gain.gain.setValueAtTime(0, when);
+    gain.gain.linearRampToValueAtTime(level, when + 0.01);
+    if (n.channel === 9) {
+      // Drums: a short burst of noise.
+      const noise = context.createBufferSource();
+      const buffer = context.createBuffer(1, context.sampleRate * 0.2, context.sampleRate);
+      const data = buffer.getChannelData(0);
+      for (let i = 0; i < data.length; i += 1) data[i] = (Math.random() * 2 - 1) * (1 - i / data.length);
+      noise.buffer = buffer;
+      gain.gain.exponentialRampToValueAtTime(0.001, when + 0.18);
+      noise.connect(gain).connect(context.destination);
+      noise.start(when);
+      voices.push(noise);
+      return;
+    }
+    const osc = context.createOscillator();
+    const family = Math.floor(n.program / 8);
+    osc.type = [0, 1, 3, 13].includes(family) ? "triangle" : [4, 10].includes(family) ? "sawtooth" : [2, 8, 9].includes(family) ? "square" : "sine";
+    osc.frequency.setValueAtTime(frequency(n.note), when);
+    gain.gain.setTargetAtTime(level * 0.6, when + 0.02, 0.15);
+    gain.gain.setTargetAtTime(0, when + length, 0.08);
+    osc.connect(gain).connect(context.destination);
+    osc.start(when);
+    osc.stop(when + length + 0.5);
+    voices.push(osc);
+  };
+  // Notes are scheduled a little ahead of time, as they come.
+  const schedule = () => {
+    const horizon = now() + 0.25;
+    while (next < song.notes.length && song.notes[next].start < horizon) {
+      const n = song.notes[next];
+      if (n.start >= offset - 0.01 && voices.length < 4000) voice(n, startedAt + n.start - offset, Math.max(0.05, n.end - n.start));
+      next += 1;
+    }
+    voices = voices.slice(-2000);
+    const t = now();
+    if (document.activeElement !== seek) seek.value = String(t);
+    time.textContent = `${clock(t)} / ${clock(song.duration)}`;
+    drawRoll(t);
+    if (t > song.duration + 0.5) stop(true);
+  };
+  const silence = () => { for (const v of voices) { try { v.stop(); } catch { /* already stopped */ } } voices = []; };
+  const start = () => {
+    context = context || new AudioContext();
+    context.resume();
+    startedAt = context.currentTime + 0.05;
+    next = song.notes.findIndex((n) => n.start >= offset);
+    if (next < 0) next = song.notes.length;
+    timer = setInterval(schedule, 40);
+    play.textContent = "❚❚ Pause";
+  };
+  const stop = (ended = false) => {
+    if (timer) offset = ended ? 0 : now();
+    clearInterval(timer);
+    timer = 0;
+    silence();
+    play.textContent = "▶ Play";
+    drawRoll(offset);
+  };
+  play.addEventListener("click", () => (timer ? stop() : start()));
+  seek.addEventListener("change", () => {
+    const playing = !!timer;
+    stop();
+    offset = Number(seek.value);
+    if (playing) start();
+    drawRoll(offset);
+  });
+  // A piano roll: the notes around the playing point.
+  const low = Math.min(...song.notes.map((n) => n.note), 60);
+  const high = Math.max(...song.notes.map((n) => n.note), 72);
+  function drawRoll(t) {
+    const ratio = window.devicePixelRatio || 1;
+    const width = roll.clientWidth;
+    const height = roll.clientHeight;
+    if (!width) return;
+    roll.width = width * ratio;
+    roll.height = height * ratio;
+    const ctx = roll.getContext("2d");
+    ctx.scale(ratio, ratio);
+    const span = 8;
+    const from = t - 2;
+    const accent = cssColor("--accent", "#7aa2f7");
+    const rest = cssColor("--muted", "#888");
+    for (const n of song.notes) {
+      if (n.end < from || n.start > from + span) continue;
+      const x = ((n.start - from) / span) * width;
+      const w = Math.max(2, ((n.end - n.start) / span) * width);
+      const y = height - ((n.note - low + 1) / (high - low + 2)) * height;
+      ctx.fillStyle = n.start <= t && n.end >= t ? accent : rest;
+      ctx.globalAlpha = n.channel === 9 ? 0.35 : 0.8;
+      ctx.fillRect(x, y, w, Math.max(2, height / (high - low + 2) - 1));
+    }
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = accent;
+    ctx.fillRect((2 / span) * width, 0, 1, height);
+  }
+  requestAnimationFrame(() => drawRoll(0));
+  return { destroy() { stop(); if (context) context.close(); } };
+}
+
+// ---- G-code (3D printing): the printed path, layer by layer ----
+
+export async function mountGcode(body, entry) {
+  if (entry.size > 150 * 1024 * 1024) throw new Error("This G-code file is too large to draw");
+  body.replaceChildren(h("p", "muted", "Reading the toolpath…"));
+  const [THREE, { OrbitControls }, text] = await Promise.all([
+    import("/assets/vendor/three/three.module.min.js"),
+    import("/assets/vendor/three/addons/controls/OrbitControls.js"),
+    fetchText(entry),
+  ]);
+  // Moves, split into printing (the extruder pushes) and travel.
+  const print = [];
+  const travel = [];
+  const layerZ = [];
+  const layerStart = [];
+  let x = 0, y = 0, z = 0, e = 0;
+  let relative = false;
+  let relativeE = false;
+  let filament = 0;
+  let seconds = 0;
+  let feed = 1500;
+  const comments = {};
+  for (const raw of text.split("\n")) {
+    const semicolon = raw.indexOf(";");
+    if (semicolon >= 0) {
+      const comment = raw.slice(semicolon + 1).trim();
+      const m = /^(TIME|PRINT_TIME|estimated printing time.*?|filament used.*?|Filament used|LAYER_COUNT|generated by|FLAVOR)\s*[:=]\s*(.+)$/i.exec(comment);
+      if (m && !comments[m[1].toLowerCase()]) comments[m[1].toLowerCase()] = m[2].trim();
+    }
+    const line = (semicolon >= 0 ? raw.slice(0, semicolon) : raw).trim().toUpperCase();
+    if (!line) continue;
+    const code = line.split(/\s+/)[0];
+    const arg = (letter) => { const m = new RegExp(`${letter}(-?[\\d.]+)`).exec(line); return m ? Number(m[1]) : null; };
+    if (code === "G90") relative = false;
+    else if (code === "G91") relative = true;
+    else if (code === "M82") relativeE = false;
+    else if (code === "M83") relativeE = true;
+    else if (code === "G92") { if (arg("E") !== null) e = arg("E"); if (arg("X") !== null) x = arg("X"); if (arg("Y") !== null) y = arg("Y"); if (arg("Z") !== null) z = arg("Z"); }
+    else if (code === "G0" || code === "G1" || code === "G00" || code === "G01") {
+      const nx = arg("X") === null ? x : relative ? x + arg("X") : arg("X");
+      const ny = arg("Y") === null ? y : relative ? y + arg("Y") : arg("Y");
+      const nz = arg("Z") === null ? z : relative ? z + arg("Z") : arg("Z");
+      const ne = arg("E") === null ? e : relative || relativeE ? e + arg("E") : arg("E");
+      if (arg("F") !== null) feed = arg("F");
+      const distance = Math.hypot(nx - x, ny - y, nz - z);
+      if (feed > 0) seconds += (distance / feed) * 60;
+      const extruding = ne > e + 1e-6 && (nx !== x || ny !== y);
+      if (extruding) {
+        filament += ne - e;
+        if (!layerZ.length || Math.abs(nz - layerZ[layerZ.length - 1]) > 1e-4) { layerZ.push(nz); layerStart.push(print.length / 6); }
+        print.push(x, y, z, nx, ny, nz);
+      } else if (distance > 0) {
+        travel.push(x, y, z, nx, ny, nz);
+      }
+      x = nx; y = ny; z = nz; e = ne;
+    }
+  }
+  if (!print.length) throw new Error("This G-code has no printing moves to draw");
+  const layers = layerZ.length;
+  // Printer coordinates have Z up; the viewer has Y up.
+  const toScene = (array) => {
+    const out = new Float32Array(array.length);
+    for (let i = 0; i < array.length; i += 3) { out[i] = array[i]; out[i + 1] = array[i + 2]; out[i + 2] = -array[i + 1]; }
+    return out;
+  };
+  const colors = new Float32Array(print.length);
+  const minZ = layerZ[0];
+  const maxZ = layerZ[layers - 1];
+  const color = new THREE.Color();
+  for (let i = 0; i < print.length; i += 3) {
+    color.setHSL(0.66 - 0.66 * ((print[i + 2] - minZ) / (maxZ - minZ || 1)), 0.75, 0.55);
+    colors[i] = color.r; colors[i + 1] = color.g; colors[i + 2] = color.b;
+  }
+  const printGeometry = new THREE.BufferGeometry();
+  printGeometry.setAttribute("position", new THREE.BufferAttribute(toScene(print), 3));
+  printGeometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  const printLines = new THREE.LineSegments(printGeometry, new THREE.LineBasicMaterial({ vertexColors: true }));
+  const travelGeometry = new THREE.BufferGeometry();
+  travelGeometry.setAttribute("position", new THREE.BufferAttribute(toScene(travel), 3));
+  const travelLines = new THREE.LineSegments(travelGeometry, new THREE.LineBasicMaterial({ color: 0x888888, transparent: true, opacity: 0.25 }));
+  travelLines.visible = false;
+
+  const canvasBox = h("div", "gcode-canvas");
+  const slider = h("input", "comic-slider");
+  slider.type = "range";
+  slider.min = "1";
+  slider.max = String(layers);
+  slider.value = String(layers);
+  const layerLabel = h("span", "comic-counter muted");
+  const travelToggle = h("label", "gcode-toggle", h("input", ""), " Travel moves");
+  const travelBox = travelToggle.querySelector("input");
+  travelBox.type = "checkbox";
+  const minutes = seconds / 60;
+  const facts = [
+    ["Layers", `${layers.toLocaleString()} (${minZ.toFixed(2)}–${maxZ.toFixed(2)} mm)`],
+    ["Filament", `${(filament / 1000).toFixed(2)} m`],
+    ["Time (estimated)", comments.time || comments.print_time ? clock(Number(comments.time || comments.print_time)) : minutes >= 60 ? `${Math.floor(minutes / 60)} h ${Math.round(minutes % 60)} min` : `${Math.round(minutes)} min`],
+    ["Sliced by", comments["generated by"] || comments.flavor || ""],
+  ].filter(([, v]) => v);
+  body.replaceChildren(h("div", "gcode-view", canvasBox, h("div", "comic-tools", h("span", "muted", "Layer"), slider, layerLabel, travelToggle),
+    h("dl", "track-facts", facts.map(([k, v]) => [h("dt", "muted", k), h("dd", "", v)]))));
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(window.devicePixelRatio || 1);
+  canvasBox.append(renderer.domElement);
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(cssColor("--bg-2", "#1a1a1a"));
+  scene.add(printLines, travelLines);
+  const box = new THREE.Box3().setFromObject(printLines);
+  const size = box.getSize(new THREE.Vector3());
+  const middle = box.getCenter(new THREE.Vector3());
+  const grid = new THREE.GridHelper(Math.max(size.x, size.z) * 1.4, 20, 0x555555, 0x333333);
+  grid.position.set(middle.x, box.min.y, middle.z);
+  scene.add(grid);
+  const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 100000);
+  const reach = Math.max(size.x, size.y, size.z) * 1.6 + 10;
+  camera.position.set(middle.x + reach * 0.7, middle.y + reach * 0.8, middle.z + reach);
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.copy(middle);
+  controls.update();
+  const draw = () => renderer.render(scene, camera);
+  controls.addEventListener("change", draw);
+  const showLayers = () => {
+    const shown = Number(slider.value);
+    const end = shown >= layers ? print.length / 6 : layerStart[shown];
+    printGeometry.setDrawRange(0, end * 2);
+    layerLabel.textContent = `${shown} / ${layers} · ${layerZ[shown - 1].toFixed(2)} mm`;
+    draw();
+  };
+  slider.addEventListener("input", showLayers);
+  travelBox.addEventListener("change", () => { travelLines.visible = travelBox.checked; draw(); });
+  const resize = new ResizeObserver(() => {
+    const { clientWidth: w, clientHeight: hgt } = canvasBox;
+    if (!w || !hgt) return;
+    renderer.setSize(w, hgt);
+    camera.aspect = w / hgt;
+    camera.updateProjectionMatrix();
+    draw();
+  });
+  resize.observe(canvasBox);
+  showLayers();
+  return {
+    destroy() {
+      resize.disconnect();
+      controls.dispose();
+      printGeometry.dispose();
+      travelGeometry.dispose();
+      renderer.dispose();
+    },
+  };
+}
