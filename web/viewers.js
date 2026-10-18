@@ -292,3 +292,101 @@ export async function mountSubtitles(body, entry) {
   body.replaceChildren(h("div", "subtitle-view", h("p", "muted", `${cues.length.toLocaleString()} lines${cues.length ? `, ending at ${cues[cues.length - 1].to}` : ""}`), list));
   return { destroy() {} };
 }
+
+// ---- Documents, presentations, and spreadsheets read by the server (see src/documents.rs) ----
+
+function partUrl(entry, part) {
+  return `/api/archive/entry?path=${enc(entry.path)}&entry=${enc(part)}`;
+}
+
+function renderBlocks(entry, blocks) {
+  return blocks.map((block) => {
+    if (block.type === "heading") return h(`h${Math.min(6, Math.max(2, block.level + 1))}`, "doc-heading", block.text);
+    if (block.type === "paragraph") return h("p", `doc-paragraph${block.level ? ` doc-level-${Math.min(block.level, 4)}` : ""}`, block.text);
+    if (block.type === "table") {
+      return h("div", "doc-table-wrap", h("table", "doc-table", h("tbody", "", block.rows.map((row) => h("tr", "", row.map((cell) => h("td", "", cell)))))));
+    }
+    if (block.type === "image") {
+      const img = h("img", "doc-image");
+      img.alt = "";
+      img.loading = "lazy";
+      img.src = partUrl(entry, block.entry);
+      img.addEventListener("error", () => img.remove(), { once: true });
+      return img;
+    }
+    return null;
+  });
+}
+
+/// "A", "B", … "Z", "AA": a spreadsheet's column names.
+function columnName(index) {
+  let name = "";
+  for (let n = index + 1; n > 0; n = Math.floor((n - 1) / 26)) name = String.fromCharCode(65 + ((n - 1) % 26)) + name;
+  return name;
+}
+
+function renderSheets(sheets) {
+  if (!sheets.length) return h("p", "muted", "This spreadsheet has no sheets.");
+  const tabs = h("div", "sheet-tabs");
+  const holder = h("div", "sheet-holder");
+  const show = (index) => {
+    const sheet = sheets[index];
+    for (const [i, tab] of [...tabs.children].entries()) tab.setAttribute("aria-selected", i === index ? "true" : "false");
+    const columns = Math.max(0, ...sheet.rows.map((row) => row.length));
+    const head = h("tr", "", h("th", "sheet-corner", ""), Array.from({ length: columns }, (_, i) => h("th", "", columnName(i))));
+    const rows = sheet.rows.map((row, r) => h("tr", "", h("th", "", String(r + 1)), Array.from({ length: columns }, (_, c) => {
+      const value = row[c] ?? "";
+      return h("td", /^-?[\d.,]+%?$/.test(value) ? "sheet-number" : "", value);
+    })));
+    const cut = sheet.totalRows > sheet.rows.length || sheet.totalColumns > columns;
+    holder.replaceChildren(...[
+      sheet.rows.length ? h("div", "sheet-scroll", h("table", "sheet-table", h("thead", "", head), h("tbody", "", rows))) : h("p", "muted", "This sheet is empty."),
+      cut ? h("p", "muted sheet-note", `Showing ${sheet.rows.length.toLocaleString()} of ${sheet.totalRows.toLocaleString()} rows and ${columns} of ${sheet.totalColumns} columns. Download the file to see all of it.`) : null,
+    ].filter(Boolean));
+  };
+  sheets.forEach((sheet, index) => {
+    const tab = h("button", "sheet-tab", sheet.name);
+    tab.type = "button";
+    tab.addEventListener("click", () => show(index));
+    tabs.append(tab);
+  });
+  show(0);
+  return h("div", "sheet-view", sheets.length > 1 ? tabs : null, holder);
+}
+
+export async function mountDocument(body, entry) {
+  body.replaceChildren(h("p", "muted", "Reading the document…"));
+  const view = await getJson(`/api/document?path=${enc(entry.path)}`);
+  let content;
+  if (view.kind === "document") {
+    content = h("article", "doc-view", view.note ? h("p", "doc-note muted", view.note) : null, view.blocks.length ? renderBlocks(entry, view.blocks) : h("p", "muted", "This document has no text."));
+  } else if (view.kind === "slides") {
+    const slides = view.slides.map((slide, index) => h("section", "slide-card",
+      h("header", "slide-head", h("span", "slide-number", String(index + 1)), h("h3", "slide-title", slide.title || "")),
+      h("div", "slide-body", renderBlocks(entry, slide.blocks)),
+      slide.notes ? h("details", "slide-notes", h("summary", "", "Speaker notes"), h("p", "", slide.notes)) : null,
+    ));
+    content = h("div", "slides-view",
+      h("p", "muted", `${view.slides.length} slide${view.slides.length === 1 ? "" : "s"}${view.note ? `. ${view.note}` : ""}`),
+      slides);
+  } else if (view.kind === "sheets") {
+    content = renderSheets(view.sheets);
+  } else if (view.kind === "picture") {
+    const url = partUrl(entry, view.entry);
+    let shown;
+    if (view.pdf) {
+      shown = h("iframe", "doc-pdf");
+      shown.title = entry.name;
+      shown.src = url;
+    } else {
+      shown = h("img", "doc-picture");
+      shown.alt = entry.name;
+      shown.src = url;
+    }
+    content = h("div", "doc-picture-view", shown, h("p", "muted", view.note));
+  } else {
+    throw new Error("This document could not be shown");
+  }
+  body.replaceChildren(content);
+  return { destroy() {} };
+}

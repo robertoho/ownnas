@@ -1,9 +1,11 @@
 mod agents;
+mod archives;
 mod audio_info;
 mod albums;
 mod auth;
 mod content_index;
 mod db;
+mod documents;
 mod file_index;
 mod files;
 mod image_edit;

@@ -2323,6 +2323,10 @@ async function openEntry(entry) {
     } catch (err) {
       if (state.current === entry) body.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
     }
+  } else if (DOCUMENT_VIEW.test(entry.name)) {
+    // A ".key" file is as often a private key as a Keynote presentation: shown as text then.
+    const fallback = /\.key$/i.test(entry.name) ? () => openMetaPreview(body, entry) : null;
+    mountViewer(body, entry, (module) => module.mountDocument(body, entry), fallback);
   } else if (entry.kind === "cad2d") {
     openCadPreview(body, entry, raw).catch((err) => {
       if (state.current && state.current.path === entry.path) {
@@ -2346,21 +2350,29 @@ async function openEntry(entry) {
       }
     });
   } else {
-    body.innerHTML = `<p class="muted">Loading preview…</p>`;
-    try {
-      const meta = await api(`/api/meta?path=${encodeURIComponent(entry.path)}`);
-      if (!state.current || state.current.path !== entry.path) return;
-      renderMeta(body, entry, meta);
-    } catch (err) {
-      if (state.current && state.current.path === entry.path) {
-        body.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
-      }
+    await openMetaPreview(body, entry);
+  }
+}
+
+/// The general preview: text, an archive's list, or the file's details.
+async function openMetaPreview(body, entry) {
+  body.innerHTML = `<p class="muted">Loading preview…</p>`;
+  try {
+    const meta = await api(`/api/meta?path=${encodeURIComponent(entry.path)}`);
+    if (!state.current || state.current.path !== entry.path) return;
+    renderMeta(body, entry, meta);
+  } catch (err) {
+    if (state.current && state.current.path === entry.path) {
+      body.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
     }
   }
 }
 
+/// Documents, presentations, and spreadsheets the server reads for the preview.
+const DOCUMENT_VIEW = /\.(pptx|ppsx|odp|doc|ppt|pps|rtf|xls|xlsb|ods|pages|numbers|key)$/i;
+
 /// Opens a preview from the viewers module (formats the browser does not show by itself).
-async function mountViewer(body, entry, mount) {
+async function mountViewer(body, entry, mount, fallback = null) {
   try {
     const module = await import("/assets/viewers.js");
     if (state.current !== entry) return;
@@ -2371,7 +2383,9 @@ async function mountViewer(body, entry, mount) {
     }
     state.editor = { dirty: false, destroy: () => viewer && viewer.destroy() };
   } catch (err) {
-    if (state.current === entry) body.innerHTML = `<p class="muted">${esc(err.message || "Could not open the preview")}</p>`;
+    if (state.current !== entry) return;
+    if (fallback) fallback();
+    else body.innerHTML = `<p class="muted">${esc(err.message || "Could not open the preview")}</p>`;
   }
 }
 

@@ -5,11 +5,13 @@
 //! for Android.
 
 pub mod agents;
+pub mod archives;
 pub mod audio_info;
 pub mod albums;
 pub mod auth;
 pub mod content_index;
 pub mod db;
+pub mod documents;
 pub mod file_index;
 pub mod files;
 pub mod image_edit;

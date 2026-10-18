@@ -41,6 +41,12 @@ zip = "2"
 lopdf = "0.34"
 jxl-oxide = { version = "0.12", default-features = false, features = ["image"] }
 lofty = "0.25"
+roxmltree = "0.21"
+cfb = "0.15"
+calamine = { version = "0.36", default-features = false }
+sevenz-rust2 = { version = "0.24", default-features = false, features = ["bzip2", "ppmd"] }
+unrar = "0.5"
+bzip2 = "0.5"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"

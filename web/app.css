@@ -3706,3 +3706,40 @@ body.is-gallery .app > .explorer-status-bar { display: none; }
   .audio-cover { width: 88px; height: 88px; }
   .subtitle-list li { grid-template-columns: 1fr; gap: 0.15rem; }
 }
+
+.doc-view { display: grid; gap: 0.55rem; padding: 0.25rem 0.1rem; line-height: 1.55; }
+.doc-note { margin: 0 0 0.4rem; font-size: 0.85rem; }
+.doc-paragraph { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.doc-level-1 { padding-left: 1.2rem; }
+.doc-level-2 { padding-left: 2.4rem; }
+.doc-level-3 { padding-left: 3.6rem; }
+.doc-level-4 { padding-left: 4.8rem; }
+.doc-heading { margin: 0.6rem 0 0.1rem; }
+.doc-image { max-width: 100%; height: auto; border-radius: 8px; }
+.doc-table-wrap { overflow-x: auto; }
+.doc-table { border-collapse: collapse; font-size: 0.88rem; }
+.doc-table td { border: 1px solid var(--line); padding: 0.3rem 0.5rem; vertical-align: top; white-space: pre-wrap; }
+.slides-view { display: grid; gap: 0.9rem; }
+.slides-view > p { margin: 0; }
+.slide-card { border: 1px solid var(--line); border-radius: 12px; background: var(--bg-2); padding: 0.8rem 1rem; display: grid; gap: 0.5rem; }
+.slide-head { display: flex; gap: 0.7rem; align-items: baseline; }
+.slide-number { flex: 0 0 auto; min-width: 1.6rem; height: 1.6rem; border-radius: 999px; display: grid; place-items: center; font-size: 0.8rem; font-weight: 700; background: var(--accent); color: var(--bg); }
+.slide-title { margin: 0; font-size: 1.05rem; }
+.slide-body { display: grid; gap: 0.35rem; }
+.slide-body .doc-paragraph { line-height: 1.45; }
+.slide-notes summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; }
+.slide-notes p { margin: 0.4rem 0 0; white-space: pre-wrap; font-size: 0.9rem; }
+.sheet-view { display: grid; gap: 0.6rem; min-width: 0; }
+.sheet-tabs { display: flex; gap: 0.35rem; flex-wrap: wrap; }
+.sheet-tab { padding: 0.3rem 0.75rem; min-height: 0; border-radius: 999px; font-size: 0.85rem; }
+.sheet-tab[aria-selected="true"] { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+.sheet-scroll { overflow: auto; max-height: 70vh; border: 1px solid var(--line); border-radius: 8px; }
+.sheet-table { border-collapse: collapse; font-size: 0.82rem; font-variant-numeric: tabular-nums; }
+.sheet-table th, .sheet-table td { border: 1px solid var(--line); padding: 0.2rem 0.45rem; white-space: nowrap; max-width: 22rem; overflow: hidden; text-overflow: ellipsis; }
+.sheet-table th { background: var(--bg-2); color: var(--muted); font-weight: 600; position: sticky; top: 0; }
+.sheet-table tbody th { position: sticky; left: 0; text-align: right; }
+.sheet-number { text-align: right; }
+.sheet-note { margin: 0; font-size: 0.85rem; }
+.doc-picture-view { display: grid; gap: 0.5rem; }
+.doc-picture { max-width: 100%; height: auto; border-radius: 8px; border: 1px solid var(--line); }
+.doc-pdf { width: 100%; height: 70vh; border: 0; border-radius: 8px; }

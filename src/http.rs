@@ -261,6 +261,8 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/video/probe", get(video_probe))
         .route("/api/video/stream", get(video_stream))
         .route("/api/subtitles", get(subtitles))
+        .route("/api/document", get(document_view))
+        .route("/api/archive/entry", get(archive_entry))
         .route("/api/mkdir", post(mkdir))
         .route("/api/create", post(create_entry))
         .route("/api/write", post(write_entry))
@@ -3174,6 +3176,61 @@ async fn subtitles(
         text,
     )
         .into_response())
+}
+
+/// An office document, presentation, or spreadsheet without a viewer of its own, as structure
+/// for the page to draw (see `documents`).
+async fn document_view(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    let view = tokio::task::spawn_blocking(move || crate::documents::view(&resolved.full))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the document"))?
+        .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err))?;
+    Ok(Json(view))
+}
+
+#[derive(Deserialize)]
+struct ArchiveEntryQuery {
+    path: Option<String>,
+    entry: String,
+    download: Option<String>,
+}
+
+/// One file from inside an archive (or a document, comic, or e-book, which are archives
+/// inside), shown in the browser or downloaded.
+async fn archive_entry(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ArchiveEntryQuery>,
+) -> Result<Response, ApiError> {
+    require_user(&state, &headers)?;
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    let archive_name = resolved.full.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let wanted = query.entry.clone();
+    let bytes = tokio::task::spawn_blocking(move || crate::archives::read(&resolved.full, &archive_name, &wanted, 256 * 1024 * 1024))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the archive"))?
+        .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err))?;
+    let name = query.entry.rsplit('/').next().unwrap_or(&query.entry).to_string();
+    let mime = mime_guess::from_path(&name).first_raw().unwrap_or("application/octet-stream");
+    let active = files::active_content(&name);
+    // Pages, scripts, and the like are shown as text, never run.
+    let mime = if active || mime.starts_with("text/") { "text/plain; charset=utf-8" } else { mime };
+    // The browser's PDF viewer needs to run in its frame; anything else is sandboxed.
+    let policy = if mime == "application/pdf" { "default-src 'none'; frame-ancestors 'self'" } else { "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'" };
+    Response::builder()
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CONTENT_DISPOSITION, files::content_disposition(&name, flag(&query.download) || mime == "application/octet-stream"))
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CACHE_CONTROL, "private, max-age=300")
+        .header(header::CONTENT_SECURITY_POLICY, policy)
+        .body(Body::from(bytes))
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not send the file"))
 }
 
 /// A photo browsers cannot show on their own (RAW, JPEG XL, HEIC, AVIF) as a JPEG or PNG
