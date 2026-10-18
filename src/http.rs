@@ -263,6 +263,9 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/subtitles", get(subtitles))
         .route("/api/document", get(document_view))
         .route("/api/archive/entry", get(archive_entry))
+        .route("/api/archive/list", get(archive_list))
+        .route("/api/book/info", get(book_info))
+        .route("/api/book/{book}/{*entry}", get(book_part))
         .route("/api/mkdir", post(mkdir))
         .route("/api/create", post(create_entry))
         .route("/api/write", post(write_entry))
@@ -3231,6 +3234,78 @@ async fn archive_entry(
         .header(header::CONTENT_SECURITY_POLICY, policy)
         .body(Body::from(bytes))
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not send the file"))
+}
+
+/// What an archive (or comic) holds.
+async fn archive_list(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    let name = resolved.full.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let (entries, more) = tokio::task::spawn_blocking(move || crate::archives::list(&resolved.full, &name, 20_000))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the archive"))?
+        .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err))?;
+    Ok(Json(json!({ "entries": entries, "truncated": more })))
+}
+
+/// An EPUB book's title, author, chapters, and table of contents.
+async fn book_info(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    let book = tokio::task::spawn_blocking(move || crate::ebook::read(&resolved.full))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the book"))?
+        .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err))?;
+    Ok(Json(book))
+}
+
+/// A page (or its picture, style sheet, or font) from inside an EPUB book. The path in the
+/// address lets the page's own relative links work. Pages show in a sandbox: no scripts, no
+/// forms, nothing loaded from elsewhere.
+async fn book_part(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path((book, entry)): axum::extract::Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    require_user(&state, &headers)?;
+    if extension_of(&book) != "epub" {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Only EPUB books are read this way"));
+    }
+    let resolved = files::resolve(&state.root, &book)?;
+    let wanted = entry.clone();
+    let bytes = tokio::task::spawn_blocking(move || crate::archives::read(&resolved.full, "book.epub", &wanted, 64 * 1024 * 1024))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the book"))?
+        .map_err(|err| ApiError::new(StatusCode::NOT_FOUND, err))?;
+    let mime = match extension_of(&entry).as_str() {
+        "xhtml" | "xht" => "application/xhtml+xml; charset=utf-8".to_string(),
+        "html" | "htm" => "text/html; charset=utf-8".to_string(),
+        "css" => "text/css; charset=utf-8".to_string(),
+        _ => mime_guess::from_path(&entry).first_raw().unwrap_or("application/octet-stream").to_string(),
+    };
+    // Scripts in books never run: an SVG or a script file is sent as plain text.
+    let mime = if mime.contains("svg") || mime.contains("javascript") { "text/plain; charset=utf-8".to_string() } else { mime };
+    Ok((
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CACHE_CONTROL, "private, max-age=3600".to_string()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "sandbox allow-same-origin; default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; frame-ancestors 'self'; base-uri 'none'; form-action 'none'".to_string(),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 /// A photo browsers cannot show on their own (RAW, JPEG XL, HEIC, AVIF) as a JPEG or PNG

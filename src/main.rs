@@ -6,6 +6,7 @@ mod auth;
 mod content_index;
 mod db;
 mod documents;
+mod ebook;
 mod file_index;
 mod files;
 mod image_edit;

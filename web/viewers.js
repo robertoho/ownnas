@@ -390,3 +390,138 @@ export async function mountDocument(body, entry) {
   body.replaceChildren(content);
   return { destroy() {} };
 }
+
+/// Remembered per viewer (the place in a book, the page of a comic); never required.
+function remember(key, value) {
+  try {
+    if (value === undefined) return localStorage.getItem(key);
+    localStorage.setItem(key, String(value));
+  } catch { /* private window, or storage off */ }
+  return null;
+}
+
+/// Arrow keys (and Page Up/Down) for a viewer while it shows, before the file browser sees them.
+function captureArrows(container, onStep) {
+  const handler = (event) => {
+    if (!container.isConnected || event.metaKey || event.ctrlKey || event.altKey) return;
+    if (event.target.closest && event.target.closest("input, textarea, select, [contenteditable]")) return;
+    const step = { ArrowLeft: -1, ArrowRight: 1, PageUp: -1, PageDown: 1 }[event.key];
+    if (!step) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    onStep(step);
+  };
+  window.addEventListener("keydown", handler, true);
+  return () => window.removeEventListener("keydown", handler, true);
+}
+
+// ---- E-books (EPUB): chapters in a sandboxed frame, with the table of contents ----
+
+function bookPartUrl(entry, part) {
+  const [path, fragment] = part.split("#");
+  return `/api/book/${enc(entry.path)}/${path.split("/").map(enc).join("/")}${fragment ? `#${fragment}` : ""}`;
+}
+
+export async function mountBook(body, entry) {
+  body.replaceChildren(h("p", "muted", "Opening the book…"));
+  const book = await getJson(`/api/book/info?path=${enc(entry.path)}`);
+  const frame = h("iframe", "book-frame");
+  frame.title = book.title || entry.name;
+  // No scripts: pages are read, not run.
+  frame.setAttribute("sandbox", "allow-same-origin");
+  const prev = h("button", "book-step", "‹ Previous");
+  const next = h("button", "book-step", "Next ›");
+  prev.type = next.type = "button";
+  const contents = h("select", "book-contents");
+  contents.setAttribute("aria-label", "Contents");
+  const position = h("span", "book-position muted");
+  const head = h("div", "book-head",
+    h("div", "book-title", h("strong", "", book.title || entry.name), book.author ? h("span", "muted", ` · ${book.author}`) : null),
+    h("div", "book-tools", prev, contents, next, position));
+  body.replaceChildren(h("div", "book-view", head, frame));
+
+  // The table of contents, or the chapters by number when the book has none.
+  const items = book.toc.length ? book.toc : book.chapters.map((chapter, index) => ({ title: `Part ${index + 1}`, entry: chapter, level: 0 }));
+  for (const item of items) {
+    const option = h("option", "", `${"  ".repeat(Math.min(item.level, 4))}${item.title}`);
+    option.value = item.entry;
+    contents.append(option);
+  }
+  const key = `ownnas-book:${entry.path}`;
+  let chapter = Math.min(Math.max(0, Number(remember(key)) || 0), book.chapters.length - 1);
+  const show = (index, part = null) => {
+    chapter = Math.min(Math.max(0, index), book.chapters.length - 1);
+    frame.src = bookPartUrl(entry, part || book.chapters[chapter]);
+    prev.disabled = chapter === 0;
+    next.disabled = chapter === book.chapters.length - 1;
+    position.textContent = `${chapter + 1} / ${book.chapters.length}`;
+    // The contents entry for this chapter, if it has one.
+    const match = items.findIndex((item) => item.entry.split("#")[0] === book.chapters[chapter]);
+    if (match >= 0 && (!part || part.split("#")[0] !== contents.value.split("#")[0])) contents.selectedIndex = match;
+    remember(key, chapter);
+  };
+  prev.addEventListener("click", () => show(chapter - 1));
+  next.addEventListener("click", () => show(chapter + 1));
+  contents.addEventListener("change", () => {
+    const target = contents.value;
+    const index = book.chapters.indexOf(target.split("#")[0]);
+    show(index >= 0 ? index : chapter, target);
+  });
+  const release = captureArrows(body, (step) => show(chapter + step));
+  show(chapter);
+  return { destroy: release };
+}
+
+// ---- Comics (CBZ, CBR, CB7): their pages, one at a time ----
+
+const PAGE_PICTURE = /\.(jpe?g|png|gif|webp|avif|bmp)$/i;
+
+export async function mountComic(body, entry) {
+  body.replaceChildren(h("p", "muted", "Opening the comic…"));
+  const listing = await getJson(`/api/archive/list?path=${enc(entry.path)}`);
+  const pages = listing.entries
+    .filter((item) => !item.dir && PAGE_PICTURE.test(item.name) && !/(^|\/)(__MACOSX|\.)/.test(item.name))
+    .map((item) => item.name)
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
+  if (!pages.length) throw new Error("This comic has no pages inside");
+  const img = h("img", "comic-page");
+  img.alt = "";
+  const prev = h("button", "comic-step", "‹");
+  const next = h("button", "comic-step", "›");
+  prev.type = next.type = "button";
+  prev.setAttribute("aria-label", "Previous page");
+  next.setAttribute("aria-label", "Next page");
+  const slider = h("input", "comic-slider");
+  slider.type = "range";
+  slider.min = "1";
+  slider.max = String(pages.length);
+  const counter = h("span", "comic-counter muted");
+  const stage = h("div", "comic-stage", img);
+  body.replaceChildren(h("div", "comic-view", stage, h("div", "comic-tools", prev, slider, next, counter)));
+
+  const key = `ownnas-comic:${entry.path}`;
+  let page = Math.min(Math.max(0, Number(remember(key)) || 0), pages.length - 1);
+  const url = (index) => `/api/archive/entry?path=${enc(entry.path)}&entry=${enc(pages[index])}`;
+  const show = (index) => {
+    page = Math.min(Math.max(0, index), pages.length - 1);
+    img.src = url(page);
+    slider.value = String(page + 1);
+    counter.textContent = `${page + 1} / ${pages.length}`;
+    prev.disabled = page === 0;
+    next.disabled = page === pages.length - 1;
+    remember(key, page);
+    // The next page loads while this one is read.
+    if (page + 1 < pages.length) new Image().src = url(page + 1);
+  };
+  prev.addEventListener("click", () => show(page - 1));
+  next.addEventListener("click", () => show(page + 1));
+  slider.addEventListener("input", () => show(Number(slider.value) - 1));
+  // A click on the left of the page goes back, on the right forward.
+  stage.addEventListener("click", (event) => {
+    const box = stage.getBoundingClientRect();
+    show(page + (event.clientX - box.left < box.width / 3 ? -1 : 1));
+  });
+  const release = captureArrows(body, (step) => show(page + step));
+  show(page);
+  return { destroy: release };
+}

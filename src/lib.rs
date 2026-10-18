@@ -12,6 +12,7 @@ pub mod auth;
 pub mod content_index;
 pub mod db;
 pub mod documents;
+pub mod ebook;
 pub mod file_index;
 pub mod files;
 pub mod image_edit;

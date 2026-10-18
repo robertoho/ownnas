@@ -2323,6 +2323,10 @@ async function openEntry(entry) {
     } catch (err) {
       if (state.current === entry) body.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
     }
+  } else if (/\.epub$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountBook(body, entry), () => openMetaPreview(body, entry));
+  } else if (/\.(cbz|cbr|cb7)$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountComic(body, entry), () => openMetaPreview(body, entry));
   } else if (DOCUMENT_VIEW.test(entry.name)) {
     // A ".key" file is as often a private key as a Keynote presentation: shown as text then.
     const fallback = /\.key$/i.test(entry.name) ? () => openMetaPreview(body, entry) : null;
@@ -2689,13 +2693,13 @@ function renderMeta(body, entry, meta) {
     return;
   }
   if (meta.archive) {
-    mountArchiveBrowser(body, meta.archive, !!meta.archiveTruncated);
+    mountArchiveBrowser(body, meta.archive, !!meta.archiveTruncated, entry.path);
     return;
   }
   body.innerHTML = `<p class="muted">${esc(meta.note || "No inline preview for this file. Download it to open it locally.")}</p>`;
 }
 
-function mountArchiveBrowser(body, entries, truncated) {
+function mountArchiveBrowser(body, entries, truncated, archivePath) {
   const rootNode = { id: 0, name: "Contents", dir: true, children: new Map() };
   const nodes = new Map([[0, rootNode]]);
   let nextId = 1;
@@ -2715,6 +2719,7 @@ function mountArchiveBrowser(body, entries, truncated) {
       if (index === parts.length - 1) {
         child.dir = !!entry.dir || child.children.size > 0;
         child.size = Number(entry.size) || 0;
+        child.entry = entry.name;
       }
       parent = child;
     }
@@ -2750,18 +2755,26 @@ function mountArchiveBrowser(body, entries, truncated) {
     }
     for (const child of children) {
       const row = document.createElement("li"); row.className = child.dir ? "archive-dir-row" : "archive-file-row";
-      const name = document.createElement(child.dir ? "button" : "span");
+      const fileUrl = !child.dir && child.entry ? `/api/archive/entry?path=${encodeURIComponent(archivePath)}&entry=${encodeURIComponent(child.entry)}` : "";
+      const name = document.createElement(child.dir ? "button" : fileUrl ? "a" : "span");
       if (child.dir) {
         name.type = "button"; name.addEventListener("click", () => { current = child; render(); });
+      } else if (fileUrl) {
+        // Opens in a new tab: pictures, PDFs, and text show; anything else downloads.
+        name.href = fileUrl; name.target = "_blank"; name.rel = "noopener"; name.title = "Open this file";
       }
       name.className = "archive-entry-name"; name.textContent = child.name; row.append(name);
       const detail = document.createElement("span"); detail.className = "muted"; detail.textContent = child.dir ? "Archived folder" : formatSize(child.size, false); row.append(detail);
+      if (fileUrl) {
+        const save = document.createElement("a"); save.className = "archive-entry-download"; save.href = `${fileUrl}&download=1`; save.textContent = "Download"; save.title = `Download ${child.name}`;
+        row.append(save);
+      }
       list.append(row);
     }
     if (!children.length) {
       const empty = document.createElement("li"); empty.className = "muted archive-empty"; empty.textContent = current === rootNode ? "This archive is empty." : "This archived folder is empty."; list.append(empty);
     }
-    footnote.textContent = truncated ? "Showing the first entries only. No files have been extracted." : "Select a folder to browse its archived files. No files have been extracted.";
+    footnote.textContent = truncated ? "Showing the first entries only. Open a file to see it, without unpacking the rest." : "Open a folder to browse it, or a file to see it, without unpacking the rest.";
   }
   function linkParents(node, parent) {
     node.parent = parent;
