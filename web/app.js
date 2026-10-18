@@ -2210,7 +2210,7 @@ async function openEntry(entry) {
   const imageIndex = images.findIndex((item) => item.path === entry.path);
   $("preview-prev").hidden = imageIndex <= 0;
   $("preview-next").hidden = imageIndex < 0 || imageIndex >= images.length - 1;
-  const canEditImage = write && entry.kind === "image" && !inTrashPath(entry.path);
+  const canEditImage = write && entry.kind === "image" && !inTrashPath(entry.path) && !NEEDS_DISPLAY.test(entry.name);
   $("preview-edit-image").hidden = !canEditImage;
   if (!inTrashPath(entry.path)) {
     api("/api/recent", { method: "POST", json: { path: entry.path } }).then(() => refreshLibrary()).catch(() => {});
@@ -2219,7 +2219,11 @@ async function openEntry(entry) {
   const body = $("preview-body");
   const raw = `/api/raw?path=${encodeURIComponent(entry.path)}`;
   if (entry.kind === "image" || entry.kind === "svg") {
-    body.innerHTML = `<img alt="${esc(entry.name)}" src="${raw}&t=${entry.modified || Date.now()}">`;
+    body.innerHTML = `<img alt="${esc(entry.name)}" src="${imageUrl(entry)}">`;
+    const shown = body.querySelector("img");
+    shown.addEventListener("error", () => {
+      if (state.current === entry) body.innerHTML = `<p class="muted">This photo could not be shown. It can still be downloaded.</p>`;
+    }, { once: true });
   } else if (entry.kind === "video") {
     const poster = entry.thumb ? ` poster="/api/thumb?path=${encodeURIComponent(entry.path)}&v=${entry.modified}"` : "";
     body.innerHTML = `<video controls playsinline${poster} src="${raw}"></video>`;
@@ -3244,6 +3248,17 @@ async function deleteEntries(entries) {
 /// Deletes photos (into the Trash) and remembers their contents (SHA-256), so phones never back
 /// them up again, even while they are still on a phone. Returns how many, or 0 when cancelled.
 const RESIZABLE = /\.(jpe?g|png|webp|bmp|tiff?)$/i;
+
+/// Photos the browser cannot show itself (camera RAW, JPEG XL, HEIC, AVIF): the server converts them.
+const NEEDS_DISPLAY = /\.(cr2|cr3|crw|nef|nrw|arw|srf|sr2|dng|raf|orf|rw2|rwl|pef|srw|x3f|3fr|iiq|erf|mef|mos|kdc|dcr|jxl|heic|heif|avif)$/i;
+
+/// Where the browser can load a photo from.
+function imageUrl(entry) {
+  const path = encodeURIComponent(entry.path);
+  return NEEDS_DISPLAY.test(entry.name || entry.path || "")
+    ? `/api/display?path=${path}&v=${entry.modified || 0}`
+    : `/api/raw?path=${path}&t=${entry.modified || Date.now()}`;
+}
 
 function isResizable(entry) {
   return !!entry && !entry.dir && entry.kind === "image" && RESIZABLE.test(entry.name || entry.path || "");

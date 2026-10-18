@@ -103,6 +103,14 @@ pub fn ensure(source: &Path, cache_root: &Path, video: bool) -> Result<PathBuf, 
     } else if needs_converter(&extension) {
         let out = temp("jpg");
         (render_converted(source, &out).map(|_| out), "jpg")
+    } else if crate::photo_formats::handles(&extension) {
+        let jpg = temp("jpg");
+        let made = crate::photo_formats::decode(source).and_then(|picture| write_thumbnail(&picture.thumbnail(SIZE, SIZE), &jpg));
+        match made {
+            Ok(Encoded::Jpeg) => (Ok(jpg), "jpg"),
+            Ok(Encoded::Png) => (Ok(jpg), "png"),
+            Err(err) => (Err(err), "jpg"),
+        }
     } else {
         let jpg = temp("jpg");
         match render_image(source, &jpg) {
@@ -262,8 +270,54 @@ pub fn decode_for_analysis(source: &Path, max: u32) -> Result<image::DynamicImag
         let _ = std::fs::remove_file(&out);
         return result;
     }
+    if crate::photo_formats::handles(&extension) {
+        return Ok(shrink(crate::photo_formats::decode(source)?, max));
+    }
     let image = apply_orientation(decode(source)?, read_orientation(source));
     Ok(shrink(image, max))
+}
+
+/// Longest side of a converted photo shown in the preview.
+const DISPLAY_SIZE: u32 = 4096;
+
+/// Photos browsers cannot show (RAW, JPEG XL, and HEIC or AVIF outside Safari), as a JPEG or
+/// PNG they can: converted once and kept beside the thumbnails.
+pub fn needs_display(extension: &str) -> bool {
+    crate::photo_formats::handles(extension) || needs_converter(extension)
+}
+
+/// The browser-ready copy of `source` (see `needs_display`), made now if there is none yet.
+pub fn ensure_display(source: &Path, cache_root: &Path) -> Result<PathBuf, String> {
+    let meta = std::fs::metadata(source).map_err(|_| "Could not read the file".to_string())?;
+    let base = cache_base(cache_root, source, &meta);
+    let base = base.with_file_name(format!("{}-display", base.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
+    if let Some(found) = cached(&base) {
+        return Ok(found);
+    }
+    if let Some(parent) = base.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| "Could not create the thumbnail cache".to_string())?;
+    }
+    let extension = source.extension().map(|ext| ext.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let stamp = std::time::SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let temp = base.with_file_name(format!(".{}.{stamp}.display", std::process::id()));
+    let ext = if crate::photo_formats::handles(&extension) {
+        let (bytes, media) = crate::photo_formats::displayable(source)?;
+        std::fs::write(&temp, bytes).map_err(|_| "Could not store the picture".to_string())?;
+        if media == "image/png" { "png" } else { "jpg" }
+    } else {
+        let picture = decode_for_analysis(source, DISPLAY_SIZE)?;
+        match write_thumbnail(&picture, &temp) {
+            Ok(Encoded::Png) => "png",
+            Ok(Encoded::Jpeg) => "jpg",
+            Err(err) => {
+                let _ = std::fs::remove_file(&temp);
+                return Err(err);
+            }
+        }
+    };
+    let dest = base.with_extension(ext);
+    std::fs::rename(&temp, &dest).map_err(|_| "Could not store the picture".to_string())?;
+    Ok(dest)
 }
 
 fn shrink(image: image::DynamicImage, max: u32) -> image::DynamicImage {
@@ -332,7 +386,7 @@ fn read_orientation(path: &Path) -> u32 {
         .unwrap_or(1)
 }
 
-fn apply_orientation(img: image::DynamicImage, orientation: u32) -> image::DynamicImage {
+pub(crate) fn apply_orientation(img: image::DynamicImage, orientation: u32) -> image::DynamicImage {
     match orientation {
         2 => img.fliph(),
         3 => img.rotate180(),

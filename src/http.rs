@@ -253,6 +253,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/sqlite/query", post(sqlite_query))
         .route("/api/sqlite/value", get(sqlite_value))
         .route("/api/thumb", get(thumb))
+        .route("/api/display", get(display_image))
         .route("/api/mkdir", post(mkdir))
         .route("/api/create", post(create_entry))
         .route("/api/write", post(write_entry))
@@ -3001,6 +3002,40 @@ async fn thumb(
     .await
     .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not make a thumbnail"))?
     .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "No thumbnail"))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "private, max-age=86400"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        image,
+    )
+        .into_response())
+}
+
+/// A photo browsers cannot show on their own (RAW, JPEG XL, HEIC, AVIF) as a JPEG or PNG
+/// they can, converted once and kept with the thumbnails.
+async fn display_image(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<Response, ApiError> {
+    require_user(&state, &headers)?;
+    let root = state.root.clone();
+    let cache = state.thumbs.clone();
+    let rel = rel_of(&query.path);
+    let (content_type, image) = tokio::task::spawn_blocking(move || -> Result<(&'static str, Vec<u8>), String> {
+        let resolved = files::resolve(&root, &rel).map_err(|_| "Not found".to_string())?;
+        let extension = extension_of(&resolved.full.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
+        if resolved.full.is_dir() || !thumbs::needs_display(&extension) {
+            return Err("This photo can be shown as it is".into());
+        }
+        let cached = thumbs::ensure_display(&resolved.full, &cache)?;
+        Ok((thumbs::content_type(&cached), thumbs::read_cached(&cached)?))
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not show the photo"))?
+    .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err))?;
     Ok((
         [
             (header::CONTENT_TYPE, content_type),

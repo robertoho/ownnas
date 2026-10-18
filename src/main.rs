@@ -14,6 +14,7 @@ mod ml;
 mod http;
 mod pdf_ops;
 mod photo_details;
+mod photo_formats;
 mod terminal;
 mod preview;
 mod sqlite_view;

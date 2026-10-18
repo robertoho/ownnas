@@ -20,6 +20,7 @@ pub mod ml;
 pub mod http;
 pub mod pdf_ops;
 pub mod photo_details;
+pub mod photo_formats;
 pub mod terminal;
 pub mod preview;
 pub mod sqlite_view;

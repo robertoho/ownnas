@@ -526,6 +526,14 @@ fn read_photo(path: &Path) -> Taken {
     if turned {
         std::mem::swap(&mut taken.width, &mut taken.height);
     }
+    // RAW and JPEG XL: the size of the picture inside, already upright.
+    let extension = path.extension().map(|ext| ext.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    if crate::photo_formats::handles(&extension) {
+        if let Some((width, height)) = crate::photo_formats::shown_size(path) {
+            taken.width = Some(width.into());
+            taken.height = Some(height.into());
+        }
+    }
     taken
 }
 

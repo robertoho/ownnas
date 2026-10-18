@@ -39,6 +39,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 tower = { version = "0.5", features = ["util"] }
 zip = "2"
 lopdf = "0.34"
+jxl-oxide = { version = "0.12", default-features = false, features = ["image"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"

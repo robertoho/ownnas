@@ -1158,7 +1158,8 @@ pub fn kind_of(name: &str) -> &'static str {
     }
     match extension(&lower).as_str() {
         "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "ico" | "heic"
-        | "heif" | "avif" | "jfif" => "image",
+        | "heif" | "avif" | "jfif" | "jxl" => "image",
+        ext if crate::photo_formats::is_raw(ext) => "image",
         "svg" | "svgz" => "svg",
         "mp4" | "m4v" | "webm" | "mkv" | "mov" | "avi" | "ogv" | "mpeg" | "mpg" | "wmv" => "video",
         "mp3" | "wav" | "flac" | "ogg" | "opus" | "m4a" | "aac" | "wma" => "audio",
@@ -1184,6 +1185,8 @@ pub fn can_thumb(name: &str, ffmpeg: bool) -> bool {
             let ext = extension(&name.to_ascii_lowercase());
             if crate::thumbs::needs_converter(&ext) {
                 crate::thumbs::converter_available()
+            } else if crate::photo_formats::handles(&ext) {
+                true
             } else {
                 !matches!(ext.as_str(), "svg" | "svgz" | "jxl")
             }
