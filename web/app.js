@@ -2224,6 +2224,7 @@ async function openEntry(entry) {
     shown.addEventListener("error", () => {
       if (state.current === entry) body.innerHTML = `<p class="muted">This photo could not be shown. It can still be downloaded.</p>`;
     }, { once: true });
+    if (/\.(jpe?g|heic|heif)$/i.test(entry.name)) showPhotoMotion(body, entry, shown);
   } else if (entry.kind === "video") {
     const poster = entry.thumb ? `/api/thumb?path=${encodeURIComponent(entry.path)}&v=${entry.modified}` : "";
     mountViewer(body, entry, (module) => module.mountVideo(body, entry, { poster }));
@@ -2382,6 +2383,40 @@ async function openMetaPreview(body, entry) {
       body.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
     }
   }
+}
+
+/// A Live Photo or Motion Photo: a button under the photo plays its moment, then shows the photo again.
+async function showPhotoMotion(body, entry, photo) {
+  const motion = await api(`/api/photo/motion?path=${encodeURIComponent(entry.path)}`).catch(() => null);
+  if (!motion || !motion.kind || state.current !== entry || !photo.isConnected) return;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "motion-button";
+  button.textContent = motion.kind === "live" ? "▶ Live Photo" : "▶ Motion Photo";
+  const bar = document.createElement("div");
+  bar.className = "motion-bar";
+  bar.append(button);
+  body.append(bar);
+  let video = null;
+  const back = () => {
+    if (!video) return;
+    video.pause();
+    video.replaceWith(photo);
+    video = null;
+    button.textContent = motion.kind === "live" ? "▶ Live Photo" : "▶ Motion Photo";
+  };
+  button.addEventListener("click", () => {
+    if (video) return back();
+    video = document.createElement("video");
+    video.src = motion.url;
+    video.playsInline = true;
+    video.autoplay = true;
+    video.className = "motion-video";
+    video.addEventListener("ended", back, { once: true });
+    video.addEventListener("error", () => { back(); toast("The moving part could not be played", true); }, { once: true });
+    photo.replaceWith(video);
+    button.textContent = "■ Photo";
+  });
 }
 
 /// Documents, presentations, and spreadsheets the server reads for the preview.

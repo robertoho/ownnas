@@ -256,6 +256,8 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/sqlite/value", get(sqlite_value))
         .route("/api/thumb", get(thumb))
         .route("/api/display", get(display_image))
+        .route("/api/photo/motion", get(photo_motion))
+        .route("/api/photo/motion/video", get(photo_motion_video))
         .route("/api/audio/info", get(audio_info))
         .route("/api/audio/cover", get(audio_cover))
         .route("/api/video/probe", get(video_probe))
@@ -3431,6 +3433,56 @@ async fn book_part(
                 header::CONTENT_SECURITY_POLICY,
                 "sandbox allow-same-origin; default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; frame-ancestors 'self'; base-uri 'none'; form-action 'none'".to_string(),
             ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// Whether a photo moves (a Live Photo or a Motion Photo), and where its video plays from.
+async fn photo_motion(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    let rel = resolved.rel.clone();
+    let found = tokio::task::spawn_blocking(move || crate::photo_formats::motion(&resolved.full))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the photo"))?;
+    let dir = rel.rsplit_once('/').map_or(String::new(), |(dir, _)| format!("{dir}/"));
+    Ok(Json(match found {
+        Some(crate::photo_formats::Motion::Beside(video)) => {
+            let name = video.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            json!({ "kind": "live", "url": format!("/api/raw?path={}", url_encode(&format!("{dir}{name}"))) })
+        }
+        Some(crate::photo_formats::Motion::Inside { .. }) => json!({ "kind": "motion", "url": format!("/api/photo/motion/video?path={}", url_encode(&rel)) }),
+        None => json!({ "kind": null }),
+    }))
+}
+
+/// The video a Motion Photo keeps after its picture.
+async fn photo_motion_video(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<Response, ApiError> {
+    require_user(&state, &headers)?;
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    let bytes = tokio::task::spawn_blocking(move || -> Option<Vec<u8>> {
+        let crate::photo_formats::Motion::Inside { start, end } = crate::photo_formats::motion(&resolved.full)? else { return None };
+        let data = std::fs::read(&resolved.full).ok()?;
+        data.get(start as usize..end as usize).map(<[u8]>::to_vec)
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the photo"))?
+    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "This photo has no video inside"))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "video/mp4"),
+            (header::CACHE_CONTROL, "private, max-age=3600"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         ],
         bytes,
     )

@@ -427,8 +427,15 @@ fn scan_paced(conn: &Connection, root: &Path, progress: &dyn Fn(u64, u64), pace:
             if !meta.is_file() || (kind != "image" && kind != "video") || name.starts_with('.') {
                 continue;
             }
-            // Design files, icons, and textures are pictures, but not photos for the timeline.
             let extension = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
+            // A Live Photo's video belongs to its photo, and plays from there.
+            if kind == "video" && extension == "mov" {
+                let stem = name.rsplit_once('.').map_or(name.as_str(), |(stem, _)| stem);
+                if ["HEIC", "heic", "JPG", "jpg", "JPEG", "jpeg"].iter().any(|ext| dir.join(format!("{stem}.{ext}")).is_file()) {
+                    continue;
+                }
+            }
+            // Design files, icons, and textures are pictures, but not photos for the timeline.
             if crate::photo_formats::is_layered(&extension) || crate::photo_formats::is_other_raster(&extension) {
                 continue;
             }

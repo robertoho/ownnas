@@ -618,3 +618,108 @@ mod samples {
         }
     }
 }
+
+/// The moving part of a photo: an Apple Live Photo's video beside it (same name, .MOV), or the
+/// video a Google or Samsung Motion Photo keeps after its picture.
+#[derive(Debug, PartialEq)]
+pub enum Motion {
+    Beside(std::path::PathBuf),
+    Inside { start: u64, end: u64 },
+}
+
+/// Photo formats that can move.
+pub fn may_move(extension: &str) -> bool {
+    matches!(extension, "jpg" | "jpeg" | "heic" | "heif")
+}
+
+pub fn motion(path: &Path) -> Option<Motion> {
+    if !may_move(&extension_of(path)) {
+        return None;
+    }
+    let stem = path.file_stem()?.to_string_lossy().into_owned();
+    if let Some(dir) = path.parent() {
+        for ext in ["MOV", "mov", "Mov"] {
+            let beside = dir.join(format!("{stem}.{ext}"));
+            if beside.is_file() {
+                return Some(Motion::Beside(beside));
+            }
+        }
+    }
+    let size = std::fs::metadata(path).ok()?.len();
+    if size > 200 * 1024 * 1024 {
+        return None;
+    }
+    let data = std::fs::read(path).ok()?;
+    let (start, end) = embedded_video(&data)?;
+    Some(Motion::Inside { start: start as u64, end: end as u64 })
+}
+
+/// Where an MP4 appended to a photo starts and ends: its first box is "ftyp" with a video brand,
+/// and it runs as long as its boxes do.
+fn embedded_video(data: &[u8]) -> Option<(usize, usize)> {
+    const BRANDS: [&[u8; 4]; 8] = [b"isom", b"mp42", b"mp41", b"iso4", b"iso5", b"avc1", b"qt  ", b"MSNV"];
+    let mut from = 64;
+    while let Some(found) = data.get(from..)?.windows(4).position(|w| w == b"ftyp") {
+        let type_at = from + found;
+        from = type_at + 4;
+        let start = type_at.checked_sub(4)?;
+        let brand = data.get(type_at + 4..type_at + 8)?;
+        if !BRANDS.iter().any(|b| b.as_slice() == brand) {
+            continue;
+        }
+        // Walk the boxes to find where the video ends.
+        let mut at = start;
+        let mut boxes = 0;
+        while at + 8 <= data.len() {
+            let size = u32::from_be_bytes(data[at..at + 4].try_into().ok()?) as u64;
+            let kind = &data[at + 4..at + 8];
+            if !kind.iter().all(|c| c.is_ascii_alphanumeric() || *c == b' ') {
+                break;
+            }
+            let size = match size {
+                1 => u64::from_be_bytes(data.get(at + 8..at + 16)?.try_into().ok()?),
+                0 => (data.len() - at) as u64,
+                n => n,
+            };
+            if size < 8 || at as u64 + size > data.len() as u64 {
+                break;
+            }
+            at += size as usize;
+            boxes += 1;
+        }
+        if boxes >= 2 {
+            return Some((start, at));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod motion_tests {
+    use super::*;
+
+    #[test]
+    fn finds_live_and_motion_photos() {
+        let dir = std::env::temp_dir().join(format!("ownnas-motion-{}-{}", std::process::id(), rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("IMG_1.HEIC"), b"heic").unwrap();
+        std::fs::write(dir.join("IMG_1.MOV"), b"mov").unwrap();
+        assert_eq!(motion(&dir.join("IMG_1.HEIC")), Some(Motion::Beside(dir.join("IMG_1.MOV"))));
+        // A JPEG, then an MP4 of two boxes, then a trailer.
+        let mut jpeg = vec![0xFF, 0xD8];
+        jpeg.extend_from_slice(&[0u8; 100]);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+        let start = jpeg.len();
+        jpeg.extend_from_slice(&[0, 0, 0, 16]);
+        jpeg.extend_from_slice(b"ftypisom\0\0\0\0");
+        jpeg.extend_from_slice(&[0, 0, 0, 12]);
+        jpeg.extend_from_slice(b"mdat\x01\x02\x03\x04");
+        let end = jpeg.len();
+        jpeg.extend_from_slice(b"SEFT trailer");
+        std::fs::write(dir.join("PXL_2.MP.jpg"), &jpeg).unwrap();
+        assert_eq!(motion(&dir.join("PXL_2.MP.jpg")), Some(Motion::Inside { start: start as u64, end: end as u64 }));
+        std::fs::write(dir.join("plain.jpg"), [0xFF, 0xD8, 0xFF, 0xD9]).unwrap();
+        assert_eq!(motion(&dir.join("plain.jpg")), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
