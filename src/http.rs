@@ -269,6 +269,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/mail/html", get(mail_html))
         .route("/api/mail/attachment", get(mail_attachment))
         .route("/api/font/info", get(font_info))
+        .route("/api/map/tile/{z}/{x}/{y}", get(map_tile))
         .route("/api/book/{book}/{*entry}", get(book_part))
         .route("/api/mkdir", post(mkdir))
         .route("/api/create", post(create_entry))
@@ -3316,6 +3317,30 @@ async fn mail_attachment(
         .header(header::CONTENT_SECURITY_POLICY, policy)
         .body(Body::from(bytes))
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not send the attachment"))
+}
+
+/// A map tile for drawing GPS tracks on (see `map_tiles`): "/api/map/tile/z/x/y.png".
+async fn map_tile(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path((z, x, y)): axum::extract::Path<(u32, u32, String)>,
+) -> Result<Response, ApiError> {
+    require_user(&state, &headers)?;
+    let y: u32 = y.trim_end_matches(".png").parse().map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "There is no such map tile"))?;
+    let cache = state.db_path.parent().map(|dir| dir.join("map-tiles")).unwrap_or_else(|| PathBuf::from("map-tiles"));
+    let bytes = tokio::task::spawn_blocking(move || crate::map_tiles::tile(&cache, z, x, y))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not get the map"))?
+        .map_err(|err| ApiError::new(StatusCode::BAD_GATEWAY, err))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "private, max-age=604800"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 /// A font's family, style, version, and designer.

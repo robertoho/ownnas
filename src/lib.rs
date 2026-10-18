@@ -25,6 +25,7 @@ pub mod smart;
 pub mod ml;
 pub mod http;
 pub mod mail;
+pub mod map_tiles;
 pub mod pdf_ops;
 pub mod photo_details;
 pub mod photo_formats;

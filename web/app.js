@@ -2325,6 +2325,8 @@ async function openEntry(entry) {
     }
   } else if (/\.(eml|msg)$/i.test(entry.name)) {
     mountViewer(body, entry, (module) => module.mountMail(body, entry), () => openMetaPreview(body, entry));
+  } else if (/\.(gpx|kml|kmz|geojson)$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountTrack(body, entry), () => openMetaPreview(body, entry));
   } else if (/\.ics$/i.test(entry.name)) {
     mountViewer(body, entry, (module) => module.mountCalendar(body, entry), () => openMetaPreview(body, entry));
   } else if (/\.(vcf|vcard)$/i.test(entry.name)) {

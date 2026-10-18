@@ -826,3 +826,286 @@ export async function mountFont(body, entry) {
   body.replaceChildren(h("div", "font-view", h("h3", "font-title", info?.fullName || info?.family || entry.name), sample, lines, charset, facts));
   return { destroy() { document.fonts.delete(face); } };
 }
+
+// ---- GPS tracks (GPX, KML, KMZ, GeoJSON) on a map ----
+
+/// Lines (lists of [lat, lon, elevation?, time?]) and named points from a track file.
+function parseTrack(name, text) {
+  const lines = [];
+  const points = [];
+  const lower = name.toLowerCase();
+  if (lower.endsWith(".geojson") || lower.endsWith(".json")) {
+    const data = JSON.parse(text);
+    const geometry = (g, props = {}) => {
+      if (!g) return;
+      const ll = (c) => [c[1], c[0], c[2] ?? null, null];
+      if (g.type === "LineString") lines.push(g.coordinates.map(ll));
+      if (g.type === "MultiLineString") for (const part of g.coordinates) lines.push(part.map(ll));
+      if (g.type === "Polygon") lines.push(g.coordinates[0].map(ll));
+      if (g.type === "MultiPolygon") for (const poly of g.coordinates) lines.push(poly[0].map(ll));
+      if (g.type === "Point") points.push({ lat: g.coordinates[1], lon: g.coordinates[0], name: props.name || props.title || "" });
+      if (g.type === "MultiPoint") for (const c of g.coordinates) points.push({ lat: c[1], lon: c[0], name: props.name || "" });
+      if (g.type === "GeometryCollection") for (const part of g.geometries) geometry(part, props);
+    };
+    const features = data.type === "FeatureCollection" ? data.features : data.type === "Feature" ? [data] : [{ geometry: data }];
+    for (const feature of features) geometry(feature.geometry, feature.properties || {});
+    return { lines, points };
+  }
+  const xml = new DOMParser().parseFromString(text, "application/xml");
+  if (xml.querySelector("parsererror")) throw new Error("This track file could not be read");
+  const local = (node, tag) => [...node.getElementsByTagName("*")].filter((n) => n.localName === tag);
+  const childText = (node, tag) => [...node.children].find((n) => n.localName === tag)?.textContent?.trim() || "";
+  if (lower.endsWith(".gpx")) {
+    for (const segment of [...local(xml, "trkseg"), ...local(xml, "rte")]) {
+      const pts = [...segment.children].filter((n) => n.localName === "trkpt" || n.localName === "rtept");
+      lines.push(pts.map((p) => [Number(p.getAttribute("lat")), Number(p.getAttribute("lon")), childText(p, "ele") ? Number(childText(p, "ele")) : null, childText(p, "time") ? Date.parse(childText(p, "time")) : null]));
+    }
+    for (const w of local(xml, "wpt")) points.push({ lat: Number(w.getAttribute("lat")), lon: Number(w.getAttribute("lon")), name: childText(w, "name") });
+    return { lines, points };
+  }
+  // KML: lines, points, and Google's timed tracks.
+  const coords = (text) => text.trim().split(/\s+/).map((triple) => triple.split(",").map(Number)).filter((c) => c.length >= 2 && !c.some(Number.isNaN)).map((c) => [c[1], c[0], c[2] ?? null, null]);
+  for (const placemark of local(xml, "Placemark")) {
+    const label = childText(placemark, "name");
+    for (const line of [...local(placemark, "LineString"), ...local(placemark, "LinearRing")]) lines.push(coords(local(line, "coordinates")[0]?.textContent || ""));
+    for (const point of local(placemark, "Point")) {
+      const [c] = coords(local(point, "coordinates")[0]?.textContent || "");
+      if (c) points.push({ lat: c[0], lon: c[1], name: label });
+    }
+    for (const track of local(placemark, "Track")) {
+      const when = local(track, "when").map((n) => Date.parse(n.textContent));
+      lines.push(local(track, "coord").map((n, i) => {
+        const [lon, lat, ele] = n.textContent.trim().split(/\s+/).map(Number);
+        return [lat, lon, ele ?? null, when[i] ?? null];
+      }));
+    }
+  }
+  return { lines: lines.filter((l) => l.length), points };
+}
+
+function haversine(a, b) {
+  const rad = Math.PI / 180;
+  const dLat = (b[0] - a[0]) * rad;
+  const dLon = (b[1] - a[1]) * rad;
+  const s = Math.sin(dLat / 2) ** 2 + Math.cos(a[0] * rad) * Math.cos(b[0] * rad) * Math.sin(dLon / 2) ** 2;
+  return 2 * 6371000 * Math.asin(Math.min(1, Math.sqrt(s)));
+}
+
+function trackStats(lines) {
+  let distance = 0;
+  let climb = 0;
+  let descent = 0;
+  let low = Infinity;
+  let high = -Infinity;
+  let first = null;
+  let last = null;
+  const profile = [];
+  for (const line of lines) {
+    for (let i = 0; i < line.length; i += 1) {
+      const p = line[i];
+      if (i > 0) {
+        distance += haversine(line[i - 1], p);
+        if (p[2] != null && line[i - 1][2] != null) {
+          const step = p[2] - line[i - 1][2];
+          if (step > 0) climb += step; else descent -= step;
+        }
+      }
+      if (p[2] != null) {
+        low = Math.min(low, p[2]);
+        high = Math.max(high, p[2]);
+        profile.push([distance, p[2]]);
+      }
+      if (p[3] != null && !Number.isNaN(p[3])) {
+        if (first == null || p[3] < first) first = p[3];
+        if (last == null || p[3] > last) last = p[3];
+      }
+    }
+  }
+  return { distance, climb, descent, low, high, first, last, profile };
+}
+
+const TILE = 256;
+const project = (lat, lon, zoom) => {
+  const scale = TILE * 2 ** zoom;
+  const sin = Math.sin((Math.max(-85, Math.min(85, lat)) * Math.PI) / 180);
+  return [((lon + 180) / 360) * scale, (0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI)) * scale];
+};
+
+export async function mountTrack(body, entry, { api } = {}) {
+  body.replaceChildren(h("p", "muted", "Reading the track…"));
+  let text;
+  if (/\.kmz$/i.test(entry.name)) {
+    const listing = await getJson(`/api/archive/list?path=${enc(entry.path)}`);
+    const kml = listing.entries.find((e) => /\.kml$/i.test(e.name));
+    if (!kml) throw new Error("This KMZ file has no map inside");
+    const response = await fetch(`/api/archive/entry?path=${enc(entry.path)}&entry=${enc(kml.name)}`, { credentials: "same-origin" });
+    text = await response.text();
+  } else {
+    if (entry.size > 60 * 1024 * 1024) throw new Error("This track is too large to draw");
+    const response = await fetch(`/api/raw?path=${enc(entry.path)}`, { credentials: "same-origin" });
+    if (!response.ok) throw new Error("Could not read the track");
+    text = await response.text();
+  }
+  const { lines, points } = parseTrack(entry.name.replace(/\.kmz$/i, ".kml"), text);
+  const all = [...lines.flat(), ...points.map((p) => [p.lat, p.lon])].filter((p) => Number.isFinite(p[0]) && Number.isFinite(p[1]));
+  if (!all.length) throw new Error("This file has no places to show");
+
+  const tiles = h("div", "map-tiles");
+  const svgNs = "http://www.w3.org/2000/svg";
+  const overlay = document.createElementNS(svgNs, "svg");
+  overlay.setAttribute("class", "map-overlay");
+  const zoomIn = h("button", "map-zoom", "+");
+  const zoomOut = h("button", "map-zoom", "−");
+  zoomIn.type = zoomOut.type = "button";
+  const credit = h("div", "map-credit", "© OpenStreetMap contributors");
+  const map = h("div", "map-box", tiles, overlay, h("div", "map-zooms", zoomIn, zoomOut), credit);
+
+  const stats = trackStats(lines);
+  const km = (m) => (m >= 1000 ? `${(m / 1000).toFixed(m >= 100000 ? 0 : 2)} km` : `${Math.round(m)} m`);
+  const facts = [];
+  if (stats.distance) facts.push(["Distance", km(stats.distance)]);
+  if (stats.first != null && stats.last > stats.first) {
+    const seconds = (stats.last - stats.first) / 1000;
+    facts.push(["Time", clock(seconds)]);
+    if (stats.distance) facts.push(["Average speed", `${((stats.distance / seconds) * 3.6).toFixed(1)} km/h`]);
+    facts.push(["Started", new Date(stats.first).toLocaleString()]);
+  }
+  if (Number.isFinite(stats.low) && stats.high > stats.low) {
+    facts.push(["Climb", `${Math.round(stats.climb)} m up, ${Math.round(stats.descent)} m down`]);
+    facts.push(["Elevation", `${Math.round(stats.low)}–${Math.round(stats.high)} m`]);
+  }
+  if (points.length) facts.push(["Places", String(points.length)]);
+  const factList = h("dl", "track-facts", facts.map(([k, v]) => [h("dt", "muted", k), h("dd", "", v)]));
+
+  // The elevation along the way.
+  let chart = null;
+  if (stats.profile.length > 1 && stats.high > stats.low) {
+    chart = document.createElementNS(svgNs, "svg");
+    chart.setAttribute("class", "track-profile");
+    chart.setAttribute("viewBox", "0 0 1000 120");
+    chart.setAttribute("preserveAspectRatio", "none");
+    const total = stats.profile[stats.profile.length - 1][0] || 1;
+    const d = stats.profile.map(([x, e], i) => `${i ? "L" : "M"}${((x / total) * 1000).toFixed(1)},${(115 - ((e - stats.low) / (stats.high - stats.low)) * 105).toFixed(1)}`).join("");
+    const area = document.createElementNS(svgNs, "path");
+    area.setAttribute("d", `${d}L1000,120L0,120Z`);
+    area.setAttribute("class", "track-profile-area");
+    const line = document.createElementNS(svgNs, "path");
+    line.setAttribute("d", d);
+    line.setAttribute("class", "track-profile-line");
+    chart.append(area, line);
+  }
+  body.replaceChildren(h("div", "track-view", map, factList, chart));
+
+  // Fit the whole track in view.
+  const lats = all.map((p) => p[0]);
+  const lons = all.map((p) => p[1]);
+  const box = () => map.getBoundingClientRect();
+  let zoom = 16;
+  let center = [0, 0];
+  const fit = () => {
+    const { width, height } = box();
+    for (zoom = 17; zoom > 1; zoom -= 1) {
+      const [x1, y1] = project(Math.max(...lats), Math.min(...lons), zoom);
+      const [x2, y2] = project(Math.min(...lats), Math.max(...lons), zoom);
+      if (x2 - x1 < width * 0.85 && y2 - y1 < height * 0.85) break;
+    }
+    const [x1, y1] = project(Math.max(...lats), Math.min(...lons), zoom);
+    const [x2, y2] = project(Math.min(...lats), Math.max(...lons), zoom);
+    center = [(x1 + x2) / 2, (y1 + y2) / 2];
+  };
+  const draw = () => {
+    const { width, height } = box();
+    if (!width) return;
+    const left = center[0] - width / 2;
+    const top = center[1] - height / 2;
+    const count = 2 ** zoom;
+    const wanted = new Map();
+    for (let tx = Math.floor(left / TILE); tx <= Math.floor((left + width) / TILE); tx += 1) {
+      for (let ty = Math.floor(top / TILE); ty <= Math.floor((top + height) / TILE); ty += 1) {
+        if (ty < 0 || ty >= count) continue;
+        const wrapped = ((tx % count) + count) % count;
+        wanted.set(`${zoom}/${tx}/${ty}`, { x: tx * TILE - left, y: ty * TILE - top, src: `/api/map/tile/${zoom}/${wrapped}/${ty}.png` });
+      }
+    }
+    for (const img of [...tiles.children]) if (!wanted.has(img.dataset.key)) img.remove();
+    const have = new Set([...tiles.children].map((img) => img.dataset.key));
+    for (const [key, tile] of wanted) {
+      let img = tiles.querySelector(`[data-key="${key}"]`);
+      if (!have.has(key)) {
+        img = h("img", "map-tile");
+        img.alt = "";
+        img.dataset.key = key;
+        img.src = tile.src;
+        img.addEventListener("error", () => img.classList.add("map-tile-missing"), { once: true });
+        tiles.append(img);
+      }
+      img.style.transform = `translate(${tile.x}px, ${tile.y}px)`;
+    }
+    overlay.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    overlay.replaceChildren();
+    for (const line of lines) {
+      const path = document.createElementNS(svgNs, "path");
+      path.setAttribute("class", "map-line");
+      path.setAttribute("d", line.map((p, i) => {
+        const [x, y] = project(p[0], p[1], zoom);
+        return `${i ? "L" : "M"}${(x - left).toFixed(1)},${(y - top).toFixed(1)}`;
+      }).join(""));
+      overlay.append(path);
+    }
+    const dot = (p, cls, label) => {
+      const [x, y] = project(p[0], p[1], zoom);
+      const circle = document.createElementNS(svgNs, "circle");
+      circle.setAttribute("cx", (x - left).toFixed(1));
+      circle.setAttribute("cy", (y - top).toFixed(1));
+      circle.setAttribute("r", "6");
+      circle.setAttribute("class", cls);
+      if (label) {
+        const title = document.createElementNS(svgNs, "title");
+        title.textContent = label;
+        circle.append(title);
+      }
+      overlay.append(circle);
+    };
+    if (lines.length) {
+      dot(lines[0][0], "map-start", "Start");
+      const lastLine = lines[lines.length - 1];
+      dot(lastLine[lastLine.length - 1], "map-end", "End");
+    }
+    for (const p of points) dot([p.lat, p.lon], "map-point", p.name);
+  };
+  const zoomBy = (step, at = null) => {
+    const next = Math.max(1, Math.min(19, zoom + step));
+    if (next === zoom) return;
+    const { width, height, left, top } = box();
+    // Keep the point under the pointer (or the middle) where it is.
+    const anchor = at ? [at[0] - left - width / 2, at[1] - top - height / 2] : [0, 0];
+    const factor = 2 ** (next - zoom);
+    center = [(center[0] + anchor[0]) * factor - anchor[0], (center[1] + anchor[1]) * factor - anchor[1]];
+    zoom = next;
+    draw();
+  };
+  zoomIn.addEventListener("click", () => zoomBy(1));
+  zoomOut.addEventListener("click", () => zoomBy(-1));
+  map.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    zoomBy(event.deltaY < 0 ? 1 : -1, [event.clientX, event.clientY]);
+  }, { passive: false });
+  let drag = null;
+  map.addEventListener("pointerdown", (event) => {
+    if (event.target.closest("button")) return;
+    drag = { x: event.clientX, y: event.clientY, center: [...center] };
+    map.setPointerCapture(event.pointerId);
+  });
+  map.addEventListener("pointermove", (event) => {
+    if (!drag) return;
+    center = [drag.center[0] - (event.clientX - drag.x), drag.center[1] - (event.clientY - drag.y)];
+    draw();
+  });
+  map.addEventListener("pointerup", () => { drag = null; });
+  map.addEventListener("dblclick", (event) => zoomBy(1, [event.clientX, event.clientY]));
+  const resize = new ResizeObserver(() => draw());
+  resize.observe(map);
+  fit();
+  draw();
+  return { destroy() { resize.disconnect(); } };
+}

@@ -19,6 +19,7 @@ mod smart;
 mod ml;
 mod http;
 mod mail;
+mod map_tiles;
 mod pdf_ops;
 mod photo_details;
 mod photo_formats;

@@ -42,7 +42,7 @@ pub fn format(name: &str) -> Option<Format> {
     }
     match lower.rsplit_once('.').map_or("", |(_, ext)| ext) {
         "tar" => Some(Format::Tar),
-        "zip" | "jar" | "cbz" | "epub" | "docx" | "xlsx" | "pptx" | "ppsx" | "odt" | "ods" | "odp" | "pages" | "numbers" | "key" | "apk" => Some(Format::Zip),
+        "zip" | "jar" | "cbz" | "epub" | "docx" | "xlsx" | "pptx" | "ppsx" | "odt" | "ods" | "odp" | "pages" | "numbers" | "key" | "apk" | "kmz" => Some(Format::Zip),
         "7z" | "cb7" => Some(Format::SevenZip),
         "rar" | "cbr" => Some(Format::Rar),
         _ => None,

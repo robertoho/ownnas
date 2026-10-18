@@ -3822,3 +3822,23 @@ a.archive-entry-name:hover { text-decoration: underline; }
 .preview-body > .doc-picture-view, .preview-body > .audio-view, .preview-body > .mail-view {
   flex: 1 1 auto; min-height: 0; overflow: auto; align-content: start; padding-right: 0.2rem;
 }
+
+.track-view { display: flex; flex-direction: column; gap: 0.7rem; flex: 1 1 auto; min-height: 0; overflow: auto; }
+.map-box { position: relative; flex: 1 0 auto; height: min(56vh, 30rem); min-height: 16rem; overflow: hidden; border-radius: 12px; border: 1px solid var(--line); background: #dfe6e2; touch-action: none; cursor: grab; }
+.map-box:active { cursor: grabbing; }
+.map-tiles { position: absolute; inset: 0; }
+.preview-body .map-tile { position: absolute; left: 0; top: 0; width: 256px; height: 256px; max-height: none; max-width: none; flex: none; border-radius: 0; background: none; object-fit: fill; user-select: none; pointer-events: none; }
+.map-tile-missing { visibility: hidden; }
+.map-overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.map-line { fill: none; stroke: #e5482f; stroke-width: 4; stroke-linejoin: round; stroke-linecap: round; }
+.map-start { fill: #2f9e44; stroke: #fff; stroke-width: 2; }
+.map-end { fill: #e5482f; stroke: #fff; stroke-width: 2; }
+.map-point { fill: #1c7ed6; stroke: #fff; stroke-width: 2; pointer-events: auto; }
+.map-zooms { position: absolute; top: 0.5rem; right: 0.5rem; display: grid; gap: 0.25rem; }
+.map-zoom { min-height: 0; width: 2rem; height: 2rem; padding: 0; font-size: 1.1rem; line-height: 1; }
+.map-credit { position: absolute; right: 0; bottom: 0; padding: 0.1rem 0.4rem; font-size: 0.7rem; color: #333; background: rgba(255, 255, 255, 0.75); border-top-left-radius: 6px; }
+.track-facts { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 0.9rem; margin: 0; font-size: 0.9rem; }
+.track-facts dd { margin: 0; }
+.track-profile { width: 100%; height: 90px; flex: none; }
+.track-profile-area { fill: color-mix(in srgb, var(--accent) 22%, transparent); }
+.track-profile-line { fill: none; stroke: var(--accent); stroke-width: 2; vector-effect: non-scaling-stroke; }
