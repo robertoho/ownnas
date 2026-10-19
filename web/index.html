@@ -702,8 +702,20 @@
   <dialog id="duplicates-dialog">
     <h3>Duplicate files</h3>
     <p id="duplicates-status" class="muted">Scanning this folder and subfolders for same-size, same-hash files…</p>
+    <div id="duplicates-bar" class="duplicates-bar" hidden>
+      <label>Keep
+        <select id="duplicates-keep">
+          <option value="oldest">the oldest copy</option>
+          <option value="newest">the newest copy</option>
+          <option value="shortest">the copy nearest the top</option>
+          <option value="name">the first by name</option>
+        </select>
+      </label>
+      <span class="muted">and move the others to the Trash. Untick a copy to keep it too.</span>
+    </div>
     <div id="duplicates-results" class="duplicates-results"></div>
-    <form method="dialog">
+    <form method="dialog" class="duplicates-actions">
+      <button id="duplicates-trash" type="button" class="danger" hidden></button>
       <button value="cancel" type="submit">Close</button>
     </form>
   </dialog>

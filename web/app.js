@@ -6528,16 +6528,21 @@ $("versions-list").addEventListener("click", async (event) => {
   }
 });
 
+let duplicateGroups = [];
+
 async function openDuplicatesFinder() {
   const dialog = $("duplicates-dialog");
   $("duplicates-status").textContent = "Scanning this folder and subfolders…";
   $("duplicates-results").innerHTML = "";
+  $("duplicates-bar").hidden = true;
+  $("duplicates-trash").hidden = true;
+  duplicateGroups = [];
   dialog.showModal();
   const id = `dupes-${++jobState.seq}`;
   const controller = new AbortController();
   upsertJob(id, {
     title: "Duplicate scan",
-    detail: "Comparing sizes and hashes…",
+    detail: "Comparing sizes and contents…",
     percent: null,
     cancelable: true,
     onCancel: () => controller.abort(),
@@ -6546,23 +6551,17 @@ async function openDuplicatesFinder() {
     const data = await api(`/api/duplicates?path=${encodeURIComponent(state.path)}`, {
       signal: controller.signal,
     });
-    const groups = data.groups || [];
     removeJob(id);
-    if (!groups.length) {
+    duplicateGroups = data.groups || [];
+    if (!duplicateGroups.length) {
       $("duplicates-status").textContent = "No duplicates found under this folder.";
       return;
     }
-    $("duplicates-status").textContent = `${groups.length} duplicate group${groups.length === 1 ? "" : "s"} (same size + SHA-256).`;
-    $("duplicates-results").innerHTML = groups.map((group, groupIndex) => {
-      const paths = group.paths || [];
-      return `<section class="dup-group" data-group="${groupIndex}">
-        <div class="dup-group-meta">${formatSize(group.size || 0, false)} · ${esc((group.sha256 || "").slice(0, 12))}… · ${paths.length} copies</div>
-        <ul>${paths.map((path) => `<li>
-          <button type="button" data-dup-open="${esc(path)}">${esc(path)}</button>
-          <button type="button" class="danger" data-dup-trash="${esc(path)}">Trash</button>
-        </li>`).join("")}</ul>
-      </section>`;
-    }).join("");
+    const copies = duplicateGroups.reduce((sum, group) => sum + group.copies.length - 1, 0);
+    const more = data.truncated ? (data.indexed ? " Only the biggest are listed: remove these and look again for more." : " The search index is still being built, so only part of the folder was compared.") : "";
+    $("duplicates-status").textContent = `${duplicateGroups.length.toLocaleString()} file${duplicateGroups.length === 1 ? "" : "s"} with ${copies.toLocaleString()} extra cop${copies === 1 ? "y" : "ies"}, taking ${formatSize(data.wasted || 0, false)} (same contents, compared byte for byte by SHA-256).${more}`;
+    $("duplicates-bar").hidden = !(state.me && !state.me.readonly);
+    renderDuplicates();
   } catch (err) {
     removeJob(id);
     if (isCancelError(err)) {
@@ -6575,31 +6574,109 @@ async function openDuplicatesFinder() {
   }
 }
 
-$("duplicates-results").addEventListener("click", async (event) => {
-  const openBtn = event.target.closest("[data-dup-open]");
-  const trashBtn = event.target.closest("[data-dup-trash]");
-  if (openBtn) {
-    const path = openBtn.dataset.dupOpen;
-    const parent = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
-    $("duplicates-dialog").close();
-    try {
-      if (state.path !== parent) await go(parent);
-      const entry = findEntry(path);
-      if (entry) await openEntry(entry);
-      else await openEntry({ path, name: path.split("/").pop(), dir: false, size: 0, modified: 0, kind: "file" });
-    } catch (err) {
-      toast(err.message, true);
+/// Which copy a rule keeps.
+function keptCopy(copies, rule) {
+  const depth = (path) => path.split("/").length;
+  const sorted = [...copies].sort((a, b) => {
+    if (rule === "oldest") return a.modified - b.modified || a.path.localeCompare(b.path);
+    if (rule === "newest") return b.modified - a.modified || a.path.localeCompare(b.path);
+    if (rule === "shortest") return depth(a.path) - depth(b.path) || a.path.length - b.path.length || a.path.localeCompare(b.path);
+    return a.path.localeCompare(b.path);
+  });
+  return sorted[0].path;
+}
+
+function renderDuplicates() {
+  const write = state.me && !state.me.readonly;
+  const rule = $("duplicates-keep").value;
+  $("duplicates-results").innerHTML = duplicateGroups.map((group, groupIndex) => {
+    const keep = keptCopy(group.copies, rule);
+    return `<section class="dup-group" data-group="${groupIndex}">
+      <div class="dup-group-meta">${formatSize(group.size || 0, false)} · ${group.copies.length} copies · ${esc((group.sha256 || "").slice(0, 12))}…</div>
+      <ul>${group.copies.map((copy) => `<li>
+        ${write ? `<input type="checkbox" class="dup-remove" data-dup-path="${esc(copy.path)}" aria-label="Move to the Trash" ${copy.path === keep ? "" : "checked"}>` : ""}
+        <button type="button" class="dup-path" data-dup-open="${esc(copy.path)}">${esc(copy.path)}</button>
+        <span class="muted dup-date">${esc(formatDateShort(copy.modified))}</span>
+        <span class="dup-fate"></span>
+      </li>`).join("")}</ul>
+    </section>`;
+  }).join("");
+  syncDuplicateChoices();
+}
+
+/// Labels each copy kept or going, never letting a group lose every copy, and sums it up.
+function syncDuplicateChoices(changed) {
+  let count = 0;
+  let bytes = 0;
+  for (const section of $("duplicates-results").querySelectorAll(".dup-group")) {
+    const group = duplicateGroups[Number(section.dataset.group)];
+    const boxes = [...section.querySelectorAll(".dup-remove")];
+    if (boxes.length && boxes.every((box) => box.checked)) {
+      // Every copy ticked: the one just ticked (or the first) stays.
+      const keep = boxes.includes(changed) ? changed : boxes[0];
+      keep.checked = false;
+      if (changed) toast("At least one copy is always kept", true);
     }
+    for (const box of boxes) {
+      const fate = box.closest("li").querySelector(".dup-fate");
+      fate.textContent = box.checked ? "to the Trash" : "keep";
+      fate.className = `dup-fate ${box.checked ? "dup-going" : "dup-kept"}`;
+      if (box.checked) {
+        count += 1;
+        bytes += group.size;
+      }
+    }
+  }
+  const button = $("duplicates-trash");
+  button.hidden = !count;
+  button.textContent = `Move ${count.toLocaleString()} cop${count === 1 ? "y" : "ies"} to the Trash (${formatSize(bytes, false)})`;
+}
+
+$("duplicates-keep").addEventListener("change", () => renderDuplicates());
+
+$("duplicates-trash").addEventListener("click", async () => {
+  const groups = [];
+  for (const section of $("duplicates-results").querySelectorAll(".dup-group")) {
+    const group = duplicateGroups[Number(section.dataset.group)];
+    const boxes = [...section.querySelectorAll(".dup-remove")];
+    const remove = boxes.filter((box) => box.checked).map((box) => box.dataset.dupPath);
+    const keep = boxes.filter((box) => !box.checked).map((box) => box.dataset.dupPath);
+    if (remove.length && keep.length) groups.push({ sha256: group.sha256, keep, remove });
+  }
+  const count = groups.reduce((sum, group) => sum + group.remove.length, 0);
+  if (!count) return;
+  $("duplicates-dialog").close();
+  if (!await askConfirm(`Move ${count.toLocaleString()} duplicate cop${count === 1 ? "y" : "ies"} to the Trash? One copy of each file is kept, and each one is checked again before it goes.`, "Move to Trash")) {
+    $("duplicates-dialog").showModal();
     return;
   }
-  if (!trashBtn) return;
-  const path = trashBtn.dataset.dupTrash;
-  const name = path.split("/").pop();
   try {
-    await deleteEntries([{ path, name, dir: false }]);
-    const li = trashBtn.closest("li");
-    if (li) li.remove();
-    toast("Moved to Trash");
+    const result = await api("/api/duplicates/trash", { method: "POST", json: { groups } });
+    const skipped = result.skipped || [];
+    toast(`Moved ${result.trashed.toLocaleString()} cop${result.trashed === 1 ? "y" : "ies"} to the Trash, freeing ${formatSize(result.freed || 0, false)}${skipped.length ? `; ${skipped.length} left where they were (changed since)` : ""}`);
+    invalidateFolderSizes();
+    await load(state.path);
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+$("duplicates-results").addEventListener("change", (event) => {
+  const box = event.target.closest(".dup-remove");
+  if (box) syncDuplicateChoices(box);
+});
+
+$("duplicates-results").addEventListener("click", async (event) => {
+  const openBtn = event.target.closest("[data-dup-open]");
+  if (!openBtn) return;
+  const path = openBtn.dataset.dupOpen;
+  const parent = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+  $("duplicates-dialog").close();
+  try {
+    if (state.path !== parent) await go(parent);
+    const entry = findEntry(path);
+    if (entry) await openEntry(entry);
+    else await openEntry({ path, name: path.split("/").pop(), dir: false, size: 0, modified: 0, kind: "file" });
   } catch (err) {
     toast(err.message, true);
   }

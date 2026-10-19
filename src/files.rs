@@ -52,7 +52,7 @@ impl CancelFlag {
         self.0.load(Ordering::Relaxed)
     }
 
-    fn check(&self) -> Result<(), FileError> {
+    pub(crate) fn check(&self) -> Result<(), FileError> {
         if self.is_cancelled() {
             Err(FileError::Cancelled)
         } else {

@@ -362,6 +362,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/index", get(index_status))
         .route("/api/helpers", get(helper_programs))
         .route("/api/versions", get(list_versions))
+        .route("/api/duplicates/trash", post(trash_duplicates))
         .route("/api/versions/file", get(version_file))
         .route("/api/versions/restore", post(restore_version))
         .route("/api/versions/delete", post(delete_version))
@@ -4155,11 +4156,100 @@ async fn find_duplicates(
     let path = rel_of(&query.path);
     let cancel = files::CancelFlag::new();
     let _guard = CancelOnDrop(cancel.clone());
-    let groups = tokio::task::spawn_blocking(move || files::find_duplicates(&root, &path, &cancel))
-        .await
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not scan for duplicates"))?
-        .map_err(ApiError::from)?;
-    Ok(Json(json!({ "groups": groups })))
+    let indexed = state.file_index.ready() && !crate::file_index::inside_package(&path);
+    let conn = own_connection(&state)?;
+    let report = tokio::task::spawn_blocking(move || {
+        if indexed {
+            return crate::duplicates::find(&conn, &root, &path, &cancel);
+        }
+        // Until the search index is ready: walk the folder, as far as it goes.
+        let groups = files::find_duplicates(&root, &path, &cancel)?;
+        let modified = |rel: &str| {
+            std::fs::metadata(root.join(rel)).ok().and_then(|meta| meta.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs() as i64)
+        };
+        let groups: Vec<crate::duplicates::Group> = groups
+            .into_iter()
+            .map(|group| crate::duplicates::Group {
+                size: group.size,
+                sha256: group.sha256,
+                copies: group.paths.iter().map(|path| crate::duplicates::Copy { path: path.clone(), modified: modified(path) }).collect(),
+            })
+            .collect();
+        let wasted = groups.iter().map(|group| group.size * (group.copies.len() as u64 - 1)).sum();
+        Ok(crate::duplicates::Report { compared: 0, wasted, truncated: true, groups })
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not scan for duplicates"))?
+    .map_err(ApiError::from)?;
+    Ok(Json(json!({ "groups": report.groups, "compared": report.compared, "wasted": report.wasted, "truncated": report.truncated, "indexed": indexed })))
+}
+
+#[derive(Deserialize)]
+struct DuplicateChoice {
+    sha256: String,
+    keep: Vec<String>,
+    remove: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct TrashDuplicatesBody {
+    groups: Vec<DuplicateChoice>,
+}
+
+/// Moves extra copies to the Trash. Each one is checked first: it must still have the group's
+/// contents, and so must at least one copy being kept.
+async fn trash_duplicates(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<TrashDuplicatesBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let conn = own_connection(&state)?;
+    let worker = state.clone();
+    let (trashed, freed, skipped) = tokio::task::spawn_blocking(move || {
+        let state = worker;
+        let cancel = files::CancelFlag::new();
+        let same = |rel: &str, sha256: &str| -> bool {
+            let Ok(found) = files::resolve(&state.root, rel) else { return false };
+            let Ok(meta) = std::fs::metadata(&found.full) else { return false };
+            meta.is_file() && crate::duplicates::sha256(&conn, &found.rel, &found.full, &meta, &cancel).ok().flatten().as_deref() == Some(sha256)
+        };
+        let (mut trashed, mut freed, mut skipped) = (0u64, 0u64, Vec::new());
+        for group in body.groups {
+            if !group.keep.iter().any(|rel| !group.remove.contains(rel) && same(rel, &group.sha256)) {
+                skipped.extend(group.remove.into_iter().map(|path| json!({ "path": path, "reason": "No copy of it would be left" })));
+                continue;
+            }
+            for rel in group.remove {
+                if group.keep.contains(&rel) || files::is_under_trash(&rel) {
+                    continue;
+                }
+                if !same(&rel, &group.sha256) {
+                    skipped.push(json!({ "path": rel, "reason": "It changed since it was compared" }));
+                    continue;
+                }
+                let size = std::fs::metadata(state.root.join(&rel)).map(|meta| meta.len()).unwrap_or(0);
+                match files::trash_or_delete(&state.root, &rel) {
+                    Ok((_, Some(to))) => {
+                        rewrite_meta(&state, &rel, &to);
+                        trashed += 1;
+                        freed += size;
+                    }
+                    Ok((_, None)) => delete_meta(&state, &rel),
+                    Err(_) => skipped.push(json!({ "path": rel, "reason": "Could not move it to the Trash" })),
+                }
+            }
+        }
+        (trashed, freed, skipped)
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not remove the duplicates"))?;
+    invalidate_sizes(&state, "");
+    state.file_index.changed();
+    record(&state, &user, "trash-duplicates", &format!("{trashed} copies"));
+    Ok(Json(json!({ "trashed": trashed, "freed": freed, "skipped": skipped })))
 }
 
 async fn rename(

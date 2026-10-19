@@ -2170,6 +2170,14 @@ td, th { border: 1px solid var(--line); padding: 0.3rem 0.45rem; text-align: lef
   gap: 0.4rem;
 }
 .dup-group-meta { font-size: 0.82rem; color: var(--muted); }
+.duplicates-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem 0.75rem; margin: 0 0 0.6rem; font-size: 0.9rem; }
+.duplicates-bar label { display: flex; align-items: center; gap: 0.4rem; }
+.duplicates-actions { display: flex; gap: 0.5rem; justify-content: flex-end; flex-wrap: wrap; }
+.dup-group li .dup-path { flex: 1; min-width: 0; text-align: left; overflow-wrap: anywhere; }
+.dup-date { font-size: 0.8rem; white-space: nowrap; }
+.dup-fate { font-size: 0.78rem; font-weight: 600; white-space: nowrap; min-width: 5.5rem; text-align: right; }
+.dup-going { color: var(--danger); }
+.dup-kept { color: var(--accent); }
 .dup-group ul {
   list-style: none;
   margin: 0;
