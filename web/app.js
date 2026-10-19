@@ -939,6 +939,7 @@ const MENU_ICONS = {
   bookmark: "M4 2.5h8v11l-4-2.5-4 2.5z",
   usage: `${ICON_FOLDER} M4.5 9.25h7v2.5h-7z M4.75 10.5h3.75`,
   reindex: `${ICON_FOLDER} M10.5 9.5a2.25 2.25 0 1 1-.66-1.6 M10.5 7.25v1.5H9`,
+  versions: "M2.75 8a5.25 5.25 0 1 0 1.54-3.71 M2.5 2.75v2h2 M8 5v3.25l2 1.25",
   duplicates: "M2.5 3.5h6v6h-6z M7.5 6.5h6v6h-6z",
   activity: "M8 2.5a5.5 5.5 0 1 1 0 11a5.5 5.5 0 1 1 0-11z M8 5v3.25L10.25 10",
   toggleHidden: "M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8s-2.5 4.5-6.5 4.5S1.5 8 1.5 8z M8 6a2 2 0 1 1 0 4a2 2 0 1 1 0-4z",
@@ -1257,6 +1258,7 @@ function openSelectionMenu(x, y, pasteInto) {
       buttons.push(`<button type="button" data-menu="terminal">Open terminal here</button>`);
     }
     if (one && one.dir) buttons.push(`<button type="button" data-menu="reindex">Reindex</button>`);
+    if (one && !one.dir) buttons.push(`<button type="button" data-menu="versions">Versions…</button>`);
     if (write && entries.every(customizableFolder)) buttons.push(`<button type="button" data-menu="folderAppearance">${entries.length === 1 ? 'Customize folder…' : 'Customize folders…'}</button>`);
     if (entries.length) buttons.push(`<button type="button" data-menu="download">Download</button>`);
     if (write && allInTrash) buttons.push(`<button type="button" data-menu="restore">Restore</button>`);
@@ -5016,6 +5018,7 @@ function runMenuAction(button, entries, pasteInto) {
   if (action === "usage") $("usage-btn").click();
   if (action === "reindex") reindexFolder(one && one.dir ? one.path : state.path).catch((err) => toast(err.message, true));
   if (action === "duplicates") openDuplicatesFinder().catch((err) => toast(err.message, true));
+  if (action === "versions" && one) openVersions(one.path).catch((err) => toast(err.message, true));
   if (action === "activity") $("activity-btn").click();
   if (action === "bulkTag") bulkTagEntries(entries).catch((err) => toast(err.message, true));
   if (action === "emptyTrash") $("empty-trash-btn").click();
@@ -6435,6 +6438,95 @@ async function renameEntries(entries) {
   invalidateFolderSizes();
   await load(state.path);
 }
+
+// ---- Earlier versions of a file (kept when OwnNAS saves over it) ----
+
+const VERSION_REASONS = { edit: "Before an edit", upload: "Before an upload replaced it", sync: "Before a sync replaced it", restore: "Before a version was restored" };
+let versionsPath = "";
+
+async function openVersions(path) {
+  versionsPath = path;
+  $("versions-title").textContent = `Versions of “${path.split("/").pop()}”`;
+  $("versions-status").textContent = "Loading…";
+  $("versions-list").replaceChildren();
+  $("versions-note").textContent = "";
+  if (!$("versions-dialog").open) $("versions-dialog").showModal();
+  const data = await api(`/api/versions?path=${encodeURIComponent(path)}`);
+  const write = state.me && !state.me.readonly;
+  const versions = data.versions || [];
+  $("versions-status").textContent = versions.length
+    ? `${versions.length} earlier version${versions.length === 1 ? "" : "s"}, newest first.`
+    : "No earlier versions yet. One is kept each time OwnNAS saves over this file: an editor saving it, or an upload or a sync replacing it.";
+  $("versions-list").replaceChildren(...versions.map((version) => {
+    const item = document.createElement("li");
+    item.className = "version";
+    const info = document.createElement("div");
+    info.className = "version-info";
+    const when = document.createElement("strong");
+    when.textContent = formatDate(version.savedAt);
+    const detail = document.createElement("span");
+    detail.className = "muted";
+    detail.textContent = `${VERSION_REASONS[version.reason] || "Before a change"}${version.by ? ` by ${version.by}` : ""} · ${formatSize(version.size, false)} · last changed ${formatDate(version.modified)}`;
+    info.append(when, detail);
+    const actions = document.createElement("div");
+    actions.className = "version-actions";
+    const link = (label, download) => {
+      const anchor = document.createElement("a");
+      anchor.className = "button";
+      anchor.textContent = label;
+      anchor.href = `/api/versions/file?id=${version.id}${download ? "&download=1" : ""}`;
+      if (!download) anchor.target = "_blank";
+      anchor.rel = "noopener";
+      return anchor;
+    };
+    actions.append(link("Open", false), link("Download", true));
+    if (write) {
+      const restore = document.createElement("button");
+      restore.type = "button";
+      restore.textContent = "Restore";
+      restore.dataset.versionRestore = version.id;
+      restore.dataset.versionWhen = formatDate(version.savedAt);
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "danger";
+      remove.textContent = "Delete";
+      remove.dataset.versionDelete = version.id;
+      actions.append(restore, remove);
+    }
+    item.append(info, actions);
+    return item;
+  }));
+  const limits = data.limits || {};
+  const total = data.total || {};
+  $("versions-note").textContent = `Each file keeps up to ${limits.perFile} versions for ${limits.days} days; files over ${formatSize(limits.maxFile, false)} are not versioned. All versions together take ${formatSize(total.bytes || 0, false)} of the ${formatSize(limits.maxTotal, false)} allowed (the oldest go first). They are kept in OwnNAS's data folder, not in the library.`;
+}
+
+$("versions-list").addEventListener("click", async (event) => {
+  const restore = event.target.closest("[data-version-restore]");
+  const remove = event.target.closest("[data-version-delete]");
+  try {
+    if (restore) {
+      $("versions-dialog").close();
+      const ok = await askConfirm(`Put back the version from ${restore.dataset.versionWhen}? The file as it is now is kept as a version too.`, "Restore");
+      if (ok) {
+        await api("/api/versions/restore", { method: "POST", json: { id: Number(restore.dataset.versionRestore) } });
+        toast("Version restored");
+        await load(state.path, { keepPreview: true });
+      }
+      await openVersions(versionsPath);
+    } else if (remove) {
+      $("versions-dialog").close();
+      const ok = await askConfirm("Delete this version for good? The file itself is not changed.", "Delete");
+      if (ok) {
+        await api("/api/versions/delete", { method: "POST", json: { id: Number(remove.dataset.versionDelete) } });
+        toast("Version deleted");
+      }
+      await openVersions(versionsPath);
+    }
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
 
 async function openDuplicatesFinder() {
   const dialog = $("duplicates-dialog");

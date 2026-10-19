@@ -3047,6 +3047,7 @@ pub fn sync_commit_write(
     temp: &Path,
     base: SyncBase,
     mtime: Option<i64>,
+    keep: &dyn Fn(&Path),
 ) -> Result<SyncOutcome<SyncEntry>, FileError> {
     let _guard = SYNC_COMMIT.lock().unwrap_or_else(|err| err.into_inner());
     let current = sync_current(dest, rel);
@@ -3059,6 +3060,9 @@ pub fn sync_commit_write(
         if let Ok(file) = fs::OpenOptions::new().write(true).open(temp) {
             let _ = file.set_modified(time);
         }
+    }
+    if dest.is_file() {
+        keep(dest);
     }
     if let Err(err) = fs::rename(temp, dest) {
         let _ = fs::remove_file(temp);

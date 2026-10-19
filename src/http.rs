@@ -104,6 +104,8 @@ pub struct AppState {
     pub file_index: std::sync::Arc<crate::file_index::FileIndex>,
     /// The words inside files, for search.
     pub text_index: std::sync::Arc<crate::text_index::TextIndex>,
+    /// Copies of files from before OwnNAS saved over them (`versions.rs`).
+    pub versions: PathBuf,
     /// How full the disk is, and how much the library and OwnNAS's data take.
     pub storage: std::sync::Arc<crate::storage::Storage>,
     /// The Gallery's machine-learning models (downloaded when switched on).
@@ -190,6 +192,7 @@ pub fn new_state(
         media: std::sync::Arc::default(),
         file_index: std::sync::Arc::default(),
         text_index: std::sync::Arc::default(),
+        versions: crate::versions::store_dir(&data_dir),
         storage: {
             let storage = std::sync::Arc::new(crate::storage::Storage::default());
             storage.load(&db_path);
@@ -358,6 +361,10 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/storage/measure", post(measure_storage))
         .route("/api/index", get(index_status))
         .route("/api/helpers", get(helper_programs))
+        .route("/api/versions", get(list_versions))
+        .route("/api/versions/file", get(version_file))
+        .route("/api/versions/restore", post(restore_version))
+        .route("/api/versions/delete", post(delete_version))
         .route("/api/index/reindex", post(reindex))
         .route("/api/videos/convert", post(convert_video))
         .route("/api/videos/job", get(video_job).delete(cancel_video_job))
@@ -2866,12 +2873,17 @@ async fn raw(
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".to_string());
-    let meta = tokio::fs::metadata(&resolved.full)
+    send_file(&headers, &resolved.full, &name, download).await
+}
+
+/// Sends the file at `full` as `name` (whose extension picks its type), answering ranges.
+async fn send_file(headers: &HeaderMap, full: &std::path::Path, name: &str, download: bool) -> Result<Response, ApiError> {
+    let meta = tokio::fs::metadata(full)
         .await
         .map_err(|_| ApiError::from(FileError::NotFound))?;
     let total = meta.len();
-    let mime = raw_media_type(&resolved.full, &name);
-    let sandbox = files::active_content(&name);
+    let mime = raw_media_type(std::path::Path::new(name), name);
+    let sandbox = files::active_content(name);
     let range_header = headers
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok())
@@ -2887,7 +2899,7 @@ async fn raw(
                 .into_response());
         }
     };
-    let mut file = tokio::fs::File::open(&resolved.full)
+    let mut file = tokio::fs::File::open(full)
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not open the file"))?;
     let (status, start, len) = if let Some(span) = span {
@@ -2907,7 +2919,7 @@ async fn raw(
         .header(header::ACCEPT_RANGES, "bytes")
         .header(
             header::CONTENT_DISPOSITION,
-            files::content_disposition(&name, download || mime == "application/octet-stream"),
+            files::content_disposition(name, download || mime == "application/octet-stream"),
         )
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(header::CACHE_CONTROL, "private, max-age=60");
@@ -3787,6 +3799,25 @@ async fn create_entry(
     Ok(Json(json!({ "ok": true, "path": created })))
 }
 
+/// Keeps a file as a version before it is saved over: give it the file's full path (blocking).
+fn keeper(state: &AppState, user: &User, reason: &'static str) -> impl Fn(&std::path::Path) + Send + 'static {
+    let (db_path, store, by) = (state.db_path.clone(), state.versions.clone(), user.username.clone());
+    let root = state.root.canonicalize().unwrap_or_else(|_| state.root.clone());
+    move |full: &std::path::Path| {
+        let Some(rel) = full.strip_prefix(&root).ok().map(|rel| rel.to_string_lossy().replace('\\', "/")) else { return };
+        let Ok(conn) = rusqlite::Connection::open(&db_path) else { return };
+        let _ = conn.busy_timeout(Duration::from_secs(10));
+        crate::versions::keep(&conn, &store, full, &rel, &by, reason);
+    }
+}
+
+/// `keeper` for a library path.
+fn keep_at(root: &std::path::Path, rel: &str, keep: &dyn Fn(&std::path::Path)) {
+    if let Ok(found) = files::resolve(root, rel) {
+        keep(&found.full);
+    }
+}
+
 async fn write_entry(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
@@ -3798,7 +3829,11 @@ async fn write_entry(
     let root = state.root.clone();
     let path = body.path.clone();
     let content = body.content;
-    tokio::task::spawn_blocking(move || files::write_text_file(&root, &path, &content))
+    let keep = keeper(&state, &user, "edit");
+    tokio::task::spawn_blocking(move || {
+        keep_at(&root, &path, &keep);
+        files::write_text_file(&root, &path, &content)
+    })
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not save the file"))?
         .map_err(ApiError::from)?;
@@ -3826,7 +3861,11 @@ async fn write_docx_entry(
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Invalid document data"))?;
     let root = state.root.clone();
     let path = body.path.clone();
-    let hash = tokio::task::spawn_blocking(move || files::write_docx_bytes(&root, &path, &bytes, &body.expected_hash))
+    let keep = keeper(&state, &user, "edit");
+    let hash = tokio::task::spawn_blocking(move || {
+        keep_at(&root, &path, &keep);
+        files::write_docx_bytes(&root, &path, &bytes, &body.expected_hash)
+    })
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not save document"))?
         .map_err(ApiError::from)?;
@@ -3855,7 +3894,11 @@ async fn write_odt_entry(
     let root = state.root.clone();
     let path = body.path.clone();
     let expected_hash = body.expected_hash.clone();
-    let hash = tokio::task::spawn_blocking(move || files::write_odt_bytes(&root, &path, &bytes, &expected_hash))
+    let keep = keeper(&state, &user, "edit");
+    let hash = tokio::task::spawn_blocking(move || {
+        keep_at(&root, &path, &keep);
+        files::write_odt_bytes(&root, &path, &bytes, &expected_hash)
+    })
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not save document"))?
         .map_err(ApiError::from)?;
@@ -3884,7 +3927,11 @@ async fn write_xlsx_entry(
     let root = state.root.clone();
     let path = body.path.clone();
     let expected_hash = body.expected_hash.clone();
-    let hash = tokio::task::spawn_blocking(move || files::write_xlsx_bytes(&root, &path, &bytes, &expected_hash))
+    let keep = keeper(&state, &user, "edit");
+    let hash = tokio::task::spawn_blocking(move || {
+        keep_at(&root, &path, &keep);
+        files::write_xlsx_bytes(&root, &path, &bytes, &expected_hash)
+    })
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not save spreadsheet"))?
         .map_err(ApiError::from)?;
@@ -3910,7 +3957,11 @@ async fn write_image_entry(
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Image data is not valid base64"))?;
     let root = state.root.clone();
     let path = body.path.clone();
-    tokio::task::spawn_blocking(move || files::write_image_bytes(&root, &path, &bytes))
+    let keep = keeper(&state, &user, "edit");
+    tokio::task::spawn_blocking(move || {
+        keep_at(&root, &path, &keep);
+        files::write_image_bytes(&root, &path, &bytes)
+    })
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not save the image"))?
         .map_err(ApiError::from)?;
@@ -4319,6 +4370,12 @@ async fn upload(
             files::PreparedUpload::Write(dest) => (dest, None),
             files::PreparedUpload::StoreInArchive { path, original_name } => (path, Some(original_name)),
         };
+        if archived_as.is_none() && dest.is_file() {
+            // Uploaded over a file: keep what was there.
+            let keep = keeper(&state, &user, "upload");
+            let replaced = dest.clone();
+            let _ = tokio::task::spawn_blocking(move || keep(&replaced)).await;
+        }
         let mut out = tokio::fs::File::create(&dest).await.map_err(|_| {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload")
         })?;
@@ -4473,7 +4530,8 @@ async fn sync_upload(
     }
     let mtime = query.mtime;
     let committed_rel = rel.clone();
-    let outcome = tokio::task::spawn_blocking(move || files::sync_commit_write(&committed_rel, &dest, &temp, base, mtime))
+    let keep = keeper(&state, &user, "sync");
+    let outcome = tokio::task::spawn_blocking(move || files::sync_commit_write(&committed_rel, &dest, &temp, base, mtime, &keep))
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload"))?
         .map_err(ApiError::from)?;
@@ -5877,6 +5935,121 @@ fn storage_json(state: &AppState, disk: Option<crate::storage::Disk>) -> serde_j
 }
 
 /// The search index: how much it holds and what it is doing, and the indexing speed.
+/// A connection for work that may take a while, so it does not hold up the shared one.
+fn own_connection(state: &AppState) -> Result<rusqlite::Connection, ApiError> {
+    let conn = rusqlite::Connection::open(&state.db_path)
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not open the database"))?;
+    let _ = conn.busy_timeout(Duration::from_secs(10));
+    Ok(conn)
+}
+
+/// The earlier versions of a file, newest first, with how much room all versions take.
+async fn list_versions(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let rel = rel_of(&query.path);
+    // A deleted file's versions are still listed under where it was.
+    let rel = files::resolve(&state.root, &rel).map(|found| found.rel).unwrap_or(rel);
+    let conn = own_connection(&state)?;
+    let versions = crate::versions::list(&conn, &rel).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let (count, bytes) = crate::versions::totals(&conn);
+    Ok(Json(json!({
+        "versions": versions,
+        "total": { "count": count, "bytes": bytes },
+        "limits": { "perFile": crate::versions::KEEP_PER_FILE, "days": crate::versions::KEEP_DAYS, "maxFile": crate::versions::MAX_FILE, "maxTotal": crate::versions::MAX_TOTAL },
+    })))
+}
+
+#[derive(Deserialize)]
+struct VersionQuery {
+    id: i64,
+    download: Option<String>,
+}
+
+/// One earlier version's contents, to look at or download.
+async fn version_file(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<VersionQuery>,
+) -> Result<Response, ApiError> {
+    require_user(&state, &headers)?;
+    let version = crate::versions::get(&own_connection(&state)?, query.id).ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That version is gone"))?;
+    let name = version.path.rsplit('/').next().unwrap_or("file").to_string();
+    let download = flag(&query.download);
+    let name = if download {
+        // "report (version of 2026-10-19 12.30).docx"
+        let stamp = chrono_stamp(version.saved_at);
+        match name.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() => format!("{stem} (version of {stamp}).{ext}"),
+            _ => format!("{name} (version of {stamp})"),
+        }
+    } else {
+        name
+    };
+    send_file(&headers, &crate::versions::file(&state.versions, version.id), &name, download).await
+}
+
+/// "2026-10-19 12.30 UTC" for a time in seconds.
+fn chrono_stamp(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let (hour, minute) = (secs.rem_euclid(86_400) / 3600, secs.rem_euclid(3600) / 60);
+    // Days since 1970 to a date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}.{minute:02} UTC")
+}
+
+#[derive(Deserialize)]
+struct VersionBody {
+    id: i64,
+}
+
+/// Puts an earlier version back (what it replaces becomes a version too).
+async fn restore_version(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<VersionBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let conn = own_connection(&state)?;
+    let (store, root, by) = (state.versions.clone(), state.root.clone(), user.username.clone());
+    let version = tokio::task::spawn_blocking(move || crate::versions::restore(&conn, &store, &root, body.id, &by))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not restore the version"))?
+        .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    invalidate_sizes(&state, &parent_rel_path(&version.path));
+    state.file_index.changed();
+    record(&state, &user, "restore-version", &version.path);
+    Ok(Json(json!({ "ok": true, "path": version.path })))
+}
+
+async fn delete_version(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<VersionBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let conn = own_connection(&state)?;
+    let version = crate::versions::get(&conn, body.id).ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That version is gone"))?;
+    crate::versions::delete(&conn, &state.versions, body.id).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    record(&state, &user, "delete-version", &version.path);
+    Ok(Json(json!({ "ok": true })))
+}
+
 /// The outside programs OwnNAS can use, checked now. One installed after OwnNAS started is only
 /// used after a restart.
 async fn helper_programs(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {

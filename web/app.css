@@ -3614,6 +3614,13 @@ body.is-gallery .app > .explorer-status-bar { display: none; }
 .index-speed-option > span { display: grid; gap: 0.2rem; }
 .index-speed-option .muted { font-size: 0.85rem; }
 .index-status { min-height: 1.3rem; }
+.versions-dialog { width: min(40rem, calc(100vw - 2rem)); }
+.versions-list { list-style: none; margin: 0.4rem 0; padding: 0; display: grid; gap: 0.45rem; max-height: min(55vh, 30rem); overflow: auto; }
+.version { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 8px; padding: 0.5rem 0.7rem; }
+.version-info { display: grid; gap: 0.1rem; min-width: 0; }
+.version-info .muted { font-size: 0.85em; overflow-wrap: anywhere; }
+.version-actions { display: flex; gap: 0.35rem; flex-wrap: wrap; }
+.versions-note { font-size: 0.85em; }
 .helpers-list { list-style: none; margin: 0 0 0.6rem; padding: 0; display: grid; gap: 0.5rem; }
 .helper { border: 1px solid var(--line); border-radius: 8px; padding: 0.5rem 0.7rem; }
 .helper p { margin: 0.15rem 0 0; overflow-wrap: anywhere; }
