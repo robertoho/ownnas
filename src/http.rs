@@ -102,6 +102,8 @@ pub struct AppState {
     pub media: std::sync::Arc<crate::media_index::Indexer>,
     /// Every file and folder name, for search.
     pub file_index: std::sync::Arc<crate::file_index::FileIndex>,
+    /// The words inside files, for search.
+    pub text_index: std::sync::Arc<crate::text_index::TextIndex>,
     /// How full the disk is, and how much the library and OwnNAS's data take.
     pub storage: std::sync::Arc<crate::storage::Storage>,
     /// The Gallery's machine-learning models (downloaded when switched on).
@@ -123,6 +125,16 @@ impl AppState {
         // Search's name index works at the same speed.
         let media = self.media.clone();
         self.file_index.start(self.db_path.clone(), self.root.clone(), move || media.speed());
+        // And so does reading the words inside files, after each scan of the names.
+        let media = self.media.clone();
+        self.text_index.start(
+            self.db_path.clone(),
+            self.root.clone(),
+            self.text_cache.clone(),
+            self.ocr,
+            self.file_index.clone(),
+            move || media.speed(),
+        );
     }
 }
 
@@ -177,6 +189,7 @@ pub fn new_state(
         agent_url: std::sync::OnceLock::new(),
         media: std::sync::Arc::default(),
         file_index: std::sync::Arc::default(),
+        text_index: std::sync::Arc::default(),
         storage: {
             let storage = std::sync::Arc::new(crate::storage::Storage::default());
             storage.load(&db_path);
@@ -5892,7 +5905,7 @@ async fn helper_programs(State(state): State<std::sync::Arc<AppState>>, headers:
 
 async fn index_status(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
-    Ok(Json(json!({ "speed": state.media.speed(), "files": state.file_index.status(), "media": state.media.status() })))
+    Ok(Json(json!({ "speed": state.media.speed(), "files": state.file_index.status(), "text": state.text_index.status(), "media": state.media.status() })))
 }
 
 #[derive(Deserialize)]
@@ -5925,11 +5938,12 @@ async fn reindex(
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "Photo libraries are searched directly, not indexed"));
     }
     state.file_index.reindex(&rel);
+    state.text_index.reread(&state.db_path, &rel);
     if rel.is_empty() {
         state.media.rescan();
     }
     record(&state, &user, "reindex", if rel.is_empty() { "/" } else { &rel });
-    Ok(Json(json!({ "speed": state.media.speed(), "files": state.file_index.status(), "media": state.media.status() })))
+    Ok(Json(json!({ "speed": state.media.speed(), "files": state.file_index.status(), "text": state.text_index.status(), "media": state.media.status() })))
 }
 
 /// Measures the library again now.
@@ -6189,17 +6203,20 @@ async fn search(
             let listed = db::open(&db_path).map_err(|_| FileError::Rejected("Could not open the search index")).and_then(|conn| {
                 let names = crate::file_index::search_names(&conn, &start.rel, &lower, 100)
                     .map_err(|_| FileError::Rejected("Could not read the search index"))?;
-                let contents = crate::file_index::files_of_kinds(&conn, &start.rel, &["text", "pdf"], 8_000).unwrap_or_default();
-                let images = if ocr { crate::file_index::files_of_kinds(&conn, &start.rel, &["image"], 8_000).unwrap_or_default() } else { Vec::new() };
-                Ok((names, contents, images))
+                // Words read ahead of time, then the files not read yet, looked in as the search goes.
+                let words = crate::text_index::search(&conn, &start.rel, &lower, 100).unwrap_or_default();
+                let contents = crate::text_index::unread(&conn, &start.rel, &["text", "pdf"], 8_000);
+                let images = if ocr { crate::text_index::unread(&conn, &start.rel, &["image"], 8_000) } else { Vec::new() };
+                Ok((names, words, contents, images))
             });
-            let (names, contents, images) = listed?;
+            let (names, words, contents, images) = listed?;
             files::search_listed(
                 &root,
                 &needle,
                 names.into_iter().map(|hit| (hit.path, hit.dir)).collect(),
-                contents.into_iter().map(|(path, _)| path).collect(),
-                images.into_iter().map(|(path, _)| path).collect(),
+                words.into_iter().map(|hit| (hit.path, hit.snippet)).collect(),
+                contents,
+                images,
                 &options,
             )
         })

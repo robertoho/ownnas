@@ -387,6 +387,9 @@
       <h3>Search index</h3>
       <p class="muted">OwnNAS keeps a list of every file and folder name, so a search finds them at once however big the library is. It only reads folders that changed since it last looked: changes made through OwnNAS show within seconds, ones made in Finder, Explorer, or another program within five minutes. To read one folder again, right-click it and choose Reindex.</p>
       <p id="files-index-status" class="index-status"></p>
+      <h3>Words inside files</h3>
+      <p class="muted">OwnNAS also reads the words in text files, PDFs, Word, Excel, PowerPoint, OpenDocument and Pages files, e-books, and emails (and, when tesseract is installed, photos and scans), so a search finds them by what they say. It reads new and changed files after each look for changes. Until a file is read, a search reads it as it goes, which is slower.</p>
+      <p id="text-index-status" class="index-status"></p>
       <h3>Photos and videos</h3>
       <p id="index-status" class="muted index-status"></p>
       <button id="index-rescan" type="button">Reindex everything</button>

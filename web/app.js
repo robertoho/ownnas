@@ -1543,6 +1543,20 @@ $("helpers-recheck").addEventListener("click", () => {
   refreshHelpers().then(() => toast("Checked the helper programs")).catch((err) => toast(err.message, true));
 });
 
+function describeTextIndex(text) {
+  if (!text) return "";
+  const count = (n) => Number(n).toLocaleString();
+  if (!text.available) return "This build of OwnNAS cannot keep the words of files: searches read them as they go.";
+  const photos = text.ocr ? "" : " Photos are not read: install tesseract (see Helper programs below).";
+  if (text.reading) {
+    const where = text.current ? ` Now: “${libraryPath(text.current)}”.` : "";
+    return `Reading the words inside files… ${count(text.done)} of ${count(text.waiting)}.${where}${photos}`;
+  }
+  if (text.error) return `The last reading stopped: ${text.error}`;
+  if (!text.finishedAt) return `Starts once the names are indexed.${photos}`;
+  return `${count(text.files)} files read. Last read new and changed files ${formatDate(text.finishedAt)}.${photos}`;
+}
+
 async function refreshIndexing() {
   const data = await api("/api/index");
   const admin = !!(state.me && state.me.admin);
@@ -1552,10 +1566,11 @@ async function refreshIndexing() {
   }
   $("index-speed-admin").hidden = admin;
   $("files-index-status").textContent = describeFilesIndex(data.files);
+  $("text-index-status").textContent = describeTextIndex(data.text);
   $("index-status").textContent = describeIndexStatus(data.media);
   clearTimeout(indexingTimer);
   if (!$("settings").hidden && !$("settings-indexing").hidden) {
-    const busy = data.files.scanning || data.media.scanning || data.media.thumbnailing;
+    const busy = data.files.scanning || (data.text && data.text.reading) || data.media.scanning || data.media.thumbnailing;
     indexingTimer = setTimeout(() => refreshIndexing().catch(() => {}), busy ? 1000 : 10000);
   }
 }

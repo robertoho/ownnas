@@ -91,6 +91,143 @@ pub fn view(path: &Path) -> Result<View, String> {
     }
 }
 
+/// File names whose words `plain_text` can read, for search.
+pub fn has_text(name: &str) -> bool {
+    let extension = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
+    TEXT_FORMATS.contains(&extension.as_str())
+}
+
+pub const TEXT_FORMATS: [&str; 24] = [
+    "docx", "odt", "ods", "odp", "xlsx", "xls", "xlsb", "pptx", "ppsx", "doc", "ppt", "pps", "rtf", "pages", "numbers", "key", "epub", "mobi", "azw",
+    "azw3", "prc", "fb2", "eml", "msg",
+];
+
+/// The words of a document, a spreadsheet, a slideshow, a book, or an email, as plain text (for
+/// search). `None` when it cannot be read.
+pub fn plain_text(path: &Path) -> Option<String> {
+    let size = std::fs::metadata(path).ok()?.len();
+    if size > MAX_FILE || path.is_dir() {
+        return None;
+    }
+    let extension = path.extension().map(|ext| ext.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    match extension.as_str() {
+        "docx" => {
+            let mut zip = open_zip(path).ok()?;
+            let mut out = String::new();
+            for name in ["word/document.xml", "word/footnotes.xml", "word/endnotes.xml"] {
+                if let Some(xml) = read_part(&mut zip, name) {
+                    xml_words(&xml, &mut out);
+                }
+            }
+            Some(out)
+        }
+        "odt" | "ods" | "odp" => {
+            let mut zip = open_zip(path).ok()?;
+            let mut out = String::new();
+            xml_words(&read_part(&mut zip, "content.xml")?, &mut out);
+            Some(out)
+        }
+        "xlsx" => view_text(spreadsheet(path).ok()?),
+        "epub" => {
+            let book = crate::ebook::read(path).ok()?;
+            let mut zip = open_zip(path).ok()?;
+            let mut out = [book.title, book.author].into_iter().flatten().collect::<Vec<_>>().join("\n");
+            for chapter in &book.chapters {
+                if let Some(html) = read_part(&mut zip, chapter) {
+                    out.push('\n');
+                    blocks_text(&crate::books::html_blocks(&html), &mut out);
+                }
+            }
+            Some(out)
+        }
+        "eml" | "msg" => {
+            let mail = crate::mail::read(path, None).ok()?;
+            let names = mail.attachments.iter().map(|attachment| attachment.name.clone()).collect::<Vec<_>>().join("\n");
+            Some([mail.subject, mail.from, mail.to, mail.cc, mail.text, Some(names)].into_iter().flatten().collect::<Vec<_>>().join("\n"))
+        }
+        _ if has_text(&format!("x.{extension}")) => view_text(view(path).ok()?),
+        _ => None,
+    }
+}
+
+fn view_text(view: View) -> Option<String> {
+    let mut out = String::new();
+    match view {
+        View::Document { blocks, .. } => blocks_text(&blocks, &mut out),
+        View::Slides { slides, .. } => {
+            for slide in slides {
+                out.extend(slide.title.map(|title| title + "\n"));
+                blocks_text(&slide.blocks, &mut out);
+                out.extend(slide.notes.map(|notes| notes + "\n"));
+            }
+        }
+        View::Sheets { sheets } => {
+            for sheet in sheets {
+                out.push_str(&sheet.name);
+                out.push('\n');
+                for row in sheet.rows {
+                    let cells: Vec<String> = row.into_iter().filter(|cell| !cell.is_empty()).collect();
+                    if !cells.is_empty() {
+                        out.push_str(&cells.join("\t"));
+                        out.push('\n');
+                    }
+                }
+            }
+        }
+        View::Picture { .. } => return None,
+    }
+    Some(out)
+}
+
+fn blocks_text(blocks: &[Block], out: &mut String) {
+    for block in blocks {
+        match block {
+            Block::Heading { text, .. } | Block::Paragraph { text, .. } => {
+                out.push_str(text);
+                out.push('\n');
+            }
+            Block::Table { rows } => {
+                for row in rows {
+                    out.push_str(&row.join("\t"));
+                    out.push('\n');
+                }
+            }
+            Block::Image { .. } => {}
+        }
+    }
+}
+
+/// The words in a Word or OpenDocument XML part: its text, a line per paragraph.
+fn xml_words(xml: &str, out: &mut String) {
+    let Ok(doc) = roxmltree::Document::parse_with_options(xml, roxmltree::ParsingOptions { allow_dtd: true, ..Default::default() }) else { return };
+    fn walk(node: roxmltree::Node, out: &mut String) {
+        for child in node.children() {
+            if child.is_text() {
+                // Word keeps its words in w:t; the rest of its text nodes are layout whitespace.
+                let parent = child.parent_element().map(|parent| parent.tag_name());
+                let word = parent.is_some_and(|tag| tag.namespace() != Some(WORD_NS) || tag.name() == "t" || tag.name() == "delText");
+                if word {
+                    out.push_str(child.text().unwrap_or_default());
+                }
+                continue;
+            }
+            match child.tag_name().name() {
+                "tab" => out.push('\t'),
+                "s" | "br" | "line-break" => out.push(' '),
+                _ => walk(child, out),
+            }
+            if matches!(child.tag_name().name(), "p" | "h" | "table-row" | "tr") {
+                out.push('\n');
+            } else if matches!(child.tag_name().name(), "table-cell" | "tc") {
+                out.push('\t');
+            }
+        }
+    }
+    walk(doc.root(), out);
+}
+
+const WORD_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+
 /// Text split into paragraphs, blank ones left out.
 fn paragraphs(text: &str) -> Vec<Block> {
     text.split('\n')

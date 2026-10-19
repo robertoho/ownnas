@@ -1484,12 +1484,14 @@ pub fn search(
 }
 
 /// A search using the name index: `names` are the files and folders whose names matched (as
-/// library paths, with whether each is a folder), `contents` the text files and PDFs, and
-/// `images` the photos, whose text is looked in. What has gone since it was indexed is left out.
+/// library paths, with whether each is a folder), `words` the files whose words (read ahead of
+/// time) matched, and `contents` (text files and PDFs) and `images` (photos) the files not read
+/// yet, which are looked in now. What has gone since it was indexed is left out.
 pub fn search_listed(
     root: &Path,
     query: &str,
     names: Vec<(String, bool)>,
+    words: Vec<(String, Option<String>)>,
     contents: Vec<String>,
     images: Vec<String>,
     options: &SearchOptions,
@@ -1533,7 +1535,15 @@ pub fn search_listed(
     if query.chars().count() < 2 {
         return Ok(hits);
     }
-    let named: HashSet<String> = names.into_iter().map(|(rel, _)| rel).collect();
+    let mut named: HashSet<String> = names.into_iter().map(|(rel, _)| rel).collect();
+    for (rel, snippet) in words {
+        if hits.len() >= 100 {
+            return Ok(hits);
+        }
+        if named.insert(rel.clone()) {
+            add(&rel, Some(snippet.unwrap_or_default()), &mut hits);
+        }
+    }
     let mut ocr_budget = 12usize;
     for rel in contents {
         if hits.len() >= 100 {
@@ -1570,7 +1580,7 @@ pub fn search_listed(
     Ok(hits)
 }
 
-fn content_snippet(haystack: &str, needle: &str) -> Option<String> {
+pub(crate) fn content_snippet(haystack: &str, needle: &str) -> Option<String> {
     if !crate::content_index::text_matches(haystack, needle) {
         return None;
     }

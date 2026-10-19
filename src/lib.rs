@@ -19,6 +19,7 @@ pub mod file_index;
 pub mod files;
 pub mod font_info;
 pub mod helper_tools;
+pub mod text_index;
 pub mod image_edit;
 pub mod video_edit;
 pub mod media_index;

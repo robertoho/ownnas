@@ -459,7 +459,7 @@ fn scan_paced(conn: &Connection, root: &Path, progress: &dyn Fn(u64, u64), pace:
     // Forget what is gone (moves made by OwnNAS have already updated their rows).
     let gone: Vec<&String> = known.keys().filter(|path| !seen.contains(*path) && !files::is_under_trash(path)).collect();
     for chunk in gone.chunks(BATCH) {
-        let tx = conn.unchecked_transaction().map_err(|err| err.to_string())?;
+        let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate).map_err(|err| err.to_string())?;
         for path in chunk {
             tx.execute("DELETE FROM media_index WHERE path = ?1", [path]).map_err(|err| err.to_string())?;
         }
@@ -481,7 +481,7 @@ fn store(conn: &Connection, found: Vec<Found>, pace: &dyn Fn(std::time::Instant)
         (item, taken)
     }).collect();
     let now = crate::db::now_secs();
-    let tx = conn.unchecked_transaction().map_err(|err| err.to_string())?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate).map_err(|err| err.to_string())?;
     for (item, taken) in rows {
         let (taken_at, source) = match taken.at {
             Some(at) => (at, "exif"),

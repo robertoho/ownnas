@@ -266,7 +266,19 @@ fn scan(
     let mut queue = VecDeque::from([start.to_string()]);
     let (mut folders, mut read) = (0u64, 0u64);
     let mut writes = 0usize;
+    // Looks are read-only. Before writing, the transaction starts again holding the write lock,
+    // so it waits its turn (a read turned write would fail at once if another write came first).
     let mut tx = conn.unchecked_transaction().map_err(sql)?;
+    let mut writing = false;
+    macro_rules! start_writing {
+        () => {
+            if !writing {
+                tx.commit().map_err(sql)?;
+                tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate).map_err(sql)?;
+                writing = true;
+            }
+        };
+    }
     while let Some(rel) = queue.pop_front() {
         if stop() {
             tx.commit().map_err(sql)?;
@@ -277,6 +289,7 @@ fn scan(
         let full_path = if rel.is_empty() { root.to_path_buf() } else { root.join(&rel) };
         let Ok(meta) = full_path.symlink_metadata() else {
             // Gone: forget it and everything that was in it.
+            start_writing!();
             forget(&tx, &rel)?;
             continue;
         };
@@ -295,6 +308,7 @@ fn scan(
             queue.extend(children);
         } else {
             read += 1;
+            start_writing!();
             let mut found = Vec::new();
             if !packaged {
                 if let Ok(entries) = std::fs::read_dir(&full_path) {
@@ -357,6 +371,7 @@ fn scan(
         if writes >= BATCH {
             tx.commit().map_err(sql)?;
             tx = conn.unchecked_transaction().map_err(sql)?;
+            writing = false;
             writes = 0;
         }
         if folders % 50 == 0 {
@@ -403,28 +418,6 @@ pub fn search_names(conn: &Connection, rel: &str, query: &str, limit: usize) -> 
         .map_err(|err| err.to_string())?;
     let rows = stmt
         .query_map(params![query, rel, limit as i64], |row| Ok(NameHit { path: row.get(0)?, dir: row.get(1)? }))
-        .map_err(|err| err.to_string())?;
-    Ok(rows.filter_map(Result::ok).collect())
-}
-
-/// Files under `rel` of the given kinds (whose contents a search can look in), shallowest first.
-pub fn files_of_kinds(conn: &Connection, rel: &str, kinds: &[&str], limit: usize) -> Result<Vec<(String, String)>, String> {
-    let marks = vec!["?"; kinds.len()].join(", ");
-    let sql = format!(
-        "SELECT path, kind FROM file_index
-         WHERE dir = 0 AND kind IN ({marks})
-           AND (?{n} = '' OR substr(path, 1, length(?{n}) + 1) = ?{n} || '/')
-         ORDER BY length(path) - length(replace(path, '/', '')), path
-         LIMIT ?{m}",
-        n = kinds.len() + 1,
-        m = kinds.len() + 2,
-    );
-    let mut stmt = conn.prepare(&sql).map_err(|err| err.to_string())?;
-    let mut values: Vec<rusqlite::types::Value> = kinds.iter().map(|kind| rusqlite::types::Value::Text(kind.to_string())).collect();
-    values.push(rusqlite::types::Value::Text(rel.to_string()));
-    values.push(rusqlite::types::Value::Integer(limit as i64));
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(values), |row| Ok((row.get(0)?, row.get(1)?)))
         .map_err(|err| err.to_string())?;
     Ok(rows.filter_map(Result::ok).collect())
 }
