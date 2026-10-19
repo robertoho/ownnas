@@ -476,7 +476,7 @@ fn store(conn: &Connection, found: Vec<Found>, pace: &dyn Fn(std::time::Instant)
     // Reading dates happens before the transaction, so the database is locked only to write.
     let rows: Vec<(Found, Taken)> = found.into_iter().map(|item| {
         let started = std::time::Instant::now();
-        let taken = if item.kind == "image" { read_photo(&item.full) } else { Taken::default() };
+        let taken = if item.kind == "image" { read_photo(&item.full) } else { read_video(&item.full) };
         pace(started);
         (item, taken)
     }).collect();
@@ -484,13 +484,14 @@ fn store(conn: &Connection, found: Vec<Found>, pace: &dyn Fn(std::time::Instant)
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate).map_err(|err| err.to_string())?;
     for (item, taken) in rows {
         let (taken_at, source) = match taken.at {
-            Some(at) => (at, "exif"),
+            Some(at) => (at, taken.source.unwrap_or("exif")),
             None => (item.mtime, "file"),
         };
+        let (lat, lon) = taken.place.map_or((None, None), |(lat, lon)| (Some(lat), Some(lon)));
         tx.execute(
-            "INSERT OR REPLACE INTO media_index(path, kind, size, mtime, taken_at, date_source, width, height, indexed_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![item.rel, item.kind, item.size, item.mtime, taken_at, source, taken.width, taken.height, now],
+            "INSERT OR REPLACE INTO media_index(path, kind, size, mtime, taken_at, date_source, width, height, indexed_at, lat, lon)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![item.rel, item.kind, item.size, item.mtime, taken_at, source, taken.width, taken.height, now, lat, lon],
         )
         .map_err(|err| err.to_string())?;
     }
@@ -502,8 +503,23 @@ struct Taken {
     /// When the photo was taken, as written by the camera: a local time with no time zone,
     /// stored as if it were UTC so it shows the same wherever it is viewed.
     at: Option<i64>,
+    /// What `at` is: "exif" (a camera's local time, the default) or "utc" (a real instant).
+    source: Option<&'static str>,
     width: Option<i64>,
     height: Option<i64>,
+    /// Where it was taken (latitude, longitude).
+    place: Option<(f64, f64)>,
+}
+
+/// When and where a video was filmed, as the file says (MP4 and QuickTime).
+fn read_video(path: &Path) -> Taken {
+    let filmed = crate::video_meta::read(path);
+    let (at, source) = match (filmed.local, filmed.utc) {
+        (Some(local), _) => (Some(local), Some("exif")),
+        (None, Some(utc)) => (Some(utc), Some("utc")),
+        (None, None) => (None, None),
+    };
+    Taken { at, source, place: filmed.place, ..Taken::default() }
 }
 
 /// The date taken and the size the photo shows at (after the camera's rotation).
@@ -524,6 +540,7 @@ fn read_photo(path: &Path) -> Taken {
                 }
             }
             let number = |tag| exif.get_field(tag, exif::In::PRIMARY).and_then(|field| field.value.get_uint(0)).map(i64::from);
+            taken.place = crate::photo_details::gps_position(&exif);
             taken.width = number(exif::Tag::PixelXDimension);
             taken.height = number(exif::Tag::PixelYDimension);
             // Orientations 5 to 8 turn the picture a quarter: it shows the other way round.

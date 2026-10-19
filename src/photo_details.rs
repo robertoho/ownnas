@@ -362,7 +362,7 @@ fn labelled(exif: &exif::Exif, tags: &[(&str, exif::Tag)]) -> Vec<Value> {
     tags.iter().filter_map(|(label, tag)| exif_text(exif, *tag).map(|value| row(label, value.trim_matches('"').to_string()))).collect()
 }
 
-fn gps_position(exif: &exif::Exif) -> Option<(f64, f64)> {
+pub(crate) fn gps_position(exif: &exif::Exif) -> Option<(f64, f64)> {
     let degrees = |tag, reference, negative: &[u8]| -> Option<f64> {
         let field = exif.get_field(tag, exif::In::PRIMARY)?;
         let exif::Value::Rational(ref parts) = field.value else { return None };
@@ -474,7 +474,7 @@ fn fraction(text: &str) -> Option<f64> {
 }
 
 /// "+48.8577+002.2950+035.000/" → (48.8577, 2.295).
-fn iso6709(text: &str) -> Option<(f64, f64)> {
+pub(crate) fn iso6709(text: &str) -> Option<(f64, f64)> {
     let mut numbers = Vec::new();
     let mut start = None;
     for (i, c) in text.char_indices() {

@@ -3851,14 +3851,29 @@ a.archive-entry-name:hover { text-decoration: underline; }
 .map-box { position: relative; flex: 1 0 auto; height: min(56vh, 30rem); min-height: 16rem; overflow: hidden; border-radius: 12px; border: 1px solid var(--line); background: #dfe6e2; touch-action: none; cursor: grab; }
 .map-box:active { cursor: grabbing; }
 .map-tiles { position: absolute; inset: 0; }
-.preview-body .map-tile { position: absolute; left: 0; top: 0; width: 256px; height: 256px; max-height: none; max-width: none; flex: none; border-radius: 0; background: none; object-fit: fill; user-select: none; pointer-events: none; }
+.map-box .map-tile { position: absolute; left: 0; top: 0; width: 256px; height: 256px; max-height: none; max-width: none; flex: none; border-radius: 0; background: none; object-fit: fill; user-select: none; pointer-events: none; }
 .map-tile-missing { visibility: hidden; }
 .map-overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 .map-line { fill: none; stroke: #e5482f; stroke-width: 4; stroke-linejoin: round; stroke-linecap: round; }
 .map-start { fill: #2f9e44; stroke: #fff; stroke-width: 2; }
 .map-end { fill: #e5482f; stroke: #fff; stroke-width: 2; }
 .map-point { fill: #1c7ed6; stroke: #fff; stroke-width: 2; pointer-events: auto; }
-.map-zooms { position: absolute; top: 0.5rem; right: 0.5rem; display: grid; gap: 0.25rem; }
+.map-zooms { position: absolute; top: 0.5rem; right: 0.5rem; display: grid; gap: 0.25rem; z-index: 2; }
+.map-markers { position: absolute; inset: 0; overflow: hidden; }
+.map-marker { position: absolute; left: 0; top: 0; width: 3rem; height: 3rem; margin: -1.5rem 0 0 -1.5rem; padding: 0; min-height: 0; border: 2px solid #fff; border-radius: 10px; background: var(--bg-2); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45); cursor: pointer; overflow: visible; }
+.map-marker:hover, .map-marker:focus-visible { z-index: 1; outline: 2px solid var(--accent); outline-offset: 1px; }
+.map-box .map-marker img { width: 100%; height: 100%; object-fit: cover; border-radius: 8px; display: block; pointer-events: none; }
+.map-marker-count { position: absolute; right: -0.6rem; top: -0.6rem; min-width: 1.35rem; padding: 0.05rem 0.35rem; border-radius: 999px; background: var(--accent); color: var(--accent-ink); font-size: 0.72rem; font-weight: 700; line-height: 1.25rem; text-align: center; }
+.gallery-places { display: grid; gap: 0.6rem; padding-top: 0.6rem; }
+.gallery-places .map-box { height: min(60vh, 34rem); }
+.gallery-places-count { margin: 0; }
+.gallery-memories { margin-bottom: 0.4rem; }
+.gallery-memory-row { display: flex; gap: 0.75rem; overflow-x: auto; padding: 0.3rem 0 0.6rem; }
+.gallery-memory { position: relative; flex: none; width: 11rem; height: 8rem; border-radius: 12px; overflow: hidden; color: #fff; text-decoration: none; background: var(--bg-2); }
+.gallery-memory img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform 0.25s ease; }
+.gallery-memory:hover img { transform: scale(1.04); }
+.gallery-memory-label { position: absolute; inset: auto 0 0 0; display: grid; padding: 1.6rem 0.6rem 0.45rem; background: linear-gradient(transparent, rgba(0, 0, 0, 0.7)); font-size: 0.8rem; }
+.gallery-memory-label strong { font-size: 0.95rem; }
 .map-zoom { min-height: 0; width: 2rem; height: 2rem; padding: 0; font-size: 1.1rem; line-height: 1; }
 .map-credit { position: absolute; right: 0; bottom: 0; padding: 0.1rem 0.4rem; font-size: 0.7rem; color: #333; background: rgba(255, 255, 255, 0.75); border-top-left-radius: 6px; }
 .track-facts { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 0.9rem; margin: 0; font-size: 0.9rem; }

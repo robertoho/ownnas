@@ -249,6 +249,13 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|_| "Could not create the database schema".to_string())?;
     ensure_admin_column(conn)?;
+    for column in ["lat", "lon"] {
+        let has: bool = conn.prepare("SELECT 1 FROM pragma_table_info('media_index') WHERE name = ?1").and_then(|mut stmt| stmt.exists([column])).unwrap_or(false);
+        if !has {
+            conn.execute(&format!("ALTER TABLE media_index ADD COLUMN {column} REAL"), [])
+                .map_err(|_| "Could not update the photo index".to_string())?;
+        }
+    }
     let version: i64 = conn
         .query_row("SELECT value FROM settings WHERE key = 'schema_version'", [], |row| row.get::<_, String>(0))
         .ok()
@@ -260,8 +267,14 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         conn.execute("UPDATE media_index SET mtime = -1 WHERE kind = 'image'", [])
             .map_err(|_| "Could not update the photo index".to_string())?;
     }
+    if version < 14 {
+        // Videos now have the date they were filmed, and photos and videos where: read them all
+        // again on the next scan.
+        conn.execute("UPDATE media_index SET mtime = -1", [])
+            .map_err(|_| "Could not update the photo index".to_string())?;
+    }
     conn.execute(
-        "INSERT INTO settings(key, value) VALUES('schema_version', '13')
+        "INSERT INTO settings(key, value) VALUES('schema_version', '14')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )
@@ -1104,9 +1117,9 @@ pub fn copy_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), Str
     .map_err(|_| "Could not copy fingerprints".to_string())?;
     // The copy shows in the timeline right away; it is not added to the original's albums.
     conn.execute(
-        "INSERT OR REPLACE INTO media_index(path, kind, size, mtime, taken_at, date_source, width, height, indexed_at)
+        "INSERT OR REPLACE INTO media_index(path, kind, size, mtime, taken_at, date_source, width, height, indexed_at, lat, lon)
          SELECT CASE WHEN path = ?1 THEN ?2 ELSE ?2 || substr(path, length(?1) + 1) END,
-                kind, size, mtime, taken_at, date_source, width, height, indexed_at
+                kind, size, mtime, taken_at, date_source, width, height, indexed_at, lat, lon
          FROM media_index WHERE path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/'",
         params![from, to],
     )

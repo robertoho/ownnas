@@ -16,6 +16,7 @@ mod helper_tools;
 mod text_index;
 mod versions;
 mod duplicates;
+mod video_meta;
 mod image_edit;
 mod video_edit;
 mod media_index;

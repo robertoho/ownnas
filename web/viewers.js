@@ -1071,15 +1071,40 @@ export async function mountTrack(body, entry, { api } = {}) {
   const all = [...lines.flat(), ...points.map((p) => [p.lat, p.lon])].filter((p) => Number.isFinite(p[0]) && Number.isFinite(p[1]));
   if (!all.length) throw new Error("This file has no places to show");
 
-  const tiles = h("div", "map-tiles");
   const svgNs = "http://www.w3.org/2000/svg";
-  const overlay = document.createElementNS(svgNs, "svg");
-  overlay.setAttribute("class", "map-overlay");
-  const zoomIn = h("button", "map-zoom", "+");
-  const zoomOut = h("button", "map-zoom", "−");
-  zoomIn.type = zoomOut.type = "button";
-  const credit = h("div", "map-credit", "© OpenStreetMap contributors");
-  const map = h("div", "map-box", tiles, overlay, h("div", "map-zooms", zoomIn, zoomOut), credit);
+  const dot = (overlay, [x, y], cls, label) => {
+    const circle = document.createElementNS(svgNs, "circle");
+    circle.setAttribute("cx", x.toFixed(1));
+    circle.setAttribute("cy", y.toFixed(1));
+    circle.setAttribute("r", "6");
+    circle.setAttribute("class", cls);
+    if (label) {
+      const title = document.createElementNS(svgNs, "title");
+      title.textContent = label;
+      circle.append(title);
+    }
+    overlay.append(circle);
+  };
+  const view = createMap({
+    paint({ overlay, at }) {
+      for (const line of lines) {
+        const path = document.createElementNS(svgNs, "path");
+        path.setAttribute("class", "map-line");
+        path.setAttribute("d", line.map((p, i) => {
+          const [x, y] = at(p[0], p[1]);
+          return `${i ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`;
+        }).join(""));
+        overlay.append(path);
+      }
+      if (lines.length) {
+        dot(overlay, at(...lines[0][0]), "map-start", "Start");
+        const lastLine = lines[lines.length - 1];
+        dot(overlay, at(...lastLine[lastLine.length - 1]), "map-end", "End");
+      }
+      for (const p of points) dot(overlay, at(p.lat, p.lon), "map-point", p.name);
+    },
+  });
+  const map = view.element;
 
   const stats = trackStats(lines);
   const km = (m) => (m >= 1000 ? `${(m / 1000).toFixed(m >= 100000 ? 0 : 2)} km` : `${Math.round(m)} m`);
@@ -1120,23 +1145,53 @@ export async function mountTrack(body, entry, { api } = {}) {
   // Fit the whole track in view.
   const lats = all.map((p) => p[0]);
   const lons = all.map((p) => p[1]);
+  view.fit({ north: Math.max(...lats), south: Math.min(...lats), west: Math.min(...lons), east: Math.max(...lons) });
+  return { destroy() { view.destroy(); } };
+}
+
+/// A pannable, zoomable OpenStreetMap, its tiles fetched through the server. After each move,
+/// `paint` draws over it: an SVG `overlay` and a `layer` for HTML markers, with `at(lat, lon)`
+/// giving a place's position on screen. `moved` hears where the map settled, after a pause.
+export function createMap({ paint = () => {}, moved = null, maxZoom = 19 } = {}) {
+  const svgNs = "http://www.w3.org/2000/svg";
+  const tiles = h("div", "map-tiles");
+  const overlay = document.createElementNS(svgNs, "svg");
+  overlay.setAttribute("class", "map-overlay");
+  const layer = h("div", "map-markers");
+  const zoomIn = h("button", "map-zoom", "+");
+  const zoomOut = h("button", "map-zoom", "−");
+  zoomIn.type = zoomOut.type = "button";
+  zoomIn.setAttribute("aria-label", "Zoom in");
+  zoomOut.setAttribute("aria-label", "Zoom out");
+  const credit = h("div", "map-credit", "© OpenStreetMap contributors");
+  const map = h("div", "map-box", tiles, overlay, layer, h("div", "map-zooms", zoomIn, zoomOut), credit);
   const box = () => map.getBoundingClientRect();
-  let zoom = 16;
-  let center = [0, 0];
-  const fit = () => {
+  let zoom = 2;
+  let center = project(20, 0, zoom);
+  let pending = null; // a fit asked for before the map had a size
+  let settle = 0;
+  const unproject = (x, y, z) => {
+    const scale = TILE * 2 ** z;
+    const lon = (x / scale) * 360 - 180;
+    const n = Math.PI - (2 * Math.PI * y) / scale;
+    return [(180 / Math.PI) * Math.atan(Math.sinh(n)), lon];
+  };
+  /// What the map shows: its zoom and box.
+  const current = () => {
     const { width, height } = box();
-    for (zoom = 17; zoom > 1; zoom -= 1) {
-      const [x1, y1] = project(Math.max(...lats), Math.min(...lons), zoom);
-      const [x2, y2] = project(Math.min(...lats), Math.max(...lons), zoom);
-      if (x2 - x1 < width * 0.85 && y2 - y1 < height * 0.85) break;
-    }
-    const [x1, y1] = project(Math.max(...lats), Math.min(...lons), zoom);
-    const [x2, y2] = project(Math.min(...lats), Math.max(...lons), zoom);
-    center = [(x1 + x2) / 2, (y1 + y2) / 2];
+    const [north, west] = unproject(center[0] - width / 2, center[1] - height / 2, zoom);
+    const [south, east] = unproject(center[0] + width / 2, center[1] + height / 2, zoom);
+    return { zoom, north: Math.min(85, north), south: Math.max(-85, south), west: width >= TILE * 2 ** zoom ? -180 : ((west + 540) % 360) - 180, east: width >= TILE * 2 ** zoom ? 180 : ((east + 540) % 360) - 180 };
   };
   const draw = () => {
     const { width, height } = box();
     if (!width) return;
+    if (pending) {
+      const bounds = pending;
+      pending = null;
+      fit(bounds);
+      return;
+    }
     const left = center[0] - width / 2;
     const top = center[1] - height / 2;
     const count = 2 ** zoom;
@@ -1164,38 +1219,39 @@ export async function mountTrack(body, entry, { api } = {}) {
     }
     overlay.setAttribute("viewBox", `0 0 ${width} ${height}`);
     overlay.replaceChildren();
-    for (const line of lines) {
-      const path = document.createElementNS(svgNs, "path");
-      path.setAttribute("class", "map-line");
-      path.setAttribute("d", line.map((p, i) => {
-        const [x, y] = project(p[0], p[1], zoom);
-        return `${i ? "L" : "M"}${(x - left).toFixed(1)},${(y - top).toFixed(1)}`;
-      }).join(""));
-      overlay.append(path);
-    }
-    const dot = (p, cls, label) => {
-      const [x, y] = project(p[0], p[1], zoom);
-      const circle = document.createElementNS(svgNs, "circle");
-      circle.setAttribute("cx", (x - left).toFixed(1));
-      circle.setAttribute("cy", (y - top).toFixed(1));
-      circle.setAttribute("r", "6");
-      circle.setAttribute("class", cls);
-      if (label) {
-        const title = document.createElementNS(svgNs, "title");
-        title.textContent = label;
-        circle.append(title);
-      }
-      overlay.append(circle);
+    layer.replaceChildren();
+    // The copy of a place nearest the middle, so markers follow the map round the world.
+    const world = TILE * count;
+    const at = (lat, lon) => {
+      const [x, y] = project(lat, lon, zoom);
+      const shifted = x + Math.round((center[0] - x) / world) * world;
+      return [shifted - left, y - top];
     };
-    if (lines.length) {
-      dot(lines[0][0], "map-start", "Start");
-      const lastLine = lines[lines.length - 1];
-      dot(lastLine[lastLine.length - 1], "map-end", "End");
+    paint({ overlay, layer, at, zoom, width, height });
+    if (moved) {
+      clearTimeout(settle);
+      settle = setTimeout(() => moved(current()), 250);
     }
-    for (const p of points) dot([p.lat, p.lon], "map-point", p.name);
+  };
+  /// Shows a box (north, south, west, east) as close up as it fits.
+  const fit = (bounds) => {
+    const { width, height } = box();
+    if (!width) {
+      pending = bounds;
+      return;
+    }
+    for (zoom = Math.min(17, maxZoom); zoom > 1; zoom -= 1) {
+      const [x1, y1] = project(bounds.north, bounds.west, zoom);
+      const [x2, y2] = project(bounds.south, bounds.east, zoom);
+      if (x2 - x1 < width * 0.85 && y2 - y1 < height * 0.85) break;
+    }
+    const [x1, y1] = project(bounds.north, bounds.west, zoom);
+    const [x2, y2] = project(bounds.south, bounds.east, zoom);
+    center = [(x1 + x2) / 2, (y1 + y2) / 2];
+    draw();
   };
   const zoomBy = (step, at = null) => {
-    const next = Math.max(1, Math.min(19, zoom + step));
+    const next = Math.max(1, Math.min(maxZoom, zoom + step));
     if (next === zoom) return;
     const { width, height, left, top } = box();
     // Keep the point under the pointer (or the middle) where it is.
@@ -1203,6 +1259,12 @@ export async function mountTrack(body, entry, { api } = {}) {
     const factor = 2 ** (next - zoom);
     center = [(center[0] + anchor[0]) * factor - anchor[0], (center[1] + anchor[1]) * factor - anchor[1]];
     zoom = next;
+    draw();
+  };
+  /// Centres a place at a zoom.
+  const show = (lat, lon, z) => {
+    zoom = Math.max(1, Math.min(maxZoom, z));
+    center = project(lat, lon, zoom);
     draw();
   };
   zoomIn.addEventListener("click", () => zoomBy(1));
@@ -1213,7 +1275,7 @@ export async function mountTrack(body, entry, { api } = {}) {
   }, { passive: false });
   let drag = null;
   map.addEventListener("pointerdown", (event) => {
-    if (event.target.closest("button")) return;
+    if (event.target.closest("button, a, .map-marker")) return;
     drag = { x: event.clientX, y: event.clientY, center: [...center] };
     map.setPointerCapture(event.pointerId);
   });
@@ -1223,12 +1285,23 @@ export async function mountTrack(body, entry, { api } = {}) {
     draw();
   });
   map.addEventListener("pointerup", () => { drag = null; });
-  map.addEventListener("dblclick", (event) => zoomBy(1, [event.clientX, event.clientY]));
+  map.addEventListener("dblclick", (event) => {
+    if (!event.target.closest(".map-marker")) zoomBy(1, [event.clientX, event.clientY]);
+  });
   const resize = new ResizeObserver(() => draw());
   resize.observe(map);
-  fit();
-  draw();
-  return { destroy() { resize.disconnect(); } };
+  return {
+    element: map,
+    fit,
+    show,
+    redraw: draw,
+    view: current,
+    get zoom() { return zoom; },
+    destroy() {
+      resize.disconnect();
+      clearTimeout(settle);
+    },
+  };
 }
 
 

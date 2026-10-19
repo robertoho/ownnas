@@ -31,6 +31,7 @@ const plural = (n, one, many = `${one}s`) => `${number(n)} ${n === 1 ? one : man
 function dateParts(item) {
   if (item.takenAt === null || item.takenAt === undefined) return null;
   const date = new Date(item.takenAt * 1000);
+  // "exif": a camera's local time with no zone, kept as UTC. "utc" and "file": real instants.
   const timeZone = item.dateSource === "exif" ? "UTC" : undefined;
   const pick = (options) => new Intl.DateTimeFormat(undefined, { ...options, timeZone }).format(date);
   const key = (options) => new Intl.DateTimeFormat("en-CA", { ...options, timeZone }).format(date);
@@ -111,9 +112,10 @@ export function mountGallery(root, ctx) {
   let current = null; // the album shown, if any
   let cardAlbums = new Map(); // id -> the albums shown as cards
   let menu = null;
+  let placesMap = null; // the Places map, while it shows
 
   const tabs = el("nav", { class: "gallery-tabs", "aria-label": "Gallery sections" });
-  for (const [tab, label] of [["photos", "Photos"], ["albums", "Albums"], ["people", "People"], ["tags", "Tags"]]) {
+  for (const [tab, label] of [["photos", "Photos"], ["albums", "Albums"], ["people", "People"], ["places", "Places"], ["tags", "Tags"]]) {
     tabs.append(el("a", { href: `#gallery${tab === "photos" ? "" : `/${tab}`}`, "data-tab": tab, hidden: tab === "people" }, label));
   }
   const searchBox = el("input", { type: "search", class: "gallery-search", placeholder: "Search photos: “dog on the beach”…", "aria-label": "Search photos by what they show", hidden: true, title: "Search in words, or drop a picture here to find photos like it" });
@@ -632,6 +634,7 @@ export function mountGallery(root, ctx) {
       sections.push(month.section);
     }
     body.replaceChildren(...sections);
+    showMemories(mine);
     sizePlaceholders();
     monthObserver?.disconnect();
     monthObserver = new IntersectionObserver((entries) => {
@@ -1638,11 +1641,149 @@ export function mountGallery(root, ctx) {
 
   // ---- Routing ----
 
+  // ---- On this day: photos taken on today's date in earlier years ----
+
+  /// Today as the viewer sees it.
+  function today() {
+    const now = new Date();
+    return { year: now.getFullYear(), month: now.getMonth() + 1, day: now.getDate() };
+  }
+
+  async function memories() {
+    const { year, month, day } = today();
+    return ctx.api(`/api/gallery/memories?month=${month}&day=${day}&year=${year}`);
+  }
+
+  /// A strip of years above the timeline, when there are any.
+  async function showMemories(mine) {
+    let data;
+    try {
+      data = await memories();
+    } catch {
+      return;
+    }
+    if (stale(mine) || !data.years.length) return;
+    const { year: now } = today();
+    const cards = data.years.map((entry) => {
+      const ago = now - entry.year;
+      const cover = entry.items[0];
+      return el("a", { class: "gallery-memory", href: `#gallery/memories/${entry.year}`, title: `Photos from this day in ${entry.year}` },
+        el("img", { src: thumbUrl(cover), alt: "", loading: "lazy", draggable: "false" }),
+        el("span", { class: "gallery-memory-label" }, el("strong", {}, ago === 1 ? "1 year ago" : `${ago} years ago`), el("span", {}, `${entry.year} · ${plural(entry.count, "photo")}`)));
+    });
+    body.prepend(el("section", { class: "gallery-memories", "aria-label": "On this day" }, el("h2", { class: "gallery-month" }, "On this day"), el("div", { class: "gallery-memory-row" }, cards)));
+  }
+
+  async function showMemoryYear(year) {
+    const mine = ++generation;
+    actions.replaceChildren();
+    body.replaceChildren(el("p", { class: "muted gallery-message" }, "Loading…"));
+    try {
+      const data = await memories();
+      if (stale(mine)) return;
+      const entry = data.years.find((found) => found.year === year);
+      items = entry ? entry.items : [];
+      const { year: now } = today();
+      const label = new Intl.DateTimeFormat(undefined, { day: "numeric", month: "long", year: "numeric" }).format(new Date(year, new Date().getMonth(), new Date().getDate()));
+      status.textContent = entry && entry.count > items.length ? `${number(items.length)} of ${plural(entry.count, "photo")}` : plural(items.length, "photo");
+      body.replaceChildren(
+        el("nav", { class: "gallery-crumbs" }, el("a", { href: "#gallery" }, "Photos"), el("span", { "aria-hidden": "true" }, "›"), el("strong", {}, `On this day, ${now - year === 1 ? "1 year" : `${now - year} years`} ago (${label})`)),
+        items.length ? grid(items) : el("p", { class: "muted gallery-message" }, "No photos from this day in that year."),
+      );
+    } catch (err) {
+      if (!stale(mine)) body.replaceChildren(el("p", { class: "muted gallery-message" }, err.message));
+    }
+  }
+
+  // ---- Places: photos with a location, on a map ----
+
+  async function showPlaces() {
+    const mine = ++generation;
+    actions.replaceChildren();
+    body.replaceChildren(el("p", { class: "muted gallery-message" }, "Loading the map…"));
+    let viewers;
+    let data;
+    try {
+      [viewers, data] = await Promise.all([import("/assets/viewers.js"), ctx.api("/api/gallery/places?zoom=2")]);
+    } catch (err) {
+      if (!stale(mine)) body.replaceChildren(el("p", { class: "muted gallery-message" }, err.message));
+      return;
+    }
+    if (stale(mine)) return;
+    if (!data.extent) {
+      status.textContent = "";
+      body.replaceChildren(el("p", { class: "muted gallery-message" }, "No photos with a location yet. Photos and videos taken with location on (most phones do) show up here on a map."));
+      return;
+    }
+    const byZoom = new Map([[2, data.places]]);
+    let places = data.places;
+    let shownZoom = 2;
+    const here = el("p", { class: "muted gallery-places-count" });
+    const list = el("div", { class: "gallery-places-list" });
+    const map = viewers.createMap({
+      maxZoom: 18,
+      paint({ layer, at, width, height }) {
+        // The biggest groups last, so they show on top of smaller ones nearby.
+        for (const place of [...places].reverse()) {
+          const [x, y] = at(place.lat, place.lon);
+          if (x < -40 || y < -40 || x > width + 40 || y > height + 40) continue;
+          const marker = el("button", { type: "button", class: "map-marker", title: place.count === 1 ? nameOf(place.newest.path) : `${plural(place.count, "photo")} here` },
+            el("img", { src: thumbUrl(place.newest), alt: "", draggable: "false" }),
+            place.count > 1 ? el("span", { class: "map-marker-count" }, number(place.count)) : null);
+          marker.style.transform = `translate(${Math.round(x)}px, ${Math.round(y)}px)`;
+          marker.addEventListener("click", () => {
+            if (place.count > 1 && map.zoom < 16) map.show(place.lat, place.lon, map.zoom + 2);
+            else ctx.openPreview(place.newest, [place.newest]);
+          });
+          layer.append(marker);
+        }
+      },
+      async moved(view) {
+        if (stale(mine)) return;
+        // Places group differently at each zoom: fetch them once per zoom.
+        if (view.zoom !== shownZoom) {
+          shownZoom = view.zoom;
+          if (!byZoom.has(view.zoom)) {
+            try {
+              byZoom.set(view.zoom, (await ctx.api(`/api/gallery/places?zoom=${view.zoom}`)).places);
+            } catch {
+              return;
+            }
+          }
+          if (stale(mine) || shownZoom !== view.zoom) return;
+          places = byZoom.get(view.zoom);
+          map.redraw();
+        }
+        listHere(view);
+      },
+    });
+    placesMap = map;
+    let listed = "";
+    async function listHere(view) {
+      const query = `west=${view.west}&south=${view.south}&east=${view.east}&north=${view.north}`;
+      if (query === listed) return;
+      listed = query;
+      try {
+        const found = await ctx.api(`/api/gallery/places/items?${query}&limit=300`);
+        if (stale(mine) || listed !== query) return;
+        items = found.items;
+        here.textContent = found.total ? `${plural(found.total, "photo")} on this part of the map${found.total > items.length ? ` (the newest ${number(items.length)} below)` : ""}` : "No photos on this part of the map.";
+        status.textContent = plural(data.extent.count, "photo") + " with a location";
+        list.replaceChildren(items.length ? grid(items) : "");
+      } catch {}
+    }
+    body.replaceChildren(el("div", { class: "gallery-places" }, map.element, here, list));
+    const e = data.extent;
+    map.fit({ north: e.north, south: e.south, west: e.west, east: e.east });
+  }
+
   function parse(hash) {
     const parts = hash.replace(/^#?gallery\/?/, "").split("/").filter(Boolean).map(decodeURIComponent);
     if (parts[0] === "albums") return { tab: "albums", id: parts[1] ? Number(parts[1]) : null };
     if (parts[0] === "tags") return { tab: "tags", tag: parts[1] || "" };
     if (parts[0] === "hidden") return { tab: "hidden" };
+    if (parts[0] === "places") return { tab: "places" };
+    if (parts[0] === "memories" && parts[1]) return { tab: "memories", year: Number(parts[1]) };
     if (parts[0] === "search") return { tab: "search", query: parts.slice(1).join("/") };
     if (parts[0] === "similar") return { tab: "similar", path: parts.slice(1).join("/") };
     if (parts[0] === "people" && parts[1] === "hidden") return { tab: "people", hidden: true };
@@ -1655,6 +1796,8 @@ export function mountGallery(root, ctx) {
     root.hidden = false;
     route = parse(hash);
     current = null;
+    placesMap?.destroy();
+    placesMap = null;
     selected = new Set();
     anchor = "";
     focusPath = "";
@@ -1668,7 +1811,7 @@ export function mountGallery(root, ctx) {
     status.textContent = "";
     scrubber.hidden = true;
     applySize(Number(size.value));
-    const tab = { hidden: "photos", search: "photos", similar: "photos", person: "people" }[route.tab] || route.tab;
+    const tab = { hidden: "photos", search: "photos", similar: "photos", memories: "photos", person: "people" }[route.tab] || route.tab;
     if (route.tab !== "search") searchBox.value = "";
     for (const link of tabs.children) link.setAttribute("aria-current", link.dataset.tab === tab ? "page" : "false");
     scroller.scrollTop = 0;
@@ -1679,12 +1822,16 @@ export function mountGallery(root, ctx) {
     else if (route.tab === "similar") showSimilar(route.path);
     else if (route.tab === "people") showPeople(!!route.hidden);
     else if (route.tab === "person") showPerson(route.id);
+    else if (route.tab === "places") showPlaces();
+    else if (route.tab === "memories") showMemoryYear(route.year);
     else showPhotos();
     loadSmart();
   }
 
   function hide() {
     closeMenu();
+    placesMap?.destroy();
+    placesMap = null;
     root.hidden = true;
     generation++;
     monthObserver?.disconnect();

@@ -22,6 +22,7 @@ pub mod helper_tools;
 pub mod text_index;
 pub mod versions;
 pub mod duplicates;
+pub mod video_meta;
 pub mod image_edit;
 pub mod video_edit;
 pub mod media_index;

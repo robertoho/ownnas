@@ -338,6 +338,132 @@ pub fn taken_between(conn: &Connection, from: i64, to: i64, limit: usize) -> Res
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+/// A group of photos close together on the map at some zoom: where they are on average, how
+/// many, and the newest of them (for its picture).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Place {
+    pub lat: f64,
+    pub lon: f64,
+    pub count: u64,
+    pub newest: MediaItem,
+}
+
+/// The box (west, south, east, north) a map shows.
+#[derive(Clone, Copy, Debug)]
+pub struct Bounds {
+    pub west: f64,
+    pub south: f64,
+    pub east: f64,
+    pub north: f64,
+}
+
+/// Web map position (0..1) of a latitude, from the top.
+fn mercator_y(lat: f64) -> f64 {
+    let lat = lat.clamp(-85.05, 85.05).to_radians();
+    (1.0 - (lat.tan() + 1.0 / lat.cos()).ln() / std::f64::consts::PI) / 2.0
+}
+
+fn geotagged(conn: &Connection, bounds: Option<Bounds>) -> Result<Vec<(f64, f64, MediaItem)>> {
+    let b = bounds.unwrap_or(Bounds { west: -180.0, south: -90.0, east: 180.0, north: 90.0 });
+    // A box over the date line has its west east of its east.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT m.lat, m.lon, m.path, {MEDIA_COLUMNS}, 0 FROM media_index m
+         WHERE m.lat IS NOT NULL AND m.lon IS NOT NULL AND m.lat BETWEEN ?2 AND ?4
+           AND (CASE WHEN ?1 <= ?3 THEN m.lon BETWEEN ?1 AND ?3 ELSE m.lon >= ?1 OR m.lon <= ?3 END)
+           AND substr(m.path, 1, 14) <> '.ownnas-trash/' AND substr(m.path, 1, 6) <> 'Trash/' AND {NOT_HIDDEN}
+         ORDER BY m.taken_at DESC, m.path DESC"
+    ))?;
+    let rows = stmt.query_map(params![b.west, b.south, b.east, b.north], |row| {
+        let item = MediaItem {
+            path: row.get(2)?,
+            kind: row.get(3)?,
+            taken_at: row.get(4)?,
+            date_source: row.get(5)?,
+            width: row.get(6)?,
+            height: row.get(7)?,
+            size: row.get(8)?,
+            hidden: row.get(9)?,
+        };
+        Ok((row.get(0)?, row.get(1)?, item))
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// Photos with a place, grouped into cells about `cell` pixels wide at `zoom`, within `bounds`.
+pub fn places(conn: &Connection, zoom: u8, bounds: Option<Bounds>, cell: f64) -> Result<Vec<Place>> {
+    let world = 256.0 * 2f64.powi(i32::from(zoom.min(22)));
+    let mut cells: std::collections::HashMap<(i64, i64), (f64, f64, u64, Option<MediaItem>)> = std::collections::HashMap::new();
+    // Newest first, so a cell's first photo is its newest.
+    for (lat, lon, item) in geotagged(conn, bounds)? {
+        let x = ((lon + 180.0) / 360.0 * world / cell).floor() as i64;
+        let y = (mercator_y(lat) * world / cell).floor() as i64;
+        let entry = cells.entry((x, y)).or_insert((0.0, 0.0, 0, None));
+        entry.0 += lat;
+        entry.1 += lon;
+        entry.2 += 1;
+        entry.3.get_or_insert(item);
+    }
+    let mut out: Vec<Place> = cells
+        .into_values()
+        .filter_map(|(lat, lon, count, newest)| Some(Place { lat: lat / count as f64, lon: lon / count as f64, count, newest: newest? }))
+        .collect();
+    out.sort_by(|a, b| b.count.cmp(&a.count));
+    Ok(out)
+}
+
+/// The photos with a place within `bounds`, newest first, and how many there are.
+pub fn placed_items(conn: &Connection, bounds: Bounds, limit: usize) -> Result<(Vec<MediaItem>, usize)> {
+    let all = geotagged(conn, Some(bounds))?;
+    let total = all.len();
+    Ok((all.into_iter().take(limit).map(|(_, _, item)| item).collect(), total))
+}
+
+/// The box around every photo with a place, and how many there are.
+pub fn place_extent(conn: &Connection) -> Result<Option<(Bounds, u64)>> {
+    let row: (Option<f64>, Option<f64>, Option<f64>, Option<f64>, i64) = conn.query_row(
+        &format!(
+            "SELECT min(lon), min(lat), max(lon), max(lat), count(*) FROM media_index m
+             WHERE m.lat IS NOT NULL AND m.lon IS NOT NULL
+               AND substr(m.path, 1, 14) <> '.ownnas-trash/' AND substr(m.path, 1, 6) <> 'Trash/' AND {NOT_HIDDEN}"
+        ),
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    )?;
+    Ok(match row {
+        (Some(west), Some(south), Some(east), Some(north), count) if count > 0 => Some((Bounds { west, south, east, north }, count as u64)),
+        _ => None,
+    })
+}
+
+/// Photos and videos taken on this day of the year (`month`, `day`) in earlier years than
+/// `year`, newest year first. Only dates from the camera count: a file's date is often just
+/// when it was copied.
+pub fn on_this_day(conn: &Connection, month: u32, day: u32, year: i32, per_year: usize) -> Result<Vec<(i32, usize, Vec<MediaItem>)>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT m.path, {MEDIA_COLUMNS}, 0, CAST(strftime('%Y', m.taken_at, 'unixepoch') AS INTEGER) AS year FROM media_index m
+         WHERE strftime('%m-%d', m.taken_at, 'unixepoch') = ?1 AND m.date_source <> 'file'
+           AND CAST(strftime('%Y', m.taken_at, 'unixepoch') AS INTEGER) < ?2
+           AND substr(m.path, 1, 14) <> '.ownnas-trash/' AND substr(m.path, 1, 6) <> 'Trash/' AND {NOT_HIDDEN}
+         ORDER BY year DESC, m.taken_at, m.path"
+    ))?;
+    let rows = stmt.query_map(params![format!("{month:02}-{day:02}"), year], |row| Ok((row.get::<_, i32>(8)?, media_item(row)?)))?;
+    let mut years: Vec<(i32, usize, Vec<MediaItem>)> = Vec::new();
+    for row in rows {
+        let (year, item) = row?;
+        match years.last_mut() {
+            Some((last, count, items)) if *last == year => {
+                *count += 1;
+                if items.len() < per_year {
+                    items.push(item);
+                }
+            }
+            _ => years.push((year, 1, vec![item])),
+        }
+    }
+    Ok(years)
+}
+
 /// The media items for some paths, in the same order (paths not indexed get no details).
 pub fn media_items(conn: &Connection, paths: &[String]) -> Result<Vec<MediaItem>> {
     let mut stmt = conn.prepare(&format!(
@@ -432,6 +558,35 @@ mod tests {
             params![path, taken_at],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn places_group_on_the_map_and_memories_come_by_day() {
+        let conn = conn();
+        // 2023-10-19 12:00 and 2021-10-19 08:00 (camera times), a file date, and today.
+        index(&conn, "paris/a.jpg", 1_697_716_800);
+        index(&conn, "paris/b.jpg", 1_634_630_400);
+        index(&conn, "sydney.jpg", 1_697_716_800 + 60);
+        index(&conn, "copied.jpg", 1_697_716_800 + 120);
+        conn.execute("UPDATE media_index SET date_source = 'file' WHERE path = 'copied.jpg'", []).unwrap();
+        index(&conn, "today.jpg", 1_792_400_000);
+        for (path, lat, lon) in [("paris/a.jpg", 48.857, 2.295), ("paris/b.jpg", 48.86, 2.34), ("sydney.jpg", -33.86, 151.21)] {
+            conn.execute("UPDATE media_index SET lat = ?2, lon = ?3 WHERE path = ?1", params![path, lat, lon]).unwrap();
+        }
+        let world = places(&conn, 2, None, 72.0).unwrap();
+        assert_eq!(world.iter().map(|place| place.count).collect::<Vec<_>>(), [2, 1], "Paris is one place from afar");
+        assert_eq!(world[0].newest.path, "paris/a.jpg");
+        assert_eq!(places(&conn, 16, None, 72.0).unwrap().len(), 3, "and two places close up");
+        let europe = Bounds { west: -10.0, south: 35.0, east: 30.0, north: 60.0 };
+        assert_eq!(placed_items(&conn, europe, 10).unwrap().1, 2);
+        // Across the date line.
+        let pacific = Bounds { west: 150.0, south: -40.0, east: -170.0, north: 0.0 };
+        assert_eq!(placed_items(&conn, pacific, 10).unwrap().0[0].path, "sydney.jpg");
+        assert_eq!(place_extent(&conn).unwrap().unwrap().1, 3);
+
+        let years = on_this_day(&conn, 10, 19, 2026, 10).unwrap();
+        let summary: Vec<(i32, usize)> = years.iter().map(|(year, count, _)| (*year, *count)).collect();
+        assert_eq!(summary, [(2023, 2), (2021, 1)], "not this year, and not file dates");
     }
 
     #[test]

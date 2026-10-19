@@ -352,6 +352,9 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/gallery/rescan", post(gallery_rescan))
         .route("/api/gallery/timeline", get(gallery_timeline))
         .route("/api/gallery/days", get(gallery_days))
+        .route("/api/gallery/places", get(gallery_places))
+        .route("/api/gallery/places/items", get(gallery_place_items))
+        .route("/api/gallery/memories", get(gallery_memories))
         .route("/api/ml", get(ml_status).post(set_ml_settings))
         .route("/api/backup", get(backup_config).post(set_backup_config))
         .route("/api/backup/upload", post(backup_upload).layer(DefaultBodyLimit::disable()))
@@ -1689,6 +1692,82 @@ async fn gallery_days(State(state): State<std::sync::Arc<AppState>>, headers: He
         "days": days.into_iter().map(|(day, count)| json!({ "day": day, "count": count })).collect::<Vec<_>>(),
         "hidden": hidden,
         "status": state.media.status(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct PlacesQuery {
+    zoom: Option<u8>,
+    west: Option<f64>,
+    south: Option<f64>,
+    east: Option<f64>,
+    north: Option<f64>,
+    limit: Option<usize>,
+}
+
+impl PlacesQuery {
+    fn bounds(&self) -> Option<crate::albums::Bounds> {
+        Some(crate::albums::Bounds { west: self.west?, south: self.south?, east: self.east?, north: self.north? })
+    }
+}
+
+/// Photos with a place, grouped for the map at a zoom (all of them without a box), and the box
+/// around them all (to fit the map to them at first).
+async fn gallery_places(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PlacesQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let conn = own_connection(&state)?;
+    let zoom = query.zoom.unwrap_or(2);
+    let bounds = query.bounds();
+    let (places, extent) = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
+        Ok((crate::albums::places(&conn, zoom, bounds, 72.0)?, crate::albums::place_extent(&conn)?))
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the places"))??;
+    Ok(Json(json!({
+        "places": places,
+        "extent": extent.map(|(b, count)| json!({ "west": b.west, "south": b.south, "east": b.east, "north": b.north, "count": count })),
+    })))
+}
+
+/// The photos on a part of the map, newest first.
+async fn gallery_place_items(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PlacesQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let bounds = query.bounds().ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Say which part of the map"))?;
+    let limit = query.limit.unwrap_or(500).min(5000);
+    let conn = own_connection(&state)?;
+    let (items, total) = crate::albums::placed_items(&conn, bounds, limit)?;
+    Ok(Json(json!({ "items": items, "total": total })))
+}
+
+#[derive(Deserialize)]
+struct MemoriesQuery {
+    month: u32,
+    day: u32,
+    year: i32,
+}
+
+/// Photos taken on this day in earlier years (the day as the viewer sees it).
+async fn gallery_memories(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<MemoriesQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    if !(1..=12).contains(&query.month) || !(1..=31).contains(&query.day) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "That is not a day"));
+    }
+    let conn = own_connection(&state)?;
+    let years = crate::albums::on_this_day(&conn, query.month, query.day, query.year, 60)?;
+    Ok(Json(json!({
+        "years": years.into_iter().map(|(year, count, items)| json!({ "year": year, "count": count, "items": items })).collect::<Vec<_>>(),
     })))
 }
 
