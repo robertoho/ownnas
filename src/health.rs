@@ -86,8 +86,8 @@ pub fn level(total: u64, free: u64) -> &'static str {
 /// volumes that only mirror another are left out.
 pub fn volumes(library: &Path, data: &Path) -> Vec<Volume> {
     let disks = sysinfo::Disks::new_with_refreshed_list();
-    let library = library.canonicalize().unwrap_or_else(|_| library.to_path_buf());
-    let data = data.canonicalize().unwrap_or_else(|_| data.to_path_buf());
+    let library = plain(library);
+    let data = plain(data);
     // The disk of a path is the one mounted deepest above it.
     let owner = |path: &Path| {
         disks.list().iter().filter(|disk| path.starts_with(disk.mount_point())).max_by_key(|disk| disk.mount_point().as_os_str().len()).map(|disk| disk.mount_point().to_path_buf())
@@ -135,6 +135,17 @@ pub fn volumes(library: &Path, data: &Path) -> Vec<Volume> {
     }
     out.sort_by_key(|volume| (volume.holds.is_empty(), volume.mount.clone()));
     out
+}
+
+/// A path in full, as the disks list mounts them: on Windows, without the `\\?\` prefix that
+/// resolving a path adds (`\\?\C:\Users` is on the disk mounted at `C:\`).
+fn plain(path: &Path) -> std::path::PathBuf {
+    let full = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let text = full.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC\\") => std::path::PathBuf::from(rest),
+        _ => full,
+    }
 }
 
 /// Temperatures the system reports, hottest first.
