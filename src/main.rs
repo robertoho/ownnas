@@ -12,6 +12,7 @@ mod ebook;
 mod file_index;
 mod files;
 mod font_info;
+mod helper_tools;
 mod image_edit;
 mod video_edit;
 mod media_index;

@@ -344,6 +344,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/storage", get(storage_status))
         .route("/api/storage/measure", post(measure_storage))
         .route("/api/index", get(index_status))
+        .route("/api/helpers", get(helper_programs))
         .route("/api/index/reindex", post(reindex))
         .route("/api/videos/convert", post(convert_video))
         .route("/api/videos/job", get(video_job).delete(cancel_video_job))
@@ -5863,6 +5864,32 @@ fn storage_json(state: &AppState, disk: Option<crate::storage::Disk>) -> serde_j
 }
 
 /// The search index: how much it holds and what it is doing, and the indexing speed.
+/// The outside programs OwnNAS can use, checked now. One installed after OwnNAS started is only
+/// used after a restart.
+async fn helper_programs(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let tools = tokio::task::spawn_blocking(crate::helper_tools::check)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not check the helper programs"))?;
+    let in_use = |name: &str| match name {
+        "tesseract" => state.ocr,
+        "ffmpeg" => state.ffmpeg,
+        "pdftotext" => crate::content_index::pdftotext_available(),
+        "sips" | "heif-convert" => crate::thumbs::converter_available(),
+        _ => true,
+    };
+    let tools: Vec<serde_json::Value> = tools
+        .into_iter()
+        .map(|tool| {
+            let restart = tool.found && !in_use(tool.name);
+            let mut value = serde_json::to_value(&tool).unwrap_or_default();
+            value["restart"] = json!(restart);
+            value
+        })
+        .collect();
+    Ok(Json(json!({ "tools": tools })))
+}
+
 async fn index_status(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     Ok(Json(json!({ "speed": state.media.speed(), "files": state.file_index.status(), "media": state.media.status() })))

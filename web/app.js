@@ -1384,7 +1384,10 @@ function setSettingsTab(tab) {
   $("settings-tab-indexing").setAttribute("aria-selected", indexingTab ? "true" : "false");
   $("settings-indexing").hidden = !indexingTab;
   clearTimeout(indexingTimer);
-  if (indexingTab) refreshIndexing().catch((err) => toast(err.message, true));
+  if (indexingTab) {
+    refreshIndexing().catch((err) => toast(err.message, true));
+    refreshHelpers().catch(() => {});
+  }
   $("settings-tab-storage").setAttribute("aria-selected", storageTab ? "true" : "false");
   $("settings-storage").hidden = !storageTab;
   if (storageTab) refreshStorage(true).catch((err) => toast(err.message, true));
@@ -1498,6 +1501,47 @@ function describeFilesIndex(files) {
   const took = files.tookMs != null ? ` (took ${files.tookMs < 1000 ? "under a second" : `${Math.round(files.tookMs / 1000).toLocaleString()} s`})` : "";
   return `${count(files.entries)} files and folders indexed. Last checked for changes ${formatDate(files.finishedAt)}${took}.`;
 }
+
+/// Settings → Indexing: which outside programs (tesseract, ffmpeg, …) are installed.
+async function refreshHelpers() {
+  const { tools } = await api("/api/helpers");
+  const list = $("helpers-list");
+  list.replaceChildren(...tools.map((tool) => {
+    const item = document.createElement("li");
+    item.className = `helper ${tool.found ? (tool.restart ? "helper-restart" : "helper-found") : "helper-missing"}`;
+    const head = document.createElement("div");
+    head.className = "helper-head";
+    const name = document.createElement("code");
+    name.textContent = tool.name;
+    const status = document.createElement("span");
+    status.className = "helper-status";
+    status.textContent = !tool.found ? "Not installed" : tool.restart ? "Installed: restart OwnNAS to use it" : "Installed";
+    head.append(name, status);
+    const lines = [tool.purpose];
+    if (tool.found) lines.push([tool.version, tool.path && `(${tool.path})`].filter(Boolean).join(" "));
+    if (!tool.found) lines.push(tool.without);
+    if (tool.note) lines.push(tool.note);
+    item.append(head, ...lines.map((text) => {
+      const line = document.createElement("p");
+      line.className = "muted";
+      line.textContent = text;
+      return line;
+    }));
+    if (!tool.found && tool.install) {
+      const how = document.createElement("p");
+      how.className = "helper-install";
+      const command = document.createElement("code");
+      command.textContent = tool.install;
+      how.append("To install: ", command);
+      item.append(how);
+    }
+    return item;
+  }));
+}
+
+$("helpers-recheck").addEventListener("click", () => {
+  refreshHelpers().then(() => toast("Checked the helper programs")).catch((err) => toast(err.message, true));
+});
 
 async function refreshIndexing() {
   const data = await api("/api/index");
@@ -6484,8 +6528,14 @@ function syncSearchHint() {
   const ocr = !!(state.me && state.me.ocr);
   hint.innerHTML = ocr
     ? `Searching this folder and below for partial file and folder names, tags, and text in documents (including PDFs and OCR’d images). Press Enter. Use <code>tag:family</code> for an exact tag.`
-    : `Searching this folder and below for partial file and folder names, tags, and text in documents (including PDFs). Install <code>tesseract</code> for image OCR. Press Enter. Use <code>tag:family</code> for an exact tag.`;
+    : `Searching this folder and below for partial file and folder names, tags, and text in documents (including PDFs). Install <code>tesseract</code> for image OCR (<button type="button" class="link-button" data-open-helpers>check what is installed</button>). Press Enter. Use <code>tag:family</code> for an exact tag.`;
 }
+
+$("search-hint").addEventListener("click", (event) => {
+  if (!event.target.closest("[data-open-helpers]")) return;
+  openSettings("indexing");
+  setTimeout(() => $("helpers-heading").scrollIntoView({ block: "start", behavior: "smooth" }), 50);
+});
 
 let searchAbort = null;
 

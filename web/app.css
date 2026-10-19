@@ -3614,6 +3614,15 @@ body.is-gallery .app > .explorer-status-bar { display: none; }
 .index-speed-option > span { display: grid; gap: 0.2rem; }
 .index-speed-option .muted { font-size: 0.85rem; }
 .index-status { min-height: 1.3rem; }
+.helpers-list { list-style: none; margin: 0 0 0.6rem; padding: 0; display: grid; gap: 0.5rem; }
+.helper { border: 1px solid var(--line); border-radius: 8px; padding: 0.5rem 0.7rem; }
+.helper p { margin: 0.15rem 0 0; overflow-wrap: anywhere; }
+.helper-head { display: flex; align-items: center; justify-content: space-between; gap: 0.6rem; }
+.helper-status { font-size: 0.85em; font-weight: 600; white-space: nowrap; }
+.helper-found .helper-status { color: var(--ok, #2e9d55); }
+.helper-restart .helper-status { color: var(--warn, #c98a00); }
+.helper-missing .helper-status { color: var(--danger, #d33); }
+.helper-install code { user-select: all; }
 
 .smart-settings { margin-top: 1.4rem; padding-top: 1rem; border-top: 1px solid var(--line); }
 .smart-settings h3 { margin: 0 0 0.4rem; }
