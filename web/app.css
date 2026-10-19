@@ -876,12 +876,12 @@ input, select, textarea {
 .files.icons .card.trash-folder .glyph .type-icon,
 .files.masonry .card.archive-folder .glyph .type-icon,
 .files.masonry .card.trash-folder .glyph .type-icon {
-  width: clamp(2.5rem, calc(var(--tile-size, 180px) * 0.5), 7.5rem);
-  height: clamp(2.5rem, calc(var(--tile-size, 180px) * 0.5), 7.5rem);
-  max-width: 8.5rem;
-  max-height: 8.5rem;
-  min-width: 2.5rem;
-  min-height: 2.5rem;
+  width: clamp(1.75rem, calc(var(--tile-size, 180px) * 0.35), 5.25rem);
+  height: clamp(1.75rem, calc(var(--tile-size, 180px) * 0.35), 5.25rem);
+  max-width: 6rem;
+  max-height: 6rem;
+  min-width: 1.75rem;
+  min-height: 1.75rem;
   filter: drop-shadow(0 6px 10px color-mix(in srgb, currentColor 28%, transparent));
 }
 .files.list .card.archive-folder .glyph .type-icon,
@@ -1018,10 +1018,10 @@ input, select, textarea {
 }
 .files.icons .glyph .type-icon,
 .files.masonry .glyph .type-icon {
-  width: clamp(2.5rem, calc(var(--tile-size, 180px) * 0.5), 11.25rem);
-  height: clamp(2.5rem, calc(var(--tile-size, 180px) * 0.5), 11.25rem);
-  max-width: 11.25rem;
-  max-height: 11.25rem;
+  width: clamp(1.75rem, calc(var(--tile-size, 180px) * 0.35), 7.875rem);
+  height: clamp(1.75rem, calc(var(--tile-size, 180px) * 0.35), 7.875rem);
+  max-width: 7.875rem;
+  max-height: 7.875rem;
 }
 .card-body { padding: 0.6rem 0.75rem 0.75rem; min-width: 0; }
 .name {
