@@ -17,6 +17,7 @@ mod text_index;
 mod versions;
 mod duplicates;
 mod video_meta;
+mod health;
 mod image_edit;
 mod video_edit;
 mod media_index;

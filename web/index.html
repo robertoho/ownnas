@@ -256,6 +256,11 @@
         <div id="search-results" class="search-results"></div>
       </section>
 
+      <div id="health-alert" class="health-alert" role="alert" hidden>
+        <span id="health-alert-text"></span>
+        <button id="health-alert-open" type="button" class="link-button">See Health</button>
+        <button id="health-alert-close" type="button" class="health-alert-close" aria-label="Dismiss">✕</button>
+      </div>
       <p id="banner" class="banner" hidden></p>
       <div id="files" class="files icons" tabindex="0" role="region" aria-label="Files and folders"></div>
       <p id="empty" class="empty" hidden></p>
@@ -319,6 +324,7 @@
       <button id="settings-tab-gallery" type="button" role="tab" aria-selected="false" data-settings-tab="gallery" hidden>Gallery</button>
       <button id="settings-tab-storage" type="button" role="tab" aria-selected="false" data-settings-tab="storage">Storage</button>
       <button id="settings-tab-indexing" type="button" role="tab" aria-selected="false" data-settings-tab="indexing">Indexing</button>
+      <button id="settings-tab-health" type="button" role="tab" aria-selected="false" data-settings-tab="health">Health</button>
     </div>
     <section id="settings-theme" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-theme">
       <p class="muted">Themes inspired by Omarchy palettes. Choice is saved in this browser.</p>
@@ -382,6 +388,20 @@
       <dl id="storage-legend" class="storage-legend"></dl>
       <p id="storage-measured" class="muted"></p>
       <button id="storage-measure" type="button">Measure again</button>
+    </section>
+    <section id="settings-health" class="settings-panel health-settings" role="tabpanel" aria-labelledby="settings-tab-health" hidden>
+      <h3>Disks</h3>
+      <div id="health-volumes" class="health-list"></div>
+      <h3>Drives</h3>
+      <p class="muted">What each drive says of its own health (S.M.A.R.T.).</p>
+      <div id="health-drives" class="health-list"></div>
+      <p id="health-drives-note" class="muted"></p>
+      <h3>This computer</h3>
+      <dl id="health-system" class="health-system"></dl>
+      <h3>Temperatures</h3>
+      <div id="health-sensors" class="health-sensors"></div>
+      <p id="health-checked" class="muted"></p>
+      <button id="health-refresh" type="button">Check again</button>
     </section>
     <section id="settings-indexing" class="settings-panel indexing-settings" role="tabpanel" aria-labelledby="settings-tab-indexing" hidden>
       <h3>Search index</h3>

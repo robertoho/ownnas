@@ -89,6 +89,13 @@ pub fn check() -> Vec<HelperTool> {
         tools.push(heif);
     }
     tools.push(tool(
+        "smartctl",
+        &["--version"],
+        "Reads the drives' own health reports for Settings > Health: temperature, wear, and errors (part of smartmontools).",
+        "Health shows only whether a drive says it is healthy, where the system tells.",
+        install("brew install smartmontools", "sudo apt install smartmontools", "winget install smartmontools.smartmontools"),
+    ));
+    tools.push(tool(
         "git",
         &["--version"],
         "Shows what changed in a terminal's project folder.",

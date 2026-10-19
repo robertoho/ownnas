@@ -106,6 +106,8 @@ pub struct AppState {
     pub text_index: std::sync::Arc<crate::text_index::TextIndex>,
     /// Copies of files from before OwnNAS saved over them (`versions.rs`).
     pub versions: PathBuf,
+    /// The drives' health reports, asked for now and then.
+    pub health: std::sync::Arc<crate::health::Health>,
     /// How full the disk is, and how much the library and OwnNAS's data take.
     pub storage: std::sync::Arc<crate::storage::Storage>,
     /// The Gallery's machine-learning models (downloaded when switched on).
@@ -193,6 +195,7 @@ pub fn new_state(
         file_index: std::sync::Arc::default(),
         text_index: std::sync::Arc::default(),
         versions: crate::versions::store_dir(&data_dir),
+        health: std::sync::Arc::default(),
         storage: {
             let storage = std::sync::Arc::new(crate::storage::Storage::default());
             storage.load(&db_path);
@@ -365,6 +368,8 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/index", get(index_status))
         .route("/api/helpers", get(helper_programs))
         .route("/api/versions", get(list_versions))
+        .route("/api/system", get(health_report))
+        .route("/api/system/alerts", get(health_alerts))
         .route("/api/duplicates/trash", post(trash_duplicates))
         .route("/api/versions/file", get(version_file))
         .route("/api/versions/restore", post(restore_version))
@@ -6104,6 +6109,63 @@ fn storage_json(state: &AppState, disk: Option<crate::storage::Disk>) -> serde_j
 }
 
 /// The search index: how much it holds and what it is doing, and the indexing speed.
+#[derive(Deserialize)]
+struct HealthQuery {
+    fresh: Option<String>,
+}
+
+/// The computer's disks, drives, temperatures, memory, and processor.
+async fn health_report(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<HealthQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let fresh = flag(&query.fresh);
+    let worker = state.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        let data = worker.db_path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+        let (drives, note) = worker.health.drives(fresh);
+        json!({
+            "volumes": crate::health::volumes(&worker.root, &data),
+            "drives": drives,
+            "drivesNote": note,
+            "sensors": crate::health::sensors(),
+            "system": crate::health::system(),
+            "checkedAt": db::now_secs(),
+        })
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not check the computer's health"))?;
+    Ok(Json(report))
+}
+
+/// What needs attention now: a disk OwnNAS uses nearly full, or a drive reporting trouble (as
+/// last asked; this never asks the drives itself).
+async fn health_alerts(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let worker = state.clone();
+    let alerts = tokio::task::spawn_blocking(move || {
+        let data = worker.db_path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+        let mut alerts = Vec::new();
+        for volume in crate::health::volumes(&worker.root, &data).into_iter().filter(|volume| !volume.holds.is_empty()) {
+            if volume.level == "ok" {
+                continue;
+            }
+            let what = if volume.holds.contains(&"library") { "the library" } else { "OwnNAS's data" };
+            alerts.push(json!({ "level": volume.level, "kind": "disk", "mount": volume.mount, "free": volume.free, "total": volume.total, "what": what }));
+        }
+        let (drives, _) = worker.health.drives(false);
+        for drive in drives.into_iter().filter(|drive| drive.healthy == Some(false) || !drive.warnings.is_empty()) {
+            alerts.push(json!({ "level": if drive.healthy == Some(false) { "full" } else { "low" }, "kind": "drive", "name": drive.name, "model": drive.model, "status": drive.status, "warnings": drive.warnings }));
+        }
+        alerts
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not check the computer's health"))?;
+    Ok(Json(json!({ "alerts": alerts })))
+}
+
 /// A connection for work that may take a while, so it does not hold up the shared one.
 fn own_connection(state: &AppState) -> Result<rusqlite::Connection, ApiError> {
     let conn = rusqlite::Connection::open(&state.db_path)

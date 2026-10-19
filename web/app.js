@@ -1383,6 +1383,10 @@ function setSettingsTab(tab) {
   const galleryTab = tab === "gallery";
   const storageTab = tab === "storage";
   const indexingTab = tab === "indexing";
+  const healthTab = tab === "health";
+  $("settings-tab-health").setAttribute("aria-selected", healthTab ? "true" : "false");
+  $("settings-health").hidden = !healthTab;
+  if (healthTab) refreshHealth(false).catch((err) => toast(err.message, true));
   $("settings-tab-indexing").setAttribute("aria-selected", indexingTab ? "true" : "false");
   $("settings-indexing").hidden = !indexingTab;
   clearTimeout(indexingTimer);
@@ -1750,6 +1754,7 @@ $("index-rescan").addEventListener("click", () => {
 });
 $("gallery-index-link").addEventListener("click", () => setSettingsTab("indexing"));
 $("settings-tab-indexing").addEventListener("click", () => setSettingsTab("indexing"));
+$("settings-tab-health").addEventListener("click", () => setSettingsTab("health"));
 
 $("settings-tab-gallery").addEventListener("click", () => setSettingsTab("gallery"));
 $("settings-tab-storage").addEventListener("click", () => setSettingsTab("storage"));
@@ -4650,12 +4655,119 @@ async function boot() {
     if (!updateStatusTimer) updateStatusTimer = setInterval(pollUpdateNotice, 15 * 60 * 1000);
   }
   syncControls();
+  pollHealthAlerts().catch(() => {});
+  if (!healthTimer) healthTimer = setInterval(() => pollHealthAlerts().catch(() => {}), 10 * 60 * 1000);
   try {
     await route();
   } catch (err) {
     toast(err.message, true);
   }
 }
+
+// ---- Health: disks, drives, temperatures (Settings → Health), and a warning when it matters ----
+
+function healthNode(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function uptimeText(seconds) {
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  return days ? `${days} day${days === 1 ? "" : "s"}, ${hours} h` : `${hours} h ${Math.floor((seconds % 3600) / 60)} min`;
+}
+
+async function refreshHealth(fresh) {
+  $("health-checked").textContent = fresh ? "Asking the drives…" : "Checking…";
+  const data = await api(`/api/system${fresh ? "?fresh=1" : ""}`);
+  const holdsLabel = { library: "Library", data: "OwnNAS data" };
+  $("health-volumes").replaceChildren(...data.volumes.map((volume) => {
+    const used = volume.total ? 1 - volume.free / volume.total : 0;
+    const row = healthNode("div", `health-item level-${volume.level}`);
+    const head = healthNode("div", "health-head");
+    const name = healthNode("strong", "", volume.mount === "/" ? `${volume.name || "System disk"} (/)` : volume.mount);
+    const tags = healthNode("span", "health-tags");
+    for (const hold of volume.holds) tags.append(healthNode("span", "health-tag", holdsLabel[hold] || hold));
+    if (volume.removable) tags.append(healthNode("span", "health-tag", "Removable"));
+    head.append(name, tags);
+    const meter = healthNode("div", "health-meter");
+    const fill = healthNode("span", "");
+    fill.style.width = `${Math.min(100, Math.max(0, used * 100)).toFixed(1)}%`;
+    meter.append(fill);
+    const level = volume.level === "full" ? " Nearly full: make room soon." : volume.level === "low" ? " Getting full." : "";
+    const detail = healthNode("p", "muted", `${formatSize(volume.free, false)} free of ${formatSize(volume.total, false)} (${Math.round((volume.free / (volume.total || 1)) * 100)}% free) · ${[volume.fileSystem, volume.kind.toUpperCase()].filter(Boolean).join(" · ")}.${level}`);
+    row.append(head, meter, detail);
+    return row;
+  }));
+  $("health-drives").replaceChildren(...(data.drives.length ? data.drives.map((drive) => {
+    const level = drive.healthy === false ? "full" : drive.warnings.length ? "low" : drive.healthy ? "ok" : "unknown";
+    const row = healthNode("div", `health-item level-${level}`);
+    const head = healthNode("div", "health-head");
+    head.append(healthNode("strong", "", drive.model || drive.name), healthNode("span", `health-state state-${level}`, drive.healthy === true && !drive.warnings.length ? "Healthy" : drive.healthy === false ? "Failing" : drive.warnings.length ? "Has errors" : drive.status || "Not reported"));
+    const facts = [drive.name];
+    if (drive.temperature != null) facts.push(`${Math.round(drive.temperature)} °C`);
+    if (drive.powerOnHours != null) facts.push(`on for ${Number(drive.powerOnHours).toLocaleString()} hours`);
+    if (drive.wear != null) facts.push(`${drive.wear}% of its rated wear used`);
+    row.append(head, healthNode("p", "muted", facts.join(" · ")));
+    if (drive.warnings.length) row.append(healthNode("p", "health-warning", drive.warnings.join(", ")));
+    if (drive.healthy === false) row.append(healthNode("p", "health-warning", "This drive says it is failing: copy what is on it somewhere else now."));
+    return row;
+  }) : [healthNode("p", "muted", "No drive reports were found.")]));
+  $("health-drives-note").textContent = data.drivesNote || "";
+  const system = data.system || {};
+  const facts = [];
+  if (system.host) facts.push(["Name", system.host]);
+  if (system.os) facts.push(["System", system.os]);
+  if (system.cpu) facts.push(["Processor", `${system.cpu} (${system.cores} cores)`]);
+  if (system.cpuUsage != null) facts.push(["Processor use", `${Math.round(system.cpuUsage)}%${system.load ? ` · load ${system.load.map((n) => n.toFixed(2)).join(", ")}` : ""}`]);
+  if (system.memory && system.memory.total) facts.push(["Memory", `${formatSize(system.memory.used, false)} used of ${formatSize(system.memory.total, false)}`]);
+  if (system.swap && system.swap.total) facts.push(["Swap", `${formatSize(system.swap.used, false)} used of ${formatSize(system.swap.total, false)}`]);
+  if (system.uptime) facts.push(["Up for", uptimeText(system.uptime)]);
+  $("health-system").replaceChildren(...facts.flatMap(([label, value]) => [healthNode("dt", "muted", label), healthNode("dd", "", value)]));
+  const sensors = data.sensors || [];
+  $("health-sensors").replaceChildren(...(sensors.length ? sensors.slice(0, 12).map((sensor) => {
+    const hot = sensor.critical ? sensor.celsius >= sensor.critical - 10 : sensor.celsius >= 90;
+    const chip = healthNode("span", `health-sensor${hot ? " is-hot" : ""}`);
+    chip.append(healthNode("span", "muted", sensor.label), healthNode("strong", "", `${Math.round(sensor.celsius)} °C`));
+    return chip;
+  }) : [healthNode("p", "muted", "This computer reports no temperatures to OwnNAS.")]));
+  if (sensors.length > 12) $("health-sensors").append(healthNode("p", "muted", `The hottest 12 of ${sensors.length} sensors.`));
+  $("health-checked").textContent = `Checked ${formatDate(data.checkedAt)}.`;
+  pollHealthAlerts().catch(() => {});
+}
+
+$("health-refresh").addEventListener("click", () => refreshHealth(true).catch((err) => toast(err.message, true)));
+
+let healthAlertKey = "";
+let healthTimer = 0;
+
+/// Shows a warning over the files when a disk OwnNAS uses is nearly full or a drive reports
+/// trouble. Dismissed, it stays away until something changes (or the next visit).
+async function pollHealthAlerts() {
+  const { alerts } = await api("/api/system/alerts");
+  const box = $("health-alert");
+  if (!alerts.length) {
+    box.hidden = true;
+    return;
+  }
+  const texts = alerts.map((alert) => alert.kind === "disk"
+    ? `The disk with ${alert.what} is ${alert.level === "full" ? "nearly full" : "getting full"}: ${formatSize(alert.free, false)} free (${Math.round((alert.free / (alert.total || 1)) * 100)}%).`
+    : `The drive ${alert.model || alert.name} ${alert.status === "Failing" ? "says it is failing" : `reports ${alert.warnings.join(", ")}`}.`);
+  healthAlertKey = alerts.map((alert) => `${alert.kind}:${alert.level}:${alert.mount || alert.name}`).join("|");
+  let dismissed = "";
+  try { dismissed = sessionStorage.getItem("ownnas-health-dismissed") || ""; } catch {}
+  box.classList.toggle("is-serious", alerts.some((alert) => alert.level === "full"));
+  $("health-alert-text").textContent = texts.join(" ");
+  box.hidden = dismissed === healthAlertKey;
+}
+
+$("health-alert-open").addEventListener("click", () => openSettings("health"));
+$("health-alert-close").addEventListener("click", () => {
+  $("health-alert").hidden = true;
+  try { sessionStorage.setItem("ownnas-health-dismissed", healthAlertKey); } catch {}
+});
 
 async function pollUpdateNotice() {
   if (!state.me?.admin || !state.me.updatesConfigured) return;
