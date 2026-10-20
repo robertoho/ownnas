@@ -54,6 +54,7 @@ function dayLabel(day) {
 }
 
 const SIZE_KEY = "ownnas-gallery-size";
+const WORKSPACE_KEY = "ownnas-gallery-workspace";
 const VIEW_KEY = "ownnas-gallery-view";
 const GAP = 4; // between photos, as in the CSS
 
@@ -113,6 +114,20 @@ export function mountGallery(root, ctx) {
   let cardAlbums = new Map(); // id -> the albums shown as cards
   let menu = null;
   let placesMap = null; // the Places map, while it shows
+  let workspace = null; // the workspace shown (its id), or null for every photo
+  let workspaces = []; // every workspace: {id, name, folders, photos}
+  let workspacesLoaded = null; // a promise, while the list loads
+
+  /// Gallery requests carry the workspace shown, so the server sends only its photos and albums.
+  const SCOPED = /^\/api\/(gallery\/|albums|tags\/all|people)/;
+  function api(url, options) {
+    if (workspace === null || !SCOPED.test(url)) return ctx.api(url, options);
+    return ctx.api(`${url}${url.includes("?") ? "&" : "?"}workspace=${workspace}`, options);
+  }
+
+  /// The address of the Gallery in the workspace shown: every link keeps it.
+  const home = () => `#gallery/${workspace === null ? "all" : `w${workspace}`}`;
+  const workspaceName = (id) => (workspaces.find((entry) => entry.id === id) || {}).name || "";
 
   const tabs = el("nav", { class: "gallery-tabs", "aria-label": "Gallery sections" });
   for (const [tab, label] of [["photos", "Photos"], ["albums", "Albums"], ["people", "People"], ["places", "Places"], ["tags", "Tags"]]) {
@@ -135,7 +150,12 @@ export function mountGallery(root, ctx) {
     button.addEventListener("click", () => setView(option.id));
     viewSwitch.append(button);
   }
-  const head = el("div", { class: "gallery-head" }, tabs, searchBox, actions);
+  const switcher = el("button", { type: "button", class: "gallery-workspace", "aria-haspopup": "menu", title: "Workspace: which photos and albums to show", hidden: true });
+  switcher.addEventListener("click", () => {
+    const rect = switcher.getBoundingClientRect();
+    workspaceMenu(rect.left, rect.bottom + 4);
+  });
+  const head = el("div", { class: "gallery-head" }, switcher, tabs, searchBox, actions);
   // At the bottom, as in the file browser: what is shown on the left, how it is shown on the right.
   const footer = el("footer", { class: "explorer-status-bar gallery-status-bar", "aria-label": "Gallery status and layout" },
     el("div", { class: "status-summary", role: "status", "aria-live": "polite" }, status),
@@ -591,7 +611,7 @@ export function mountGallery(root, ctx) {
     body.replaceChildren(el("p", { class: "muted gallery-message" }, "Loading photos…"));
     let data;
     try {
-      data = await ctx.api("/api/gallery/days");
+      data = await api("/api/gallery/days");
     } catch (err) {
       if (!stale(mine)) body.replaceChildren(el("p", { class: "muted gallery-message" }, err.message));
       return;
@@ -601,8 +621,11 @@ export function mountGallery(root, ctx) {
     hiddenCount = data.hidden || 0;
     renderHiddenButton();
     if (!data.days.length) {
+      const space = workspaces.find((entry) => entry.id === workspace);
       body.replaceChildren(el("p", { class: "muted gallery-message" }, data.status.scanning
         ? "Looking for photos in the library…"
+        : space && !space.folders.length ? `“${space.name}” has no folders yet.${ctx.isAdmin() ? " Choose its folders with Edit workspace, in the workspace menu." : ""}`
+        : space ? `No photos or videos in “${space.name}” yet: it shows those in ${space.folders.map((folder) => `“${folder}”`).join(", ")}.`
         : "No photos or videos yet. Photos anywhere in the library show up here, newest first."));
       scheduleScrubber();
       return;
@@ -649,7 +672,7 @@ export function mountGallery(root, ctx) {
   function renderHiddenButton() {
     actions.querySelector(".gallery-hidden-link")?.remove();
     if (!hiddenCount) return;
-    actions.prepend(el("a", { class: "button gallery-hidden-link", href: "#gallery/hidden", title: "Photos left out of the timeline" }, `Hidden · ${number(hiddenCount)}`));
+    actions.prepend(el("a", { class: "button gallery-hidden-link", href: `${home()}/hidden`, title: "Photos left out of the timeline" }, `Hidden · ${number(hiddenCount)}`));
   }
 
   /// Hides photos from the timeline (or shows them again). The files are not touched.
@@ -673,7 +696,7 @@ export function mountGallery(root, ctx) {
   async function setHidden(paths, hidden) {
     if (!paths.length) return;
     try {
-      const data = await ctx.api("/api/gallery/hidden", { method: "POST", json: { paths, hidden } });
+      const data = await api("/api/gallery/hidden", { method: "POST", json: { paths, hidden } });
       ctx.toast(hidden
         ? `Hid ${plural(data.changed, "photo")} from Photos. ${data.changed === 1 ? "It is" : "They are"} still in ${data.changed === 1 ? "its folder" : "their folders"} and albums; see Hidden.`
         : `${plural(data.changed, "photo")} back in Photos`);
@@ -716,12 +739,12 @@ export function mountGallery(root, ctx) {
     actions.replaceChildren();
     body.replaceChildren(el("p", { class: "muted gallery-message" }, "Loading…"));
     try {
-      const data = await ctx.api("/api/gallery/hidden");
+      const data = await api("/api/gallery/hidden");
       if (stale(mine)) return;
       items = data.items;
       status.textContent = plural(items.length, "hidden photo");
       body.replaceChildren(
-        el("nav", { class: "gallery-crumbs" }, el("a", { href: "#gallery" }, "Photos"), el("span", { "aria-hidden": "true" }, "›"), el("strong", {}, "Hidden")),
+        el("nav", { class: "gallery-crumbs" }, el("a", { href: home() }, "Photos"), el("span", { "aria-hidden": "true" }, "›"), el("strong", {}, "Hidden")),
         el("p", { class: "muted gallery-note" }, "These are left out of the Photos timeline. They are not moved or changed, and they still show in their folders, albums, and tags. Select some and choose Show in Photos to bring them back."),
         items.length ? grid(items) : el("p", { class: "muted gallery-message" }, "Nothing is hidden."),
       );
@@ -734,7 +757,7 @@ export function mountGallery(root, ctx) {
     if (!month || month.loaded || month.loading) return;
     month.loading = true;
     try {
-      const data = await ctx.api(`/api/gallery/timeline?from=${month.from}&to=${month.to}&limit=50000`);
+      const data = await api(`/api/gallery/timeline?from=${month.from}&to=${month.to}&limit=50000`);
       if (stale(mine)) return;
       const byDay = new Map();
       for (const item of data.items) {
@@ -799,12 +822,15 @@ export function mountGallery(root, ctx) {
   function showStatus(info) {
     clearTimeout(statusTimer);
     if (!info) return;
+    // In a workspace, count its photos rather than the whole library's.
+    const space = workspaces.find((entry) => entry.id === workspace);
+    if (space) info = { ...info, total: space.photos };
     if (info.scanning) {
       status.textContent = `Looking for photos… ${number(info.seen)} found`;
       const mine = generation;
       statusTimer = setTimeout(async () => {
         try {
-          const next = await ctx.api("/api/gallery/status");
+          const next = await api("/api/gallery/status");
           if (stale(mine)) return;
           // When a scan ends, show what it found.
           if (!next.scanning && route.tab === "photos") showPhotos();
@@ -816,7 +842,7 @@ export function mountGallery(root, ctx) {
       const mine = generation;
       statusTimer = setTimeout(async () => {
         try {
-          const next = await ctx.api("/api/gallery/status");
+          const next = await api("/api/gallery/status");
           if (!stale(mine)) showStatus(next);
         } catch {}
       }, 3000);
@@ -827,7 +853,7 @@ export function mountGallery(root, ctx) {
 
   async function rescan() {
     try {
-      showStatus(await ctx.api("/api/gallery/rescan", { method: "POST" }));
+      showStatus(await api("/api/gallery/rescan", { method: "POST" }));
       ctx.toast("Looking through the library for photos");
     } catch (err) {
       ctx.toast(err.message, true);
@@ -932,18 +958,24 @@ export function mountGallery(root, ctx) {
     const mine = ++generation;
     body.replaceChildren(el("p", { class: "muted gallery-message" }, "Loading albums…"));
     try {
-      const data = await ctx.api(`/api/albums${id ? `?id=${id}` : ""}`);
+      const data = await api(`/api/albums${id ? `?id=${id}` : ""}`);
       if (stale(mine)) return;
       current = data.album;
+      // An album opened from elsewhere (a link in the files) shows in its own workspace.
+      if (current && workspace !== null && current.workspaceId !== workspace) {
+        setWorkspace(current.workspaceId ?? null);
+        history.replaceState(null, "", `${home()}/albums/${current.id}`);
+        paintWorkspace();
+      }
       items = data.items;
       cardAlbums = new Map(data.albums.map((album) => [album.id, album]));
       status.textContent = current ? `${plural(current.count, "photo")}${current.albums ? ` · ${plural(current.albums, "album")}` : ""}` : plural(data.albums.length, "album");
       renderAlbumActions();
       const crumbs = el("nav", { class: "gallery-crumbs", "aria-label": "Album path" },
-        el("a", { href: "#gallery/albums" }, "Albums"),
+        el("a", { href: `${home()}/albums` }, "Albums"),
         data.breadcrumb.map((crumb, i) => [
           el("span", { "aria-hidden": "true" }, "›"),
-          i === data.breadcrumb.length - 1 ? el("strong", {}, crumb.name) : el("a", { href: `#gallery/albums/${crumb.id}` }, crumb.name),
+          i === data.breadcrumb.length - 1 ? el("strong", {}, crumb.name) : el("a", { href: `${home()}/albums/${crumb.id}` }, crumb.name),
         ]));
       const cards = data.albums.length ? el("div", { class: "gallery-albums" }, data.albums.map(albumCard)) : null;
       let content;
@@ -965,8 +997,9 @@ export function mountGallery(root, ctx) {
       ? el("img", { src: thumbUrl({ path: album.cover }), alt: "", loading: "lazy" })
       : el("span", { class: "gallery-album-empty", "aria-hidden": "true" }, "▢");
     const detail = [album.count ? plural(album.count, "photo") : "", album.albums ? plural(album.albums, "album") : ""].filter(Boolean).join(" · ") || "Empty";
-    return el("a", { class: "gallery-album", href: `#gallery/albums/${album.id}`, "data-album": String(album.id) },
-      el("span", { class: "gallery-album-cover" }, cover),
+    const space = workspace === null && album.parentId === null && album.workspaceId ? workspaceName(album.workspaceId) : "";
+    return el("a", { class: "gallery-album", href: `${home()}/albums/${album.id}`, "data-album": String(album.id) },
+      el("span", { class: "gallery-album-cover" }, cover, space ? el("span", { class: "gallery-album-workspace", title: `In the workspace “${space}”` }, space) : null),
       el("strong", {}, album.name),
       el("span", { class: "muted" }, detail));
   }
@@ -987,8 +1020,8 @@ export function mountGallery(root, ctx) {
     const name = await ctx.askText(parentId ? "New album inside this one" : "New album", "Name", "", "Create");
     if (name === null || !name.trim()) return null;
     try {
-      const data = await ctx.api("/api/albums", { method: "POST", json: { name: name.trim(), parentId } });
-      if (open) location.hash = `#gallery/albums/${data.album.id}`;
+      const data = await api("/api/albums", { method: "POST", json: { name: name.trim(), parentId } });
+      if (open) location.hash = `${home()}/albums/${data.album.id}`;
       return data.album;
     } catch (err) {
       ctx.toast(err.message, true);
@@ -1000,7 +1033,7 @@ export function mountGallery(root, ctx) {
     const name = await ctx.askText("Rename album", "Name", album.name, "Rename");
     if (name === null || !name.trim() || name.trim() === album.name) return;
     try {
-      await ctx.api("/api/albums", { method: "PATCH", json: { id: album.id, name: name.trim() } });
+      await api("/api/albums", { method: "PATCH", json: { id: album.id, name: name.trim() } });
       showAlbums(route.id);
     } catch (err) {
       ctx.toast(err.message, true);
@@ -1011,7 +1044,7 @@ export function mountGallery(root, ctx) {
     const target = await chooseAlbum({ title: `Move “${album.name}” into…`, ok: "Move here", top: true, exclude: album.id });
     if (target === undefined) return;
     try {
-      await ctx.api("/api/albums", { method: "PATCH", json: { id: album.id, move: true, parentId: target } });
+      await api("/api/albums", { method: "PATCH", json: { id: album.id, move: true, parentId: target } });
       ctx.toast(target === null ? `Moved “${album.name}” to the top` : "Album moved");
       showAlbums(route.id);
     } catch (err) {
@@ -1023,9 +1056,9 @@ export function mountGallery(root, ctx) {
     const inside = album.albums ? ` and the ${plural(album.albums, "album")} inside it` : "";
     if (!(await ctx.askConfirm(`Delete the album “${album.name}”${inside}? The photos stay where they are; only the album goes.`, "Delete album"))) return;
     try {
-      await ctx.api(`/api/albums?id=${album.id}`, { method: "DELETE" });
+      await api(`/api/albums?id=${album.id}`, { method: "DELETE" });
       ctx.toast(`Deleted the album “${album.name}”`);
-      if (current && album.id === current.id) location.hash = album.parentId ? `#gallery/albums/${album.parentId}` : "#gallery/albums";
+      if (current && album.id === current.id) location.hash = album.parentId ? `${home()}/albums/${album.parentId}` : `${home()}/albums`;
       else showAlbums(route.id);
     } catch (err) {
       ctx.toast(err.message, true);
@@ -1034,7 +1067,7 @@ export function mountGallery(root, ctx) {
 
   async function removeFromAlbum(paths) {
     try {
-      await ctx.api("/api/albums/items", { method: "POST", json: { albumId: current.id, paths, action: "remove" } });
+      await api("/api/albums/items", { method: "POST", json: { albumId: current.id, paths, action: "remove" } });
       ctx.toast(`Removed ${plural(paths.length, "photo")} from “${current.name}”`);
       selected = new Set();
       showAlbums(current.id);
@@ -1045,7 +1078,7 @@ export function mountGallery(root, ctx) {
 
   async function setCover(path) {
     try {
-      await ctx.api("/api/albums", { method: "PATCH", json: { id: current.id, setCover: true, cover: path } });
+      await api("/api/albums", { method: "PATCH", json: { id: current.id, setCover: true, cover: path } });
       ctx.toast("Cover changed");
       clearSelection();
     } catch (err) {
@@ -1077,11 +1110,16 @@ export function mountGallery(root, ctx) {
     }
   }
 
-  /// A menu like the file browser's: `entries` are {label, icon, run, danger}; falsy ones are skipped.
-  function openMenu(x, y, label, entries) {
+  /// A menu like the file browser's: `entries` are {label, icon, run, danger}; falsy ones are
+  /// skipped. With `keepOrder`, the entries stay in their order and "-" separates groups.
+  function openMenu(x, y, label, entries, { keepOrder = false } = {}) {
     closeMenu();
-    menu = el("div", { class: "menu gallery-menu", role: "menu" }, label ? el("div", { class: "menu-label" }, label) : null);
+    menu = el("div", { class: "menu gallery-menu", role: "menu", "data-keep-order": keepOrder ? "1" : null }, label ? el("div", { class: "menu-label" }, label) : null);
     for (const entry of entries.filter(Boolean)) {
+      if (entry === "-") {
+        if (menu.lastChild && menu.lastChild.tagName === "BUTTON") menu.append(el("div", { class: "menu-separator", role: "separator" }));
+        continue;
+      }
       const button = el("button", { type: "button", role: "menuitem", "data-menu": entry.icon, class: entry.danger ? "danger" : null }, entry.label);
       button.addEventListener("click", () => {
         closeMenu();
@@ -1151,11 +1189,30 @@ export function mountGallery(root, ctx) {
   function albumMenu(event, album) {
     const write = ctx.canWrite();
     openMenu(event.clientX, event.clientY, album.name, [
-      { label: "Open", icon: "open", run: () => { location.hash = `#gallery/albums/${album.id}`; } },
+      { label: "Open", icon: "open", run: () => { location.hash = `${home()}/albums/${album.id}`; } },
       write && { label: "New album inside…", icon: "newAlbum", run: () => newAlbum(album.id) },
       write && { label: "Rename…", icon: "rename", run: () => renameAlbum(album) },
       write && { label: "Move…", icon: "move", run: () => moveAlbum(album) },
+      write && workspaces.length && { label: "Move to workspace…", icon: "workspace", run: () => albumWorkspaceMenu(event, album) },
       write && { label: "Delete album", icon: "delete", danger: true, run: () => deleteAlbum(album) },
+    ]);
+  }
+
+  /// Where an album (with the albums inside it) can go: another workspace, or none.
+  function albumWorkspaceMenu(event, album) {
+    const move = async (target) => {
+      try {
+        await api("/api/albums", { method: "PATCH", json: { id: album.id, setWorkspace: true, workspaceId: target } });
+        ctx.toast(target === null ? `“${album.name}” is in no workspace now: it shows under All photos` : `Moved “${album.name}” to “${workspaceName(target)}”`);
+        if (current && current.id === album.id) location.hash = `#gallery/${target === null ? "all" : `w${target}`}/albums/${album.id}`;
+        else showAlbums(route.id);
+      } catch (err) {
+        ctx.toast(err.message, true);
+      }
+    };
+    openMenu(event.clientX, event.clientY, `Move “${album.name}” to`, [
+      ...workspaces.filter((entry) => entry.id !== album.workspaceId).map((entry) => ({ label: entry.name, icon: "workspace", run: () => move(entry.id) })),
+      album.workspaceId && { label: "No workspace (All photos only)", icon: "close", run: () => move(null) },
     ]);
   }
 
@@ -1166,7 +1223,8 @@ export function mountGallery(root, ctx) {
       ordered().length && { label: "Select all", icon: "check", run: () => { selected = new Set(ordered().map((item) => item.path)); paintSelection(); } },
       write && current && { label: "Rename…", icon: "rename", run: () => renameAlbum() },
       write && current && { label: "Move…", icon: "move", run: () => moveAlbum() },
-      current && current.parentId !== null && { label: "Open the album above", icon: "open", run: () => { location.hash = `#gallery/albums/${current.parentId}`; } },
+      write && current && workspaces.length && { label: "Move to workspace…", icon: "workspace", run: () => albumWorkspaceMenu(event, current) },
+      current && current.parentId !== null && { label: "Open the album above", icon: "open", run: () => { location.hash = `${home()}/albums/${current.parentId}`; } },
       write && current && { label: "Delete album", icon: "delete", danger: true, run: () => deleteAlbum() },
     ]);
   }
@@ -1194,7 +1252,7 @@ export function mountGallery(root, ctx) {
       shown.length && { label: "Select all shown", icon: "check", run: () => { selected = new Set(shown.map((item) => item.path)); paintSelection(); } },
       selected.size && { label: "Clear selection", icon: "close", run: clearSelection },
       { label: "Rescan the library", icon: "restore", run: rescan },
-      hiddenCount && { label: `Hidden photos (${number(hiddenCount)})`, icon: "hide", run: () => { location.hash = "#gallery/hidden"; } },
+      hiddenCount && { label: `Hidden photos (${number(hiddenCount)})`, icon: "hide", run: () => { location.hash = `${home()}/hidden`; } },
     ]);
   }
 
@@ -1209,7 +1267,7 @@ export function mountGallery(root, ctx) {
       event.preventDefault();
       const write = ctx.canWrite();
       openMenu(event.clientX, event.clientY, person.name || "Unnamed person", [
-        { label: "Open", icon: "open", run: () => { location.hash = `#gallery/people/${person.id}`; } },
+        { label: "Open", icon: "open", run: () => { location.hash = `${home()}/people/${person.id}`; } },
         write && { label: person.name ? "Rename…" : "Add a name…", icon: "rename", run: () => renamePerson(person) },
         write && { label: "Same person as…", icon: "move", run: () => mergePerson(person) },
         write && { label: person.hidden ? "Show in People" : "Hide from People", icon: "hide", run: () => hidePerson(person, !person.hidden) },
@@ -1242,6 +1300,7 @@ export function mountGallery(root, ctx) {
   function chooseAlbum({ title, ok, top = false, exclude = null }) {
     return new Promise((resolve) => {
       let albums = [];
+      let names = new Map(); // workspace id -> name, to tell albums apart under All photos
       let choice;
       const filter = el("input", { type: "search", placeholder: "Find an album", "aria-label": "Find an album" });
       const list = el("div", { class: "album-picker-list", role: "listbox", "aria-label": "Albums" });
@@ -1281,7 +1340,8 @@ export function mountGallery(root, ctx) {
         const out = [];
         const walk = (parent, depth, path) => {
           for (const album of byParent.get(parent) || []) {
-            const full = path ? `${path} / ${album.name}` : album.name;
+            const space = !path && workspace === null && album.workspaceId ? names.get(album.workspaceId) : "";
+            const full = path ? `${path} / ${album.name}` : space ? `${album.name} (${space})` : album.name;
             out.push({ album, depth, full });
             walk(album.id, depth + 1, full);
           }
@@ -1297,7 +1357,7 @@ export function mountGallery(root, ctx) {
         for (const row of rows()) {
           if (excluded.has(row.album.id)) continue;
           if (query && !row.full.toLowerCase().includes(query)) continue;
-          options.push({ id: row.album.id, label: query ? row.full : row.album.name, depth: query ? 0 : row.depth, count: row.album.count });
+          options.push({ id: row.album.id, label: query || row.depth === 0 ? row.full : row.album.name, depth: query ? 0 : row.depth, count: row.album.count });
         }
         list.replaceChildren(...options.map((option) => {
           const button = el("button", {
@@ -1323,7 +1383,9 @@ export function mountGallery(root, ctx) {
 
       async function load() {
         try {
-          albums = (await ctx.api("/api/albums/tree")).albums;
+          const tree = await api("/api/albums/tree");
+          albums = tree.albums;
+          names = new Map((tree.workspaces || []).map((entry) => [entry.id, entry.name]));
           render();
         } catch (err) {
           list.replaceChildren(el("p", { class: "muted" }, err.message));
@@ -1347,10 +1409,18 @@ export function mountGallery(root, ctx) {
 
   async function pickAlbum(paths) {
     if (!paths.length) return;
-    const id = await chooseAlbum({ title: `Add ${plural(paths.length, "photo")} to…`, ok: "Add" });
+    // From the files (the Gallery hidden), any album can be chosen, whatever its workspace.
+    const shown = workspace;
+    if (root.hidden) workspace = null;
+    let id;
+    try {
+      id = await chooseAlbum({ title: `Add ${plural(paths.length, "photo")} to…`, ok: "Add" });
+    } finally {
+      workspace = shown;
+    }
     if (id === undefined || id === null) return;
     try {
-      const data = await ctx.api("/api/albums/items", { method: "POST", json: { albumId: id, paths } });
+      const data = await api("/api/albums/items", { method: "POST", json: { albumId: id, paths } });
       const already = paths.length - data.changed;
       ctx.toast(`Added ${plural(data.changed, "photo")} to “${data.album.name}”${already ? ` (${number(already)} already there)` : ""}`);
       clearSelection();
@@ -1369,21 +1439,21 @@ export function mountGallery(root, ctx) {
     try {
       if (!tag) {
         items = [];
-        const data = await ctx.api("/api/tags/all");
+        const data = await api("/api/tags/all");
         if (stale(mine)) return;
         status.textContent = plural(data.tags.length, "tag");
         body.replaceChildren(data.tags.length
           ? el("div", { class: "gallery-tags" }, data.tags.map((entry) =>
-            el("a", { class: "gallery-tag", href: `#gallery/tags/${encodeURIComponent(entry.tag)}` }, entry.tag, el("span", {}, number(entry.count)))))
+            el("a", { class: "gallery-tag", href: `${home()}/tags/${encodeURIComponent(entry.tag)}` }, entry.tag, el("span", {}, number(entry.count)))))
           : el("p", { class: "muted gallery-message" }, "No tags yet. Tag photos from the preview or with Tag… on a selection."));
         return;
       }
-      const data = await ctx.api(`/api/gallery/tag?tag=${encodeURIComponent(tag)}`);
+      const data = await api(`/api/gallery/tag?tag=${encodeURIComponent(tag)}`);
       if (stale(mine)) return;
       items = data.items;
       status.textContent = plural(items.length, "photo");
       body.replaceChildren(
-        el("nav", { class: "gallery-crumbs" }, el("a", { href: "#gallery/tags" }, "Tags"), el("span", { "aria-hidden": "true" }, "›"), el("strong", {}, tag)),
+        el("nav", { class: "gallery-crumbs" }, el("a", { href: `${home()}/tags` }, "Tags"), el("span", { "aria-hidden": "true" }, "›"), el("strong", {}, tag)),
         items.length ? grid(items) : el("p", { class: "muted gallery-message" }, "No photos or videos have this tag."),
       );
     } catch (err) {
@@ -1411,7 +1481,7 @@ export function mountGallery(root, ctx) {
   searchBox.addEventListener("keydown", (event) => {
     if (event.key !== "Enter") return;
     const query = searchBox.value.trim();
-    if (query) location.hash = `#gallery/search/${encodeURIComponent(query)}`;
+    if (query) location.hash = `${home()}/search/${encodeURIComponent(query)}`;
   });
   // Drop or paste a picture onto the search box (or anywhere in the Gallery) to find photos like it.
   const pictureOf = (transfer) => [...((transfer && transfer.files) || [])].find((file) => file.type.startsWith("image/") || /\.(heic|heif|avif)$/i.test(file.name));
@@ -1440,8 +1510,8 @@ export function mountGallery(root, ctx) {
 
   function findLike(picture) {
     sample = picture;
-    if (location.hash === "#gallery/similar") show(location.hash);
-    else location.hash = "#gallery/similar";
+    if (location.hash === `${home()}/similar`) show(location.hash);
+    else location.hash = `${home()}/similar`;
   }
 
   async function showSearch(query) {
@@ -1450,12 +1520,12 @@ export function mountGallery(root, ctx) {
     actions.replaceChildren();
     body.replaceChildren(el("p", { class: "muted gallery-message" }, "Searching…"));
     try {
-      const data = await ctx.api(`/api/gallery/search?q=${encodeURIComponent(query)}`);
+      const data = await api(`/api/gallery/search?q=${encodeURIComponent(query)}`);
       if (stale(mine)) return;
       items = data.items;
       status.textContent = items.length ? `${plural(items.length, "photo")}, best matches first` : "";
       body.replaceChildren(
-        el("nav", { class: "gallery-crumbs" }, el("a", { href: "#gallery" }, "Photos"), el("span", { "aria-hidden": "true" }, "›"), el("strong", {}, `“${query}”`)),
+        el("nav", { class: "gallery-crumbs" }, el("a", { href: home() }, "Photos"), el("span", { "aria-hidden": "true" }, "›"), el("strong", {}, `“${query}”`)),
         items.length ? grid(items) : el("p", { class: "muted gallery-message" }, "Nothing matches. Try other words, in English: “red car”, “people at a table”, “snowy mountains”."),
       );
     } catch (err) {
@@ -1471,10 +1541,10 @@ export function mountGallery(root, ctx) {
       let data;
       let preview;
       if (path) {
-        data = await ctx.api(`/api/gallery/similar?path=${encodeURIComponent(path)}`);
+        data = await api(`/api/gallery/similar?path=${encodeURIComponent(path)}`);
         preview = el("img", { src: thumbUrl({ path }), alt: nameOf(path) });
       } else if (sample) {
-        const response = await fetch("/api/gallery/similar", { method: "POST", body: sample, credentials: "same-origin", headers: { "X-OwnNAS": "1" } });
+        const response = await fetch(`/api/gallery/similar${workspace === null ? "" : `?workspace=${workspace}`}`, { method: "POST", body: sample, credentials: "same-origin", headers: { "X-OwnNAS": "1" } });
         data = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(data.error || "Could not search");
         preview = el("img", { src: URL.createObjectURL(sample), alt: sample.name || "Sample picture" });
@@ -1509,18 +1579,18 @@ export function mountGallery(root, ctx) {
     actions.replaceChildren();
     body.replaceChildren(el("p", { class: "muted gallery-message" }, "Loading people…"));
     try {
-      const data = await ctx.api(`/api/people${hiddenOnes ? "?hidden=1" : ""}`);
+      const data = await api(`/api/people${hiddenOnes ? "?hidden=1" : ""}`);
       if (stale(mine)) return;
       people = data.people;
       items = [];
       status.textContent = plural(people.length, hiddenOnes ? "hidden person" : "person", hiddenOnes ? "hidden people" : "people");
-      if (!hiddenOnes && data.hiddenCount) actions.append(el("a", { class: "button", href: "#gallery/people/hidden" }, `Hidden · ${number(data.hiddenCount)}`));
+      if (!hiddenOnes && data.hiddenCount) actions.append(el("a", { class: "button", href: `${home()}/people/hidden` }, `Hidden · ${number(data.hiddenCount)}`));
       const scanning = smart && smart.scanned < smart.images;
       body.replaceChildren(...[
-        hiddenOnes ? el("nav", { class: "gallery-crumbs" }, el("a", { href: "#gallery/people" }, "People"), el("span", { "aria-hidden": "true" }, "›"), el("strong", {}, "Hidden")) : null,
+        hiddenOnes ? el("nav", { class: "gallery-crumbs" }, el("a", { href: `${home()}/people` }, "People"), el("span", { "aria-hidden": "true" }, "›"), el("strong", {}, "Hidden")) : null,
         people.length
           ? el("div", { class: "gallery-people" }, people.map((person) =>
-            el("a", { class: "gallery-person", href: `#gallery/people/${person.id}`, "data-person": String(person.id) },
+            el("a", { class: "gallery-person", href: `${home()}/people/${person.id}`, "data-person": String(person.id) },
               el("span", { class: "gallery-person-face" }, faceImage(person.coverFace, person.name)),
               el("strong", { class: person.name ? null : "muted" }, person.name || "Add a name"),
               el("span", { class: "muted" }, plural(person.photos, "photo")))))
@@ -1537,7 +1607,7 @@ export function mountGallery(root, ctx) {
     const mine = ++generation;
     body.replaceChildren(el("p", { class: "muted gallery-message" }, "Loading…"));
     try {
-      const data = await ctx.api(`/api/people/photos?id=${id}`);
+      const data = await api(`/api/people/photos?id=${id}`);
       if (stale(mine)) return;
       currentPerson = data.person;
       items = data.items;
@@ -1549,7 +1619,7 @@ export function mountGallery(root, ctx) {
         write && el("button", { type: "button", onclick: () => hidePerson(currentPerson, !currentPerson.hidden) }, currentPerson.hidden ? "Show in People" : "Hide"),
       ].filter(Boolean));
       body.replaceChildren(
-        el("nav", { class: "gallery-crumbs" }, el("a", { href: "#gallery/people" }, "People"), el("span", { "aria-hidden": "true" }, "›"), el("strong", {}, currentPerson.name || "Unnamed person")),
+        el("nav", { class: "gallery-crumbs" }, el("a", { href: `${home()}/people` }, "People"), el("span", { "aria-hidden": "true" }, "›"), el("strong", {}, currentPerson.name || "Unnamed person")),
         items.length ? grid(items) : el("p", { class: "muted gallery-message" }, "No photos left for this person."),
       );
     } catch (err) {
@@ -1561,7 +1631,7 @@ export function mountGallery(root, ctx) {
     const name = await ctx.askText(person.name ? "Rename" : "Who is this?", "Name", person.name || "", "Save");
     if (name === null) return;
     try {
-      await ctx.api("/api/people", { method: "POST", json: { id: person.id, name } });
+      await api("/api/people", { method: "POST", json: { id: person.id, name } });
       show(location.hash);
     } catch (err) {
       ctx.toast(err.message, true);
@@ -1570,9 +1640,9 @@ export function mountGallery(root, ctx) {
 
   async function hidePerson(person, hidden) {
     try {
-      await ctx.api("/api/people", { method: "POST", json: { id: person.id, hidden } });
+      await api("/api/people", { method: "POST", json: { id: person.id, hidden } });
       ctx.toast(hidden ? `${person.name || "This person"} is hidden from People` : `${person.name || "This person"} is back in People`);
-      if (route.tab === "person") location.hash = hidden ? "#gallery/people" : `#gallery/people/${person.id}`;
+      if (route.tab === "person") location.hash = hidden ? `${home()}/people` : `${home()}/people/${person.id}`;
       else show(location.hash);
     } catch (err) {
       ctx.toast(err.message, true);
@@ -1583,9 +1653,9 @@ export function mountGallery(root, ctx) {
     const into = await choosePerson(`${person.name || "This person"} is the same as…`, person.id);
     if (!into) return;
     try {
-      await ctx.api("/api/people", { method: "POST", json: { id: person.id, into } });
+      await api("/api/people", { method: "POST", json: { id: person.id, into } });
       ctx.toast("Put together");
-      location.hash = `#gallery/people/${into}`;
+      location.hash = `${home()}/people/${into}`;
     } catch (err) {
       ctx.toast(err.message, true);
     }
@@ -1594,7 +1664,7 @@ export function mountGallery(root, ctx) {
   /// "This is not them": the faces move out to a person of their own (or to `to`).
   async function moveFaces(faceIds, to) {
     try {
-      await ctx.api("/api/faces/move", { method: "POST", json: { faces: faceIds, to } });
+      await api("/api/faces/move", { method: "POST", json: { faces: faceIds, to } });
       ctx.toast(to ? "Moved" : `Taken out of ${currentPerson && currentPerson.name ? currentPerson.name : "this person"}`);
       selected = new Set();
       show(location.hash);
@@ -1608,7 +1678,7 @@ export function mountGallery(root, ctx) {
     return new Promise(async (resolve) => {
       let list = [];
       try {
-        list = (await ctx.api("/api/people")).people.filter((person) => person.id !== exclude);
+        list = (await api("/api/people")).people.filter((person) => person.id !== exclude);
       } catch (err) {
         ctx.toast(err.message, true);
         resolve(null);
@@ -1651,7 +1721,7 @@ export function mountGallery(root, ctx) {
 
   async function memories() {
     const { year, month, day } = today();
-    return ctx.api(`/api/gallery/memories?month=${month}&day=${day}&year=${year}`);
+    return api(`/api/gallery/memories?month=${month}&day=${day}&year=${year}`);
   }
 
   /// A strip of years above the timeline, when there are any.
@@ -1667,7 +1737,7 @@ export function mountGallery(root, ctx) {
     const cards = data.years.map((entry) => {
       const ago = now - entry.year;
       const cover = entry.items[0];
-      return el("a", { class: "gallery-memory", href: `#gallery/memories/${entry.year}`, title: `Photos from this day in ${entry.year}` },
+      return el("a", { class: "gallery-memory", href: `${home()}/memories/${entry.year}`, title: `Photos from this day in ${entry.year}` },
         el("img", { src: thumbUrl(cover), alt: "", loading: "lazy", draggable: "false" }),
         el("span", { class: "gallery-memory-label" }, el("strong", {}, ago === 1 ? "1 year ago" : `${ago} years ago`), el("span", {}, `${entry.year} · ${plural(entry.count, "photo")}`)));
     });
@@ -1687,7 +1757,7 @@ export function mountGallery(root, ctx) {
       const label = new Intl.DateTimeFormat(undefined, { day: "numeric", month: "long", year: "numeric" }).format(new Date(year, new Date().getMonth(), new Date().getDate()));
       status.textContent = entry && entry.count > items.length ? `${number(items.length)} of ${plural(entry.count, "photo")}` : plural(items.length, "photo");
       body.replaceChildren(
-        el("nav", { class: "gallery-crumbs" }, el("a", { href: "#gallery" }, "Photos"), el("span", { "aria-hidden": "true" }, "›"), el("strong", {}, `On this day, ${now - year === 1 ? "1 year" : `${now - year} years`} ago (${label})`)),
+        el("nav", { class: "gallery-crumbs" }, el("a", { href: home() }, "Photos"), el("span", { "aria-hidden": "true" }, "›"), el("strong", {}, `On this day, ${now - year === 1 ? "1 year" : `${now - year} years`} ago (${label})`)),
         items.length ? grid(items) : el("p", { class: "muted gallery-message" }, "No photos from this day in that year."),
       );
     } catch (err) {
@@ -1704,7 +1774,7 @@ export function mountGallery(root, ctx) {
     let viewers;
     let data;
     try {
-      [viewers, data] = await Promise.all([import("/assets/viewers.js"), ctx.api("/api/gallery/places?zoom=2")]);
+      [viewers, data] = await Promise.all([import("/assets/viewers.js"), api("/api/gallery/places?zoom=2")]);
     } catch (err) {
       if (!stale(mine)) body.replaceChildren(el("p", { class: "muted gallery-message" }, err.message));
       return;
@@ -1745,7 +1815,7 @@ export function mountGallery(root, ctx) {
           shownZoom = view.zoom;
           if (!byZoom.has(view.zoom)) {
             try {
-              byZoom.set(view.zoom, (await ctx.api(`/api/gallery/places?zoom=${view.zoom}`)).places);
+              byZoom.set(view.zoom, (await api(`/api/gallery/places?zoom=${view.zoom}`)).places);
             } catch {
               return;
             }
@@ -1764,7 +1834,7 @@ export function mountGallery(root, ctx) {
       if (query === listed) return;
       listed = query;
       try {
-        const found = await ctx.api(`/api/gallery/places/items?${query}&limit=300`);
+        const found = await api(`/api/gallery/places/items?${query}&limit=300`);
         if (stale(mine) || listed !== query) return;
         items = found.items;
         here.textContent = found.total ? `${plural(found.total, "photo")} on this part of the map${found.total > items.length ? ` (the newest ${number(items.length)} below)` : ""}` : "No photos on this part of the map.";
@@ -1777,8 +1847,157 @@ export function mountGallery(root, ctx) {
     map.fit({ north: e.north, south: e.south, west: e.west, east: e.east });
   }
 
+  // ---- Workspaces: each shows the photos in some folders, with its own albums ----
+
+  async function loadWorkspaces() {
+    try {
+      workspaces = (await ctx.api("/api/workspaces")).workspaces;
+    } catch {
+      workspaces = [];
+    }
+  }
+
+  function storedWorkspace() {
+    try {
+      const stored = localStorage.getItem(WORKSPACE_KEY);
+      return stored ? Number(stored) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /// Shows a workspace from now on, and remembers it for the next visit.
+  function setWorkspace(id) {
+    workspace = id;
+    try {
+      if (id === null) localStorage.removeItem(WORKSPACE_KEY);
+      else localStorage.setItem(WORKSPACE_KEY, String(id));
+    } catch {
+      // Not remembered: the Gallery opens on All photos next time.
+    }
+  }
+
+  function inWorkspace(id, path) {
+    const space = workspaces.find((entry) => entry.id === id);
+    return !!space && space.folders.some((folder) => path === folder || path.startsWith(`${folder}/`));
+  }
+
+  /// The switcher's label, and the tabs' links in the workspace shown.
+  function paintWorkspace() {
+    const space = workspaces.find((entry) => entry.id === workspace);
+    switcher.hidden = !workspaces.length && !ctx.isAdmin();
+    switcher.textContent = space ? space.name : "All photos";
+    switcher.classList.toggle("is-all", !space);
+    for (const link of tabs.children) link.setAttribute("href", `${home()}${link.dataset.tab === "photos" ? "" : `/${link.dataset.tab}`}`);
+  }
+
+  function workspaceMenu(x, y) {
+    const admin = ctx.isAdmin();
+    const space = workspaces.find((entry) => entry.id === workspace);
+    const go = (id) => {
+      const tab = ["albums", "people", "places", "tags"].includes(route.tab) ? `/${route.tab}` : route.tab === "person" ? "/people" : "";
+      location.hash = `#gallery/${id === null ? "all" : `w${id}`}${tab}`;
+    };
+    openMenu(x, y, "Workspace", [
+      { label: "All photos", icon: workspace === null ? "check" : "workspace", run: () => go(null) },
+      ...workspaces.map((entry) => ({ label: `${entry.name} · ${number(entry.photos)}`, icon: entry.id === workspace ? "check" : "workspace", run: () => go(entry.id) })),
+      admin && "-",
+      admin && { label: "New workspace…", icon: "newWorkspace", run: () => editWorkspace(null) },
+      admin && space && { label: `Edit “${space.name}”…`, icon: "rename", run: () => editWorkspace(space) },
+      admin && space && { label: `Delete “${space.name}”…`, icon: "delete", danger: true, run: () => deleteWorkspace(space) },
+    ], { keepOrder: true });
+  }
+
+  /// A dialog to name a workspace and choose its folders (a new one for `space` null).
+  function editWorkspace(space) {
+    let folders = space ? [...space.folders] : [];
+    const name = el("input", { type: "text", maxlength: "60", placeholder: "Family, Work, Customer 1…", "aria-label": "Workspace name" });
+    name.value = space ? space.name : "";
+    const list = el("div", { class: "workspace-folders", "aria-label": "Folders" });
+    const add = el("button", { type: "button" }, "Add folder…");
+    const save = el("button", { type: "button", class: "primary" }, space ? "Save" : "Create");
+    const dialog = el("dialog", { class: "workspace-editor" },
+      el("h3", {}, space ? `Edit “${space.name}”` : "New workspace"),
+      el("label", {}, el("span", {}, "Name"), name),
+      el("div", {}, el("span", { class: "workspace-label" }, "Folders"),
+        el("p", { class: "muted" }, "The workspace shows the photos and videos in these folders and the folders inside them. Nothing is moved or copied.")),
+      list,
+      el("div", { class: "dialog-actions" }, add, el("span", { class: "spacer" }), el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"), save));
+
+    function render() {
+      list.replaceChildren(...folders.map((folder) => el("div", { class: "workspace-folder" },
+        el("span", { title: folder }, folder),
+        el("button", { type: "button", class: "workspace-folder-remove", "aria-label": `Remove “${folder}”`, title: "Remove", onclick: () => { folders = folders.filter((entry) => entry !== folder); render(); } }, "×"))));
+      if (!folders.length) list.append(el("p", { class: "muted" }, "No folders yet. Add the folders whose photos belong here."));
+    }
+
+    add.addEventListener("click", async () => {
+      dialog.close("picking");
+      // Next to the folder added last: workspaces often gather folders that sit side by side.
+      const last = folders[folders.length - 1] || "";
+      const folder = await ctx.pickFolder({ title: "Add a folder to the workspace", ok: "Add folder", start: last.includes("/") ? last.slice(0, last.lastIndexOf("/")) : "" });
+      dialog.showModal();
+      if (folder === null) return;
+      if (!folder) {
+        ctx.toast("Choose a folder inside the library: All photos already shows everything", true);
+        return;
+      }
+      if (!folders.includes(folder)) folders.push(folder);
+      render();
+    });
+    save.addEventListener("click", async () => {
+      save.disabled = true;
+      try {
+        const json = { name: name.value.trim(), folders };
+        const data = space
+          ? await ctx.api("/api/workspaces", { method: "PATCH", json: { id: space.id, ...json } })
+          : await ctx.api("/api/workspaces", { method: "POST", json });
+        dialog.close();
+        await loadWorkspaces();
+        ctx.toast(space ? `Saved “${data.workspace.name}”` : `Created “${data.workspace.name}”`);
+        if (location.hash.startsWith(`#gallery/w${data.workspace.id}`)) show(location.hash);
+        else location.hash = `#gallery/w${data.workspace.id}`;
+      } catch (err) {
+        ctx.toast(err.message, true);
+      } finally {
+        save.disabled = false;
+      }
+    });
+    // Closing while a folder is picked keeps the dialog for when the picker is done.
+    dialog.addEventListener("close", () => {
+      if (dialog.returnValue !== "picking") dialog.remove();
+      dialog.returnValue = "";
+    });
+    document.body.append(dialog);
+    render();
+    dialog.showModal();
+    name.focus();
+  }
+
+  async function deleteWorkspace(space) {
+    if (!(await ctx.askConfirm(`Delete the workspace “${space.name}”? Its albums stay, under All photos. No photo or folder is touched.`, "Delete workspace"))) return;
+    try {
+      await ctx.api(`/api/workspaces?id=${space.id}`, { method: "DELETE" });
+      ctx.toast(`Deleted the workspace “${space.name}”`);
+      await loadWorkspaces();
+      location.hash = "#gallery/all";
+    } catch (err) {
+      ctx.toast(err.message, true);
+    }
+  }
+
+  /// The route an address names, with its workspace: a number, null for All photos, or
+  /// undefined when the address leaves it out (links from the files).
   function parse(hash) {
-    const parts = hash.replace(/^#?gallery\/?/, "").split("/").filter(Boolean).map(decodeURIComponent);
+    let parts = hash.replace(/^#?gallery\/?/, "").split("/").filter(Boolean).map(decodeURIComponent);
+    let scope;
+    if (parts[0] === "all") scope = null;
+    else if (/^w\d+$/.test(parts[0] || "")) scope = Number(parts[0].slice(1));
+    if (scope !== undefined) parts = parts.slice(1);
+    return { ...parseRoute(parts), scope };
+  }
+
+  function parseRoute(parts) {
     if (parts[0] === "albums") return { tab: "albums", id: parts[1] ? Number(parts[1]) : null };
     if (parts[0] === "tags") return { tab: "tags", tag: parts[1] || "" };
     if (parts[0] === "hidden") return { tab: "hidden" };
@@ -1794,7 +2013,27 @@ export function mountGallery(root, ctx) {
 
   function show(hash) {
     root.hidden = false;
+    if (!workspacesLoaded) workspacesLoaded = loadWorkspaces();
+    if (workspacesLoaded !== true) {
+      const mine = ++generation;
+      workspacesLoaded.then(() => {
+        workspacesLoaded = true;
+        if (!stale(mine)) show(location.hash);
+      });
+      return;
+    }
     route = parse(hash);
+    let scope = route.scope;
+    if (scope === undefined) {
+      scope = storedWorkspace();
+      // "Find similar photos" from the files: look where the photo is.
+      if (route.tab === "similar" && route.path && scope !== null && !inWorkspace(scope, route.path)) scope = null;
+    }
+    if (scope !== null && !workspaces.some((entry) => entry.id === scope)) scope = null;
+    setWorkspace(scope);
+    const canonical = `${home()}${hash.replace(/^#?gallery(\/(all|w\d+))?/, "")}`;
+    if (location.hash !== canonical) history.replaceState(null, "", canonical);
+    paintWorkspace();
     current = null;
     placesMap?.destroy();
     placesMap = null;
@@ -1830,6 +2069,8 @@ export function mountGallery(root, ctx) {
 
   function hide() {
     closeMenu();
+    // Workspaces may have changed meanwhile (in another window): read them again next time.
+    workspacesLoaded = null;
     placesMap?.destroy();
     placesMap = null;
     root.hidden = true;

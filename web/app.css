@@ -3436,6 +3436,28 @@ body.is-gallery .app > .explorer-status-bar { display: none; }
 .gallery-tabs a:hover { background: var(--bg-3); }
 .gallery-tabs a[aria-current="page"] { background: var(--accent); color: var(--accent-ink); }
 .gallery-status { color: var(--muted); }
+/* The workspace switcher: which photos and albums the Gallery shows. */
+.gallery-workspace { display: inline-flex; align-items: center; gap: 0.45rem; max-width: 16rem; padding: 0.4rem 0.8rem; border-radius: 999px; font-weight: 600; font-size: 0.9rem; border: 1px solid var(--accent); color: var(--text); background: color-mix(in srgb, var(--accent) 14%, var(--bg-2)); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.gallery-workspace.is-all { border-color: var(--line); background: var(--bg-2); }
+.gallery-workspace::after { content: "▾"; color: var(--muted); font-size: 0.8em; }
+.gallery-album-cover { position: relative; }
+.menu-separator { height: 1px; margin: 0.3rem 0.4rem; background: var(--line); }
+.gallery-album-workspace { position: absolute; left: 0.4rem; bottom: 0.4rem; max-width: calc(100% - 0.8rem); padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.75rem; font-weight: 600; background: color-mix(in srgb, var(--bg) 80%, transparent); color: var(--text); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.workspace-editor { width: min(520px, calc(100vw - 2rem)); display: grid; gap: 0.7rem; }
+.workspace-editor:not([open]) { display: none; }
+.workspace-editor label { display: grid; gap: 0.3rem; }
+.workspace-editor label > span, .workspace-label { font-weight: 600; }
+.workspace-editor p { margin: 0.2rem 0 0; }
+.workspace-editor input { width: 100%; }
+.workspace-folders { display: grid; gap: 2px; min-height: 6rem; max-height: min(40vh, 18rem); overflow: auto; padding: 0.25rem; border: 1px solid var(--line); border-radius: 10px; align-content: start; }
+.workspace-folders p { margin: 0.6rem; }
+.workspace-folder { display: flex; align-items: center; gap: 0.5rem; padding: 0.35rem 0.4rem 0.35rem 0.6rem; border-radius: 8px; }
+.workspace-folder:hover { background: var(--bg-3); }
+.workspace-folder span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-folder-remove { padding: 0.1rem 0.5rem; border: 0; background: transparent; color: var(--muted); font-size: 1.1rem; }
+.workspace-folder-remove:hover { color: var(--danger, #e5534b); }
+.workspace-editor .dialog-actions { display: flex; align-items: center; gap: 0.4rem; }
+.workspace-editor .spacer { flex: 1; }
 .gallery-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-left: auto; }
 .gallery-selection {
   position: absolute;

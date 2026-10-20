@@ -8,6 +8,7 @@ pub mod agents;
 pub mod archives;
 pub mod audio_info;
 pub mod albums;
+pub mod workspaces;
 pub mod auth;
 pub mod books;
 pub mod content_index;

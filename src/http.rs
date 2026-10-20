@@ -392,6 +392,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/gallery/tag", get(gallery_tag))
         .route("/api/albums", get(get_album).post(create_album).patch(update_album).delete(delete_album))
         .route("/api/albums/tree", get(album_tree))
+        .route("/api/workspaces", get(list_workspaces).post(create_workspace).patch(update_workspace).delete(delete_workspace))
         .route("/api/albums/items", post(album_items).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
         .route("/api/tags/bulk", post(bulk_tags))
         .route("/api/comments", post(add_comment).delete(remove_comment))
@@ -1659,12 +1660,33 @@ impl From<crate::albums::AlbumError> for ApiError {
     fn from(err: crate::albums::AlbumError) -> Self {
         use crate::albums::AlbumError;
         let status = match err {
-            AlbumError::NotFound => StatusCode::NOT_FOUND,
+            AlbumError::NotFound | AlbumError::Missing(_) => StatusCode::NOT_FOUND,
             AlbumError::Invalid(_) => StatusCode::BAD_REQUEST,
             AlbumError::Conflict(_) => StatusCode::CONFLICT,
             AlbumError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         ApiError::new(status, err.to_string())
+    }
+}
+
+/// The Gallery workspace a request is about (`?workspace=<id>`); none means every photo.
+#[derive(Deserialize)]
+struct WorkspaceQuery {
+    workspace: Option<i64>,
+}
+
+impl WorkspaceQuery {
+    /// The workspace, checked to exist.
+    fn check(&self, conn: &rusqlite::Connection) -> Result<Option<i64>, ApiError> {
+        Ok(crate::workspaces::check(conn, self.workspace)?)
+    }
+
+    /// The workspace's folders, for filtering in memory (`None`: every photo).
+    fn folders(&self, conn: &rusqlite::Connection) -> Result<Option<Vec<String>>, ApiError> {
+        match self.check(conn)? {
+            Some(id) => Ok(Some(crate::workspaces::folders(conn, id)?)),
+            None => Ok(None),
+        }
     }
 }
 
@@ -1687,11 +1709,16 @@ fn gallery_items(state: &AppState, items: Vec<crate::albums::MediaItem>, check_m
         .collect()
 }
 
-async fn gallery_days(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+async fn gallery_days(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(scope): Query<WorkspaceQuery>,
+) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     let (days, hidden) = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-        (crate::albums::days(&conn)?, crate::albums::hidden_count(&conn)?)
+        let workspace = scope.check(&conn)?;
+        (crate::albums::days(&conn, workspace)?, crate::albums::hidden_count(&conn, workspace)?)
     };
     Ok(Json(json!({
         "days": days.into_iter().map(|(day, count)| json!({ "day": day, "count": count })).collect::<Vec<_>>(),
@@ -1722,13 +1749,15 @@ async fn gallery_places(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<PlacesQuery>,
+    Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     let conn = own_connection(&state)?;
+    let workspace = scope.check(&conn)?;
     let zoom = query.zoom.unwrap_or(2);
     let bounds = query.bounds();
     let (places, extent) = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
-        Ok((crate::albums::places(&conn, zoom, bounds, 72.0)?, crate::albums::place_extent(&conn)?))
+        Ok((crate::albums::places(&conn, zoom, bounds, 72.0, workspace)?, crate::albums::place_extent(&conn, workspace)?))
     })
     .await
     .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the places"))??;
@@ -1743,12 +1772,14 @@ async fn gallery_place_items(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<PlacesQuery>,
+    Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     let bounds = query.bounds().ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Say which part of the map"))?;
     let limit = query.limit.unwrap_or(500).min(5000);
     let conn = own_connection(&state)?;
-    let (items, total) = crate::albums::placed_items(&conn, bounds, limit)?;
+    let workspace = scope.check(&conn)?;
+    let (items, total) = crate::albums::placed_items(&conn, bounds, limit, workspace)?;
     Ok(Json(json!({ "items": items, "total": total })))
 }
 
@@ -1764,13 +1795,15 @@ async fn gallery_memories(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<MemoriesQuery>,
+    Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     if !(1..=12).contains(&query.month) || !(1..=31).contains(&query.day) {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "That is not a day"));
     }
     let conn = own_connection(&state)?;
-    let years = crate::albums::on_this_day(&conn, query.month, query.day, query.year, 60)?;
+    let workspace = scope.check(&conn)?;
+    let years = crate::albums::on_this_day(&conn, query.month, query.day, query.year, 60, workspace)?;
     Ok(Json(json!({
         "years": years.into_iter().map(|(year, count, items)| json!({ "year": year, "count": count, "items": items })).collect::<Vec<_>>(),
     })))
@@ -1946,11 +1979,12 @@ async fn gallery_search(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<SmartSearchQuery>,
+    Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     #[cfg(not(ownnas_ml))]
     {
-        let _ = query;
+        let _ = (query, scope);
         return Err::<Json<serde_json::Value>, _>(ApiError::new(StatusCode::BAD_REQUEST, "Smart search is not available on this device"));
     }
     #[cfg(ownnas_ml)]
@@ -1960,6 +1994,7 @@ async fn gallery_search(
         if text.is_empty() {
             return Ok(Json(json!({ "items": [] })));
         }
+        let folders = scope.folders(&state.db.lock().unwrap_or_else(|err| err.into_inner()))?;
         let worker = state.clone();
         let found = tokio::task::spawn_blocking(move || -> Result<Vec<(String, f32)>, String> {
             let vector = worker.models.describe_text(&text)?;
@@ -1968,7 +2003,8 @@ async fn gallery_search(
                 let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
                 worker.media.descriptions.get(&conn)?
             };
-            Ok(crate::smart::matching_text(&descriptions, &vector, &neutral, 300))
+            let keep = |path: &str| folders.as_deref().is_none_or(|folders| crate::workspaces::contains(folders, path));
+            Ok(crate::smart::matching_text_where(&descriptions, &vector, &neutral, 300, &keep))
         })
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not search"))?
@@ -1987,12 +2023,13 @@ async fn gallery_similar(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<SimilarQuery>,
+    Query(scope): Query<WorkspaceQuery>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     #[cfg(not(ownnas_ml))]
     {
-        let _ = (query, body);
+        let _ = (query, scope, body);
         return Err::<Json<serde_json::Value>, _>(ApiError::new(StatusCode::BAD_REQUEST, "Smart search is not available on this device"));
     }
     #[cfg(ownnas_ml)]
@@ -2003,6 +2040,7 @@ async fn gallery_similar(
             None if body.is_empty() => return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose a photo, or drop one in")),
             None => None,
         };
+        let folders = scope.folders(&state.db.lock().unwrap_or_else(|err| err.into_inner()))?;
         let worker = state.clone();
         let skip = sample.as_ref().map(|target| target.rel.clone());
         let found = tokio::task::spawn_blocking(move || -> Result<Vec<(String, f32)>, String> {
@@ -2036,7 +2074,8 @@ async fn gallery_similar(
                 let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
                 worker.media.descriptions.get(&conn)?
             };
-            let found = crate::smart::nearest(&descriptions, &vector, 200, skip.as_deref());
+            let keep = |path: &str| skip.as_deref() != Some(path) && folders.as_deref().is_none_or(|folders| crate::workspaces::contains(folders, path));
+            let found = crate::smart::nearest_where(&descriptions, &vector, 200, &keep);
             Ok(found.into_iter().filter(|(_, score)| *score >= 0.6).collect())
         })
         .await
@@ -2055,12 +2094,14 @@ async fn list_people(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<PeopleQuery>,
+    Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let workspace = scope.check(&conn)?;
     let hidden = query.hidden.as_deref() == Some("1");
-    let people = crate::smart::people(&conn, hidden).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
-    let hidden_count = if hidden { 0 } else { crate::smart::people(&conn, true).map(|list| list.len()).unwrap_or(0) };
+    let people = crate::smart::people_in(&conn, hidden, workspace).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let hidden_count = if hidden { 0 } else { crate::smart::people_in(&conn, true, workspace).map(|list| list.len()).unwrap_or(0) };
     Ok(Json(json!({ "people": people, "hiddenCount": hidden_count })))
 }
 
@@ -2073,14 +2114,16 @@ async fn person_photos(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<PersonQuery>,
+    Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     let (person, photos) = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        let workspace = scope.check(&conn)?;
         let person = crate::smart::person(&conn, query.id)
             .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?
             .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That person is no longer there"))?;
-        (person, crate::smart::person_photos(&conn, query.id).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?)
+        (person, crate::smart::person_photos_in(&conn, query.id, workspace).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?)
     };
     let face_ids: Vec<i64> = photos.iter().map(|(_, face)| *face).collect();
     let items = gallery_items(&state, photos.into_iter().map(|(item, _)| item).collect(), true)
@@ -2661,11 +2704,16 @@ fn year_month(secs: i64) -> (i64, i64) {
     (year, month)
 }
 
-async fn gallery_hidden(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+async fn gallery_hidden(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(scope): Query<WorkspaceQuery>,
+) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     let items = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-        crate::albums::hidden(&conn)?
+        let workspace = scope.check(&conn)?;
+        crate::albums::hidden(&conn, workspace)?
     };
     Ok(Json(json!({ "items": gallery_items(&state, items, true) })))
 }
@@ -2733,6 +2781,7 @@ async fn gallery_timeline(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<TimelineQuery>,
+    Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     let ranged = query.from.zip(query.to);
@@ -2740,9 +2789,10 @@ async fn gallery_timeline(
     let before = query.before.map(|at| (at, query.before_path.unwrap_or_default()));
     let items = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        let workspace = scope.check(&conn)?;
         match ranged {
-            Some((from, to)) => crate::albums::taken_between(&conn, from, to, limit)?,
-            None => crate::albums::timeline(&conn, before, limit)?,
+            Some((from, to)) => crate::albums::taken_between(&conn, from, to, limit, workspace)?,
+            None => crate::albums::timeline(&conn, before, limit, workspace)?,
         }
     };
     let more = items.len() == limit;
@@ -2758,18 +2808,20 @@ async fn get_album(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<AlbumQuery>,
+    Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     let (album, breadcrumb, children, items) = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        let workspace = scope.check(&conn)?;
         match query.id {
             Some(id) => (
                 Some(crate::albums::get(&conn, id)?),
                 crate::albums::breadcrumb(&conn, id)?,
-                crate::albums::children(&conn, Some(id))?,
+                crate::albums::children(&conn, Some(id), workspace)?,
                 crate::albums::items(&conn, id)?,
             ),
-            None => (None, Vec::new(), crate::albums::children(&conn, None)?, Vec::new()),
+            None => (None, Vec::new(), crate::albums::children(&conn, None, workspace)?, Vec::new()),
         }
     };
     Ok(Json(json!({
@@ -2780,10 +2832,15 @@ async fn get_album(
     })))
 }
 
-async fn album_tree(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+async fn album_tree(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(scope): Query<WorkspaceQuery>,
+) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-    Ok(Json(json!({ "albums": crate::albums::all(&conn)? })))
+    let workspace = scope.check(&conn)?;
+    Ok(Json(json!({ "albums": crate::albums::all(&conn, workspace)?, "workspaces": crate::workspaces::list(&conn)? })))
 }
 
 #[derive(Deserialize)]
@@ -2796,6 +2853,7 @@ struct CreateAlbumBody {
 async fn create_album(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
+    Query(scope): Query<WorkspaceQuery>,
     Json(body): Json<CreateAlbumBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     check_csrf(&headers)?;
@@ -2803,7 +2861,8 @@ async fn create_album(
     require_write(&state)?;
     let album = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-        let id = crate::albums::create(&conn, body.parent_id, &body.name)?;
+        let workspace = scope.check(&conn)?;
+        let id = crate::albums::create(&conn, body.parent_id, &body.name, workspace)?;
         crate::albums::get(&conn, id)?
     };
     record(&state, &user, "album-create", &album.name);
@@ -2823,6 +2882,11 @@ struct UpdateAlbumBody {
     #[serde(default)]
     set_cover: bool,
     cover: Option<String>,
+    /// With `setWorkspace: true`, the album (and those inside it) goes to the top of
+    /// `workspaceId` (none: no workspace).
+    #[serde(default)]
+    set_workspace: bool,
+    workspace_id: Option<i64>,
 }
 
 async fn update_album(
@@ -2844,6 +2908,10 @@ async fn update_album(
         if body.set_cover {
             let cover = body.cover.as_deref().map(|path| path.trim().trim_start_matches('/'));
             crate::albums::set_cover(&conn, body.id, cover)?;
+        }
+        if body.set_workspace {
+            let workspace = crate::workspaces::check(&conn, body.workspace_id)?;
+            crate::albums::set_workspace(&conn, body.id, workspace)?;
         }
         crate::albums::get(&conn, body.id)?
     };
@@ -2911,10 +2979,104 @@ async fn album_items(
     Ok(Json(json!({ "changed": changed, "album": album })))
 }
 
-async fn all_tags(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+async fn list_workspaces(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let conn = own_connection(&state)?;
+    Ok(Json(json!({ "workspaces": crate::workspaces::list(&conn)? })))
+}
+
+#[derive(Deserialize)]
+struct WorkspaceBody {
+    id: Option<i64>,
+    name: Option<String>,
+    folders: Option<Vec<String>>,
+}
+
+/// A workspace's folders, checked to be folders in the library.
+fn workspace_folders(state: &AppState, raw: &[String]) -> Result<Vec<String>, ApiError> {
+    let folders = crate::workspaces::normalize_folders(raw)?;
+    for folder in &folders {
+        let not_folder = || ApiError::new(StatusCode::BAD_REQUEST, format!("“{folder}” is not a folder in the library"));
+        let target = files::resolve(&state.root, folder).map_err(|_| not_folder())?;
+        if !target.full.is_dir() {
+            return Err(not_folder());
+        }
+        if files::is_under_trash(&target.rel) {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "Folders in the Trash cannot be in a workspace"));
+        }
+    }
+    Ok(folders)
+}
+
+async fn create_workspace(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<WorkspaceBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let folders = workspace_folders(&state, body.folders.as_deref().unwrap_or_default())?;
+    let workspace = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        let id = crate::workspaces::create(&conn, body.name.as_deref().unwrap_or_default(), &folders)?;
+        crate::workspaces::get(&conn, id)?
+    };
+    record(&state, &user, "workspace-create", &workspace.name);
+    Ok(Json(json!({ "workspace": workspace })))
+}
+
+async fn update_workspace(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<WorkspaceBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let id = body.id.ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Choose a workspace"))?;
+    let folders = body.folders.as_deref().map(|raw| workspace_folders(&state, raw)).transpose()?;
+    let workspace = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::workspaces::update(&conn, id, body.name.as_deref(), folders.as_deref())?;
+        crate::workspaces::get(&conn, id)?
+    };
+    record(&state, &user, "workspace-update", &workspace.name);
+    Ok(Json(json!({ "workspace": workspace })))
+}
+
+#[derive(Deserialize)]
+struct WorkspaceIdQuery {
+    id: i64,
+}
+
+async fn delete_workspace(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<WorkspaceIdQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let name = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        let name = crate::workspaces::get(&conn, query.id)?.name;
+        crate::workspaces::delete(&conn, query.id)?;
+        name
+    };
+    record(&state, &user, "workspace-delete", &name);
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn all_tags(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(scope): Query<WorkspaceQuery>,
+) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-    let tags = crate::albums::tags(&conn)?;
+    let workspace = scope.check(&conn)?;
+    let tags = crate::albums::tags(&conn, workspace)?;
     Ok(Json(json!({ "tags": tags.into_iter().map(|(tag, count)| json!({ "tag": tag, "count": count })).collect::<Vec<_>>() })))
 }
 
@@ -2927,11 +3089,13 @@ async fn gallery_tag(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<GalleryTagQuery>,
+    Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     let items = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-        crate::albums::tagged(&conn, query.tag.trim())?
+        let workspace = scope.check(&conn)?;
+        crate::albums::tagged(&conn, query.tag.trim(), workspace)?
     };
     let items: Vec<_> = gallery_items(&state, items, true)
         .into_iter()

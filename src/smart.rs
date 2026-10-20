@@ -136,6 +136,11 @@ pub fn load_descriptions(conn: &Connection) -> Result<Descriptions, String> {
 
 /// The closest photos to `query`, best first, with their scores.
 pub fn nearest(descriptions: &Descriptions, query: &[f32], limit: usize, skip: Option<&str>) -> Vec<(String, f32)> {
+    nearest_where(descriptions, query, limit, &|path| skip != Some(path))
+}
+
+/// The closest photos to `query` among those `keep` accepts (a workspace's), best first.
+pub fn nearest_where(descriptions: &Descriptions, query: &[f32], limit: usize, keep: &dyn Fn(&str) -> bool) -> Vec<(String, f32)> {
     if descriptions.width == 0 || query.len() != descriptions.width {
         return Vec::new();
     }
@@ -143,7 +148,7 @@ pub fn nearest(descriptions: &Descriptions, query: &[f32], limit: usize, skip: O
         .vectors
         .chunks_exact(descriptions.width)
         .enumerate()
-        .filter(|(index, _)| skip != Some(descriptions.paths[*index].as_str()))
+        .filter(|(index, _)| keep(&descriptions.paths[*index]))
         .map(|(index, vector)| (index, similarity(vector, query)))
         .collect();
     let keep = limit.min(scored.len());
@@ -162,6 +167,11 @@ pub const TEXT_MARGIN: f32 = 0.012;
 
 /// Photos that match words: those scoring clearly above `neutral`, best first.
 pub fn matching_text(descriptions: &Descriptions, query: &[f32], neutral: &[f32], limit: usize) -> Vec<(String, f32)> {
+    matching_text_where(descriptions, query, neutral, limit, &|_| true)
+}
+
+/// Photos that match words, among those `keep` accepts (a workspace's).
+pub fn matching_text_where(descriptions: &Descriptions, query: &[f32], neutral: &[f32], limit: usize, keep: &dyn Fn(&str) -> bool) -> Vec<(String, f32)> {
     if descriptions.width == 0 || query.len() != descriptions.width || neutral.len() != descriptions.width {
         return Vec::new();
     }
@@ -169,6 +179,7 @@ pub fn matching_text(descriptions: &Descriptions, query: &[f32], neutral: &[f32]
         .vectors
         .chunks_exact(descriptions.width)
         .enumerate()
+        .filter(|(index, _)| keep(&descriptions.paths[*index]))
         .filter_map(|(index, vector)| {
             let score = similarity(vector, query);
             (score - similarity(vector, neutral) >= TEXT_MARGIN).then_some((index, score))
@@ -277,16 +288,23 @@ pub struct Person {
 
 /// The people worth showing: named, or seen at least twice. Hidden ones only when asked.
 pub fn people(conn: &Connection, hidden: bool) -> Result<Vec<Person>, String> {
+    people_in(conn, hidden, None)
+}
+
+/// The people worth showing who are in a workspace's photos, with their photos there.
+pub fn people_in(conn: &Connection, hidden: bool, workspace: Option<i64>) -> Result<Vec<Person>, String> {
+    let in_workspace = crate::workspaces::filter(workspace, "f.path");
     let mut stmt = sql(conn.prepare(&format!(
-        "SELECT p.id, p.name, p.faces,
-            (SELECT count(DISTINCT path) FROM faces f WHERE f.person_id = p.id AND {NOT_IN_TRASH}),
+        "SELECT * FROM (SELECT p.id, p.name, p.faces,
+            (SELECT count(DISTINCT path) FROM faces f WHERE f.person_id = p.id AND {NOT_IN_TRASH} AND {in_workspace}) AS photos,
             p.hidden,
-            (SELECT id FROM faces f WHERE f.person_id = p.id AND {NOT_IN_TRASH} ORDER BY f.score * f.w DESC LIMIT 1)
+            (SELECT id FROM faces f WHERE f.person_id = p.id AND {NOT_IN_TRASH} AND {in_workspace} ORDER BY f.score * f.w DESC LIMIT 1)
          FROM people p
          WHERE p.hidden = ?1 AND (p.name IS NOT NULL OR p.faces >= ?2)
-         ORDER BY p.name IS NULL, p.faces DESC, p.id"
+         ORDER BY p.name IS NULL, p.faces DESC, p.id)
+         WHERE photos > 0 OR ?3"
     )))?;
-    let rows = sql(stmt.query_map(params![hidden as i64, MIN_FACES], |row| {
+    let rows = sql(stmt.query_map(params![hidden as i64, MIN_FACES, workspace.is_none()], |row| {
         Ok(Person { id: row.get(0)?, name: row.get(1)?, faces: row.get(2)?, photos: row.get(3)?, hidden: row.get::<_, i64>(4)? != 0, cover_face: row.get(5)? })
     }))?;
     sql(rows.collect())
@@ -308,13 +326,19 @@ pub fn person(conn: &Connection, id: i64) -> Result<Option<Person>, String> {
 
 /// The photos a person is in, newest first, with the face that is them in each.
 pub fn person_photos(conn: &Connection, id: i64) -> Result<Vec<(crate::albums::MediaItem, i64)>, String> {
+    person_photos_in(conn, id, None)
+}
+
+/// The photos a person is in within a workspace.
+pub fn person_photos_in(conn: &Connection, id: i64, workspace: Option<i64>) -> Result<Vec<(crate::albums::MediaItem, i64)>, String> {
     let mut stmt = sql(conn.prepare(&format!(
         "SELECT f.path, m.kind, m.taken_at, m.date_source, m.width, m.height, m.size,
                 EXISTS(SELECT 1 FROM timeline_hidden h WHERE h.path = f.path), min(f.id)
          FROM faces f LEFT JOIN media_index m ON m.path = f.path
-         WHERE f.person_id = ?1 AND {}
+         WHERE f.person_id = ?1 AND {} AND {}
          GROUP BY f.path ORDER BY m.taken_at DESC, f.path DESC",
-        NOT_IN_TRASH.replace("path", "f.path")
+        NOT_IN_TRASH.replace("path", "f.path"),
+        crate::workspaces::filter(workspace, "f.path")
     )))?;
     let rows = sql(stmt.query_map([id], |row| {
         Ok((

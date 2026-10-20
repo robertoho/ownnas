@@ -14,6 +14,8 @@ pub const MAX_ITEMS_PER_CHANGE: usize = 10_000;
 #[derive(Debug, PartialEq)]
 pub enum AlbumError {
     NotFound,
+    /// Something else that is gone (a workspace), with what to say.
+    Missing(String),
     Invalid(String),
     Conflict(String),
     Db(String),
@@ -23,7 +25,7 @@ impl std::fmt::Display for AlbumError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound => write!(f, "That album no longer exists"),
-            Self::Invalid(why) | Self::Conflict(why) | Self::Db(why) => write!(f, "{why}"),
+            Self::Missing(why) | Self::Invalid(why) | Self::Conflict(why) | Self::Db(why) => write!(f, "{why}"),
         }
     }
 }
@@ -41,6 +43,8 @@ type Result<T> = std::result::Result<T, AlbumError>;
 pub struct Album {
     pub id: i64,
     pub parent_id: Option<i64>,
+    /// The Gallery workspace it belongs to (with everything inside it); none shows under All.
+    pub workspace_id: Option<i64>,
     pub name: String,
     /// The photo shown on the album's card: the chosen cover, or the latest photo added.
     pub cover: Option<String>,
@@ -67,11 +71,13 @@ fn exists(conn: &Connection, id: i64) -> Result<bool> {
     Ok(conn.query_row("SELECT 1 FROM albums WHERE id = ?1", [id], |_| Ok(())).optional()?.is_some())
 }
 
-fn check_sibling_name(conn: &Connection, parent: Option<i64>, name: &str, except: Option<i64>) -> Result<()> {
+/// Names are unique among an album's sub-albums, and among a workspace's top-level albums.
+fn check_sibling_name(conn: &Connection, parent: Option<i64>, workspace: Option<i64>, name: &str, except: Option<i64>) -> Result<()> {
     let taken: Option<String> = conn
         .query_row(
-            "SELECT name FROM albums WHERE parent_id IS ?1 AND lower(name) = lower(?2) AND id IS NOT ?3",
-            params![parent, name, except],
+            "SELECT name FROM albums WHERE parent_id IS ?1 AND (?1 IS NOT NULL OR workspace_id IS ?4)
+             AND lower(name) = lower(?2) AND id IS NOT ?3",
+            params![parent, name, except, workspace],
             |row| row.get(0),
         )
         .optional()?;
@@ -84,18 +90,23 @@ fn check_sibling_name(conn: &Connection, parent: Option<i64>, name: &str, except
 // Paths in the Trash, which album views leave out.
 const NOT_IN_TRASH: &str = "substr(path, 1, 14) <> '.ownnas-trash/' AND substr(path, 1, 6) <> 'Trash/'";
 
-pub fn create(conn: &Connection, parent: Option<i64>, name: &str) -> Result<i64> {
+/// A new album inside `parent` (in its workspace), or at the top of `workspace`.
+pub fn create(conn: &Connection, parent: Option<i64>, name: &str, workspace: Option<i64>) -> Result<i64> {
     let name = normalize_name(name)?;
-    if let Some(parent) = parent {
-        if !exists(conn, parent)? {
-            return Err(AlbumError::NotFound);
+    let workspace = match parent {
+        Some(parent) => {
+            if !exists(conn, parent)? {
+                return Err(AlbumError::NotFound);
+            }
+            workspace_of(conn, parent)?
         }
-    }
-    check_sibling_name(conn, parent, &name, None)?;
+        None => workspace,
+    };
+    check_sibling_name(conn, parent, workspace, &name, None)?;
     let now = now_secs();
     conn.execute(
-        "INSERT INTO albums(parent_id, name, created_at, updated_at) VALUES(?1, ?2, ?3, ?3)",
-        params![parent, name, now],
+        "INSERT INTO albums(parent_id, workspace_id, name, created_at, updated_at) VALUES(?1, ?2, ?3, ?4, ?4)",
+        params![parent, workspace, name, now],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -103,7 +114,7 @@ pub fn create(conn: &Connection, parent: Option<i64>, name: &str) -> Result<i64>
 pub fn rename(conn: &Connection, id: i64, name: &str) -> Result<()> {
     let name = normalize_name(name)?;
     let parent = parent_of(conn, id)?;
-    check_sibling_name(conn, parent, &name, Some(id))?;
+    check_sibling_name(conn, parent, workspace_of(conn, id)?, &name, Some(id))?;
     conn.execute("UPDATE albums SET name = ?1, updated_at = ?2 WHERE id = ?3", params![name, now_secs(), id])?;
     Ok(())
 }
@@ -114,7 +125,40 @@ fn parent_of(conn: &Connection, id: i64) -> Result<Option<i64>> {
         .ok_or(AlbumError::NotFound)
 }
 
-/// Moves an album (with everything in it) under another album, or to the top with `None`.
+fn workspace_of(conn: &Connection, id: i64) -> Result<Option<i64>> {
+    conn.query_row("SELECT workspace_id FROM albums WHERE id = ?1", [id], |row| row.get(0))
+        .optional()?
+        .ok_or(AlbumError::NotFound)
+}
+
+/// Puts an album and every album inside it in a workspace.
+fn set_subtree_workspace(conn: &Connection, id: i64, workspace: Option<i64>) -> Result<()> {
+    conn.execute(
+        "WITH RECURSIVE inside(id) AS (
+            SELECT ?1 UNION ALL SELECT a.id FROM albums a JOIN inside ON a.parent_id = inside.id
+         ) UPDATE albums SET workspace_id = ?2 WHERE id IN (SELECT id FROM inside)",
+        params![id, workspace],
+    )?;
+    Ok(())
+}
+
+/// Moves an album (with everything in it) to another workspace, at its top level.
+pub fn set_workspace(conn: &Connection, id: i64, workspace: Option<i64>) -> Result<()> {
+    let parent = parent_of(conn, id)?;
+    if parent.is_none() && workspace_of(conn, id)? == workspace {
+        return Ok(());
+    }
+    let name: String = conn.query_row("SELECT name FROM albums WHERE id = ?1", [id], |row| row.get(0))?;
+    check_sibling_name(conn, None, workspace, &name, Some(id))?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("UPDATE albums SET parent_id = NULL, updated_at = ?1 WHERE id = ?2", params![now_secs(), id])?;
+    set_subtree_workspace(&tx, id, workspace)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Moves an album (with everything in it) under another album (into its workspace), or to the
+/// top of its own workspace with `None`.
 pub fn move_to(conn: &Connection, id: i64, parent: Option<i64>) -> Result<()> {
     parent_of(conn, id)?;
     if let Some(parent) = parent {
@@ -134,8 +178,15 @@ pub fn move_to(conn: &Connection, id: i64, parent: Option<i64>) -> Result<()> {
         }
     }
     let name: String = conn.query_row("SELECT name FROM albums WHERE id = ?1", [id], |row| row.get(0))?;
-    check_sibling_name(conn, parent, &name, Some(id))?;
-    conn.execute("UPDATE albums SET parent_id = ?1, updated_at = ?2 WHERE id = ?3", params![parent, now_secs(), id])?;
+    let workspace = match parent {
+        Some(parent) => workspace_of(conn, parent)?,
+        None => workspace_of(conn, id)?,
+    };
+    check_sibling_name(conn, parent, workspace, &name, Some(id))?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("UPDATE albums SET parent_id = ?1, updated_at = ?2 WHERE id = ?3", params![parent, now_secs(), id])?;
+    set_subtree_workspace(&tx, id, workspace)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -190,7 +241,7 @@ pub fn change_items(conn: &Connection, id: i64, paths: &[String], add: bool, by:
 
 fn album_rows(conn: &Connection, filter: &str, value: Option<i64>) -> Result<Vec<Album>> {
     let sql = format!(
-        "SELECT a.id, a.parent_id, a.name,
+        "SELECT a.id, a.parent_id, a.workspace_id, a.name,
             coalesce(
                 a.cover_path,
                 (SELECT path FROM album_items WHERE album_id = a.id AND {NOT_IN_TRASH} ORDER BY added_at DESC, path LIMIT 1),
@@ -207,7 +258,7 @@ fn album_rows(conn: &Connection, filter: &str, value: Option<i64>) -> Result<Vec
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([value], |row| {
-        Ok(Album { id: row.get(0)?, parent_id: row.get(1)?, name: row.get(2)?, cover: row.get(3)?, count: row.get(4)?, albums: row.get(5)? })
+        Ok(Album { id: row.get(0)?, parent_id: row.get(1)?, workspace_id: row.get(2)?, name: row.get(3)?, cover: row.get(4)?, count: row.get(5)?, albums: row.get(6)? })
     })?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
@@ -216,14 +267,22 @@ pub fn get(conn: &Connection, id: i64) -> Result<Album> {
     album_rows(conn, "a.id = ?1", Some(id))?.pop().ok_or(AlbumError::NotFound)
 }
 
-/// The albums directly inside `parent` (top-level albums for `None`).
-pub fn children(conn: &Connection, parent: Option<i64>) -> Result<Vec<Album>> {
-    album_rows(conn, "a.parent_id IS ?1", parent)
+/// The albums directly inside `parent`, or the top-level albums of `workspace` (of every
+/// workspace for `None`).
+pub fn children(conn: &Connection, parent: Option<i64>, workspace: Option<i64>) -> Result<Vec<Album>> {
+    match (parent, workspace) {
+        (Some(parent), _) => album_rows(conn, "a.parent_id = ?1", Some(parent)),
+        (None, Some(workspace)) => album_rows(conn, "a.parent_id IS NULL AND a.workspace_id = ?1", Some(workspace)),
+        (None, None) => album_rows(conn, "a.parent_id IS NULL AND ?1 IS NULL", None),
+    }
 }
 
-/// Every album, for pickers that show the whole tree.
-pub fn all(conn: &Connection) -> Result<Vec<Album>> {
-    album_rows(conn, "?1 IS NULL", None)
+/// Every album of a workspace (of every one for `None`), for pickers that show the whole tree.
+pub fn all(conn: &Connection, workspace: Option<i64>) -> Result<Vec<Album>> {
+    match workspace {
+        Some(workspace) => album_rows(conn, "a.workspace_id = ?1", Some(workspace)),
+        None => album_rows(conn, "?1 IS NULL", None),
+    }
 }
 
 /// The album and the albums above it, from the top.
@@ -303,12 +362,13 @@ pub fn albums_for_path(conn: &Connection, path: &str) -> Result<Vec<(i64, String
 }
 
 /// One page of the timeline, newest first: items taken before `(taken_at, path)`.
-pub fn timeline(conn: &Connection, before: Option<(i64, String)>, limit: usize) -> Result<Vec<MediaItem>> {
+pub fn timeline(conn: &Connection, before: Option<(i64, String)>, limit: usize, workspace: Option<i64>) -> Result<Vec<MediaItem>> {
+    let in_workspace = crate::workspaces::filter(workspace, "m.path");
     let (at, path) = before.unwrap_or((i64::MAX, String::new()));
     let mut stmt = conn.prepare(&format!(
         "SELECT m.path, {MEDIA_COLUMNS}, 0 FROM media_index m
          WHERE (m.taken_at < ?1 OR (m.taken_at = ?1 AND m.path < ?2 AND ?2 <> ''))
-           AND substr(m.path, 1, 14) <> '.ownnas-trash/' AND substr(m.path, 1, 6) <> 'Trash/' AND {NOT_HIDDEN}
+           AND substr(m.path, 1, 14) <> '.ownnas-trash/' AND substr(m.path, 1, 6) <> 'Trash/' AND {NOT_HIDDEN} AND {in_workspace}
          ORDER BY m.taken_at DESC, m.path DESC LIMIT ?3"
     ))?;
     let rows = stmt.query_map(params![at, path, limit as i64], media_item)?;
@@ -317,21 +377,23 @@ pub fn timeline(conn: &Connection, before: Option<(i64, String)>, limit: usize) 
 
 /// How many photos and videos were taken each day (UTC dates), newest first: enough for the
 /// Gallery to lay out the whole timeline before loading any of it.
-pub fn days(conn: &Connection) -> Result<Vec<(String, i64)>> {
+pub fn days(conn: &Connection, workspace: Option<i64>) -> Result<Vec<(String, i64)>> {
+    let in_workspace = crate::workspaces::filter(workspace, "m.path");
     let mut stmt = conn.prepare(&format!(
         "SELECT strftime('%Y-%m-%d', taken_at, 'unixepoch') AS day, count(*) FROM media_index m
-         WHERE {NOT_IN_TRASH} AND {NOT_HIDDEN} GROUP BY day ORDER BY day DESC"
+         WHERE {NOT_IN_TRASH} AND {NOT_HIDDEN} AND {in_workspace} GROUP BY day ORDER BY day DESC"
     ))?;
     let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
 /// Photos and videos taken in `[from, to)`, newest first.
-pub fn taken_between(conn: &Connection, from: i64, to: i64, limit: usize) -> Result<Vec<MediaItem>> {
+pub fn taken_between(conn: &Connection, from: i64, to: i64, limit: usize, workspace: Option<i64>) -> Result<Vec<MediaItem>> {
+    let in_workspace = crate::workspaces::filter(workspace, "m.path");
     let mut stmt = conn.prepare(&format!(
         "SELECT m.path, {MEDIA_COLUMNS}, 0 FROM media_index m
          WHERE m.taken_at >= ?1 AND m.taken_at < ?2
-           AND substr(m.path, 1, 14) <> '.ownnas-trash/' AND substr(m.path, 1, 6) <> 'Trash/' AND {NOT_HIDDEN}
+           AND substr(m.path, 1, 14) <> '.ownnas-trash/' AND substr(m.path, 1, 6) <> 'Trash/' AND {NOT_HIDDEN} AND {in_workspace}
          ORDER BY m.taken_at DESC, m.path DESC LIMIT ?3"
     ))?;
     let rows = stmt.query_map(params![from, to, limit as i64], media_item)?;
@@ -364,14 +426,15 @@ fn mercator_y(lat: f64) -> f64 {
     (1.0 - (lat.tan() + 1.0 / lat.cos()).ln() / std::f64::consts::PI) / 2.0
 }
 
-fn geotagged(conn: &Connection, bounds: Option<Bounds>) -> Result<Vec<(f64, f64, MediaItem)>> {
+fn geotagged(conn: &Connection, bounds: Option<Bounds>, workspace: Option<i64>) -> Result<Vec<(f64, f64, MediaItem)>> {
+    let in_workspace = crate::workspaces::filter(workspace, "m.path");
     let b = bounds.unwrap_or(Bounds { west: -180.0, south: -90.0, east: 180.0, north: 90.0 });
     // A box over the date line has its west east of its east.
     let mut stmt = conn.prepare(&format!(
         "SELECT m.lat, m.lon, m.path, {MEDIA_COLUMNS}, 0 FROM media_index m
          WHERE m.lat IS NOT NULL AND m.lon IS NOT NULL AND m.lat BETWEEN ?2 AND ?4
            AND (CASE WHEN ?1 <= ?3 THEN m.lon BETWEEN ?1 AND ?3 ELSE m.lon >= ?1 OR m.lon <= ?3 END)
-           AND substr(m.path, 1, 14) <> '.ownnas-trash/' AND substr(m.path, 1, 6) <> 'Trash/' AND {NOT_HIDDEN}
+           AND substr(m.path, 1, 14) <> '.ownnas-trash/' AND substr(m.path, 1, 6) <> 'Trash/' AND {NOT_HIDDEN} AND {in_workspace}
          ORDER BY m.taken_at DESC, m.path DESC"
     ))?;
     let rows = stmt.query_map(params![b.west, b.south, b.east, b.north], |row| {
@@ -391,11 +454,11 @@ fn geotagged(conn: &Connection, bounds: Option<Bounds>) -> Result<Vec<(f64, f64,
 }
 
 /// Photos with a place, grouped into cells about `cell` pixels wide at `zoom`, within `bounds`.
-pub fn places(conn: &Connection, zoom: u8, bounds: Option<Bounds>, cell: f64) -> Result<Vec<Place>> {
+pub fn places(conn: &Connection, zoom: u8, bounds: Option<Bounds>, cell: f64, workspace: Option<i64>) -> Result<Vec<Place>> {
     let world = 256.0 * 2f64.powi(i32::from(zoom.min(22)));
     let mut cells: std::collections::HashMap<(i64, i64), (f64, f64, u64, Option<MediaItem>)> = std::collections::HashMap::new();
     // Newest first, so a cell's first photo is its newest.
-    for (lat, lon, item) in geotagged(conn, bounds)? {
+    for (lat, lon, item) in geotagged(conn, bounds, workspace)? {
         let x = ((lon + 180.0) / 360.0 * world / cell).floor() as i64;
         let y = (mercator_y(lat) * world / cell).floor() as i64;
         let entry = cells.entry((x, y)).or_insert((0.0, 0.0, 0, None));
@@ -413,19 +476,20 @@ pub fn places(conn: &Connection, zoom: u8, bounds: Option<Bounds>, cell: f64) ->
 }
 
 /// The photos with a place within `bounds`, newest first, and how many there are.
-pub fn placed_items(conn: &Connection, bounds: Bounds, limit: usize) -> Result<(Vec<MediaItem>, usize)> {
-    let all = geotagged(conn, Some(bounds))?;
+pub fn placed_items(conn: &Connection, bounds: Bounds, limit: usize, workspace: Option<i64>) -> Result<(Vec<MediaItem>, usize)> {
+    let all = geotagged(conn, Some(bounds), workspace)?;
     let total = all.len();
     Ok((all.into_iter().take(limit).map(|(_, _, item)| item).collect(), total))
 }
 
 /// The box around every photo with a place, and how many there are.
-pub fn place_extent(conn: &Connection) -> Result<Option<(Bounds, u64)>> {
+pub fn place_extent(conn: &Connection, workspace: Option<i64>) -> Result<Option<(Bounds, u64)>> {
+    let in_workspace = crate::workspaces::filter(workspace, "m.path");
     let row: (Option<f64>, Option<f64>, Option<f64>, Option<f64>, i64) = conn.query_row(
         &format!(
             "SELECT min(lon), min(lat), max(lon), max(lat), count(*) FROM media_index m
              WHERE m.lat IS NOT NULL AND m.lon IS NOT NULL
-               AND substr(m.path, 1, 14) <> '.ownnas-trash/' AND substr(m.path, 1, 6) <> 'Trash/' AND {NOT_HIDDEN}"
+               AND substr(m.path, 1, 14) <> '.ownnas-trash/' AND substr(m.path, 1, 6) <> 'Trash/' AND {NOT_HIDDEN} AND {in_workspace}"
         ),
         [],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
@@ -439,12 +503,13 @@ pub fn place_extent(conn: &Connection) -> Result<Option<(Bounds, u64)>> {
 /// Photos and videos taken on this day of the year (`month`, `day`) in earlier years than
 /// `year`, newest year first. Only dates from the camera count: a file's date is often just
 /// when it was copied.
-pub fn on_this_day(conn: &Connection, month: u32, day: u32, year: i32, per_year: usize) -> Result<Vec<(i32, usize, Vec<MediaItem>)>> {
+pub fn on_this_day(conn: &Connection, month: u32, day: u32, year: i32, per_year: usize, workspace: Option<i64>) -> Result<Vec<(i32, usize, Vec<MediaItem>)>> {
+    let in_workspace = crate::workspaces::filter(workspace, "m.path");
     let mut stmt = conn.prepare(&format!(
         "SELECT m.path, {MEDIA_COLUMNS}, 0, CAST(strftime('%Y', m.taken_at, 'unixepoch') AS INTEGER) AS year FROM media_index m
          WHERE strftime('%m-%d', m.taken_at, 'unixepoch') = ?1 AND m.date_source <> 'file'
            AND CAST(strftime('%Y', m.taken_at, 'unixepoch') AS INTEGER) < ?2
-           AND substr(m.path, 1, 14) <> '.ownnas-trash/' AND substr(m.path, 1, 6) <> 'Trash/' AND {NOT_HIDDEN}
+           AND substr(m.path, 1, 14) <> '.ownnas-trash/' AND substr(m.path, 1, 6) <> 'Trash/' AND {NOT_HIDDEN} AND {in_workspace}
          ORDER BY year DESC, m.taken_at, m.path"
     ))?;
     let rows = stmt.query_map(params![format!("{month:02}-{day:02}"), year], |row| Ok((row.get::<_, i32>(8)?, media_item(row)?)))?;
@@ -501,38 +566,44 @@ pub fn set_hidden(conn: &Connection, paths: &[String], hidden: bool, by: &str) -
 }
 
 /// The photos hidden from the timeline, newest first.
-pub fn hidden(conn: &Connection) -> Result<Vec<MediaItem>> {
+pub fn hidden(conn: &Connection, workspace: Option<i64>) -> Result<Vec<MediaItem>> {
+    let in_workspace = crate::workspaces::filter(workspace, "h.path");
     let mut stmt = conn.prepare(&format!(
         "SELECT h.path, {MEDIA_COLUMNS}, 1 FROM timeline_hidden h LEFT JOIN media_index m ON m.path = h.path
-         WHERE substr(h.path, 1, 14) <> '.ownnas-trash/' AND substr(h.path, 1, 6) <> 'Trash/'
+         WHERE substr(h.path, 1, 14) <> '.ownnas-trash/' AND substr(h.path, 1, 6) <> 'Trash/' AND {in_workspace}
          ORDER BY coalesce(m.taken_at, h.hidden_at) DESC, h.path DESC"
     ))?;
     let rows = stmt.query_map([], media_item)?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
-pub fn hidden_count(conn: &Connection) -> Result<i64> {
+pub fn hidden_count(conn: &Connection, workspace: Option<i64>) -> Result<i64> {
     Ok(conn.query_row(
-        "SELECT count(*) FROM timeline_hidden WHERE substr(path, 1, 14) <> '.ownnas-trash/' AND substr(path, 1, 6) <> 'Trash/'",
+        &format!(
+            "SELECT count(*) FROM timeline_hidden h WHERE substr(h.path, 1, 14) <> '.ownnas-trash/' AND substr(h.path, 1, 6) <> 'Trash/' AND {}",
+            crate::workspaces::filter(workspace, "h.path")
+        ),
         [],
         |row| row.get(0),
     )?)
 }
 
-/// Every tag with how many files carry it.
-pub fn tags(conn: &Connection) -> Result<Vec<(String, i64)>> {
+/// Every tag with how many files carry it (in a workspace's folders only, with one).
+pub fn tags(conn: &Connection, workspace: Option<i64>) -> Result<Vec<(String, i64)>> {
+    let in_workspace = crate::workspaces::filter(workspace, "path");
     let mut stmt = conn.prepare(&format!(
-        "SELECT min(tag), count(*) FROM file_tags WHERE {NOT_IN_TRASH} GROUP BY tag COLLATE NOCASE ORDER BY min(tag) COLLATE NOCASE"
+        "SELECT min(tag), count(*) FROM file_tags WHERE {NOT_IN_TRASH} AND {in_workspace} GROUP BY tag COLLATE NOCASE ORDER BY min(tag) COLLATE NOCASE"
     ))?;
     let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
 /// Files with a tag, newest first where the date is known.
-pub fn tagged(conn: &Connection, tag: &str) -> Result<Vec<MediaItem>> {
+pub fn tagged(conn: &Connection, tag: &str, workspace: Option<i64>) -> Result<Vec<MediaItem>> {
+    let in_workspace = crate::workspaces::filter(workspace, "t.path");
     let mut stmt = conn.prepare(&format!(
         "SELECT t.path, {MEDIA_COLUMNS}, {} FROM file_tags t LEFT JOIN media_index m ON m.path = t.path
-         WHERE t.tag = ?1 COLLATE NOCASE AND substr(t.path, 1, 14) <> '.ownnas-trash/' AND substr(t.path, 1, 6) <> 'Trash/'
+         WHERE t.tag = ?1 COLLATE NOCASE AND substr(t.path, 1, 14) <> '.ownnas-trash/' AND substr(t.path, 1, 6) <> 'Trash/' AND {in_workspace}
          ORDER BY coalesce(m.taken_at, t.created_at) DESC, t.path DESC",
         hidden_column("t")
     ))?;
@@ -573,18 +644,18 @@ mod tests {
         for (path, lat, lon) in [("paris/a.jpg", 48.857, 2.295), ("paris/b.jpg", 48.86, 2.34), ("sydney.jpg", -33.86, 151.21)] {
             conn.execute("UPDATE media_index SET lat = ?2, lon = ?3 WHERE path = ?1", params![path, lat, lon]).unwrap();
         }
-        let world = places(&conn, 2, None, 72.0).unwrap();
+        let world = places(&conn, 2, None, 72.0, None).unwrap();
         assert_eq!(world.iter().map(|place| place.count).collect::<Vec<_>>(), [2, 1], "Paris is one place from afar");
         assert_eq!(world[0].newest.path, "paris/a.jpg");
-        assert_eq!(places(&conn, 16, None, 72.0).unwrap().len(), 3, "and two places close up");
+        assert_eq!(places(&conn, 16, None, 72.0, None).unwrap().len(), 3, "and two places close up");
         let europe = Bounds { west: -10.0, south: 35.0, east: 30.0, north: 60.0 };
-        assert_eq!(placed_items(&conn, europe, 10).unwrap().1, 2);
+        assert_eq!(placed_items(&conn, europe, 10, None).unwrap().1, 2);
         // Across the date line.
         let pacific = Bounds { west: 150.0, south: -40.0, east: -170.0, north: 0.0 };
-        assert_eq!(placed_items(&conn, pacific, 10).unwrap().0[0].path, "sydney.jpg");
-        assert_eq!(place_extent(&conn).unwrap().unwrap().1, 3);
+        assert_eq!(placed_items(&conn, pacific, 10, None).unwrap().0[0].path, "sydney.jpg");
+        assert_eq!(place_extent(&conn, None).unwrap().unwrap().1, 3);
 
-        let years = on_this_day(&conn, 10, 19, 2026, 10).unwrap();
+        let years = on_this_day(&conn, 10, 19, 2026, 10, None).unwrap();
         let summary: Vec<(i32, usize)> = years.iter().map(|(year, count, _)| (*year, *count)).collect();
         assert_eq!(summary, [(2023, 2), (2021, 1)], "not this year, and not file dates");
     }
@@ -592,19 +663,19 @@ mod tests {
     #[test]
     fn albums_nest_like_folders() {
         let conn = conn();
-        let trips = create(&conn, None, "Trips").unwrap();
-        let italy = create(&conn, Some(trips), "Italy").unwrap();
-        let rome = create(&conn, Some(italy), "Rome").unwrap();
-        assert_eq!(create(&conn, None, " trips ").unwrap_err(), AlbumError::Conflict("There is already an album called “Trips” here".into()));
-        assert!(create(&conn, Some(trips), "Rome").is_ok(), "the same name can be used in another album");
-        assert!(matches!(create(&conn, None, "  "), Err(AlbumError::Invalid(_))));
-        assert_eq!(create(&conn, Some(9999), "Lost"), Err(AlbumError::NotFound));
+        let trips = create(&conn, None, "Trips", None).unwrap();
+        let italy = create(&conn, Some(trips), "Italy", None).unwrap();
+        let rome = create(&conn, Some(italy), "Rome", None).unwrap();
+        assert_eq!(create(&conn, None, " trips ", None).unwrap_err(), AlbumError::Conflict("There is already an album called “Trips” here".into()));
+        assert!(create(&conn, Some(trips), "Rome", None).is_ok(), "the same name can be used in another album");
+        assert!(matches!(create(&conn, None, "  ", None), Err(AlbumError::Invalid(_))));
+        assert_eq!(create(&conn, Some(9999), "Lost", None), Err(AlbumError::NotFound));
 
         assert_eq!(breadcrumb(&conn, rome).unwrap(), vec![(trips, "Trips".into()), (italy, "Italy".into()), (rome, "Rome".into())]);
         change_items(&conn, rome, &["rome.jpg".into()], true, "ana").unwrap();
         assert_eq!(get(&conn, trips).unwrap().cover.as_deref(), Some("rome.jpg"), "an album of albums borrows a cover");
         change_items(&conn, rome, &["rome.jpg".into()], false, "ana").unwrap();
-        assert_eq!(children(&conn, None).unwrap().iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["Trips"]);
+        assert_eq!(children(&conn, None, None).unwrap().iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["Trips"]);
         assert_eq!(get(&conn, trips).unwrap().albums, 2);
 
         // An album cannot move inside itself or below its own sub-albums.
@@ -621,7 +692,7 @@ mod tests {
         change_items(&conn, italy, &["a.jpg".into()], true, "ana").unwrap();
         delete(&conn, trips).unwrap();
         assert_eq!(get(&conn, italy).unwrap_err(), AlbumError::NotFound);
-        assert_eq!(all(&conn).unwrap().len(), 1);
+        assert_eq!(all(&conn, None).unwrap().len(), 1);
         let left: i64 = conn.query_row("SELECT count(*) FROM album_items", [], |row| row.get(0)).unwrap();
         assert_eq!(left, 0);
     }
@@ -629,7 +700,7 @@ mod tests {
     #[test]
     fn items_follow_their_files() {
         let conn = conn();
-        let album = create(&conn, None, "Family").unwrap();
+        let album = create(&conn, None, "Family", None).unwrap();
         index(&conn, "photos/a.jpg", 100);
         index(&conn, "photos/b.jpg", 300);
         index(&conn, "photos/c.jpg", 200);
@@ -647,7 +718,7 @@ mod tests {
         // A copy is not added to albums; deleting forever removes the entry.
         db::copy_path_meta(&conn, "pictures/a.jpg", "pictures/a copy.jpg").unwrap();
         assert_eq!(albums_for_path(&conn, "pictures/a copy.jpg").unwrap(), vec![]);
-        assert_eq!(timeline(&conn, None, 10).unwrap().len(), 4);
+        assert_eq!(timeline(&conn, None, 10, None).unwrap().len(), 4);
         db::delete_path_meta(&conn, "pictures/a.jpg").unwrap();
         assert_eq!(items(&conn, album).unwrap().len(), 1);
         assert_eq!(albums_for_path(&conn, "pictures/b.jpg").unwrap(), vec![(album, "Family".into())]);
@@ -665,28 +736,28 @@ mod tests {
         for (path, at) in [("a.jpg", 10), ("b.jpg", 30), ("c.jpg", 30), ("d.jpg", 20), (".ownnas-trash/1/e.jpg", 40)] {
             index(&conn, path, at);
         }
-        let first = timeline(&conn, None, 2).unwrap();
+        let first = timeline(&conn, None, 2, None).unwrap();
         assert_eq!(first.iter().map(|i| i.path.as_str()).collect::<Vec<_>>(), ["c.jpg", "b.jpg"]);
         let last = first.last().unwrap();
-        let next = timeline(&conn, Some((last.taken_at.unwrap(), last.path.clone())), 10).unwrap();
+        let next = timeline(&conn, Some((last.taken_at.unwrap(), last.path.clone())), 10, None).unwrap();
         assert_eq!(next.iter().map(|i| i.path.as_str()).collect::<Vec<_>>(), ["d.jpg", "a.jpg"]);
 
-        assert_eq!(days(&conn).unwrap(), vec![("1970-01-01".into(), 4)]);
-        assert_eq!(taken_between(&conn, 20, 31, 10).unwrap().iter().map(|i| i.path.as_str()).collect::<Vec<_>>(), ["c.jpg", "b.jpg", "d.jpg"]);
+        assert_eq!(days(&conn, None).unwrap(), vec![("1970-01-01".into(), 4)]);
+        assert_eq!(taken_between(&conn, 20, 31, 10, None).unwrap().iter().map(|i| i.path.as_str()).collect::<Vec<_>>(), ["c.jpg", "b.jpg", "d.jpg"]);
         // Hidden photos leave the timeline (and its day counts) but keep their albums and tags.
         assert_eq!(set_hidden(&conn, &["b.jpg".into()], true, "ana").unwrap(), 1);
-        assert_eq!(timeline(&conn, None, 10).unwrap().iter().map(|i| i.path.as_str()).collect::<Vec<_>>(), ["c.jpg", "d.jpg", "a.jpg"]);
-        assert_eq!(days(&conn).unwrap(), vec![("1970-01-01".into(), 3)]);
-        assert_eq!(hidden(&conn).unwrap().iter().map(|i| (i.path.as_str(), i.hidden)).collect::<Vec<_>>(), [("b.jpg", true)]);
+        assert_eq!(timeline(&conn, None, 10, None).unwrap().iter().map(|i| i.path.as_str()).collect::<Vec<_>>(), ["c.jpg", "d.jpg", "a.jpg"]);
+        assert_eq!(days(&conn, None).unwrap(), vec![("1970-01-01".into(), 3)]);
+        assert_eq!(hidden(&conn, None).unwrap().iter().map(|i| (i.path.as_str(), i.hidden)).collect::<Vec<_>>(), [("b.jpg", true)]);
         db::rewrite_path_meta(&conn, "b.jpg", "moved/b.jpg").unwrap();
-        assert_eq!(hidden(&conn).unwrap()[0].path, "moved/b.jpg", "the flag follows the file");
+        assert_eq!(hidden(&conn, None).unwrap()[0].path, "moved/b.jpg", "the flag follows the file");
         db::rewrite_path_meta(&conn, "moved/b.jpg", "b.jpg").unwrap();
         db::add_tag(&conn, "a.jpg", "Beach").unwrap();
         db::add_tag(&conn, "b.jpg", "beach").unwrap();
-        assert_eq!(tags(&conn).unwrap(), vec![("Beach".into(), 2)]);
-        let beach = tagged(&conn, "BEACH").unwrap();
+        assert_eq!(tags(&conn, None).unwrap(), vec![("Beach".into(), 2)]);
+        let beach = tagged(&conn, "BEACH", None).unwrap();
         assert_eq!(beach.iter().map(|i| (i.path.as_str(), i.hidden)).collect::<Vec<_>>(), [("b.jpg", true), ("a.jpg", false)]);
         assert_eq!(set_hidden(&conn, &["b.jpg".into()], false, "ana").unwrap(), 1);
-        assert_eq!(hidden_count(&conn).unwrap(), 0);
+        assert_eq!(hidden_count(&conn, None).unwrap(), 0);
     }
 }

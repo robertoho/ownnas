@@ -931,6 +931,8 @@ const MENU_ICONS = {
   search: "M7 2.75a4.25 4.25 0 1 1 0 8.5a4.25 4.25 0 1 1 0-8.5z M10.25 10.25 13.5 13.5",
   library: "M2.5 2.5h3v11h-3z M6.5 2.5h3v11h-3z M10.5 3.5l3 1v9l-3-1z",
   gallery: "M2.5 3h11a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z M1.5 10.5l3.5-3.5 3 3 2-2 4.5 4 M10.5 5.5h.01",
+  workspace: "M2 3.5h5v4H2z M9 3.5h5v4H9z M2 9.5h5v4H2z M9 9.5h5v4H9z",
+  newWorkspace: "M2 3.5h5v4H2z M9 3.5h5v4H9z M2 9.5h5v4H2z M11.5 9.5v4 M9.5 11.5h4",
   findSimilar: "M7 2.75a4.25 4.25 0 1 1 0 8.5a4.25 4.25 0 1 1 0-8.5z M10.25 10.25 13.5 13.5 M5.5 7h3 M7 5.5v3",
   addToAlbum: "M1.5 4.5h9a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-8a1 1 0 0 1-1-1z M3.5 2.5h9.5a1 1 0 0 1 1 1V10 M6 7v4 M4 9h4",
   newAlbum: "M1.5 4.5h9a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-8a1 1 0 0 1-1-1z M3.5 2.5h9.5a1 1 0 0 1 1 1V10 M6 7v4 M4 9h4",
@@ -999,6 +1001,8 @@ function decorateMenu(menu) {
     const action = item.dataset.menu || item.dataset.tabAction || "";
     item.prepend(menuIcon(action));
   }
+  // Menus whose order means something (a list of choices) keep it.
+  if (menu.dataset.keepOrder) return;
   const byName = (a, b) => a.textContent.trim().localeCompare(b.textContent.trim(), undefined, { numeric: true, sensitivity: "base" });
   const safe = items.filter((item) => !item.classList.contains("danger")).sort(byName);
   const risky = items.filter((item) => item.classList.contains("danger")).sort(byName);
@@ -2083,6 +2087,8 @@ async function gallery() {
       convertVideos: (paths, focus) => convertVideos(paths, focus),
       canConvertVideos: () => !!(state.me && state.me.ffmpeg),
       findSimilar: (path) => findSimilar(path).catch((err) => toast(err.message, true)),
+      isAdmin: () => !!(state.me && state.me.admin),
+      pickFolder: (options) => pickFolder(options),
     });
   }
   return galleryApi;

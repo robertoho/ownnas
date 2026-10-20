@@ -2,6 +2,7 @@ mod agents;
 mod archives;
 mod audio_info;
 mod albums;
+mod workspaces;
 mod auth;
 mod books;
 mod content_index;

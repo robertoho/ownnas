@@ -238,6 +238,19 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             reason TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS file_versions_path ON file_versions(path, saved_at);
+        -- Ids are never reused: links and remembered choices keep naming the same workspace.
+        CREATE TABLE IF NOT EXISTS workspaces (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS workspace_folders (
+            workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+            folder TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, folder)
+        );
+        CREATE INDEX IF NOT EXISTS workspace_folders_folder ON workspace_folders(folder);
         CREATE TABLE IF NOT EXISTS content_text (
             path TEXT NOT NULL UNIQUE,
             size INTEGER NOT NULL,
@@ -255,6 +268,15 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             conn.execute(&format!("ALTER TABLE media_index ADD COLUMN {column} REAL"), [])
                 .map_err(|_| "Could not update the photo index".to_string())?;
         }
+    }
+    let has_workspace: bool = conn.prepare("SELECT 1 FROM pragma_table_info('albums') WHERE name = 'workspace_id'").and_then(|mut stmt| stmt.exists([])).unwrap_or(false);
+    if !has_workspace {
+        // Albums belong to a Gallery workspace, or to none (they show under All).
+        conn.execute_batch(
+            "ALTER TABLE albums ADD COLUMN workspace_id INTEGER REFERENCES workspaces(id) ON DELETE SET NULL;
+             CREATE INDEX IF NOT EXISTS albums_workspace ON albums(workspace_id);",
+        )
+        .map_err(|_| "Could not update albums".to_string())?;
     }
     let version: i64 = conn
         .query_row("SELECT value FROM settings WHERE key = 'schema_version'", [], |row| row.get::<_, String>(0))
@@ -1048,7 +1070,7 @@ pub fn rewrite_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), 
         );
     }
     // Albums keep the photos they hold, wherever they move (into the Trash and back too).
-    for (table, column) in [("album_items", "path"), ("albums", "cover_path"), ("media_index", "path"), ("timeline_hidden", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path"), ("file_hashes", "path"), ("content_text", "path"), ("file_versions", "path")] {
+    for (table, column) in [("album_items", "path"), ("albums", "cover_path"), ("media_index", "path"), ("timeline_hidden", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path"), ("file_hashes", "path"), ("content_text", "path"), ("file_versions", "path"), ("workspace_folders", "folder")] {
         conn.execute(
             &format!(
                 "UPDATE OR REPLACE {table} SET {column} = CASE WHEN {column} = ?1 THEN ?2 ELSE ?2 || substr({column}, length(?1) + 1) END
@@ -1351,7 +1373,7 @@ pub fn delete_path_meta(conn: &Connection, path: &str) -> Result<(), String> {
         params![path, like],
     )
     .map_err(|_| "Could not remove recent files".to_string())?;
-    for (table, column) in [("album_items", "path"), ("media_index", "path"), ("timeline_hidden", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path"), ("file_hashes", "path"), ("content_text", "path"), ("file_versions", "path")] {
+    for (table, column) in [("album_items", "path"), ("media_index", "path"), ("timeline_hidden", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path"), ("file_hashes", "path"), ("content_text", "path"), ("file_versions", "path"), ("workspace_folders", "folder")] {
         conn.execute(
             &format!("DELETE FROM {table} WHERE {column} = ?1 OR substr({column}, 1, length(?1) + 1) = ?1 || '/'"),
             params![path],
