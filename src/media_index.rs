@@ -204,6 +204,8 @@ impl Indexer {
             status.seen = seen;
             status.read = read;
         }, &|started| self.pace(started)).map(|_| count(&conn)));
+        // Photos that are gone may have left the descriptions searched in memory.
+        self.descriptions.invalidate();
         let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());
         status.scanning = false;
         status.finished_at = Some(crate::db::now_secs());
@@ -465,6 +467,7 @@ fn scan_paced(conn: &Connection, root: &Path, progress: &dyn Fn(u64, u64), pace:
         }
         tx.commit().map_err(|err| err.to_string())?;
     }
+    crate::smart::forget_unindexed(conn)?;
     progress(seen.len() as u64, read);
     Ok(())
 }
@@ -671,9 +674,15 @@ mod tests {
         let read = std::cell::Cell::new(0);
         scan(&conn, &lib, &|_, r| read.set(r)).unwrap();
         assert_eq!(read.get(), 0);
+        // Its description and faces go with it.
+        let clip = crate::smart::Pending { path: "trip/clip.mp4".into(), kind: "video".into(), size: 1, mtime: 1 };
+        crate::smart::store_description(&conn, &clip, &[1.0, 0.0]).unwrap();
+        conn.execute("INSERT INTO faces(path, x, y, w, h, score, vector, created_at) VALUES('trip/clip.mp4', 0, 0, 1, 1, 1, x'', 0)", []).unwrap();
         std::fs::remove_file(lib.join("trip/clip.mp4")).unwrap();
         scan(&conn, &lib, &|_, _| {}).unwrap();
         assert_eq!(rows(&conn).len(), 1);
+        let left: i64 = conn.query_row("SELECT (SELECT count(*) FROM image_vectors) + (SELECT count(*) FROM faces)", [], |row| row.get(0)).unwrap();
+        assert_eq!(left, 0);
     }
 
     #[test]

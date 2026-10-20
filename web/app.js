@@ -931,6 +931,7 @@ const MENU_ICONS = {
   search: "M7 2.75a4.25 4.25 0 1 1 0 8.5a4.25 4.25 0 1 1 0-8.5z M10.25 10.25 13.5 13.5",
   library: "M2.5 2.5h3v11h-3z M6.5 2.5h3v11h-3z M10.5 3.5l3 1v9l-3-1z",
   gallery: "M2.5 3h11a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z M1.5 10.5l3.5-3.5 3 3 2-2 4.5 4 M10.5 5.5h.01",
+  findSimilar: "M7 2.75a4.25 4.25 0 1 1 0 8.5a4.25 4.25 0 1 1 0-8.5z M10.25 10.25 13.5 13.5 M5.5 7h3 M7 5.5v3",
   addToAlbum: "M1.5 4.5h9a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-8a1 1 0 0 1-1-1z M3.5 2.5h9.5a1 1 0 0 1 1 1V10 M6 7v4 M4 9h4",
   newAlbum: "M1.5 4.5h9a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-8a1 1 0 0 1-1-1z M3.5 2.5h9.5a1 1 0 0 1 1 1V10 M6 7v4 M4 9h4",
   removeFromAlbum: "M1.5 4.5h9a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-8a1 1 0 0 1-1-1z M3.5 2.5h9.5a1 1 0 0 1 1 1V10 M4 9h4",
@@ -1259,6 +1260,7 @@ function openSelectionMenu(x, y, pasteInto) {
     }
     if (one && one.dir) buttons.push(`<button type="button" data-menu="reindex">Reindex</button>`);
     if (one && !one.dir) buttons.push(`<button type="button" data-menu="versions">Versions…</button>`);
+    if (one && canFindSimilar(one)) buttons.push(`<button type="button" data-menu="findSimilar">Find similar photos</button>`);
     if (write && entries.every(customizableFolder)) buttons.push(`<button type="button" data-menu="folderAppearance">${entries.length === 1 ? 'Customize folder…' : 'Customize folders…'}</button>`);
     if (entries.length) buttons.push(`<button type="button" data-menu="download">Download</button>`);
     if (write && allInTrash) buttons.push(`<button type="button" data-menu="restore">Restore</button>`);
@@ -1437,6 +1439,48 @@ function megabytes(bytes) {
   return `${Math.round(bytes / 1_000_000).toLocaleString()} MB`;
 }
 
+/// What the smart features can do (from /api/ml): decides where "Find similar photos" shows.
+let smartStatus = null;
+
+async function refreshSmartStatus() {
+  try {
+    smartStatus = await api("/api/ml");
+  } catch {
+    smartStatus = { available: false };
+  }
+  return smartStatus;
+}
+
+/// Photos and videos get "Find similar photos" wherever smart search can exist, even while it
+/// is off: choosing it then explains how to switch it on.
+function canFindSimilar(entry) {
+  return !!(smartStatus && smartStatus.available && entry && !entry.dir && ["image", "video"].includes(entry.kind) && !inTrashPath(entry.path));
+}
+
+/// Shows the photos that look like this one in the Gallery, or how to switch smart search on.
+async function findSimilar(path) {
+  const smart = await refreshSmartStatus();
+  if (!smart.available) {
+    toast("Finding similar photos is not available on this server", true);
+    return;
+  }
+  if (smart.search.enabled && smart.search.ready) {
+    if (!$("preview").hidden && !closePreview()) return;
+    location.hash = `#gallery/similar/${encodeURIComponent(path)}`;
+    return;
+  }
+  if (smart.search.enabled) {
+    toast(`Finding similar photos is getting ready. ${smartState(smart.search, smart, "search")}`);
+    return;
+  }
+  if (!(state.me && state.me.admin)) {
+    toast("To find similar photos, an administrator can switch on “Search by what photos show” in Settings → Gallery.");
+    return;
+  }
+  const open = await askConfirm("Finding similar photos needs “Search by what photos show”. It downloads its model once and then looks at your photos on this computer: no photo leaves it. Open the setting?", "Open Settings");
+  if (open) openSettings("gallery");
+}
+
 /// One smart feature's line: off, downloading its models, describing photos, or ready.
 function smartState(feature, data, stage) {
   if (!feature.enabled) return "";
@@ -1451,6 +1495,7 @@ function smartState(feature, data, stage) {
 }
 
 function renderSmartSettings(data) {
+  smartStatus = data;
   $("smart-settings").hidden = !data.available;
   if (!data.available) return;
   $("smart-search").checked = data.search.enabled;
@@ -2037,6 +2082,7 @@ async function gallery() {
       resize: (paths) => resizeImages(paths),
       convertVideos: (paths, focus) => convertVideos(paths, focus),
       canConvertVideos: () => !!(state.me && state.me.ffmpeg),
+      findSimilar: (path) => findSimilar(path).catch((err) => toast(err.message, true)),
     });
   }
   return galleryApi;
@@ -2278,6 +2324,7 @@ async function openEntry(entry) {
   $("preview-next").hidden = imageIndex < 0 || imageIndex >= images.length - 1;
   const canEditImage = write && entry.kind === "image" && !inTrashPath(entry.path) && !NEEDS_DISPLAY.test(entry.name);
   $("preview-edit-image").hidden = !canEditImage;
+  syncSimilarButton();
   if (!inTrashPath(entry.path)) {
     api("/api/recent", { method: "POST", json: { path: entry.path } }).then(() => refreshLibrary()).catch(() => {});
   }
@@ -4655,6 +4702,7 @@ async function boot() {
     if (!updateStatusTimer) updateStatusTimer = setInterval(pollUpdateNotice, 15 * 60 * 1000);
   }
   syncControls();
+  refreshSmartStatus().then(syncSimilarButton);
   pollHealthAlerts().catch(() => {});
   if (!healthTimer) healthTimer = setInterval(() => pollHealthAlerts().catch(() => {}), 10 * 60 * 1000);
   try {
@@ -5130,6 +5178,7 @@ function runMenuAction(button, entries, pasteInto) {
   if (action === "usage") $("usage-btn").click();
   if (action === "reindex") reindexFolder(one && one.dir ? one.path : state.path).catch((err) => toast(err.message, true));
   if (action === "duplicates") openDuplicatesFinder().catch((err) => toast(err.message, true));
+  if (action === "findSimilar" && one) findSimilar(one.path).catch((err) => toast(err.message, true));
   if (action === "versions" && one) openVersions(one.path).catch((err) => toast(err.message, true));
   if (action === "activity") $("activity-btn").click();
   if (action === "bulkTag") bulkTagEntries(entries).catch((err) => toast(err.message, true));
@@ -7109,6 +7158,15 @@ $("preview-next").addEventListener("click", () => imageStep(1));
 $("preview-edit-image").addEventListener("click", () => {
   if (state.current) openImageEditor(state.current).catch((err) => toast(err.message, true));
 });
+/// The preview's "Find similar" button, for the photo or video it shows.
+function syncSimilarButton() {
+  $("preview-similar").hidden = !canFindSimilar(state.current);
+}
+
+$("preview-similar").addEventListener("click", () => {
+  if (state.current) findSimilar(state.current.path).catch((err) => toast(err.message, true));
+});
+
 $("preview-hash").addEventListener("click", async () => {
   if (!state.current) return;
   $("preview-hash").textContent = "Hashing…";

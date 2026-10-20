@@ -1116,7 +1116,7 @@ export function mountGallery(root, ctx) {
       write && ctx.canConvertVideos() && present.length && present.every((entry) => entry.kind === "video") && { label: "Convert video…", icon: "convertVideo", run: () => ctx.convertVideos(paths, "format") },
       paths.length && { label: "Download", icon: "download", run: () => ctx.download(paths) },
       one && !one.missing && { label: "Show in folder", icon: "folder", run: () => ctx.showInFolder(one.path) },
-      one && !one.missing && searchOn() && { label: "Find similar photos", icon: "search", run: () => { location.hash = `#gallery/similar/${encodeURIComponent(one.path)}`; } },
+      one && !one.missing && smart && smart.available && { label: "Find similar photos", icon: "findSimilar", run: () => ctx.findSimilar(one.path) },
       write && route.tab === "person" && picked.every((entry) => entry.faceId) && {
         label: `Not ${currentPerson && currentPerson.name ? currentPerson.name : "this person"}`,
         icon: "removeFromAlbum",

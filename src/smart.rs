@@ -434,6 +434,22 @@ fn recount(conn: &Connection, id: i64) -> Result<(), String> {
     Ok(())
 }
 
+/// Forgets the descriptions and faces of photos no longer in the index (deleted or moved outside
+/// OwnNAS), so "find similar" and People do not show them. True when something was forgotten.
+pub fn forget_unindexed(conn: &Connection) -> Result<bool, String> {
+    let gone = "NOT IN (SELECT path FROM media_index)";
+    let mut forgotten = sql(conn.execute(&format!("DELETE FROM image_vectors WHERE path {gone}"), []))?;
+    forgotten += sql(conn.execute(&format!("DELETE FROM face_scans WHERE path {gone}"), []))?;
+    let faces = sql(conn.execute(&format!("DELETE FROM faces WHERE path {gone}"), []))?;
+    if faces > 0 {
+        sql(conn.execute_batch(
+            "UPDATE people SET faces = (SELECT count(*) FROM faces WHERE person_id = people.id);
+             DELETE FROM people WHERE faces = 0 AND name IS NULL;",
+        ))?;
+    }
+    Ok(forgotten + faces > 0)
+}
+
 /// Forgets every face and person (the photos are not touched).
 pub fn forget_faces(conn: &Connection) -> Result<(), String> {
     sql(conn.execute_batch("DELETE FROM faces; DELETE FROM people; DELETE FROM face_scans;"))
