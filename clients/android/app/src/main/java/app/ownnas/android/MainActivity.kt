@@ -19,6 +19,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.ownnas.android.ui.AppViewModel
 import app.ownnas.android.ui.BrowserScreen
+import app.ownnas.android.ui.SearchScreen
 import app.ownnas.android.ui.ConflictDialog
 import app.ownnas.android.ui.Screen
 import app.ownnas.android.ui.HomeScreen
@@ -28,6 +29,7 @@ import app.ownnas.android.ui.BackupScreen
 import app.ownnas.android.data.Backup
 import app.ownnas.android.ui.gallery.GalleryAlbumScreen
 import app.ownnas.android.ui.gallery.GalleryHiddenScreen
+import app.ownnas.android.ui.gallery.GalleryPlaceScreen
 import app.ownnas.android.ui.gallery.GalleryPersonScreen
 import app.ownnas.android.ui.gallery.GalleryResultsScreen
 import app.ownnas.android.ui.gallery.GalleryScreen
@@ -78,6 +80,7 @@ private fun App(showBackup: Int, vm: AppViewModel = viewModel()) {
                 Screen.Servers -> HomeScreen(vm)
                 is Screen.SignIn -> SignInScreen(vm, target.existing)
                 is Screen.Browse -> BrowserScreen(vm, target.serverId, target.path)
+                is Screen.Search -> SearchScreen(vm, target.serverId, target.path)
                 is Screen.Terminals -> TerminalsScreen(vm, target.serverId, target.path)
                 is Screen.Terminal -> TerminalScreen(vm, target.serverId, target.terminalId, target.startup)
                 Screen.Sync -> SyncScreen(vm)
@@ -87,6 +90,7 @@ private fun App(showBackup: Int, vm: AppViewModel = viewModel()) {
                 is Screen.GalleryTag -> GalleryTagScreen(vm, target.serverId, target.tag)
                 is Screen.GalleryResults -> GalleryResultsScreen(vm, target.serverId, target.words, target.similarTo)
                 is Screen.GalleryHidden -> GalleryHiddenScreen(vm, target.serverId)
+                is Screen.GalleryPlace -> GalleryPlaceScreen(vm, target.serverId, target.name, app.ownnas.core.MapBounds(target.west, target.south, target.east, target.north))
                 is Screen.PhotoViewer -> PhotoViewer(vm, target.serverId, target.start, target.list)
                 Screen.Backup -> BackupScreen(vm)
             }

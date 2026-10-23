@@ -1,5 +1,6 @@
-//! The Gallery for the apps: the photo timeline, albums, tags, people, smart search, hiding
-//! photos from the timeline, and phone backups to the server's media upload folder.
+//! The Gallery for the apps: the photo timeline, albums, tags, people, smart search, places,
+//! On this day, workspaces, hiding photos from the timeline, and phone backups to the server's
+//! media upload folder.
 
 use std::sync::Arc;
 
@@ -191,6 +192,129 @@ pub struct BlockedPhoto {
     pub blocked_by: String,
 }
 
+/// A Gallery workspace ("Family", "Work"…): some library folders, shown on their own.
+#[derive(uniffi::Record, Deserialize, Clone, Debug)]
+pub struct Workspace {
+    pub id: i64,
+    pub name: String,
+    pub folders: Vec<String>,
+    /// Photos and videos in its folders.
+    pub photos: i64,
+}
+
+/// Photos taken on this day in an earlier year.
+#[derive(uniffi::Record, Deserialize, Clone, Debug)]
+pub struct MemoryYear {
+    pub year: i32,
+    pub count: i64,
+    /// Some of them, best first.
+    pub items: Vec<MediaItem>,
+}
+
+/// A box on the map, in degrees.
+#[derive(uniffi::Record, Deserialize, Clone, Copy, Debug)]
+pub struct MapBounds {
+    pub west: f64,
+    pub south: f64,
+    pub east: f64,
+    pub north: f64,
+}
+
+/// Photos close together on the map: where they are on average, how many, and the newest.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct Place {
+    pub lat: f64,
+    pub lon: f64,
+    pub count: u64,
+    pub newest: MediaItem,
+    /// The box they were gathered from: [`Server::place_photos`] with it lists them all.
+    pub area: MapBounds,
+}
+
+#[derive(Deserialize)]
+struct RawPlace {
+    lat: f64,
+    lon: f64,
+    count: u64,
+    newest: MediaItem,
+}
+
+/// How many map pixels the server gathers photos over (`cell` in the server's `albums::places`).
+const PLACE_CELL: f64 = 72.0;
+
+fn mercator_y(lat: f64) -> f64 {
+    let lat = lat.clamp(-85.05, 85.05).to_radians();
+    (1.0 - (lat.tan() + 1.0 / lat.cos()).ln() / std::f64::consts::PI) / 2.0
+}
+
+fn mercator_lat(y: f64) -> f64 {
+    (std::f64::consts::PI * (1.0 - 2.0 * y)).sinh().atan().to_degrees()
+}
+
+/// Joins groups less than a grid square apart, so a town whose photos straddle a line of the
+/// grid is one place. The joined area is the box around both (it may take in a few more photos).
+fn merge_neighbours(mut places: Vec<Place>, zoom: u8) -> Vec<Place> {
+    let square = 360.0 / (256.0 * 2f64.powi(i32::from(zoom.min(22))) / PLACE_CELL);
+    places.sort_by(|a, b| b.count.cmp(&a.count));
+    let mut out: Vec<Place> = Vec::new();
+    for place in places {
+        let near = out.iter_mut().find(|group| {
+            // A square is narrower north to south away from the equator (Mercator).
+            (group.lon - place.lon).abs() < square && (group.lat - place.lat).abs() < square * group.lat.to_radians().cos()
+        });
+        match near {
+            Some(group) => {
+                let total = (group.count + place.count) as f64;
+                group.lat = (group.lat * group.count as f64 + place.lat * place.count as f64) / total;
+                group.lon = (group.lon * group.count as f64 + place.lon * place.count as f64) / total;
+                group.count += place.count;
+                group.area = MapBounds {
+                    west: group.area.west.min(place.area.west),
+                    south: group.area.south.min(place.area.south),
+                    east: group.area.east.max(place.area.east),
+                    north: group.area.north.max(place.area.north),
+                };
+                if place.newest.taken_at > group.newest.taken_at {
+                    group.newest = place.newest;
+                }
+            }
+            None => out.push(place),
+        }
+    }
+    out.sort_by(|a, b| b.count.cmp(&a.count));
+    out
+}
+
+/// The square of the server's grid at `zoom` that holds a group's average point (an average
+/// stays inside the square its photos are in).
+fn place_area(lat: f64, lon: f64, zoom: u8) -> MapBounds {
+    let squares = 256.0 * 2f64.powi(i32::from(zoom.min(22))) / PLACE_CELL;
+    let x = ((lon + 180.0) / 360.0 * squares).floor();
+    let y = (mercator_y(lat) * squares).floor();
+    MapBounds {
+        west: x / squares * 360.0 - 180.0,
+        east: (x + 1.0) / squares * 360.0 - 180.0,
+        north: mercator_lat(y / squares),
+        south: mercator_lat((y + 1.0) / squares),
+    }
+}
+
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct PlaceMap {
+    pub places: Vec<Place>,
+    /// The box around every photo with a place (to fit the map to them at first).
+    pub extent: Option<MapBounds>,
+    /// Photos with a place.
+    pub total: u64,
+}
+
+#[derive(uniffi::Record, Deserialize, Clone, Debug)]
+pub struct PlacePhotos {
+    pub items: Vec<MediaItem>,
+    /// How many there are (more than `items` when there are many).
+    pub total: u64,
+}
+
 #[derive(Deserialize)]
 struct Items {
     items: Vec<MediaItem>,
@@ -200,25 +324,108 @@ fn id_param(id: i64) -> String {
     id.to_string()
 }
 
+impl Server {
+    /// Runs a gallery request with the chosen workspace added to its query.
+    fn scoped<T>(&self, query: &[(&str, &str)], call: impl FnOnce(&[(&str, &str)]) -> T) -> T {
+        let workspace = self.workspace.lock().unwrap_or_else(|err| err.into_inner()).map(|id| id.to_string());
+        let mut query = query.to_vec();
+        if let Some(id) = &workspace {
+            query.push(("workspace", id));
+        }
+        call(&query)
+    }
+}
+
 #[uniffi::export]
 impl Server {
+    /// The Gallery's workspaces, by name.
+    pub fn workspaces(&self) -> Result<Vec<Workspace>, ClientError> {
+        #[derive(Deserialize)]
+        struct List {
+            workspaces: Vec<Workspace>,
+        }
+        let list: List = self.api.get_json("/api/workspaces", &[])?;
+        Ok(list.workspaces)
+    }
+
+    /// Shows one workspace in the gallery calls from now on (`None`: every photo). A workspace
+    /// that no longer exists makes them fail with `NotFound`.
+    pub fn set_gallery_workspace(&self, id: Option<i64>) {
+        *self.workspace.lock().unwrap_or_else(|err| err.into_inner()) = id;
+    }
+
+    pub fn gallery_workspace(&self) -> Option<i64> {
+        *self.workspace.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
     /// How many photos were taken each day, newest first, to lay the timeline out.
     pub fn gallery_days(&self) -> Result<TimelineDays, ClientError> {
-        Ok(self.api.get_json("/api/gallery/days", &[])?)
+        Ok(self.scoped(&[], |query| self.api.get_json("/api/gallery/days", query))?)
     }
 
     /// The photos taken in [from, to) (seconds), newest first.
     pub fn gallery_between(&self, from: i64, to: i64) -> Result<Vec<MediaItem>, ClientError> {
         let (from, to) = (from.to_string(), to.to_string());
-        let page: Items = self.api.get_json("/api/gallery/timeline", &[("from", &from), ("to", &to), ("limit", "50000")])?;
+        let page: Items = self.scoped(&[("from", &from), ("to", &to), ("limit", "50000")], |query| self.api.get_json("/api/gallery/timeline", query))?;
         Ok(page.items)
+    }
+
+    /// Photos taken on `month`/`day` in the years before `year`, newest year first.
+    pub fn on_this_day(&self, month: u32, day: u32, year: i32) -> Result<Vec<MemoryYear>, ClientError> {
+        #[derive(Deserialize)]
+        struct Years {
+            years: Vec<MemoryYear>,
+        }
+        let (month, day, year) = (month.to_string(), day.to_string(), year.to_string());
+        let years: Years = self.scoped(&[("month", &month), ("day", &day), ("year", &year)], |query| self.api.get_json("/api/gallery/memories", query))?;
+        Ok(years.years)
+    }
+
+    /// Photos with a place, grouped for a map at `zoom` (0–20) inside `bounds` (everywhere for
+    /// `None`).
+    pub fn places(&self, zoom: u8, bounds: Option<MapBounds>) -> Result<PlaceMap, ClientError> {
+        #[derive(Deserialize)]
+        struct Extent {
+            west: f64,
+            south: f64,
+            east: f64,
+            north: f64,
+            count: u64,
+        }
+        #[derive(Deserialize)]
+        struct Answer {
+            places: Vec<RawPlace>,
+            extent: Option<Extent>,
+        }
+        let level = zoom.min(20);
+        let zoom = level.to_string();
+        let edges = bounds.map(|b| [b.west.to_string(), b.south.to_string(), b.east.to_string(), b.north.to_string()]);
+        let mut query = vec![("zoom", zoom.as_str())];
+        if let Some([west, south, east, north]) = &edges {
+            query.extend([("west", west.as_str()), ("south", south.as_str()), ("east", east.as_str()), ("north", north.as_str())]);
+        }
+        let answer: Answer = self.scoped(&query, |query| self.api.get_json("/api/gallery/places", query))?;
+        let total = answer.extent.as_ref().map_or(0, |extent| extent.count);
+        let places = answer.places.into_iter().map(|p| Place { area: place_area(p.lat, p.lon, level), lat: p.lat, lon: p.lon, count: p.count, newest: p.newest });
+        Ok(PlaceMap {
+            places: merge_neighbours(places.collect(), level),
+            extent: answer.extent.map(|e| MapBounds { west: e.west, south: e.south, east: e.east, north: e.north }),
+            total,
+        })
+    }
+
+    /// The photos taken inside `bounds`, newest first (up to `limit`).
+    pub fn place_photos(&self, bounds: MapBounds, limit: u32) -> Result<PlacePhotos, ClientError> {
+        let [west, south, east, north, limit] = [bounds.west, bounds.south, bounds.east, bounds.north, limit as f64].map(|n| n.to_string());
+        let query = [("west", west.as_str()), ("south", south.as_str()), ("east", east.as_str()), ("north", north.as_str()), ("limit", limit.as_str())];
+        Ok(self.scoped(&query, |query| self.api.get_json("/api/gallery/places/items", query))?)
     }
 
     /// An album with what is inside it, or the top-level albums for `None`.
     pub fn album(&self, id: Option<i64>) -> Result<AlbumPage, ClientError> {
         let id = id.map(id_param);
         let query: Vec<(&str, &str)> = id.iter().map(|id| ("id", id.as_str())).collect();
-        Ok(self.api.get_json("/api/albums", &query)?)
+        Ok(self.scoped(&query, |query| self.api.get_json("/api/albums", query))?)
     }
 
     /// Every album, for choosing one.
@@ -227,16 +434,17 @@ impl Server {
         struct Tree {
             albums: Vec<Album>,
         }
-        let tree: Tree = self.api.get_json("/api/albums/tree", &[])?;
+        let tree: Tree = self.scoped(&[], |query| self.api.get_json("/api/albums/tree", query))?;
         Ok(tree.albums)
     }
 
+    /// A new album, in the workspace shown (inside `parent_id`, it goes where that is).
     pub fn create_album(&self, name: String, parent_id: Option<i64>) -> Result<Album, ClientError> {
         #[derive(Deserialize)]
         struct Created {
             album: Album,
         }
-        let created: Created = self.api.send_json("POST", "/api/albums", &[], json!({ "name": name, "parentId": parent_id }))?;
+        let created: Created = self.scoped(&[], |query| self.api.send_json("POST", "/api/albums", query, json!({ "name": name, "parentId": parent_id })))?;
         Ok(created.album)
     }
 
@@ -264,12 +472,12 @@ impl Server {
         struct Tags {
             tags: Vec<TagCount>,
         }
-        let tags: Tags = self.api.get_json("/api/tags/all", &[])?;
+        let tags: Tags = self.scoped(&[], |query| self.api.get_json("/api/tags/all", query))?;
         Ok(tags.tags)
     }
 
     pub fn tagged(&self, tag: String) -> Result<Vec<MediaItem>, ClientError> {
-        let page: Items = self.api.get_json("/api/gallery/tag", &[("tag", &tag)])?;
+        let page: Items = self.scoped(&[("tag", &tag)], |query| self.api.get_json("/api/gallery/tag", query))?;
         Ok(page.items)
     }
 
@@ -287,7 +495,7 @@ impl Server {
     }
 
     pub fn hidden_photos(&self) -> Result<Vec<MediaItem>, ClientError> {
-        let page: Items = self.api.get_json("/api/gallery/hidden", &[])?;
+        let page: Items = self.scoped(&[], |query| self.api.get_json("/api/gallery/hidden", query))?;
         Ok(page.items)
     }
 
@@ -299,13 +507,13 @@ impl Server {
 
     /// Photos showing what the words describe, best first.
     pub fn search_photos(&self, words: String) -> Result<Vec<MediaItem>, ClientError> {
-        let page: Items = self.api.get_json("/api/gallery/search", &[("q", &words)])?;
+        let page: Items = self.scoped(&[("q", &words)], |query| self.api.get_json("/api/gallery/search", query))?;
         Ok(page.items)
     }
 
     /// Photos that look like one in the library.
     pub fn similar_photos(&self, path: String) -> Result<Vec<MediaItem>, ClientError> {
-        let page: Items = self.api.get_json("/api/gallery/similar", &[("path", &path)])?;
+        let page: Items = self.scoped(&[("path", &path)], |query| self.api.get_json("/api/gallery/similar", query))?;
         Ok(page.items)
     }
 
@@ -315,13 +523,13 @@ impl Server {
             people: Vec<Person>,
         }
         let query: &[(&str, &str)] = if hidden { &[("hidden", "1")] } else { &[] };
-        let people: People = self.api.get_json("/api/people", query)?;
+        let people: People = self.scoped(query, |query| self.api.get_json("/api/people", query))?;
         Ok(people.people)
     }
 
     pub fn person(&self, id: i64) -> Result<PersonPage, ClientError> {
         let id = id.to_string();
-        Ok(self.api.get_json("/api/people/photos", &[("id", &id)])?)
+        Ok(self.scoped(&[("id", &id)], |query| self.api.get_json("/api/people/photos", query))?)
     }
 
     /// Renames, hides or shows, or merges (`into`) a person.
@@ -474,5 +682,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!((details.sections[0].rows[0].time, details.location.unwrap().lat), (Some(5), 41.3));
+        let workspace: Workspace = serde_json::from_str(r#"{"id":3,"name":"Work","folders":["Jobs"],"photos":12}"#).unwrap();
+        assert_eq!((workspace.id, workspace.photos), (3, 12));
+        let year: MemoryYear = serde_json::from_str(r#"{"year":2019,"count":4,"items":[{"path":"a.jpg","takenAt":1}]}"#).unwrap();
+        assert_eq!((year.year, year.items.len()), (2019, 1));
+        let place: RawPlace = serde_json::from_str(r#"{"lat":41.3,"lon":2.1,"count":7,"newest":{"path":"b.jpg"}}"#).unwrap();
+        assert_eq!((place.count, place.newest.path.as_str()), (7, "b.jpg"));
+    }
+
+    #[test]
+    fn place_areas_hold_their_point() {
+        for (lat, lon, zoom) in [(41.38, 2.17, 9), (-33.86, 151.2, 4), (64.1, -21.9, 12), (0.0, 0.0, 0)] {
+            let area = place_area(lat, lon, zoom);
+            assert!(area.west <= lon && lon <= area.east && area.south <= lat && lat <= area.north, "{lat},{lon} at {zoom}: {area:?}");
+        }
+        // Squares meet: the next one along starts where this one ends.
+        let a = place_area(41.38, 2.17, 9);
+        let b = place_area(41.38, a.east + 1e-9, 9);
+        assert!((b.west - a.east).abs() < 1e-9);
+    }
+
+    #[test]
+    fn neighbouring_places_are_one() {
+        let item = |path: &str, taken_at| MediaItem { path: path.into(), kind: None, taken_at: Some(taken_at), date_source: None, width: None, height: None, size: None, hidden: false, missing: false, score: None, face_id: None };
+        let at = |lat, lon, count, newest| Place { area: place_area(lat, lon, 7), lat, lon, count, newest };
+        // Barcelona either side of a grid line, and Paris.
+        let places = vec![at(41.39, 2.10, 3, item("a", 1)), at(41.37, 2.25, 2, item("b", 9)), at(48.86, 2.35, 4, item("c", 5))];
+        let merged = merge_neighbours(places, 7);
+        assert_eq!(merged.len(), 2);
+        let barcelona = merged.iter().find(|p| p.lat < 45.0).unwrap();
+        assert_eq!((barcelona.count, barcelona.newest.path.as_str()), (5, "b"));
+        assert!(barcelona.area.west <= 2.10 && barcelona.area.east >= 2.25);
     }
 }

@@ -25,6 +25,7 @@ class Servers(private val context: Context, val store: ServerStore) {
     private val connections = ConcurrentHashMap<String, Server>()
     private val accounts = ConcurrentHashMap<String, Account>()
     private val changes = MutableStateFlow(0)
+    private val gallery = context.getSharedPreferences("gallery", Context.MODE_PRIVATE)
 
     /** Bumped after every change made on a server from this phone, so open folders reload. */
     val revision: StateFlow<Int> = changes.asStateFlow()
@@ -32,7 +33,18 @@ class Servers(private val context: Context, val store: ServerStore) {
     private fun connection(id: String): Server = connections.getOrPut(id) {
         val saved = store.find(id) ?: throw ClientException.NotFound()
         val token = store.token(id) ?: throw ClientException.Unauthorized()
-        Server(saved.address, token, saved.trust.caPem?.toByteArray(), saved.trust.pinned)
+        Server(saved.address, token, saved.trust.caPem?.toByteArray(), saved.trust.pinned).also {
+            it.setGalleryWorkspace(galleryWorkspace(id))
+        }
+    }
+
+    /** The Gallery workspace last shown for a server (`null`: every photo). */
+    fun galleryWorkspace(id: String): Long? = gallery.getLong("workspace.$id", -1).takeIf { it >= 0 }
+
+    /** Shows one workspace in that server's Gallery from now on, and remembers it. */
+    fun setGalleryWorkspace(id: String, workspace: Long?) {
+        gallery.edit().apply { if (workspace == null) remove("workspace.$id") else putLong("workspace.$id", workspace) }.apply()
+        connections[id]?.setGalleryWorkspace(workspace)
     }
 
     /** Runs a server call. A rejected token is forgotten, so the app asks to sign in again. */
@@ -66,6 +78,7 @@ class Servers(private val context: Context, val store: ServerStore) {
 
     /** Forgets a server here and ends its session there, best effort. */
     fun remove(id: String) {
+        gallery.edit().remove("workspace.$id").apply()
         accounts.remove(id)
         val server = connections.remove(id)
         store.remove(id)

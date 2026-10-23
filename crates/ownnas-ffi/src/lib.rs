@@ -92,6 +92,25 @@ pub struct Folder {
     pub truncated: bool,
 }
 
+/// A file or folder that matches a search.
+#[derive(uniffi::Record, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub name: String,
+    pub path: String,
+    pub dir: bool,
+    pub size: u64,
+    /// Seconds since the Unix epoch.
+    pub modified: i64,
+    pub kind: String,
+    /// The tag that matched, when it was a tag.
+    #[serde(default)]
+    pub matched_tag: Option<String>,
+    /// The words around the match inside the file, when it was its contents.
+    #[serde(default)]
+    pub matched_content: Option<String>,
+}
+
 /// What to do when an upload's name is taken; the web app's choices.
 #[derive(uniffi::Enum, Clone, Copy)]
 pub enum Conflict {
@@ -180,6 +199,8 @@ pub fn server_fingerprint(address: String) -> Result<String, ClientError> {
 #[derive(uniffi::Object)]
 pub struct Server {
     api: Api,
+    /// The Gallery workspace the gallery calls show (`None`: every photo).
+    workspace: std::sync::Mutex<Option<i64>>,
 }
 
 #[uniffi::export]
@@ -187,7 +208,7 @@ impl Server {
     #[uniffi::constructor]
     pub fn new(address: String, token: String, ca_pem: Option<Vec<u8>>, pinned: Vec<String>) -> Result<Arc<Self>, ClientError> {
         let api = Api::with_trust(&address, Some(token), &trust(ca_pem, pinned)).map_err(failed)?;
-        Ok(Arc::new(Server { api }))
+        Ok(Arc::new(Server { api, workspace: std::sync::Mutex::new(None) }))
     }
 
     /// Ends this token's session on the server.
@@ -249,6 +270,17 @@ impl Server {
     /// Renames in place; returns the new path.
     pub fn rename(&self, path: String, name: String) -> Result<String, ClientError> {
         Ok(self.api.rename(&path, &name)?)
+    }
+
+    /// Files and folders in `path` and below whose name, tags, or contents (text, PDFs, and
+    /// pictures read by OCR) match `words`. `tag:name` finds one tag exactly.
+    pub fn search(&self, path: String, words: String) -> Result<Vec<SearchHit>, ClientError> {
+        #[derive(serde::Deserialize)]
+        struct Hits {
+            hits: Vec<SearchHit>,
+        }
+        let hits: Hits = self.api.get_json("/api/search", &[("path", &path), ("q", &words)])?;
+        Ok(hits.hits)
     }
 
     /// Moves to the server's Trash (or deletes, inside the Trash).

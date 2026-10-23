@@ -9,6 +9,7 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -28,6 +29,7 @@ import androidx.compose.material.icons.automirrored.outlined.InsertDriveFile
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.outlined.Audiotrack
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Inventory2
@@ -67,6 +69,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -230,11 +233,14 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
                     }
                 },
                 actions = {
+                    IconButton(onClick = { vm.push(Screen.Search(serverId, path)) }) {
+                        Icon(Icons.Filled.Search, contentDescription = "Search")
+                    }
+                    IconButton(onClick = { vm.push(Screen.Gallery(serverId)) }) {
+                        Icon(Icons.Outlined.PhotoLibrary, contentDescription = "Gallery")
+                    }
                     // Shown to administrators when terminals are turned on, as in the web app.
                     if (terminalsOn) {
-                        IconButton(onClick = { vm.push(Screen.Gallery(serverId)) }) {
-                            Icon(Icons.Outlined.PhotoLibrary, contentDescription = "Gallery")
-                        }
                         IconButton(onClick = { vm.push(Screen.Terminals(serverId, path)) }) {
                             BadgedBox(badge = {
                                 if (attention > 0) Badge { Text(if (attention > 9) "9+" else attention.toString()) }
@@ -538,3 +544,127 @@ private fun details(context: Context, entry: Entry): String {
     }
     return if (entry.dir) "Folder · $modified" else "${Formatter.formatShortFileSize(context, entry.size.toLong())} · $modified"
 }
+
+/**
+ * Search in `path` and below: names, tags, and the words inside files (as the web app's search
+ * box does). Folders open in the browser; files open in another app.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SearchScreen(vm: AppViewModel, serverId: String, path: String) {
+    val server = vm.server(serverId) ?: return
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var words by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf("") }
+    var searched by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf("") }
+    var hits by remember { mutableStateOf<List<app.ownnas.core.SearchHit>?>(null) }
+    var searching by remember { mutableStateOf(false) }
+    var problem by remember { mutableStateOf<String?>(null) }
+    var fetching by remember { mutableStateOf<Fetch?>(null) }
+    val focus = remember { androidx.compose.ui.focus.FocusRequester() }
+    LaunchedEffect(Unit) { if (searched.isEmpty()) focus.requestFocus() }
+    LaunchedEffect(searched) {
+        if (searched.isBlank()) return@LaunchedEffect
+        searching = true
+        problem = null
+        try {
+            hits = vm.call(serverId) { it.search(path, searched) }
+        } catch (err: Exception) {
+            hits = null
+            problem = err.userMessage()
+        } finally {
+            searching = false
+        }
+    }
+    fun open(hit: app.ownnas.core.SearchHit) {
+        if (hit.dir) {
+            vm.push(Screen.Browse(serverId, hit.path))
+            return
+        }
+        val entry = hit.asEntry()
+        val job = Fetch(entry, share = false)
+        fetching = job
+        scope.launch {
+            try {
+                val file = vm.download(serverId, entry, job.tracker)
+                if (fetching === job) openWithAnotherApp(context, file)
+            } catch (err: ActivityNotFoundException) {
+                problem = "No app on this phone can open ${entry.name}"
+            } catch (err: Exception) {
+                if (!err.isCancel()) problem = err.userMessage()
+            } finally {
+                if (fetching === job) fetching = null
+            }
+        }
+    }
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    androidx.compose.material3.TextField(
+                        value = words,
+                        onValueChange = { words = it },
+                        placeholder = { Text("Search ${specialFolderLabel(path.substringAfterLast('/')).ifEmpty { server.name }}") },
+                        singleLine = true,
+                        colors = androidx.compose.material3.TextFieldDefaults.colors(focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent),
+                        keyboardActions = androidx.compose.foundation.text.KeyboardActions(onSearch = { searched = words.trim() }),
+                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Search),
+                        modifier = Modifier.fillMaxWidth().focusRequester(focus),
+                    )
+                },
+                navigationIcon = { IconButton(onClick = { vm.pop() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } },
+            )
+        },
+    ) { padding ->
+        Box(Modifier.padding(padding).fillMaxSize()) {
+            val found = hits
+            when {
+                searching -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+                problem != null && found == null -> Message(problem!!)
+                found == null -> Message("Names, tags, and the words inside documents, PDFs, and pictures. Type tag:name for one tag.")
+                found.isEmpty() -> Message("Nothing matches “$searched”.")
+                else -> LazyColumn(Modifier.fillMaxSize()) {
+                    items(found, key = { it.path }) { hit ->
+                        val entry = hit.asEntry()
+                        ListItem(
+                            modifier = Modifier.clickable { open(hit) },
+                            leadingContent = { Thumbnail(vm, serverId, entry) },
+                            headlineContent = { Text(specialFolderLabel(hit.name), maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                            supportingContent = {
+                                Column {
+                                    Text(
+                                        hit.path.substringBeforeLast('/', "").split('/').joinToString("/", transform = ::specialFolderLabel).ifEmpty { server.name },
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    val why = hit.matchedContent?.let { "…${it.trim()}…" } ?: hit.matchedTag?.let { "Tagged $it" }
+                                    if (why != null) Text(why, maxLines = 2, overflow = TextOverflow.Ellipsis, color = MaterialTheme.colorScheme.primary)
+                                }
+                            },
+                        )
+                    }
+                }
+            }
+            if (problem != null && found != null) {
+                Text(problem!!, color = MaterialTheme.colorScheme.error, modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp))
+            }
+        }
+    }
+    fetching?.let { job ->
+        FetchDialog(name = job.entry.name, done = job.done, size = job.entry.size.toLong(), sharing = false, onCancel = {
+            job.tracker.cancelled = true
+            fetching = null
+        })
+    }
+}
+
+/** A search hit as a folder entry, to show and open it like one. */
+private fun app.ownnas.core.SearchHit.asEntry() = Entry(
+    name = name,
+    path = path,
+    dir = dir,
+    size = size,
+    modified = modified * 1000,
+    kind = kind,
+    thumb = kind == "image" || kind == "video" || kind == "pdf",
+)

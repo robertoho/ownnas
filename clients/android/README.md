@@ -9,6 +9,8 @@ What works now:
 
 - Several servers, each signed in with a token encrypted by an Android Keystore key.
 - Folders with thumbnails and pull to refresh.
+- Search (the magnifier in a folder): names, tags, and the words inside documents, PDFs, and
+  pictures in that folder and below, as the web app's search box finds them.
 - Open a file in the app that handles its type, or share it, with download progress.
 - Upload photos and videos (the system photo picker) or any files (the system file picker).
   Uploads use the web app's endpoint (`POST /api/upload`): when a name is taken the app asks
@@ -99,9 +101,11 @@ reachable from outside it.
 ## Gallery
 
 Each server has a Gallery (the picture button in a folder, or Gallery in a server's menu):
-photos and videos by the day they were taken with a year scrubber on the right, nested albums,
-people (when the server has faces switched on), tags, and search in words or "Find similar"
-(when smart search is on). Long-press photos to add them to an album, tag them, hide them from
+photos and videos by the day they were taken with a year scrubber on the right and "On this
+day" above them, nested albums, people (when the server has faces switched on), places (photos
+by the town they were taken in, named by the phone's geocoder), tags, and search in words or
+"Find similar" (when smart search is on). The title chooses a workspace (Family, Work…) when
+the server has some; the app remembers the one shown for each server. Long-press photos to add them to an album, tag them, hide them from
 Photos, or (in a person) say they are not that person. Photos open full screen: swipe between
 them, pinch or double-tap to zoom; videos open in the phone's player.
 

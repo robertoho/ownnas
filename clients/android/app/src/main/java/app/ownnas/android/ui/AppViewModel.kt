@@ -48,6 +48,9 @@ sealed interface Screen {
 
     data class Browse(val serverId: String, val path: String) : Screen
 
+    /** Searching a folder and the folders inside it. */
+    data class Search(val serverId: String, val path: String) : Screen
+
     /** The server's terminals; new ones open in `path`. */
     data class Terminals(val serverId: String, val path: String) : Screen
 
@@ -69,6 +72,9 @@ sealed interface Screen {
     data class GalleryResults(val serverId: String, val words: String? = null, val similarTo: String? = null) : Screen
 
     data class GalleryHidden(val serverId: String) : Screen
+
+    /** The photos taken inside a box on the map, named `name`. */
+    data class GalleryPlace(val serverId: String, val name: String, val west: Double, val south: Double, val east: Double, val north: Double) : Screen
 
     /** Photos full screen, swiping through the list the Gallery handed over ([AppViewModel.viewer]). */
     data class PhotoViewer(val serverId: String, val start: Int, val list: Long) : Screen
@@ -120,6 +126,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun server(id: String): SavedServer? = store.find(id)
 
     internal suspend fun <T> call(id: String, block: (Server) -> T): T = hub.call(id, block)
+
+    fun galleryWorkspace(id: String): Long? = hub.galleryWorkspace(id)
+
+    fun setGalleryWorkspace(id: String, workspace: Long?) = hub.setGalleryWorkspace(id, workspace)
 
     /** The photos the viewer swipes through, by list id (kept while the viewer is open). */
     val viewerLists = HashMap<Long, List<app.ownnas.core.MediaItem>>()

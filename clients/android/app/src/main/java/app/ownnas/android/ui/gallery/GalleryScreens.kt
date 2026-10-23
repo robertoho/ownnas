@@ -56,6 +56,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -85,21 +86,36 @@ import app.ownnas.core.MediaItem
 import app.ownnas.core.Person
 import app.ownnas.core.SmartFeatures
 import app.ownnas.core.TagCount
+import app.ownnas.core.MapBounds
+import app.ownnas.core.MemoryYear
 import app.ownnas.core.TimelineDays
+import app.ownnas.core.Workspace
 import kotlinx.coroutines.launch
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneOffset
 import kotlin.math.roundToInt
 
-// ---- The Gallery: tabs for photos, albums, people, and tags ----
+// ---- The Gallery: tabs for photos, albums, people, places, and tags ----
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun GalleryScreen(vm: AppViewModel, serverId: String, startTab: String) {
     var smart by remember { mutableStateOf(SmartFeatures(search = false, faces = false)) }
     LaunchedEffect(serverId) { runCatching { vm.call(serverId) { it.smartFeatures() } }.onSuccess { smart = it } }
-    val tabs = listOfNotNull("photos" to "Photos", "albums" to "Albums", if (smart.faces) "people" to "People" else null, "tags" to "Tags")
+    val tabs = listOfNotNull("photos" to "Photos", "albums" to "Albums", if (smart.faces) "people" to "People" else null, "places" to "Places", "tags" to "Tags")
+    // The workspace showing (remembered per server); every tab reloads when it changes.
+    var workspaces by remember { mutableStateOf<List<Workspace>>(emptyList()) }
+    var workspace by remember { mutableStateOf(vm.galleryWorkspace(serverId)) }
+    LaunchedEffect(serverId) {
+        runCatching { vm.call(serverId) { it.workspaces() } }.onSuccess { list ->
+            workspaces = list
+            if (workspace != null && list.none { it.id == workspace }) {
+                vm.setGalleryWorkspace(serverId, null)
+                workspace = null
+            }
+        }
+    }
     var tab by rememberSaveable { mutableStateOf(startTab) }
     var searching by rememberSaveable { mutableStateOf(false) }
     var words by rememberSaveable { mutableStateOf("") }
@@ -129,7 +145,11 @@ fun GalleryScreen(vm: AppViewModel, serverId: String, startTab: String) {
                                 modifier = Modifier.fillMaxWidth().focusRequester(focus),
                             )
                         } else {
-                            Text("Gallery")
+                            WorkspaceTitle(workspaces, workspace) { chosen ->
+                                vm.setGalleryWorkspace(serverId, chosen)
+                                workspace = chosen
+                                selection.clear()
+                            }
                         }
                     },
                     navigationIcon = {
@@ -159,11 +179,14 @@ fun GalleryScreen(vm: AppViewModel, serverId: String, startTab: String) {
                 }
             }
             Box(Modifier.weight(1f)) {
-                when (tab) {
-                    "albums" -> AlbumsTab(vm, serverId)
-                    "people" -> PeopleTab(vm, serverId)
-                    "tags" -> TagsTab(vm, serverId)
-                    else -> Timeline(vm, serverId, selection)
+                key(workspace) {
+                    when (tab) {
+                        "albums" -> AlbumsTab(vm, serverId)
+                        "people" -> PeopleTab(vm, serverId)
+                        "places" -> PlacesTab(vm, serverId)
+                        "tags" -> TagsTab(vm, serverId)
+                        else -> Timeline(vm, serverId, selection)
+                    }
                 }
             }
         }
@@ -286,6 +309,7 @@ fun SelectionBar(
 // ---- Photos: the timeline ----
 
 private sealed interface Cell {
+    data object Memories : Cell
     data class MonthHead(val month: String) : Cell
     data class DayHead(val day: String) : Cell
     data class Slot(val month: String, val day: String, val index: Int) : Cell
@@ -298,9 +322,15 @@ private fun Timeline(vm: AppViewModel, serverId: String, selection: Selection) {
     LaunchedEffect(serverId) {
         runCatching { vm.call(serverId) { it.galleryDays() } }.onSuccess { days = it }.onFailure { error = it.userMessage() }
     }
+    var memories by remember { mutableStateOf<List<MemoryYear>>(emptyList()) }
+    LaunchedEffect(serverId) {
+        val today = LocalDate.now()
+        runCatching { vm.call(serverId) { it.onThisDay(today.monthValue.toUInt(), today.dayOfMonth.toUInt(), today.year) } }.onSuccess { memories = it }
+    }
     val loaded = remember { mutableStateMapOf<String, Map<String, List<MediaItem>>>() }
-    val cells = remember(days) {
+    val cells = remember(days, memories) {
         val out = mutableListOf<Cell>()
+        if (memories.isNotEmpty() && days?.days.orEmpty().isNotEmpty()) out += Cell.Memories
         var month = ""
         for (day in days?.days.orEmpty()) {
             val key = day.day.take(7)
@@ -350,6 +380,7 @@ private fun Timeline(vm: AppViewModel, serverId: String, selection: Selection) {
             ) {
                 items(cells.size, span = { index -> if (cells[index] is Cell.Slot) GridItemSpan(1) else GridItemSpan(maxLineSpan) }) { index ->
                     when (val cell = cells[index]) {
+                        Cell.Memories -> OnThisDay(vm, serverId, memories)
                         is Cell.MonthHead -> Text(monthLabel(cell.month), style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(start = 8.dp, top = 18.dp, bottom = 2.dp))
                         is Cell.DayHead -> Text(dayLabel(cell.day), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 8.dp, top = 8.dp, bottom = 4.dp))
                         is Cell.Slot -> {
@@ -635,6 +666,11 @@ private fun TagsTab(vm: AppViewModel, serverId: String) {
 @Composable
 fun GalleryTagScreen(vm: AppViewModel, serverId: String, tag: String) =
     LoadedPhotos(vm, serverId, title = tag, empty = "No photos or videos have this tag.") { it.tagged(tag) }
+
+/** The photos taken in one place (an area of the map, from the Places tab). */
+@Composable
+fun GalleryPlaceScreen(vm: AppViewModel, serverId: String, name: String, area: MapBounds) =
+    LoadedPhotos(vm, serverId, title = name, empty = "No photos here any more.") { it.placePhotos(area, 5000u).items }
 
 @Composable
 fun GalleryResultsScreen(vm: AppViewModel, serverId: String, words: String?, similarTo: String?) =
