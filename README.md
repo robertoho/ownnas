@@ -4,6 +4,19 @@ OwnNAS is a small web server you compile yourself. It shares one folder and its 
 
 For a full walkthrough (thumbnails, media playback, tags, Trash, keyboard shortcuts, and more), see [DOCS.md](DOCS.md).
 
+## Features
+
+- **Files in the browser:** browse, upload (with speed and time left), download folders as zip, move, copy, rename, and a Trash you can restore from. Earlier versions of files OwnNAS saves over are kept and can be restored.
+- **Previews of almost anything:** photos (including camera RAW, HEIC, JPEG XL, Photoshop and Live Photos), videos with subtitles, music with covers and waveforms, PDFs, Office and iWork documents, e-books and comics, archives, 3D models and CAD drawings, maps of GPS tracks, e-mails, notebooks, and data files. Text, Markdown, CSV and spreadsheets can be edited in place.
+- **Search:** file and folder names, and the words inside documents, PDFs, and (with `tesseract`) pictures, indexed in the background so results come at once. Tags and comments on any file.
+- **Photo gallery:** a timeline of every photo and video by the date it was taken, nested albums that never move your files, tags, a map of places, On this day, and **workspaces** (Family, Work, a customer…) that each show only some folders. Optional on-device smart features: search photos by describing them, find similar photos, and faces grouped into people.
+- **Terminals in any folder:** administrators can open a shell in any folder of the NAS from the browser, on a computer or a phone. Terminals keep running when you close the tab, and OwnNAS shows what coding agents such as Claude Code, Codex, or opencode are doing and tells you when one needs you.
+- **Library tools:** find and remove duplicate files across the whole library, folder sizes, disk space, and a Health page with drive health, temperatures, and a warning when a disk fills up.
+- **Users and security:** several accounts with administrators, read-only mode, an activity log, and native HTTPS with your own or a generated certificate.
+- **Sync and apps:** `ownnas-sync` keeps a folder on your computer in sync both ways, and an Android app runs the same server on the phone.
+- **Updates:** the server checks a signed release feed and an administrator installs new versions from Settings.
+- **One file:** a single binary for Windows, macOS, and Linux, with SQLite built in. Your files stay where they are, in the folder you choose.
+
 ## Build
 
 Install a C compiler as well as Rust. SQLite is compiled into the binary.
