@@ -1,0 +1,7 @@
+# Built by build-rust.sh
+/Generated/
+# Xcode's per-user state
+xcuserdata/
+*.xcuserstate
+build/
+DerivedData/

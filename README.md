@@ -10,7 +10,7 @@ OwnNAS is a small web server you compile yourself. It shares one folder and its 
 - **Terminals in any folder:** open a shell in any folder of the NAS from a browser or phone, with status for coding agents like Claude Code.
 - **Library tools:** duplicate finder, folder sizes, and disk health and temperatures.
 - **Users:** several accounts, administrators, read-only mode, and an activity log.
-- **Sync and apps:** a two-way folder sync client and an Android app.
+- **Sync and apps:** a two-way folder sync client, and native Android and iPhone apps with the gallery, search, and terminals.
 - **Easy to run:** one binary for Windows, macOS, and Linux, HTTPS, and signed updates.
 
 For a full walkthrough (thumbnails, media playback, tags, Trash, keyboard shortcuts, and more), see [DOCS.md](DOCS.md).
@@ -77,6 +77,12 @@ library and displays the existing OwnNAS web UI in a WebView. It binds only to
 supports arm64, 32-bit ARM, and x86_64. Open `android/` in Android Studio or
 run `android\\gradlew.bat assembleDebug` on Windows. See [android/README.md](android/README.md)
 for the storage model and build details.
+
+## iPhone and iPad
+
+`clients/ios` is a native SwiftUI app on the same Rust client library as the Android app in
+`clients/android`. It covers folders, search, uploads, the Gallery (workspaces, places, On this
+day), and terminals. See [clients/ios/README.md](clients/ios/README.md) to build it with Xcode.
 
 ## Sync a folder with your computer
 
