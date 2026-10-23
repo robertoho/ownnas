@@ -2,7 +2,8 @@
 import { Terminal } from "/assets/vendor/xterm/xterm.mjs";
 import { FitAddon } from "/assets/vendor/xterm/addon-fit.mjs";
 
-const THEMES = ["ownnas", "tokyo-night", "catppuccin", "catppuccin-latte", "everforest", "gruvbox", "kanagawa", "osaka-jade", "matte-black", "rose-pine", "liquid-glass", "windows-11"];
+// Every theme id (see THEMES in app.js).
+const THEMES = ["catppuccin-latte", "rose-pine", "liquid-glass", "windows-11", "github-light", "one-light", "solarized-light", "gruvbox-light", "everforest-light", "tokyo-night-day", "kanagawa-lotus", "nord-light", "flexoki-light", "paper", "ownnas", "tokyo-night", "catppuccin", "everforest", "gruvbox", "kanagawa", "osaka-jade", "matte-black", "nord", "dracula", "solarized-dark"];
 const KEYS = {
   esc: "\x1b",
   tab: "\t",

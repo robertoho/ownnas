@@ -87,17 +87,30 @@ function syncTileSize() {
 
 const THEMES = [
   { id: "ownnas", name: "OwnNAS", mode: "dark", swatches: ["#12140f", "#1b1e16", "#dff25a", "#f4f2e8"] },
+  { id: "catppuccin-latte", name: "Catppuccin Latte", mode: "light", swatches: ["#eff1f5", "#e6e9ef", "#1e66f5", "#4c4f69"] },
+  { id: "rose-pine", name: "Rose Pine Dawn", mode: "light", swatches: ["#faf4ed", "#fffaf3", "#56949f", "#575279"] },
+  { id: "liquid-glass", name: "macOS Liquid Glass", mode: "light", swatches: ["#eef1f8", "#ffffff", "#007aff", "#1d1d1f"] },
+  { id: "windows-11", name: "Windows 11", mode: "light", swatches: ["#eaf0f8", "#ffffff", "#005fb8", "#1a1a1a"] },
+  { id: "github-light", name: "GitHub Light", mode: "light", swatches: ["#ffffff", "#f6f8fa", "#0969da", "#1f2328"] },
+  { id: "one-light", name: "One Light", mode: "light", swatches: ["#fafafa", "#f0f0f1", "#4078f2", "#383a42"] },
+  { id: "solarized-light", name: "Solarized Light", mode: "light", swatches: ["#fdf6e3", "#eee8d5", "#268bd2", "#475b62"] },
+  { id: "gruvbox-light", name: "Gruvbox Light", mode: "light", swatches: ["#fbf1c7", "#f2e5bc", "#076678", "#3c3836"] },
+  { id: "everforest-light", name: "Everforest Light", mode: "light", swatches: ["#fdf6e3", "#f4f0d9", "#3a94c5", "#5c6a72"] },
+  { id: "tokyo-night-day", name: "Tokyo Night Day", mode: "light", swatches: ["#e1e2e7", "#e9e9ed", "#2e7de9", "#3760bf"] },
+  { id: "kanagawa-lotus", name: "Kanagawa Lotus", mode: "light", swatches: ["#f2ecbc", "#e7dba0", "#4d699b", "#545464"] },
+  { id: "nord-light", name: "Nord Light", mode: "light", swatches: ["#eceff4", "#e5e9f0", "#5e81ac", "#2e3440"] },
+  { id: "flexoki-light", name: "Flexoki Light", mode: "light", swatches: ["#fffcf0", "#f2f0e5", "#205ea6", "#100f0f"] },
+  { id: "paper", name: "Paper", mode: "light", swatches: ["#f4ecd8", "#ede3cb", "#a0522d", "#3b3024"] },
   { id: "tokyo-night", name: "Tokyo Night", mode: "dark", swatches: ["#1a1b26", "#24283b", "#7aa2f7", "#c0caf5"] },
   { id: "catppuccin", name: "Catppuccin", mode: "dark", swatches: ["#1e1e2e", "#313244", "#89b4fa", "#cdd6f4"] },
-  { id: "catppuccin-latte", name: "Catppuccin Latte", mode: "light", swatches: ["#eff1f5", "#e6e9ef", "#1e66f5", "#4c4f69"] },
   { id: "everforest", name: "Everforest", mode: "dark", swatches: ["#2d353b", "#374247", "#7fbbb3", "#d3c6aa"] },
   { id: "gruvbox", name: "Gruvbox", mode: "dark", swatches: ["#282828", "#3c3836", "#7daea3", "#ebdbb2"] },
   { id: "kanagawa", name: "Kanagawa", mode: "dark", swatches: ["#1f1f28", "#2a2a37", "#7e9cd8", "#dcd7ba"] },
   { id: "osaka-jade", name: "Osaka Jade", mode: "dark", swatches: ["#111c18", "#1a2a22", "#509475", "#c1c497"] },
   { id: "matte-black", name: "Matte Black", mode: "dark", swatches: ["#121212", "#1c1c1c", "#e68e0d", "#eaeaea"] },
-  { id: "rose-pine", name: "Rose Pine", mode: "light", swatches: ["#faf4ed", "#fffaf3", "#56949f", "#575279"] },
-  { id: "liquid-glass", name: "macOS Liquid Glass", mode: "light", swatches: ["#eef1f8", "#ffffff", "#007aff", "#1d1d1f"] },
-  { id: "windows-11", name: "Windows 11", mode: "light", swatches: ["#eaf0f8", "#ffffff", "#005fb8", "#1a1a1a"] },
+  { id: "nord", name: "Nord", mode: "dark", swatches: ["#2e3440", "#3b4252", "#88c0d0", "#eceff4"] },
+  { id: "dracula", name: "Dracula", mode: "dark", swatches: ["#282a36", "#343746", "#bd93f9", "#f8f8f2"] },
+  { id: "solarized-dark", name: "Solarized Dark", mode: "dark", swatches: ["#002b36", "#073642", "#268bd2", "#c8d1cf"] },
 ];
 
 function normalizeTheme(value) {
@@ -107,6 +120,7 @@ function normalizeTheme(value) {
 function applyTheme(id) {
   const theme = normalizeTheme(id);
   document.documentElement.setAttribute("data-theme", theme);
+  document.documentElement.setAttribute("data-mode", THEMES.find((entry) => entry.id === theme).mode);
   localStorage.setItem("ownnas-theme", theme);
   renderThemeGrid();
 }
@@ -126,6 +140,12 @@ function renderThemeGrid() {
       <span class="muted">${theme.mode}</span>
     </button>
   `).join("");
+  // Each card shows its theme's colors (set here: the page's security policy blocks style attributes).
+  for (const card of host.querySelectorAll(".theme-card")) {
+    const colors = THEMES.find((theme) => theme.id === card.dataset.themeId).swatches;
+    const stops = colors.map((color, i) => `${color} ${i * 25}%, ${color} ${(i + 1) * 25}%`).join(", ");
+    card.querySelector(".theme-swatch").style.backgroundImage = `linear-gradient(90deg, ${stops})`;
+  }
 }
 
 function tagInitials(tag) {

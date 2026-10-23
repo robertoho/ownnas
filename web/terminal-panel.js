@@ -427,6 +427,7 @@ function popOutChanges(item) {
   let root = doc.getElementById("changes-root");
   if (!root) {
     doc.documentElement.setAttribute("data-theme", document.documentElement.getAttribute("data-theme") || "ownnas");
+    doc.documentElement.setAttribute("data-mode", document.documentElement.getAttribute("data-mode") || "dark");
     const style = doc.createElement("link");
     style.rel = "stylesheet";
     style.href = new URL("/assets/app.css", location.href).href;

@@ -291,7 +291,7 @@ Click **Settings** in the header.
 
 ### Appearance
 
-Pick a theme inspired by [Omarchy](https://omarchy.org) palettes (Tokyo Night, Catppuccin, Everforest, Gruvbox, Kanagawa, Osaka Jade, Matte Black, Rose Pine, plus the OwnNAS default). The choice is stored in this browser (`localStorage`).
+Pick one of 25 themes: the OwnNAS default, 14 light ones (GitHub Light, Solarized Light, Gruvbox Light, Paper, macOS Liquid Glass, Windows 11, and more), and dark ones such as Tokyo Night, Catppuccin, Nord, and Dracula. The choice is stored in this browser (`localStorage`).
 
 ### Users (administrators only)
 
