@@ -16,6 +16,7 @@ enum Route: Hashable {
     case viewer(server: String, list: Int, start: Int)
     case terminals(server: String, path: String)
     case terminal(server: String, id: String)
+    case backup
 }
 
 /// The signed-in servers and the app's navigation. Server calls block, so [call] runs them off

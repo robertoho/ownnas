@@ -141,6 +141,7 @@ struct BrowserView: View {
             Menu {
                 Button("Search", systemImage: "magnifyingglass") { hub.path.append(.search(server: server, path: path)) }
                 Button("Gallery", systemImage: "photo.on.rectangle.angled") { hub.path.append(.gallery(server: server)) }
+                Button("Photo backup", systemImage: "photo.badge.arrow.down") { hub.path.append(.backup) }
                 if account?.terminal == true {
                     let attention = terminals.filter { $0.agent.attention != nil || !$0.running }.count
                     Button(attention > 0 ? "Terminals (\(attention) need you)" : "Terminals", systemImage: "terminal") {

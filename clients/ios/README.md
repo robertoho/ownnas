@@ -31,6 +31,12 @@ What works now:
     the server.
   - Photos open full screen: swipe between them, pinch or double-tap to zoom, see their
     details, and share them. Videos play.
+- **Photo backup:** backs up the camera roll (originals, newest first, iCloud photos too) to the
+  server's media upload folder, in `<folder>/<this phone>/<year>/<month>/`, like the Android app.
+  Wi-Fi only, videos or not, pause and resume, statistics, the photos sent lately, and the photos
+  deleted on the server (which are not sent again unless allowed). It runs when the app opens,
+  when new photos appear while it is open, with Back up now, and when iOS gives the app
+  background time, which it decides (usually at night while charging).
 - **Terminals:**
   - For administrators when the server has them on. The list shows what each coding agent is
     doing.
@@ -41,7 +47,6 @@ What works now:
 Not yet, compared with Android:
 
 - the Files app integration (a File Provider extension);
-- phone backups;
 - two-way folder sync;
 - terminal shortcuts.
 

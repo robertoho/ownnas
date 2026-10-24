@@ -2,11 +2,21 @@ import SwiftUI
 
 @main
 struct OwnNASApp: App {
-    @StateObject private var hub = Hub()
+    @StateObject private var hub: Hub
+    @StateObject private var backup: PhotoBackup
+
+    init() {
+        let hub = Hub()
+        let backup = PhotoBackup(hub: hub)
+        // Background tasks must be registered before the app finishes launching.
+        backup.registerBackgroundTask()
+        _hub = StateObject(wrappedValue: hub)
+        _backup = StateObject(wrappedValue: backup)
+    }
 
     var body: some Scene {
         WindowGroup {
-            RootView().environmentObject(hub)
+            RootView().environmentObject(hub).environmentObject(backup)
         }
     }
 }
@@ -14,6 +24,8 @@ struct OwnNASApp: App {
 /// The servers, and every screen pushed over them.
 struct RootView: View {
     @EnvironmentObject private var hub: Hub
+    @EnvironmentObject private var backup: PhotoBackup
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         NavigationStack(path: $hub.path) {
@@ -40,8 +52,16 @@ struct RootView: View {
                     case let .viewer(server, list, start): PhotoViewer(server: server, items: hub.viewerLists[list] ?? [], start: start)
                     case let .terminals(server, path): TerminalsView(server: server, path: path)
                     case let .terminal(server, id): TerminalScreenView(server: server, id: id)
+                    case .backup: BackupView()
                     }
                 }
+        }
+        .onChange(of: scenePhase) {
+            switch scenePhase {
+            case .active: backup.appBecameActive()
+            case .background: backup.appWentToBackground()
+            default: break
+            }
         }
     }
 }

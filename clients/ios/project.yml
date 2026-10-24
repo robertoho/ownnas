@@ -41,6 +41,10 @@ targets:
         UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         NSLocalNetworkUsageDescription: OwnNAS connects to your OwnNAS server on your home network or VPN.
         NSPhotoLibraryAddUsageDescription: OwnNAS saves the photos and videos you choose to your library.
+        NSPhotoLibraryUsageDescription: OwnNAS backs up your photos and videos to your OwnNAS server.
+        # Photo backup runs when iOS gives the app background time.
+        UIBackgroundModes: [processing, fetch]
+        BGTaskSchedulerPermittedIdentifiers: [app.ownnas.ios.backup]
         ITSAppUsesNonExemptEncryption: false
     settings:
       base:

@@ -3,6 +3,7 @@ import SwiftUI
 /// The servers signed in from this device.
 struct ServersView: View {
     @EnvironmentObject private var hub: Hub
+    @EnvironmentObject private var backup: PhotoBackup
     @State private var signingIn: SignInTarget?
     @State private var removing: SavedServer?
 
@@ -17,6 +18,19 @@ struct ServersView: View {
                     Button("Add server") { signingIn = SignInTarget(existing: nil) }.buttonStyle(.borderedProminent)
                 }
                 .frame(maxWidth: .infinity).padding(.vertical, 40).listRowBackground(Color.clear)
+            }
+            if !hub.servers.isEmpty {
+                Section {
+                    Button { hub.path.append(.backup) } label: {
+                        HStack(spacing: 14) {
+                            Image(systemName: "photo.badge.arrow.down").font(.title2).foregroundStyle(.tint).frame(width: 36)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Photo backup").font(.headline).foregroundStyle(.primary)
+                                Text(backupLine).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                            }
+                        }
+                    }
+                }
             }
             ForEach(hub.servers) { server in
                 Button {
@@ -52,12 +66,26 @@ struct ServersView: View {
         }
         .confirmationDialog("Remove \(removing?.name ?? "")?", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }), titleVisibility: .visible) {
             Button("Remove server", role: .destructive) {
-                if let removing { hub.remove(removing.id) }
+                if let removing {
+                    backup.forgetServer(removing.id)
+                    hub.remove(removing.id)
+                }
                 removing = nil
             }
         } message: {
             Text("This device signs out. Nothing on the server changes.")
         }
+    }
+}
+
+extension ServersView {
+    /// What the backup is doing, in a line.
+    private var backupLine: String {
+        let state = backup.state
+        guard let id = backup.settings.serverId, let server = hub.server(id) else { return "Off" }
+        if state.running { return "Backing up \(state.done) of \(state.total)…" }
+        if backup.settings.paused { return "Paused" }
+        return "To \(server.name) · \(state.lastResult ?? "on")"
     }
 }
 

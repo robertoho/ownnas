@@ -50,8 +50,8 @@ final class WalkthroughTests: XCTestCase {
         app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", title)).firstMatch
     }
 
-    func testWalkthrough() throws {
-        // Sign in.
+    /// Signs in to the test server, unless this device is already.
+    private func signIn() {
         if app.buttons["Add server"].firstMatch.waitForExistence(timeout: 5) {
             app.buttons["Add server"].firstMatch.tap()
             let address = app.textFields["Server address"]
@@ -67,6 +67,10 @@ final class WalkthroughTests: XCTestCase {
         } else {
             app.buttons.matching(NSPredicate(format: "label CONTAINS 'admin'")).firstMatch.tap()
         }
+    }
+
+    func testWalkthrough() throws {
+        signIn()
 
         // The library.
         waitFor(row("Docs"))
@@ -136,5 +140,24 @@ final class WalkthroughTests: XCTestCase {
         app.typeText("echo hello from the iPhone\n")
         sleep(2)
         shot("11-terminal")
+    }
+
+    /// Backs the simulator's photos up to the server (whose media upload folder must be set).
+    func testPhotoBackup() throws {
+        signIn()
+        waitFor(row("Docs"))
+        backTo(app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Photo backup'")).firstMatch)
+        app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Photo backup'")).firstMatch.tap()
+        let server = app.buttons.matching(NSPredicate(format: "label CONTAINS '127.0.0.1'")).firstMatch
+        waitFor(server)
+        server.tap()
+        // iOS asks once whether the app may see the photos.
+        let allow = XCUIApplication(bundleIdentifier: "com.apple.springboard").buttons["Allow Full Access"]
+        if allow.waitForExistence(timeout: 5) { allow.tap() }
+        let done = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'Backed up' OR label == 'Up to date'")).firstMatch
+        waitFor(done, 90)
+        shot("12-backup")
+        app.swipeUp()
+        shot("13-backup-recent")
     }
 }

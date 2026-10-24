@@ -11,6 +11,8 @@
 		09EF7119196095C2D4AB13FA /* ServerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5508D5AC36EC35D02EDB36A2 /* ServerStore.swift */; };
 		0C4CD0A871629C639FBED2E7 /* PhotoGrid.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6AD863ECB33160846CC9713B /* PhotoGrid.swift */; };
 		111BC4AA287F13D185A385FF /* WalkthroughTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FEA07065F0F048990E55F0FB /* WalkthroughTests.swift */; };
+		1C6ADCBA7CE70C94B1FA9822 /* PhotoBackup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 332778DE06875D48DCAE3B4A /* PhotoBackup.swift */; };
+		29FFB641EB60AB0293104049 /* BackupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D6DDB83F02A6DAC193CBE3D /* BackupView.swift */; };
 		3A26F86B21AEC0F6DFE42145 /* BrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0DB9F497AB77453B1F38215 /* BrowserView.swift */; };
 		942BFB2D2DFAEED938032004 /* PhotoViewer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A8416C60AC061B7AEC9D9DA /* PhotoViewer.swift */; };
 		95CC32D8BF8D704129E98A02 /* TerminalsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E109B2DCCECD9C31053600D9 /* TerminalsView.swift */; };
@@ -42,7 +44,9 @@
 		0F80043E30B73B1A00B12A8D /* OwnNAS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = OwnNAS.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		10A3FF3E4BC82241BD60AC38 /* Hub.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Hub.swift; sourceTree = "<group>"; };
 		20D342AB6339FE835FDC93CE /* ServersView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServersView.swift; sourceTree = "<group>"; };
+		2D6DDB83F02A6DAC193CBE3D /* BackupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupView.swift; sourceTree = "<group>"; };
 		325060305FF2FCA1E785F8DA /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		332778DE06875D48DCAE3B4A /* PhotoBackup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoBackup.swift; sourceTree = "<group>"; };
 		5508D5AC36EC35D02EDB36A2 /* ServerStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerStore.swift; sourceTree = "<group>"; };
 		60C85EAC6C24FFBC09BBF7FF /* SignInView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignInView.swift; sourceTree = "<group>"; };
 		6AD863ECB33160846CC9713B /* PhotoGrid.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoGrid.swift; sourceTree = "<group>"; };
@@ -74,6 +78,7 @@
 		3124158B5487B675F3579D7E /* UI */ = {
 			isa = PBXGroup;
 			children = (
+				2D6DDB83F02A6DAC193CBE3D /* BackupView.swift */,
 				F0DB9F497AB77453B1F38215 /* BrowserView.swift */,
 				93EB9DB33C50051205E95F57 /* FileActions.swift */,
 				20D342AB6339FE835FDC93CE /* ServersView.swift */,
@@ -105,6 +110,7 @@
 			isa = PBXGroup;
 			children = (
 				10A3FF3E4BC82241BD60AC38 /* Hub.swift */,
+				332778DE06875D48DCAE3B4A /* PhotoBackup.swift */,
 				5508D5AC36EC35D02EDB36A2 /* ServerStore.swift */,
 				CFB1417D2601BB3E7132C727 /* Thumbnails.swift */,
 			);
@@ -286,11 +292,13 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				29FFB641EB60AB0293104049 /* BackupView.swift in Sources */,
 				3A26F86B21AEC0F6DFE42145 /* BrowserView.swift in Sources */,
 				E927421CAD40A0CF870D01F0 /* FileActions.swift in Sources */,
 				C16504CFE13C2A74838BD3A7 /* GalleryView.swift in Sources */,
 				E087A7E2354DD68D6EC864BB /* Hub.swift in Sources */,
 				A70AEA8B47BA5631053744E4 /* OwnNASApp.swift in Sources */,
+				1C6ADCBA7CE70C94B1FA9822 /* PhotoBackup.swift in Sources */,
 				0C4CD0A871629C639FBED2E7 /* PhotoGrid.swift in Sources */,
 				942BFB2D2DFAEED938032004 /* PhotoViewer.swift in Sources */,
 				09EF7119196095C2D4AB13FA /* ServerStore.swift in Sources */,
