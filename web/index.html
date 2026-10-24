@@ -273,6 +273,10 @@
       </div>
       <button id="undo-btn" type="button" disabled title="Nothing to undo">Undo</button>
       <div class="status-right">
+        <span id="update-pill" class="update-pill" hidden>
+          <button id="update-pill-open" type="button" title="Open Settings → Updates"><span class="update-dot" aria-hidden="true"></span><span id="update-pill-text"></span><span id="update-pill-short"></span></button>
+          <button id="update-pill-later" type="button" class="update-pill-later" title="Remind me in a week" aria-label="Remind me in a week">✕</button>
+        </span>
         <button id="storage-meter" class="storage-meter" type="button" hidden aria-label="Disk space">
           <span class="storage-bar" aria-hidden="true"><span class="storage-bar-library"></span><span class="storage-bar-other"></span></span>
           <span id="storage-text" class="storage-text"></span>

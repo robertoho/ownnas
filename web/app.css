@@ -585,6 +585,21 @@ input, select, textarea {
 .storage-meter { display: inline-flex; align-items: center; gap: 0.5rem; min-height: 0; padding: 0.2rem 0.5rem; border: 0; background: transparent; box-shadow: none; color: var(--muted); font-size: 0.8rem; }
 .storage-meter:hover { color: var(--text); background: color-mix(in srgb, var(--text) 8%, transparent); }
 .storage-meter[hidden] { display: none; }
+/* A new version, in the status bar: quiet, and "✕" snoozes it for a week. */
+.update-pill { display: inline-flex; align-items: center; border-radius: 999px; }
+.update-pill[hidden] { display: none; }
+.update-pill button { min-height: 0; padding: 0.2rem 0.5rem; border: 0; background: transparent; box-shadow: none; color: var(--muted); font-size: 0.8rem; }
+.update-pill button:hover { color: var(--text); background: color-mix(in srgb, var(--text) 8%, transparent); }
+#update-pill-open { display: inline-flex; align-items: center; gap: 0.4rem; border-radius: 999px 0 0 999px; white-space: nowrap; }
+.update-pill-later { border-radius: 0 999px 999px 0; padding-inline: 0.4rem; opacity: 0.7; }
+#update-pill-short { display: none; }
+@media (max-width: 600px) {
+  #update-pill-text { display: none; }
+  #update-pill-short { display: inline; }
+  /* No room for both on a phone; the tile size comes back once the note is gone. */
+  .status-right:has(.update-pill:not([hidden])) .tile-size-control { display: none; }
+}
+.update-dot { flex: 0 0 auto; width: 0.45rem; height: 0.45rem; border-radius: 50%; background: var(--accent); }
 .storage-bar { display: flex; width: 5.5rem; height: 0.45rem; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, var(--text) 14%, transparent); }
 .storage-bar > span { display: block; height: 100%; }
 .storage-bar-library, .storage-seg-library { background: var(--accent); }

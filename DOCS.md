@@ -321,7 +321,7 @@ ownnas serve --root /path/to/library \
   --update-pubkey "$(cat releases/keys/update.pk)"
 ```
 
-Admins use **Settings → Updates** to check and install. Install replaces the binary (via `self-replace`), starts a new process with the same arguments, and exits so launchd/systemd/Task Scheduler can keep the service up.
+The server checks once a day. When a newer version is out, admins see a small note in the status bar. It opens **Settings → Updates**, and its ✕ hides it for a week, or until an even newer version comes out. Admins use **Settings → Updates** to check and install. Install replaces the binary (via `self-replace`), starts a new process with the same arguments, and exits so launchd/systemd/Task Scheduler can keep the service up.
 
 Generate signing keys once: `ownnas update keygen --out releases/keys`.
 

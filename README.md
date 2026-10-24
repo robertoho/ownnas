@@ -247,7 +247,7 @@ Put OwnNAS behind HTTPS and pass `--secure-cookie` if you terminate TLS with a r
 
 ## Updates
 
-New installations check the signed GitHub release feed once per day. Administrators see an available version in **Settings → Updates** and choose when to install it. `--update-url` and `--update-pubkey` still override the default feed for custom installations. Service-managed installs should pass `--restart-by-supervisor` so the service manager starts the replaced binary after a clean shutdown. Existing installations must first install a release that includes the updater. The release workflow requires the `OWNNAS_UPDATE_PRIVATE_KEY` Actions secret; its matching public key is embedded in the application.
+New installations check the signed GitHub release feed once per day. When there is a new version, administrators see a small note in the status bar. Choosing it opens **Settings → Updates**, where they choose when to install it. The ✕ hides the note for a week, or until an even newer version comes out. `--update-url` and `--update-pubkey` still override the default feed for custom installations. Service-managed installs should pass `--restart-by-supervisor` so the service manager starts the replaced binary after a clean shutdown. Existing installations must first install a release that includes the updater. The release workflow requires the `OWNNAS_UPDATE_PRIVATE_KEY` Actions secret; its matching public key is embedded in the application.
 
 OwnNAS also includes a basic embedded ODT editor. Open an `.odt` file or create one from **New file → OpenDocument text**. Its browser module can be reused in other projects; see [web/odt-editor.md](web/odt-editor.md).
 

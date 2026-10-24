@@ -49,7 +49,6 @@ const state = {
   pasteInto: "",
   bookmarks: [],
 };
-let updateNoticeVersion = "";
 let updateStatusTimer = null;
 
 function normalizeGroup(value) {
@@ -2222,6 +2221,7 @@ async function checkForUpdates() {
     } else {
       $("update-notes").hidden = true;
     }
+    showUpdatePill(data);
     if (data.available) {
       const signed = data.signed ? " (signature verified)" : "";
       $("update-status").textContent = `Version ${data.latest} is available${signed}.`;
@@ -4725,7 +4725,8 @@ async function boot() {
   showApp();
   if (state.me.admin && state.me.updatesConfigured) {
     pollUpdateNotice();
-    if (!updateStatusTimer) updateStatusTimer = setInterval(pollUpdateNotice, 15 * 60 * 1000);
+    // The server checks once a day; looking every few hours is enough to notice.
+    if (!updateStatusTimer) updateStatusTimer = setInterval(pollUpdateNotice, 3 * 60 * 60 * 1000);
   }
   syncControls();
   refreshSmartStatus().then(syncSimilarButton);
@@ -4843,16 +4844,41 @@ $("health-alert-close").addEventListener("click", () => {
   try { sessionStorage.setItem("ownnas-health-dismissed", healthAlertKey); } catch {}
 });
 
+const UPDATE_SNOOZE_KEY = "ownnas-update-snooze";
+const UPDATE_SNOOZE_DAYS = 7;
+
 async function pollUpdateNotice() {
   if (!state.me?.admin || !state.me.updatesConfigured) return;
   try {
-    const update = await api("/api/update/status");
-    if (update.available && update.latest !== updateNoticeVersion) {
-      updateNoticeVersion = update.latest;
-      toast(`OwnNAS ${update.latest} is available. Open Settings → Updates to install it.`);
-    }
+    showUpdatePill(await api("/api/update/status"));
   } catch {}
 }
+
+/// The status bar's "new version" note, for administrators. "✕" hides it for a week, but a
+/// newer version than the one snoozed shows it again.
+function showUpdatePill(update) {
+  const pill = $("update-pill");
+  if (!update?.available || !update.latest) {
+    pill.hidden = true;
+    return;
+  }
+  let snooze = null;
+  try { snooze = JSON.parse(localStorage.getItem(UPDATE_SNOOZE_KEY) || "null"); } catch {}
+  const snoozed = snooze && snooze.version === update.latest && Date.now() < snooze.until;
+  $("update-pill-text").textContent = `OwnNAS ${update.latest} is available`;
+  $("update-pill-short").textContent = `Update ${update.latest}`;
+  pill.dataset.version = update.latest;
+  pill.hidden = !!snoozed;
+}
+
+$("update-pill-open").addEventListener("click", () => openSettings("updates"));
+$("update-pill-later").addEventListener("click", () => {
+  const pill = $("update-pill");
+  pill.hidden = true;
+  const until = Date.now() + UPDATE_SNOOZE_DAYS * 24 * 60 * 60 * 1000;
+  try { localStorage.setItem(UPDATE_SNOOZE_KEY, JSON.stringify({ version: pill.dataset.version, until })); } catch {}
+  toast(`We'll remind you again in a week.`);
+});
 
 boot();
 applyTheme(currentTheme());
