@@ -2982,6 +2982,7 @@ dependencies = [
  "bzip2 0.5.2",
  "calamine",
  "cfb",
+ "chrono",
  "clap",
  "djvu-rs",
  "ed25519-dalek",

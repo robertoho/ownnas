@@ -1409,6 +1409,14 @@ function setSettingsTab(tab) {
   const storageTab = tab === "storage";
   const indexingTab = tab === "indexing";
   const healthTab = tab === "health";
+  const backupTab = tab === "backup";
+  $("settings-tab-backup").setAttribute("aria-selected", backupTab ? "true" : "false");
+  $("settings-backup").hidden = !backupTab;
+  if (backupTab) {
+    nasBackupModule()
+      .then((module) => module.renderSettings($("settings-backup")))
+      .catch((err) => toast(err.message, true));
+  }
   $("settings-tab-health").setAttribute("aria-selected", healthTab ? "true" : "false");
   $("settings-health").hidden = !healthTab;
   if (healthTab) refreshHealth(false).catch((err) => toast(err.message, true));
@@ -1823,6 +1831,7 @@ $("index-rescan").addEventListener("click", () => {
 $("gallery-index-link").addEventListener("click", () => setSettingsTab("indexing"));
 $("settings-tab-indexing").addEventListener("click", () => setSettingsTab("indexing"));
 $("settings-tab-health").addEventListener("click", () => setSettingsTab("health"));
+$("settings-tab-backup").addEventListener("click", () => setSettingsTab("backup"));
 
 $("settings-tab-gallery").addEventListener("click", () => setSettingsTab("gallery"));
 $("settings-tab-storage").addEventListener("click", () => setSettingsTab("storage"));
@@ -1895,6 +1904,27 @@ function paintStorage(data) {
 }
 
 let terminalModule = null;
+
+let nasBackup = null;
+
+/// Loads Settings → Backup on first use.
+async function nasBackupModule() {
+  if (!nasBackup) {
+    nasBackup = await import("/assets/nas-backup.js");
+    nasBackup.init({
+      api,
+      toast,
+      askText,
+      askConfirm,
+      formatSize,
+      goToFolder: (path) => {
+        closeSettings();
+        go(path).catch((err) => toast(err.message, true));
+      },
+    });
+  }
+  return nasBackup;
+}
 
 /// Loads the terminal panel on first use.
 async function terminalPanel() {
@@ -2145,7 +2175,8 @@ function openSettings(tab) {
   $("settings-tab-users").hidden = !admin;
   $("settings-tab-terminal").hidden = !admin;
   $("settings-tab-gallery").hidden = !admin;
-  if (!admin && (tab === "users" || tab === "terminal" || tab === "gallery")) tab = "theme";
+  $("settings-tab-backup").hidden = !admin;
+  if (!admin && (tab === "users" || tab === "terminal" || tab === "gallery" || tab === "backup")) tab = "theme";
   if (!tab) tab = "theme";
   setSettingsTab(tab);
   renderThemeGrid();
@@ -4816,6 +4847,7 @@ async function refreshHealth(fresh) {
 $("health-refresh").addEventListener("click", () => refreshHealth(true).catch((err) => toast(err.message, true)));
 
 let healthAlertKey = "";
+let healthAlertTab = "health";
 let healthTimer = 0;
 
 /// Shows a warning over the files when a disk OwnNAS uses is nearly full or a drive reports
@@ -4827,10 +4859,18 @@ async function pollHealthAlerts() {
     box.hidden = true;
     return;
   }
-  const texts = alerts.map((alert) => alert.kind === "disk"
-    ? `The disk with ${alert.what} is ${alert.level === "full" ? "nearly full" : "getting full"}: ${formatSize(alert.free, false)} free (${Math.round((alert.free / (alert.total || 1)) * 100)}%).`
-    : `The drive ${alert.model || alert.name} ${alert.status === "Failing" ? "says it is failing" : `reports ${alert.warnings.join(", ")}`}.`);
-  healthAlertKey = alerts.map((alert) => `${alert.kind}:${alert.level}:${alert.mount || alert.name}`).join("|");
+  const texts = alerts.map((alert) => {
+    if (alert.kind === "disk") return `The disk with ${alert.what} is ${alert.level === "full" ? "nearly full" : "getting full"}: ${formatSize(alert.free, false)} free (${Math.round((alert.free / (alert.total || 1)) * 100)}%).`;
+    if (alert.kind === "backup") {
+      const since = alert.lastSuccess ? ` The last one that worked was on ${new Date(alert.lastSuccess * 1000).toLocaleDateString()}.` : "";
+      return alert.problem === "failed" ? `The last backup failed: ${(alert.error || "unknown error").replace(/\.$/, "")}.${since}` : `Backups have not worked for a while.${since}`;
+    }
+    return `The drive ${alert.model || alert.name} ${alert.status === "Failing" ? "says it is failing" : `reports ${alert.warnings.join(", ")}`}.`;
+  });
+  healthAlertKey = alerts.map((alert) => `${alert.kind}:${alert.level}:${alert.mount || alert.name || alert.problem}:${alert.lastSuccess || ""}`).join("|");
+  // Only backup problems: the button goes to Backup instead of Health.
+  healthAlertTab = alerts.every((alert) => alert.kind === "backup") ? "backup" : "health";
+  $("health-alert-open").textContent = healthAlertTab === "backup" ? "See Backup" : "See Health";
   let dismissed = "";
   try { dismissed = sessionStorage.getItem("ownnas-health-dismissed") || ""; } catch {}
   box.classList.toggle("is-serious", alerts.some((alert) => alert.level === "full"));
@@ -4838,7 +4878,7 @@ async function pollHealthAlerts() {
   box.hidden = dismissed === healthAlertKey;
 }
 
-$("health-alert-open").addEventListener("click", () => openSettings("health"));
+$("health-alert-open").addEventListener("click", () => openSettings(healthAlertTab));
 $("health-alert-close").addEventListener("click", () => {
   $("health-alert").hidden = true;
   try { sessionStorage.setItem("ownnas-health-dismissed", healthAlertKey); } catch {}

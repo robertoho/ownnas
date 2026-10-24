@@ -96,6 +96,13 @@ pub fn check() -> Vec<HelperTool> {
         install("brew install smartmontools", "sudo apt install smartmontools", "winget install smartmontools.smartmontools"),
     ));
     tools.push(tool(
+        "restic",
+        &["version"],
+        "Backs up the library and OwnNAS's data to a drive, a bucket, or another machine (Settings > Backup).",
+        "Backups are not available.",
+        install("brew install restic", "sudo apt install restic", "winget install restic.restic"),
+    ));
+    tools.push(tool(
         "git",
         &["--version"],
         "Shows what changed in a terminal's project folder.",
@@ -131,7 +138,7 @@ fn tool(name: &'static str, args: &[&str], purpose: &'static str, without: &'sta
 }
 
 /// Where `name` is on the PATH.
-fn find(name: &str) -> Option<PathBuf> {
+pub(crate) fn find(name: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     let names: Vec<String> = if cfg!(windows) { vec![format!("{name}.exe"), format!("{name}.cmd"), name.to_string()] } else { vec![name.to_string()] };
     std::env::split_paths(&paths)

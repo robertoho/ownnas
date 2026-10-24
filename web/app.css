@@ -3802,6 +3802,51 @@ body.is-gallery .app > .explorer-status-bar { display: none; }
 .health-alert span { flex: 1; min-width: 12rem; }
 .health-alert-close { min-height: 0; padding: 0.1rem 0.45rem; }
 .health-settings h3 { margin: 1.1rem 0 0.4rem; }
+/* Settings → Backup */
+.backup-card { border: 1px solid var(--line); border-radius: 12px; padding: 0.8rem 1rem; margin: 0.8rem 0 1rem; display: grid; gap: 0.35rem; }
+.backup-card p { margin: 0; overflow-wrap: anywhere; }
+.backup-card .link-button, .backup-password .link-button { display: inline; min-height: 0; padding: 0; text-align: left; white-space: normal; overflow-wrap: anywhere; }
+.backup-headline { font-weight: 600; display: flex; gap: 0.5rem; align-items: baseline; }
+.backup-headline::before { content: ""; flex: 0 0 auto; width: 0.6rem; height: 0.6rem; border-radius: 50%; background: var(--muted); transform: translateY(-0.05rem); }
+.backup-headline.is-good::before { background: #3fb950; }
+.backup-headline.is-warn::before { background: #e8a400; }
+.backup-headline.is-bad::before { background: var(--danger); }
+.backup-actions { justify-content: flex-start; margin-top: 0.4rem; }
+.backup-progress { display: grid; gap: 0.3rem; margin-top: 0.3rem; }
+.backup-bar { height: 0.5rem; border-radius: 999px; background: var(--bg-3); overflow: hidden; }
+.backup-bar > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width 0.4s ease; }
+.backup-current { font-family: var(--mono, ui-monospace, monospace); font-size: 0.78rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.backup-command, .backup-secret { display: block; padding: 0.5rem 0.7rem; border-radius: 8px; background: var(--bg-3); font-family: var(--mono, ui-monospace, monospace); font-size: 0.82rem; overflow-wrap: anywhere; user-select: all; }
+.backup-secret { font-size: 1.05rem; letter-spacing: 0.04em; text-align: center; margin: 0.6rem 0; }
+.backup-form h3 { margin: 1.2rem 0 0.4rem; }
+.backup-form h3:first-child { margin-top: 0.4rem; }
+.backup-kinds { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.6rem; }
+.backup-kinds button[aria-checked="true"] { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 16%, var(--bg-2)); color: var(--text); }
+.backup-where { display: grid; gap: 0.6rem; }
+.backup-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: 0.6rem; }
+.backup-hint { display: block; font-size: 0.8rem; margin-top: 0.2rem; font-weight: normal; }
+.backup-ssh { display: grid; gap: 0.4rem; justify-items: start; }
+.backup-ssh p { margin: 0; }
+.backup-when { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.backup-when [hidden] { display: none; }
+.backup-when input[type="time"] { width: auto; }
+.backup-keeps { line-height: 2.2; margin: 0; }
+.backup-keep { width: 4.5rem; display: inline-block; padding-block: 0.2rem; }
+.backup-form textarea { font-family: var(--mono, ui-monospace, monospace); font-size: 0.85rem; }
+.backup-snapshots { margin-top: 1.4rem; padding-top: 1rem; border-top: 1px solid var(--line); }
+.backup-snapshots-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
+.backup-snapshots h3 { margin: 0 0 0.4rem; }
+.backup-snapshot-list, .backup-browse { list-style: none; margin: 0.4rem 0 0; padding: 0; display: grid; gap: 0.15rem; }
+.backup-snapshot-list li { display: flex; align-items: center; justify-content: space-between; gap: 0.8rem; padding: 0.35rem 0.5rem; border-radius: 8px; }
+.backup-snapshot-list li:hover { background: color-mix(in srgb, var(--text) 6%, transparent); }
+.backup-restore-dialog, .backup-password-dialog { width: min(34rem, calc(100vw - 2rem)); }
+.backup-restore-dialog h3, .backup-password-dialog h3 { margin-top: 0; }
+.backup-crumbs { font-size: 0.9rem; margin-bottom: 0.4rem; overflow-wrap: anywhere; }
+.backup-browse { max-height: min(50vh, 24rem); overflow: auto; border: 1px solid var(--line); border-radius: 8px; padding: 0.3rem; }
+.backup-browse li { padding: 0.15rem 0.3rem; }
+.backup-dir { width: 100%; text-align: left; justify-content: flex-start; border: 0; background: transparent; box-shadow: none; min-height: 0; padding: 0.3rem 0.4rem; }
+.backup-dir:hover { background: color-mix(in srgb, var(--text) 8%, transparent); }
+.backup-file { display: flex; justify-content: space-between; gap: 1rem; padding: 0.3rem 0.4rem !important; font-size: 0.9rem; }
 .health-settings h3:first-child { margin-top: 0.2rem; }
 .health-list { display: grid; gap: 0.5rem; }
 .health-item { border: 1px solid var(--line); border-radius: 10px; padding: 0.55rem 0.75rem; display: grid; gap: 0.3rem; }

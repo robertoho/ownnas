@@ -28,6 +28,7 @@ mod smart;
 mod ml;
 mod http;
 mod mail;
+mod nas_backup;
 mod map_tiles;
 mod pdf_ops;
 mod photo_details;
@@ -328,6 +329,7 @@ fn serve(args: ServeArgs) -> Result<(), String> {
     app_state.https = args.tls_cert.is_some();
     let state = Arc::new(app_state);
     state.start_media_index();
+    state.nas_backup.start_scheduler(state.root.clone(), state.data_dir(), state.db_path.clone());
     {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
         let count = db::count_users(&conn)?;

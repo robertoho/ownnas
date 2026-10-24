@@ -67,6 +67,7 @@ const OCCT_WASM: &[u8] = include_bytes!("../web/vendor/occt/occt-import-js.wasm"
 const TERMINAL_HTML: &str = include_str!("../web/terminal.html");
 const TERMINAL_JS: &str = include_str!("../web/terminal.js");
 const TERMINAL_PANEL_JS: &str = include_str!("../web/terminal-panel.js");
+const NAS_BACKUP_JS: &str = include_str!("../web/nas-backup.js");
 const TERMINAL_CSS: &str = include_str!("../web/terminal.css");
 const XTERM_JS: &str = include_str!("../web/vendor/xterm/xterm.mjs");
 const XTERM_FIT_JS: &str = include_str!("../web/vendor/xterm/addon-fit.mjs");
@@ -114,9 +115,16 @@ pub struct AppState {
     #[cfg(ownnas_ml)]
     pub models: std::sync::Arc<crate::ml::Models>,
     pub db_path: PathBuf,
+    /// Backups of the library and OwnNAS's data, with restic.
+    pub nas_backup: std::sync::Arc<crate::nas_backup::NasBackup>,
 }
 
 impl AppState {
+    /// OwnNAS's data folder: the database, caches, and file history.
+    pub fn data_dir(&self) -> PathBuf {
+        self.db_path.parent().map(std::path::Path::to_path_buf).unwrap_or_default()
+    }
+
     /// Starts indexing the library's photos and videos for the Gallery timeline.
     pub fn start_media_index(&self) {
         let speed = setting(self, crate::media_index::SETTING_SPEED)
@@ -204,6 +212,7 @@ pub fn new_state(
         #[cfg(ownnas_ml)]
         models: std::sync::Arc::new(crate::ml::Models::new(&data_dir)),
         db_path,
+        nas_backup: std::sync::Arc::default(),
     })
 }
 
@@ -363,6 +372,16 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/backup/upload", post(backup_upload).layer(DefaultBodyLimit::disable()))
         .route("/api/backup/has", get(backup_has))
         .route("/api/images/resize", post(resize_images))
+        .route("/api/nas-backup", get(nas_backup_status))
+        .route("/api/nas-backup/config", post(set_nas_backup_config))
+        .route("/api/nas-backup/password", post(reveal_nas_backup_password))
+        .route("/api/nas-backup/run", post(run_nas_backup))
+        .route("/api/nas-backup/verify", post(verify_nas_backup))
+        .route("/api/nas-backup/stop", post(stop_nas_backup))
+        .route("/api/nas-backup/snapshots", get(nas_backup_snapshots))
+        .route("/api/nas-backup/browse", get(browse_nas_backup))
+        .route("/api/nas-backup/restore", post(restore_nas_backup))
+        .route("/api/nas-backup/ssh-key", post(create_nas_backup_ssh_key))
         .route("/api/storage", get(storage_status))
         .route("/api/storage/measure", post(measure_storage))
         .route("/api/index", get(index_status))
@@ -403,6 +422,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/terminal", get(terminal_page))
         .route("/assets/terminal.js", get(terminal_javascript))
         .route("/assets/terminal-panel.js", get(terminal_panel_javascript))
+        .route("/assets/nas-backup.js", get(nas_backup_javascript))
         .route("/assets/terminal.css", get(terminal_css))
         .route("/assets/vendor/xterm/xterm.mjs", get(xterm_module))
         .route("/assets/vendor/xterm/addon-fit.mjs", get(xterm_fit_module))
@@ -969,6 +989,10 @@ async fn odt_editor_javascript() -> impl IntoResponse {
 
 async fn xlsx_editor_javascript() -> impl IntoResponse {
     app_module_javascript(XLSX_EDITOR_JS)
+}
+
+async fn nas_backup_javascript() -> impl IntoResponse {
+    app_module_javascript(NAS_BACKUP_JS)
 }
 
 async fn sqlite_viewer_javascript() -> impl IntoResponse {
@@ -5092,19 +5116,7 @@ async fn set_terminal_config(
         return Err(ApiError::new(StatusCode::FORBIDDEN, "Terminals are not available on this server"));
     }
     // A stolen session cookie must not be enough to turn on a shell or change its password.
-    let gate_key = format!("terminal-settings:{}", user.username);
-    {
-        let mut gate = state.attempts.lock().unwrap_or_else(|err| err.into_inner());
-        if !login_allowed(&mut gate, &gate_key) {
-            return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Too many attempts. Wait a few minutes and try again."));
-        }
-    }
-    if !auth::verify_password(&body.account_password, &user.password_hash) {
-        let mut gate = state.attempts.lock().unwrap_or_else(|err| err.into_inner());
-        login_failed(&mut gate, &gate_key);
-        return Err(ApiError::new(StatusCode::FORBIDDEN, "Your account password is not correct"));
-    }
-    login_succeeded(&mut state.attempts.lock().unwrap_or_else(|err| err.into_inner()), &gate_key);
+    confirm_account_password(&state, &user, &body.account_password, "terminal-settings")?;
     let password_hash = match body.password.as_deref() {
         Some("") => Some(None),
         Some(password) => {
@@ -6251,6 +6263,357 @@ async fn cancel_video_job(State(state): State<std::sync::Arc<AppState>>, headers
     Ok(Json(json!({ "ok": true })))
 }
 
+// ---- Backups of the NAS (restic) ----
+
+fn nas_backup_context(state: &AppState) -> Result<crate::nas_backup::Context, ApiError> {
+    let restic = crate::nas_backup::find_restic()
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "restic is not installed on this computer"))?;
+    let config = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::nas_backup::load_config(&conn)
+    };
+    let secrets = crate::nas_backup::load_secrets(&state.data_dir());
+    if config.destination.kind.is_empty() || secrets.password.is_empty() {
+        return Err(ApiError::new(StatusCode::CONFLICT, "Choose where backups go first"));
+    }
+    Ok(crate::nas_backup::Context { restic, root: state.root.clone(), data: state.data_dir(), db_path: state.db_path.clone(), config, secrets })
+}
+
+async fn nas_backup_status(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let (config, backup) = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        (crate::nas_backup::load_config(&conn), crate::nas_backup::load_state(&conn))
+    };
+    let data = state.data_dir();
+    let secrets = crate::nas_backup::load_secrets(&data);
+    let restic = tokio::task::spawn_blocking(|| {
+        let path = crate::nas_backup::find_restic();
+        let version = path.as_deref().and_then(crate::nas_backup::version);
+        (path, version)
+    })
+    .await
+    .unwrap_or((None, None));
+    let now = db::now_secs();
+    let install = if cfg!(target_os = "macos") { "brew install restic" } else if cfg!(windows) { "winget install restic.restic" } else { "sudo apt install restic" };
+    Ok(Json(json!({
+        "restic": {
+            "found": restic.0.is_some(),
+            "path": restic.0.map(|p| p.display().to_string()),
+            "version": restic.1.map(|(a, b, c)| format!("{a}.{b}.{c}")),
+            "newEnough": restic.1.is_some_and(crate::nas_backup::new_enough),
+            "install": install,
+        },
+        "config": config,
+        "where": crate::nas_backup::describe(&config.destination),
+        "configured": !config.destination.kind.is_empty() && !secrets.password.is_empty(),
+        "passwordSet": !secrets.password.is_empty(),
+        "s3SecretSet": !secrets.s3_secret.is_empty(),
+        "state": backup,
+        "progress": state.nas_backup.progress(),
+        "next": if config.enabled { crate::nas_backup::next_slot(&config, now) } else { None },
+        "alert": crate::nas_backup::alert(&config, &backup, now),
+        "sshKey": crate::nas_backup::ssh_public_key(),
+        "library": state.root.display().to_string(),
+        "dataDir": data.display().to_string(),
+        "restoreFolder": crate::nas_backup::RESTORE_FOLDER,
+        // Schedules follow this computer's clock; the page says so when the browser's differs.
+        "serverOffset": chrono::Local::now().offset().local_minus_utc() / 60,
+    })))
+}
+
+/// Asks for the admin's own password again before a setting that a stolen session must not
+/// be able to change (where backups go, terminals).
+fn confirm_account_password(state: &AppState, user: &User, password: &str, scope: &str) -> Result<(), ApiError> {
+    let gate_key = format!("{scope}:{}", user.username);
+    {
+        let mut gate = state.attempts.lock().unwrap_or_else(|err| err.into_inner());
+        if !login_allowed(&mut gate, &gate_key) {
+            return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Too many attempts. Wait a few minutes and try again."));
+        }
+    }
+    if !auth::verify_password(password, &user.password_hash) {
+        let mut gate = state.attempts.lock().unwrap_or_else(|err| err.into_inner());
+        login_failed(&mut gate, &gate_key);
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "Your account password is not correct"));
+    }
+    login_succeeded(&mut state.attempts.lock().unwrap_or_else(|err| err.into_inner()), &gate_key);
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NasBackupConfigBody {
+    #[serde(default)]
+    account_password: String,
+    config: crate::nas_backup::Config,
+    /// The password of a backup made before (otherwise one is made up).
+    password: Option<String>,
+    s3_secret: Option<String>,
+}
+
+async fn set_nas_backup_config(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<NasBackupConfigBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let data = state.data_dir();
+    let old = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::nas_backup::load_config(&conn)
+    };
+    let mut config = body.config;
+    config.destination = crate::nas_backup::validate(&config.destination, &state.root, &data).map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    if !matches!(config.frequency.as_str(), "daily" | "weekly" | "manual") {
+        config.frequency = "daily".into();
+    }
+    config.minute = config.minute.min(24 * 60 - 1);
+    config.weekday %= 7;
+    config.keep_daily = config.keep_daily.min(1000);
+    config.keep_weekly = config.keep_weekly.min(1000);
+    config.keep_monthly = config.keep_monthly.min(1000);
+    config.excludes = config.excludes.iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).take(200).collect();
+    let password = body.password.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
+    let s3_secret = body.s3_secret.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    // Where backups go, and their keys, decide who can read the whole library.
+    let sensitive = config.destination != old.destination || password.is_some() || s3_secret.is_some() || (config.enabled && !old.enabled);
+    if sensitive {
+        confirm_account_password(&state, &user, &body.account_password, "backup-settings")?;
+    }
+    let mut secrets = crate::nas_backup::load_secrets(&data);
+    let s3_changed = s3_secret.is_some();
+    if let Some(secret) = s3_secret {
+        secrets.s3_secret = secret;
+    }
+    if config.destination.kind == "s3" && secrets.s3_secret.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Enter the secret access key"));
+    }
+    let mut new_password = None;
+    if let Some(password) = &password {
+        secrets.password = password.clone();
+    } else if secrets.password.is_empty() {
+        secrets.password = crate::nas_backup::new_password();
+        new_password = Some(secrets.password.clone());
+    }
+    let schedule_changed = config.enabled != old.enabled || config.frequency != old.frequency || config.minute != old.minute || config.weekday != old.weekday;
+    config.saved_at = if schedule_changed || old.saved_at == 0 { db::now_secs() } else { old.saved_at };
+    crate::nas_backup::save_secrets(&data, &secrets).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::nas_backup::save_config(&conn, &config).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    }
+    record(&state, &user, "backup-settings", &crate::nas_backup::describe(&config.destination));
+    // A new destination or password is tried at once, so a mistake shows now and not tonight.
+    let mut connected = json!(null);
+    if config.destination != old.destination || password.is_some() || new_password.is_some() || s3_changed {
+        let ctx = nas_backup_context(&state)?;
+        let worker = state.nas_backup.clone();
+        connected = match tokio::task::spawn_blocking(move || worker.test(&ctx)).await {
+            Ok(Ok(created)) => json!({ "ok": true, "created": created }),
+            Ok(Err(err)) => json!({ "ok": false, "error": err }),
+            Err(_) => json!({ "ok": false, "error": "Could not try the destination" }),
+        };
+    }
+    Ok(Json(json!({ "saved": true, "connected": connected, "newPassword": new_password })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountPasswordBody {
+    #[serde(default)]
+    account_password: String,
+}
+
+async fn reveal_nas_backup_password(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AccountPasswordBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    confirm_account_password(&state, &user, &body.account_password, "backup-settings")?;
+    record(&state, &user, "backup-password-shown", "");
+    Ok(Json(json!({ "password": crate::nas_backup::load_secrets(&state.data_dir()).password })))
+}
+
+/// Starts a backup (or a check of the backup) in the background.
+async fn start_nas_backup(state: std::sync::Arc<AppState>, headers: HeaderMap, verify: bool) -> Result<Json<serde_json::Value>, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let ctx = nas_backup_context(&state)?;
+    if let Some(running) = state.nas_backup.progress() {
+        return Err(ApiError::new(StatusCode::CONFLICT, format!("A {} is already running", running.action)));
+    }
+    let worker = state.nas_backup.clone();
+    let db_path = state.db_path.clone();
+    std::thread::spawn(move || {
+        let Ok(conn) = db::open(&db_path) else { return };
+        let _ = if verify { worker.verify(&ctx, &conn, "5%") } else { worker.backup(&ctx, &conn).map(|_| ()) };
+    });
+    // Let the worker claim itself, so the page sees it running.
+    for _ in 0..20 {
+        if state.nas_backup.busy() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    record(&state, &user, if verify { "backup-verify" } else { "backup-run" }, "");
+    Ok(Json(json!({ "started": true, "progress": state.nas_backup.progress() })))
+}
+
+async fn run_nas_backup(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    start_nas_backup(state, headers, false).await
+}
+
+async fn verify_nas_backup(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    start_nas_backup(state, headers, true).await
+}
+
+async fn stop_nas_backup(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    state.nas_backup.stop();
+    Ok(Json(json!({ "stopping": true })))
+}
+
+#[derive(Deserialize)]
+struct SnapshotsQuery {
+    fresh: Option<String>,
+}
+
+async fn nas_backup_snapshots(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<SnapshotsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let ctx = nas_backup_context(&state)?;
+    let worker = state.nas_backup.clone();
+    let fresh = query.fresh.is_some();
+    let snapshots = tokio::task::spawn_blocking(move || worker.snapshots(&ctx, fresh))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not list the snapshots"))?
+        .map_err(|err| ApiError::new(StatusCode::BAD_GATEWAY, err))?;
+    Ok(Json(json!({ "snapshots": snapshots })))
+}
+
+/// Where a snapshot's library was, from the list of snapshots.
+fn snapshot_library(state: &AppState, ctx: &crate::nas_backup::Context, id: &str) -> Result<String, ApiError> {
+    let list = state.nas_backup.snapshots(ctx, false).map_err(|err| ApiError::new(StatusCode::BAD_GATEWAY, err))?;
+    list.iter()
+        .find(|s| s.id == id || s.short_id == id)
+        .and_then(|s| s.library.clone())
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That snapshot is not in the backup any more"))
+}
+
+#[derive(Deserialize)]
+struct BrowseBackupQuery {
+    snapshot: String,
+    #[serde(default)]
+    path: String,
+}
+
+async fn browse_nas_backup(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<BrowseBackupQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let ctx = nas_backup_context(&state)?;
+    let worker = state.clone();
+    let entries = tokio::task::spawn_blocking(move || {
+        let library = snapshot_library(&worker, &ctx, &query.snapshot)?;
+        worker.nas_backup.browse(&ctx, &query.snapshot, &library, &query.path).map_err(|err| ApiError::new(StatusCode::BAD_GATEWAY, err))
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not look inside the snapshot"))??;
+    Ok(Json(json!({ "entries": entries })))
+}
+
+#[derive(Deserialize)]
+struct RestoreBackupBody {
+    snapshot: String,
+    #[serde(default)]
+    path: String,
+}
+
+/// Restores a folder of a snapshot into a new folder of the library; nothing is overwritten.
+async fn restore_nas_backup(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<RestoreBackupBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    require_write(&state)?;
+    let ctx = nas_backup_context(&state)?;
+    if let Some(running) = state.nas_backup.progress() {
+        return Err(ApiError::new(StatusCode::CONFLICT, format!("A {} is already running", running.action)));
+    }
+    let lookup = state.clone();
+    let lookup_ctx = ctx.clone();
+    let id = body.snapshot.clone();
+    let (library, time) = tokio::task::spawn_blocking(move || {
+        let library = snapshot_library(&lookup, &lookup_ctx, &id)?;
+        let time = lookup.nas_backup.snapshots(&lookup_ctx, false).ok().and_then(|list| list.into_iter().find(|s| s.id == id).map(|s| s.time)).unwrap_or_default();
+        Ok::<_, ApiError>((library, time))
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not restore"))??;
+    // "Restored from backup/2026-10-24 03.00 Docs"
+    let when: String = time.chars().take(16).collect::<String>().replace('T', " ").replace(':', ".");
+    let name = body.path.trim_matches('/').rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("Library").to_string();
+    let base = format!("{when} {name}").trim().to_string();
+    let parent = state.root.join(crate::nas_backup::RESTORE_FOLDER);
+    let mut folder = base.clone();
+    let mut n = 2;
+    while parent.join(&folder).exists() {
+        folder = format!("{base} ({n})");
+        n += 1;
+    }
+    std::fs::create_dir_all(&parent).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not create the folder to restore into"))?;
+    let target = parent.join(&folder);
+    let shown = format!("{}/{folder}", crate::nas_backup::RESTORE_FOLDER);
+    let worker = state.nas_backup.clone();
+    let db_path = state.db_path.clone();
+    let snapshot = body.snapshot.clone();
+    let rel = body.path.clone();
+    let shown_as = shown.clone();
+    std::thread::spawn(move || {
+        let Ok(conn) = db::open(&db_path) else { return };
+        let _ = worker.restore(&ctx, &conn, &snapshot, &library, &rel, &target, &shown_as);
+    });
+    for _ in 0..20 {
+        if state.nas_backup.busy() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    record(&state, &user, "backup-restore", &format!("{} {} → {shown}", body.snapshot.chars().take(8).collect::<String>(), body.path));
+    Ok(Json(json!({ "started": true, "to": shown })))
+}
+
+async fn create_nas_backup_ssh_key(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let key = tokio::task::spawn_blocking(crate::nas_backup::create_ssh_key)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not make an SSH key"))?
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(Json(json!({ "sshKey": key })))
+}
+
 /// The library's disk (size, used, free) and what the library, its Trash, and OwnNAS's own data
 /// take. Starts measuring again when the last measurement is old.
 async fn storage_status(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
@@ -6307,7 +6670,8 @@ async fn health_report(
 /// What needs attention now: a disk OwnNAS uses nearly full, or a drive reporting trouble (as
 /// last asked; this never asks the drives itself).
 async fn health_alerts(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    let is_admin = user.is_admin;
     let worker = state.clone();
     let alerts = tokio::task::spawn_blocking(move || {
         let data = worker.db_path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
@@ -6322,6 +6686,14 @@ async fn health_alerts(State(state): State<std::sync::Arc<AppState>>, headers: H
         let (drives, _) = worker.health.drives(false);
         for drive in drives.into_iter().filter(|drive| drive.healthy == Some(false) || !drive.warnings.is_empty()) {
             alerts.push(json!({ "level": if drive.healthy == Some(false) { "full" } else { "low" }, "kind": "drive", "name": drive.name, "model": drive.model, "status": drive.status, "warnings": drive.warnings }));
+        }
+        let (config, backup) = {
+            let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
+            (crate::nas_backup::load_config(&conn), crate::nas_backup::load_state(&conn))
+        };
+        // Only administrators can do something about backups.
+        if is_admin {
+            alerts.extend(crate::nas_backup::alert(&config, &backup, db::now_secs()));
         }
         alerts
     })

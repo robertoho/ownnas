@@ -274,6 +274,9 @@ ownnas-data/
   text-cache/
     <aa>/
       <sha256>.txt   # cached PDF text / OCR for content search
+  backup-secrets.json  # the backup's password and S3 secret key (never backed up)
+  backup-cache/      # restic's cache of the backup's index
+  backup-staging/    # the copy of ownnas.db made for each backup
 ```
 
 Inside `--root` (managed by OwnNAS):
@@ -305,6 +308,10 @@ The first account created on a server is an **administrator**. Admins can:
 - **Check / install updates** (Settings → Updates) when `--update-url` is set
 
 Existing databases are upgraded automatically: if no admin exists, the oldest account is promoted.
+
+### Backup (administrators only)
+
+Backs up the library and OwnNAS's data with restic to a drive, an S3-compatible bucket, or another computer over SFTP. Choose where, when (daily, weekly, or by hand), and how many daily, weekly, and monthly snapshots to keep. The page shows the last backup, the next one, and how much the backup takes at the destination, and lets you restore a folder from any snapshot into `Restored from backup/` in the library. Saving a new destination or password asks for your account password and tries the destination at once. See [Backups in the README](README.md#backups).
 
 ### Updates (self-hosted)
 

@@ -9,6 +9,7 @@ OwnNAS is a small web server you compile yourself. It shares one folder and its 
 - **Smart photos:** optional search by description, similar photos, and faces grouped into people, all on your own machine.
 - **Terminals in any folder:** open a shell in any folder of the NAS from a browser or phone, with status for coding agents like Claude Code.
 - **Library tools:** duplicate finder, folder sizes, and disk health and temperatures.
+- **Backups:** encrypted, scheduled backups of the library and OwnNAS's data to a USB drive, an S3-compatible bucket, or another computer over SFTP, with restore from any snapshot.
 - **Users:** several accounts, administrators, read-only mode, and an activity log.
 - **Sync and apps:** a two-way folder sync client, and native Android and iPhone apps with the gallery, search, and terminals.
 - **Easy to run:** one binary for Windows, macOS, and Linux, HTTPS, and signed updates.
@@ -244,6 +245,26 @@ Point the task or service at the release binary with absolute paths. Prefer mach
 Thumbnails are small JPEGs (PNG for pictures with transparency) kept in the data folder; the Gallery makes them in the background after each scan, newest photos first, so scrolling does not wait. Video thumbnails use `ffmpeg` when it is on `PATH`. HEIC and AVIF photos (from iPhones, for example) get thumbnails through `sips` on macOS, or `heif-convert` or `ffmpeg` elsewhere. Content search OCR for images uses `tesseract` when it is on `PATH`. Pictures, SVG, PDF, audio, video playback, text, CSV, JSON, zip, and tar (including `.tar.gz`) preview without either.
 
 Put OwnNAS behind HTTPS and pass `--secure-cookie` if you terminate TLS with a reverse proxy. The login is the application boundary; the VPN is the network boundary.
+
+## Backups
+
+**Settings → Backup** (administrators) backs up the library and OwnNAS's own data with [restic](https://restic.net), which needs to be installed (`brew install restic`, `sudo apt install restic`, or `winget install restic.restic`; 0.17 or newer). The data includes the database with users, albums, tags, and settings, and the file history. Thumbnails and caches are left out, because OwnNAS can make them again.
+
+- **Where:** a folder on another drive, an S3-compatible bucket (AWS, Backblaze B2, Cloudflare R2, Wasabi, MinIO…), or another computer over SFTP, signed in with this computer's SSH key. The page shows the key, or makes one.
+- **Encrypted:** OwnNAS makes up a password for the backup and shows it once. Write it down somewhere else: without it the backup cannot be restored, also by you. Settings → Backup shows it again after you enter your account password.
+- **When:** every day or every week at a time you choose, or only when you click Back up now. A backup missed while the computer was off runs when it is back. A failed one is tried again an hour later, up to three times. After the first backup, only what changed is sent.
+- **How long:** one snapshot a day for 7 days, one a week for 4 weeks, and one a month for 12 months by default. Older ones are removed after each backup.
+- **Checked:** once a month OwnNAS reads a sample of the backup back. Check the backup reads 5% on demand.
+- **Restore:** pick a snapshot, open the folder you want, and restore it. It is copied into a new folder, `Restored from backup/<date> <name>`, in the library, so nothing is overwritten.
+- **Warnings:** if a backup fails, or none has worked for two scheduled times in a row, administrators see it in the warning line above the files.
+
+To bring back OwnNAS's database on a new computer, restore it with restic yourself:
+
+```bash
+restic -r <destination> restore latest --include '*/backup-staging/ownnas.db' --target /tmp/restore
+```
+
+It lands in `/tmp/restore` under the path it had, ending in `backup-staging/ownnas.db`. Put it into the new data folder before OwnNAS's first start there. The library restores the same way, or from the page once OwnNAS runs.
 
 ## Updates
 
