@@ -93,10 +93,10 @@ final class WalkthroughTests: XCTestCase {
         if app.buttons["Done"].exists { app.buttons["Done"].tap() } else { app.swipeDown() }
         backTo(row("Docs"))
 
-        // The Gallery, with On this day.
+        // The Gallery (with On this day, when a photo was taken on today's date another year).
         app.navigationBars.buttons["More"].firstMatch.tap()
         app.buttons["Gallery"].tap()
-        waitFor(app.staticTexts["On this day"])
+        waitFor(app.buttons["Photos"])
         sleep(2)
         shot("05-gallery")
 
@@ -159,5 +159,104 @@ final class WalkthroughTests: XCTestCase {
         shot("12-backup")
         app.swipeUp()
         shot("13-backup-recent")
+    }
+
+    /// The server in the Files app: browse to Docs and see notes.md there.
+    func testFilesApp() throws {
+        signIn()
+        waitFor(row("Docs"))
+        let files = XCUIApplication(bundleIdentifier: "com.apple.DocumentsApp")
+        files.launch()
+        // Files comes back where it was left: close what is open and go to Browse's top.
+        for _ in 0..<10 where !files.staticTexts["Locations"].exists {
+            if files.buttons["QLOverlayDoneButtonAccessibilityIdentifier"].firstMatch.exists {
+                files.buttons["QLOverlayDoneButtonAccessibilityIdentifier"].firstMatch.tap()
+            } else if files.buttons["Browse"].firstMatch.exists {
+                files.buttons["Browse"].firstMatch.tap()
+            }
+            sleep(1)
+        }
+        sleep(2)
+        shotOf(files, "14-files-locations")
+        // With one server Files names the location after the app; with several, after each server.
+        let location = files.staticTexts["library"].exists ? files.staticTexts["library"].firstMatch : files.staticTexts["OwnNAS"].firstMatch
+        if !location.waitForExistence(timeout: 10) {
+            shotOf(files, "failed-files")
+            XCTFail("no OwnNAS location in Files:\n\(files.debugDescription)")
+            return
+        }
+        location.tap()
+        // The first time, Files asks to turn the new location on.
+        let turnOn = files.buttons["Turn On"]
+        if turnOn.waitForExistence(timeout: 5) { turnOn.tap() }
+        let docs = files.staticTexts["Docs"].firstMatch
+        if !docs.waitForExistence(timeout: 20) {
+            shotOf(files, "failed-files-library")
+            XCTFail("Docs not listed:\n\(files.debugDescription)")
+            return
+        }
+        shotOf(files, "15-files-library")
+        // The icon opens the folder; the name would start renaming it.
+        docs.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: -3)).tap()
+        let notes = files.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'notes'")).firstMatch
+        if !notes.waitForExistence(timeout: 20) {
+            shotOf(files, "failed-files-docs")
+            XCTFail("notes.md not listed:\n\(files.debugDescription)")
+            return
+        }
+        shotOf(files, "16-files-docs")
+
+        // Open it: Files downloads it through the extension.
+        notes.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: -3)).tap()
+        sleep(4)
+        shotOf(files, "17-files-open")
+        XCTAssertTrue(files.staticTexts.matching(NSPredicate(format: "label CONTAINS 'hello'")).firstMatch.waitForExistence(timeout: 10) || files.textViews.firstMatch.exists, "notes.md did not open")
+        files.buttons["QLOverlayDoneButtonAccessibilityIdentifier"].firstMatch.tap()
+        sleep(2)
+
+        // A new folder, made in Files, on the server.
+        files.buttons["More"].firstMatch.tap()
+        let newFolder = files.buttons["New Folder"].firstMatch
+        if !newFolder.waitForExistence(timeout: 5) {
+            shotOf(files, "failed-files-more")
+            XCTFail("no New Folder:\n\(files.debugDescription)")
+            return
+        }
+        newFolder.tap()
+        sleep(1)
+        files.typeText("From Files\n")
+        XCTAssertTrue(files.staticTexts["From Files"].firstMatch.waitForExistence(timeout: 20), "the new folder did not appear")
+        sleep(2)
+        shotOf(files, "18-files-new-folder")
+
+        // Delete it again: it goes to the server's Trash.
+        files.staticTexts["From Files"].firstMatch.press(forDuration: 1.2)
+        // Files says "Delete Now"; the server still keeps it in its Trash.
+        let delete = files.buttons["Delete Now"].firstMatch
+        if !delete.waitForExistence(timeout: 5) {
+            shotOf(files, "failed-files-menu")
+            XCTFail("no Delete:\n\(files.debugDescription)")
+            return
+        }
+        delete.tap()
+        let confirm = files.buttons.matching(NSPredicate(format: "label == 'Delete' OR label == 'Delete Now'")).firstMatch
+        if confirm.waitForExistence(timeout: 3) { confirm.tap() }
+        let gone = NSPredicate(format: "exists == false")
+        expectation(for: gone, evaluatedWith: files.staticTexts["From Files"].firstMatch)
+        waitForExpectations(timeout: 20)
+
+        // Duplicate notes.md: Files uploads the copy through the extension.
+        notes.press(forDuration: 1.2)
+        let duplicate = files.buttons["Duplicate"].firstMatch
+        XCTAssertTrue(duplicate.waitForExistence(timeout: 5), "no Duplicate")
+        duplicate.tap()
+        XCTAssertTrue(files.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'notes 2'")).firstMatch.waitForExistence(timeout: 20), "no copy")
+        sleep(4)
+        shotOf(files, "19-files-duplicate")
+    }
+
+    private func shotOf(_ other: XCUIApplication, _ name: String) {
+        _ = other
+        shot(name)
     }
 }

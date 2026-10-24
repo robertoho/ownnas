@@ -37,7 +37,16 @@ final class Hub: ObservableObject {
     private var nextList = 0
 
     init() {
+        store.shareWithExtension()
         servers = store.load()
+        syncFiles()
+    }
+
+    /// The servers in the Files app follow the signed-in ones.
+    func syncFiles() {
+        let servers = servers
+        let signedIn = Set(servers.map(\.id).filter { store.token($0) != nil })
+        Task { await FilesDomains.sync(servers, signedIn: signedIn) }
     }
 
     func server(_ id: String) -> SavedServer? { servers.first { $0.id == id } }
@@ -64,6 +73,7 @@ final class Hub: ObservableObject {
             connections[id] = nil
             accounts[id] = nil
             store.setToken(id, nil)
+            syncFiles()
             objectWillChange.send()
             throw ClientError.Unauthorized
         }
@@ -93,6 +103,7 @@ final class Hub: ObservableObject {
         store.setToken(saved.id, token)
         connections[saved.id] = nil
         accounts[saved.id] = account
+        syncFiles()
         return saved
     }
 
@@ -104,6 +115,7 @@ final class Hub: ObservableObject {
         store.save(servers)
         store.setToken(id, nil)
         store.setGalleryWorkspace(id, nil)
+        syncFiles()
         if let server { Task.detached { try? server.signOut() } }
     }
 

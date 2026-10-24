@@ -37,6 +37,14 @@ What works now:
   deleted on the server (which are not sent again unless allowed). It runs when the app opens,
   when new photos appear while it is open, with Back up now, and when iOS gives the app
   background time, which it decides (usually at night while charging).
+- **Files app:** each signed-in server is a location in the iOS Files app (and in other apps'
+  Open and Save dialogs). The first time, Files asks to turn it on. Folders are listed from the
+  server when opened, files download when opened, and new files and folders, edits, renames,
+  moves, and deletions go to the server. "Delete Now" in Files moves to the server's Trash.
+  Thumbnails come from the server. The app and its extension share the server list through an
+  App Group (`OWNNAS_APP_GROUP` in `project.yml`) and the sign-in tokens through a shared
+  Keychain group, so signing in to your own build needs those two capabilities on your team,
+  which automatic signing adds.
 - **Terminals:**
   - For administrators when the server has them on. The list shows what each coding agent is
     doing.
@@ -46,7 +54,6 @@ What works now:
 
 Not yet, compared with Android:
 
-- the Files app integration (a File Provider extension);
 - two-way folder sync;
 - terminal shortcuts.
 

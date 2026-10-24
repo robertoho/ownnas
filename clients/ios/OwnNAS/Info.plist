@@ -34,6 +34,8 @@
 	<string>OwnNAS saves the photos and videos you choose to your library.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>OwnNAS backs up your photos and videos to your OwnNAS server.</string>
+	<key>OwnNASAppGroup</key>
+	<string>$(OWNNAS_APP_GROUP)</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

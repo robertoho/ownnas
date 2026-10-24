@@ -272,6 +272,11 @@ impl Server {
         Ok(self.api.rename(&path, &name)?)
     }
 
+    /// Moves into the folder `dest` (`""` is the top); returns the new path.
+    pub fn move_to(&self, path: String, dest: String) -> Result<String, ClientError> {
+        Ok(self.api.move_to(&path, &dest)?)
+    }
+
     /// Files and folders in `path` and below whose name, tags, or contents (text, PDFs, and
     /// pictures read by OCR) match `words`. `tag:name` finds one tag exactly.
     pub fn search(&self, path: String, words: String) -> Result<Vec<SearchHit>, ClientError> {

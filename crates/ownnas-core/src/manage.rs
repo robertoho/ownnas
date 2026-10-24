@@ -149,6 +149,13 @@ impl Api {
         body.path.ok_or_else(|| ApiError::Other("The server did not say where the item went".into()))
     }
 
+    /// Moves a file or folder into the folder `dest`; returns its new path.
+    pub fn move_to(&self, path: &str, dest: &str) -> Result<String, ApiError> {
+        let response = self.post_json("/api/move", json!({ "path": path, "dest": dest }))?;
+        let body: PathResponse = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
+        body.path.ok_or_else(|| ApiError::Other("The server did not say where the item went".into()))
+    }
+
     /// Moves a file or folder to the server's Trash, or deletes it if it is already there.
     pub fn trash(&self, path: &str) -> Result<(), ApiError> {
         self.request("DELETE", "/api/entry")

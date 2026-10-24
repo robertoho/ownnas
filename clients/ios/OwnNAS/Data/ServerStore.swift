@@ -19,8 +19,12 @@ struct SavedServer: Codable, Identifiable, Hashable {
 }
 
 /// The saved servers (in UserDefaults) and their tokens (in the Keychain, this device only).
+/// Both are shared with the Files app extension: the list through the App Group, the tokens
+/// through the first Keychain group in the entitlements, where items go by default.
 final class ServerStore {
-    private let defaults = UserDefaults.standard
+    /// The App Group shared with the extension (`OwnNASAppGroup` in Info.plist).
+    static let appGroup = Bundle.main.object(forInfoDictionaryKey: "OwnNASAppGroup") as? String
+    private let defaults = ServerStore.appGroup.flatMap { UserDefaults(suiteName: $0) } ?? .standard
     private let listKey = "servers"
     /// Tokens the Keychain refused (an unsigned build): kept for this run only.
     private var unsaved: [String: String] = [:]
@@ -32,6 +36,21 @@ final class ServerStore {
 
     func save(_ servers: [SavedServer]) {
         defaults.set(try? JSONEncoder().encode(servers), forKey: listKey)
+    }
+
+    /// Moves what the app saved before it shared with the extension: the server list into the
+    /// App Group, and the tokens into the shared Keychain group. Once.
+    func shareWithExtension() {
+        guard defaults != .standard, !defaults.bool(forKey: "shared.v1") else { return }
+        let old = UserDefaults.standard
+        for key in old.dictionaryRepresentation().keys where key == listKey || key.hasPrefix("gallery.workspace.") {
+            if defaults.object(forKey: key) == nil { defaults.set(old.object(forKey: key), forKey: key) }
+        }
+        for server in load() {
+            // Saved again without a group, it lands in the default (shared) one.
+            if let token = token(server.id) { setToken(server.id, token) }
+        }
+        defaults.set(true, forKey: "shared.v1")
     }
 
     func token(_ id: String) -> String? {
