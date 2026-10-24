@@ -329,7 +329,7 @@ pub fn ensure_upload_dirs(root: &Path, parent_rel: &str, names: &[String]) -> Re
 /// Returns the relative path of the created file.
 pub fn create_file(root: &Path, parent_rel: &str, name: &str, kind: &str) -> Result<String, FileError> {
     let ext = match kind {
-        "md" | "csv" | "txt" | "json" | "html" | "docx" | "odt" => kind,
+        "md" | "csv" | "txt" | "json" | "html" | "docx" | "odt" | "m3u8" => kind,
         _ => return Err(FileError::Rejected("Unsupported file type")),
     };
     let name = finalize_new_filename(name, ext)?;
@@ -353,6 +353,8 @@ pub fn create_file(root: &Path, parent_rel: &str, name: &str, kind: &str) -> Res
         "csv" => String::new(),
         "txt" => String::new(),
         "json" => "{\n  \n}\n".to_string(),
+        // A playlist (the music player saves its queue as one).
+        "m3u8" => "#EXTM3U\n".to_string(),
         "html" => format!(
             "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <title>{stem}</title>\n</head>\n<body>\n  <h1>{stem}</h1>\n</body>\n</html>\n"
         ),
@@ -402,7 +404,9 @@ pub fn write_text_file(root: &Path, rel: &str, content: &str) -> Result<(), File
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    if kind_of(&name) != "text" {
+    // Playlists are text too (the music player saves its queue as one).
+    let playlist = matches!(extension(&name.to_ascii_lowercase()).as_str(), "m3u" | "m3u8" | "pls" | "xspf");
+    if kind_of(&name) != "text" && !playlist {
         return Err(FileError::Rejected("Only text files can be edited"));
     }
     let parent = target.full.parent().ok_or(FileError::Forbidden)?;

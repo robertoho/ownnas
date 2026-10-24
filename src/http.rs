@@ -68,6 +68,7 @@ const TERMINAL_HTML: &str = include_str!("../web/terminal.html");
 const TERMINAL_JS: &str = include_str!("../web/terminal.js");
 const TERMINAL_PANEL_JS: &str = include_str!("../web/terminal-panel.js");
 const NAS_BACKUP_JS: &str = include_str!("../web/nas-backup.js");
+const MUSIC_JS: &str = include_str!("../web/music.js");
 const TERMINAL_CSS: &str = include_str!("../web/terminal.css");
 const XTERM_JS: &str = include_str!("../web/vendor/xterm/xterm.mjs");
 const XTERM_FIT_JS: &str = include_str!("../web/vendor/xterm/addon-fit.mjs");
@@ -302,6 +303,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/photo/motion/video", get(photo_motion_video))
         .route("/api/audio/info", get(audio_info))
         .route("/api/audio/cover", get(audio_cover))
+        .route("/api/music/folder", get(music_folder))
         .route("/api/video/probe", get(video_probe))
         .route("/api/video/stream", get(video_stream))
         .route("/api/subtitles", get(subtitles))
@@ -423,6 +425,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/assets/terminal.js", get(terminal_javascript))
         .route("/assets/terminal-panel.js", get(terminal_panel_javascript))
         .route("/assets/nas-backup.js", get(nas_backup_javascript))
+        .route("/assets/music.js", get(music_javascript))
         .route("/assets/terminal.css", get(terminal_css))
         .route("/assets/vendor/xterm/xterm.mjs", get(xterm_module))
         .route("/assets/vendor/xterm/addon-fit.mjs", get(xterm_fit_module))
@@ -989,6 +992,10 @@ async fn odt_editor_javascript() -> impl IntoResponse {
 
 async fn xlsx_editor_javascript() -> impl IntoResponse {
     app_module_javascript(XLSX_EDITOR_JS)
+}
+
+async fn music_javascript() -> impl IntoResponse {
+    app_module_javascript(MUSIC_JS)
 }
 
 async fn nas_backup_javascript() -> impl IntoResponse {
@@ -3377,6 +3384,22 @@ async fn audio_info(
     // The lyrics file as a library path, for the page to read.
     info.lrc = info.lrc.map(|name| format!("{dir}{name}"));
     Ok(Json(info))
+}
+
+/// Every song in a folder and its subfolders, in album order, for the music player.
+async fn music_folder(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let root = state.root.clone();
+    let rel = rel_of(&query.path);
+    let (songs, truncated) = tokio::task::spawn_blocking(move || crate::music::songs_in(&root, &rel))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not look through the folder"))?
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "songs": songs, "truncated": truncated })))
 }
 
 /// A song's cover picture (its own, or the folder's).

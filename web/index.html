@@ -64,6 +64,13 @@
             </svg>
             <span id="terminals-badge" class="terminals-badge" hidden></span>
           </button>
+          <button id="music-btn" class="icon-btn music-top-btn" type="button" title="Music: the queue, and folders and playlists played lately" aria-label="Music">
+            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+              <path d="M6 12.25V3.5l7-1.5v8.75" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/>
+              <circle cx="4.25" cy="12.25" r="1.75" fill="none" stroke="currentColor" stroke-width="1.35"/>
+              <circle cx="11.25" cy="10.75" r="1.75" fill="none" stroke="currentColor" stroke-width="1.35"/>
+            </svg>
+          </button>
           <button id="gallery-btn" class="icon-btn" type="button" title="Gallery: photos, albums, and tags" aria-label="Gallery">
             <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
               <rect x="1.75" y="2.75" width="12.5" height="10.5" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.35"/>
@@ -266,6 +273,7 @@
       <p id="empty" class="empty" hidden></p>
     </main>
     <section id="gallery" class="gallery" aria-label="Gallery" hidden></section>
+    <div id="music-bar" class="music-bar" role="region" aria-label="Music player" hidden></div>
     <footer class="explorer-status-bar" aria-label="File browser status and tile size">
       <div class="status-summary" role="status" aria-live="polite" aria-atomic="true">
         <span id="folder-summary">0 items</span>

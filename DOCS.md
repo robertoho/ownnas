@@ -134,6 +134,14 @@ Tags appear on the thumbnail as small stacked **color badges** (1–2 letter ini
 
 ---
 
+## Music player
+
+Right-click a folder and choose **Play music** (or **Shuffle music**) to play every song in it and its subfolders, folder by folder, each album in track order ("2 Song" before "10 Song"). **Play music in this folder** is in the menu of the empty space too. A playlist file (`.m3u`, `.m3u8`, `.pls`, `.xspf`) plays with **Play playlist**, the songs in it that are in the library. Right-click songs to **Play** them (one song plays on into the rest of its folder) or **Add to queue**. A playlist's preview has **Play in the music player**.
+
+The music plays in a bar above the status bar while you browse and open other things: the song and its cover, previous, play, next, shuffle, repeat (the queue, or one song), the position, and the volume. Media keys and the lock screen control it too. Another player starting on the page (a video, a preview) pauses it.
+
+The ♪ button at the top opens a panel with the queue (choose a song, or remove one), **Play** and **Shuffle** for the folder you are in, **Save as playlist…**, which writes the queue as an `.m3u8` file in the folder you are in (with paths relative to it, so other players read it too), and the folders and playlists played lately, to play or shuffle again in one click. The queue, the song, and where it was are kept in this browser: after a reload the bar is back, paused.
+
 ## Previews and media playback
 
 Opening a file opens the preview panel. Content streams from `/api/raw?path=…` (download uses `download=1`).

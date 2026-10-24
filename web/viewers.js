@@ -1336,7 +1336,7 @@ export async function mountLyrics(body, entry) {
 }
 
 /// A path in a playlist as a library path, when it is relative to the playlist's folder.
-function libraryTarget(entry, location) {
+export function libraryTarget(entry, location) {
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(location)) return { url: location };
   const clean = location.replace(/\\/g, "/");
   if (/^([a-z]:)?\//i.test(clean)) return { foreign: clean };
@@ -1348,7 +1348,7 @@ function libraryTarget(entry, location) {
   return { path: parts.join("/") };
 }
 
-function parsePlaylist(name, text) {
+export function parsePlaylist(name, text) {
   const items = [];
   if (/\.pls$/i.test(name)) {
     const files = {};
@@ -1376,7 +1376,7 @@ function parsePlaylist(name, text) {
   return items;
 }
 
-export async function mountPlaylist(body, entry, { openPath } = {}) {
+export async function mountPlaylist(body, entry, { openPath, playInPlayer } = {}) {
   const items = parsePlaylist(entry.name, await fetchText(entry)).map((item) => ({ ...item, ...libraryTarget(entry, item.location) }));
   const audio = h("audio", "audio-player-element");
   audio.controls = true;
@@ -1410,10 +1410,15 @@ export async function mountPlaylist(body, entry, { openPath } = {}) {
   playAll.type = "button";
   playAll.disabled = !playable.length;
   playAll.addEventListener("click", () => play(0));
+  // The music player keeps playing while you browse.
+  const inPlayer = h("button", "playlist-play", "Play in the music player");
+  inPlayer.type = "button";
+  inPlayer.hidden = !playInPlayer || !playable.length;
+  inPlayer.addEventListener("click", () => { audio.pause(); playInPlayer(); });
   const foreign = items.filter((i) => i.foreign).length;
   body.replaceChildren(h("div", "subtitle-view",
     h("p", "muted", `${items.length} item${items.length === 1 ? "" : "s"}${foreign ? `, ${foreign} outside the library` : ""}`),
-    h("div", "playlist-tools", playAll), audio, h("ol", "playlist-list", rows)));
+    h("div", "playlist-tools", playAll, inPlayer), audio, h("ol", "playlist-list", rows)));
   return { destroy() { audio.pause(); audio.removeAttribute("src"); audio.load(); } };
 }
 

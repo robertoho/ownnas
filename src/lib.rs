@@ -34,6 +34,7 @@ pub mod smart;
 pub mod ml;
 pub mod http;
 pub mod mail;
+pub mod music;
 pub mod nas_backup;
 pub mod map_tiles;
 pub mod pdf_ops;

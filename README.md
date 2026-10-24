@@ -4,6 +4,7 @@ OwnNAS is a small web server you compile yourself. It shares one folder and its 
 
 - **File browser:** upload, download, move, rename, a Trash, and earlier versions of saved files.
 - **Previews:** photos (RAW, HEIC, Live Photos), video, music, PDFs, Office documents, e-books, 3D models, maps, and more. Text and spreadsheets can be edited in place.
+- **Music player:** play a folder and its subfolders, or a playlist, in a bar that keeps playing while you browse, with a quick panel for the queue and the music played lately.
 - **Search:** file names and the words inside documents and pictures, plus tags and comments.
 - **Photo gallery:** a timeline, nested albums that never move your files, places on a map, and workspaces (Family, Work, a customer…).
 - **Smart photos:** optional search by description, similar photos, and faces grouped into people, all on your own machine.

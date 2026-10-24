@@ -28,6 +28,7 @@ mod smart;
 mod ml;
 mod http;
 mod mail;
+mod music;
 mod nas_backup;
 mod map_tiles;
 mod pdf_ops;

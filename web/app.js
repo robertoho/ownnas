@@ -996,7 +996,35 @@ const MENU_ICONS = {
   changes: "M5 3.5a1.5 1.5 0 1 1 0 .01 M5 12.5a1.5 1.5 0 1 1 0 .01 M11 5.5a1.5 1.5 0 1 1 0 .01 M5 5v6 M11 7a3 3 0 0 1-3 3H5",
   hide: "M2 2l12 12 M6.5 3.7A6.6 6.6 0 0 1 8 3.5c4 0 6.5 4.5 6.5 4.5a11 11 0 0 1-1.7 2.2 M4.2 5.2A11 11 0 0 0 1.5 8s2.5 4.5 6.5 4.5a6 6 0 0 0 2.6-.6",
   close: "M4 4l8 8 M12 4l-8 8",
+  playFolder: "M6 12.25V3.5l7-1.5v8.75 M4.25 10.5a1.75 1.75 0 1 1 0 3.5a1.75 1.75 0 1 1 0-3.5z M11.25 9a1.75 1.75 0 1 1 0 3.5a1.75 1.75 0 1 1 0-3.5z",
+  playSongs: "M5 3.5v9l7.5-4.5z",
+  playPlaylist: "M2.5 4h8 M2.5 8h8 M2.5 12h4 M9.5 10v4.5l3.5-2.25z",
+  shuffleFolder: "M2 4.5h2.5c3 0 4 7 7 7H14 M2 11.5h2.5c1.3 0 2.2-1.3 3-2.8 M9.6 6.3c.7-1 1.4-1.8 2-1.8H14 M12 2.5l2 2-2 2 M12 9.5l2 2-2 2",
+  shufflePlaylist: "M2 4.5h2.5c3 0 4 7 7 7H14 M2 11.5h2.5c1.3 0 2.2-1.3 3-2.8 M9.6 6.3c.7-1 1.4-1.8 2-1.8H14 M12 2.5l2 2-2 2 M12 9.5l2 2-2 2",
+  queueSongs: "M2.5 4h8 M2.5 8h8 M2.5 12h5 M12 9.5v5 M9.5 12h5",
+  queuePlaylist: "M2.5 4h8 M2.5 8h8 M2.5 12h5 M12 9.5v5 M9.5 12h5",
 };
+
+function isPlaylistFile(entry) {
+  return /\.(m3u8?|pls|xspf)$/i.test(entry.name);
+}
+
+/// The music actions of the right-click menu.
+async function playMusic(action, entries) {
+  const player = await music();
+  const one = entries.length === 1 ? entries[0] : null;
+  if (action === "playFolder" || action === "shuffleFolder") {
+    await player.playFolder(one && one.dir ? one.path : state.path, { shuffled: action === "shuffleFolder" });
+  } else if (action === "playSongs") {
+    // One song plays on into the rest of its folder, as a music player would.
+    const songs = entries.length === 1 ? state.entries.filter((entry) => !entry.dir && entry.kind === "audio") : entries;
+    player.playSongs(songs, Math.max(0, songs.findIndex((entry) => entry.path === entries[0].path)));
+  } else if (action === "queueSongs") {
+    player.addToQueue(entries);
+  } else if (one) {
+    await player.playPlaylist(one.path, { shuffled: action === "shufflePlaylist", append: action === "queuePlaylist" });
+  }
+}
 
 function menuIcon(name) {
   const path = MENU_ICONS[name] || "M8 7.25a.75.75 0 1 1 0 1.5a.75.75 0 1 1 0-1.5z";
@@ -1260,6 +1288,7 @@ function openSelectionMenu(x, y, pasteInto) {
     buttons.push(`<button type="button" data-menu="search">Search…</button>`);
     buttons.push(`<button type="button" data-menu="library">Library</button>`);
     buttons.push(`<button type="button" data-menu="gallery">Gallery</button>`);
+    buttons.push(`<button type="button" data-menu="playFolder">Play music in this folder</button>`);
     if (write) {
       buttons.push(`<button type="button" data-menu="bookmark">${bookmarked ? "Remove bookmark" : "Bookmark this folder"}</button>`);
     }
@@ -1282,6 +1311,19 @@ function openSelectionMenu(x, y, pasteInto) {
       buttons.push(`<button type="button" data-menu="terminal">Open terminal here</button>`);
     }
     if (one && one.dir) buttons.push(`<button type="button" data-menu="reindex">Reindex</button>`);
+    if (one && one.dir && !allInTrash) {
+      buttons.push(`<button type="button" data-menu="playFolder">Play music</button>`);
+      buttons.push(`<button type="button" data-menu="shuffleFolder">Shuffle music</button>`);
+    }
+    if (entries.length && entries.every((entry) => !entry.dir && entry.kind === "audio")) {
+      buttons.push(`<button type="button" data-menu="playSongs">Play</button>`);
+      buttons.push(`<button type="button" data-menu="queueSongs">Add to queue</button>`);
+    }
+    if (one && !one.dir && isPlaylistFile(one)) {
+      buttons.push(`<button type="button" data-menu="playPlaylist">Play playlist</button>`);
+      buttons.push(`<button type="button" data-menu="shufflePlaylist">Shuffle playlist</button>`);
+      buttons.push(`<button type="button" data-menu="queuePlaylist">Add to queue</button>`);
+    }
     if (one && !one.dir) buttons.push(`<button type="button" data-menu="versions">Versions…</button>`);
     if (one && canFindSimilar(one)) buttons.push(`<button type="button" data-menu="findSimilar">Find similar photos</button>`);
     if (write && entries.every(customizableFolder)) buttons.push(`<button type="button" data-menu="folderAppearance">${entries.length === 1 ? 'Customize folder…' : 'Customize folders…'}</button>`);
@@ -1905,6 +1947,24 @@ function paintStorage(data) {
 
 let terminalModule = null;
 
+let musicModule = null;
+
+/// Loads the music player on first use.
+async function music() {
+  if (!musicModule) {
+    musicModule = await import("/assets/music.js");
+    musicModule.init({
+      api,
+      toast,
+      askText,
+      currentPath: () => state.path,
+      canWrite: () => !!(state.me && !state.me.readonly),
+      refresh: () => load(state.path).catch(() => {}),
+    });
+  }
+  return musicModule;
+}
+
 let nasBackup = null;
 
 /// Loads Settings → Backup on first use.
@@ -2409,7 +2469,7 @@ async function openEntry(entry) {
   } else if (/\.lrc$/i.test(entry.name)) {
     mountViewer(body, entry, (module) => module.mountLyrics(body, entry), () => openMetaPreview(body, entry));
   } else if (/\.(m3u8?|pls|xspf)$/i.test(entry.name)) {
-    mountViewer(body, entry, (module) => module.mountPlaylist(body, entry, { openPath: (path) => openFileByPath(path) }), () => openMetaPreview(body, entry));
+    mountViewer(body, entry, (module) => module.mountPlaylist(body, entry, { openPath: (path) => openFileByPath(path), playInPlayer: () => music().then((player) => player.playPlaylist(entry.path)).catch((err) => toast(err.message, true)) }), () => openMetaPreview(body, entry));
   } else if (/\.cue$/i.test(entry.name)) {
     mountViewer(body, entry, (module) => module.mountCue(body, entry), () => openMetaPreview(body, entry));
   } else if (/\.torrent$/i.test(entry.name)) {
@@ -4760,6 +4820,10 @@ async function boot() {
     if (!updateStatusTimer) updateStatusTimer = setInterval(pollUpdateNotice, 3 * 60 * 60 * 1000);
   }
   syncControls();
+  // Music from before a reload comes back paused, where it was.
+  let savedMusic = null;
+  try { savedMusic = localStorage.getItem("ownnas-music"); } catch {}
+  if (savedMusic) music().then((player) => player.restore()).catch(() => {});
   refreshSmartStatus().then(syncSimilarButton);
   pollHealthAlerts().catch(() => {});
   if (!healthTimer) healthTimer = setInterval(() => pollHealthAlerts().catch(() => {}), 10 * 60 * 1000);
@@ -4879,6 +4943,7 @@ async function pollHealthAlerts() {
 }
 
 $("health-alert-open").addEventListener("click", () => openSettings(healthAlertTab));
+$("music-btn").addEventListener("click", () => music().then((player) => player.togglePanel()).catch((err) => toast(err.message, true)));
 $("health-alert-close").addEventListener("click", () => {
   $("health-alert").hidden = true;
   try { sessionStorage.setItem("ownnas-health-dismissed", healthAlertKey); } catch {}
@@ -5265,6 +5330,9 @@ function runMenuAction(button, entries, pasteInto) {
   if (action === "search") focusSearch();
   if (action === "library") $("library-btn").click();
   if (action === "gallery") location.hash = "#gallery";
+  if (["playFolder", "shuffleFolder", "playSongs", "queueSongs", "playPlaylist", "shufflePlaylist", "queuePlaylist"].includes(action)) {
+    playMusic(action, entries).catch((err) => toast(err.message, true));
+  }
   if (action === "addToAlbum") gallery().then((api) => api.pickAlbum(entries.map((entry) => entry.path))).catch((err) => toast(err.message, true));
   if (action === "bookmark") $("bookmark-btn").click();
   if (action === "usage") $("usage-btn").click();
