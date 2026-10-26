@@ -111,7 +111,9 @@ pub fn volumes(library: &Path, data: &Path) -> Vec<Volume> {
         if (system_part || tiny) && holds.is_empty() || disk.total_space() == 0 {
             continue;
         }
-        let (total, free) = (disk.total_space(), disk.available_space());
+        // Asked the same way as the status bar: on macOS, `available_space` also counts what the
+        // system could purge (local snapshots, caches), which is not there to write to now.
+        let (total, free) = crate::storage::disk(&mount).map_or((disk.total_space(), disk.available_space()), |own| (own.total, own.available));
         // The same space mounted twice (as APFS volumes in one container are): keep one.
         if holds.is_empty() && out.iter().any(|seen| seen.total == total && seen.free == free) {
             continue;
