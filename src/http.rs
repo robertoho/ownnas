@@ -176,6 +176,11 @@ pub fn new_state(
 ) -> Result<AppState, String> {
     let db_path = data_dir.join("ownnas.db");
     let conn = db::open(&db_path)?;
+    // Before anything else reads it: a log left large by an earlier run is emptied and cut back.
+    if let Some(before) = db::checkpoint(&db_path).filter(|&before| before > 256 * 1024 * 1024) {
+        println!("Database: emptied a {} MB write-ahead log", before / (1024 * 1024));
+    }
+    db::start_checkpoints(db_path.clone());
     let thumbs = crate::thumbs::prepare_cache(&data_dir.join("thumbs"))?;
     let text_cache = crate::content_index::ensure_cache_dir(&data_dir)?;
     // Pasted files belong to terminals, which do not survive a restart.
@@ -4101,8 +4106,7 @@ fn keeper(state: &AppState, user: &User, reason: &'static str) -> impl Fn(&std::
     let root = state.root.canonicalize().unwrap_or_else(|_| state.root.clone());
     move |full: &std::path::Path| {
         let Some(rel) = full.strip_prefix(&root).ok().map(|rel| rel.to_string_lossy().replace('\\', "/")) else { return };
-        let Ok(conn) = rusqlite::Connection::open(&db_path) else { return };
-        let _ = conn.busy_timeout(Duration::from_secs(10));
+        let Ok(conn) = db::connect(&db_path) else { return };
         crate::versions::keep(&conn, &store, full, &rel, &by, reason);
     }
 }
@@ -6727,10 +6731,7 @@ async fn health_alerts(State(state): State<std::sync::Arc<AppState>>, headers: H
 
 /// A connection for work that may take a while, so it does not hold up the shared one.
 fn own_connection(state: &AppState) -> Result<rusqlite::Connection, ApiError> {
-    let conn = rusqlite::Connection::open(&state.db_path)
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not open the database"))?;
-    let _ = conn.busy_timeout(Duration::from_secs(10));
-    Ok(conn)
+    db::connect(&state.db_path).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not open the database"))
 }
 
 /// The earlier versions of a file, newest first, with how much room all versions take.

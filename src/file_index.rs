@@ -24,8 +24,6 @@ const SETTING_COMPLETE: &str = "file_index_complete";
 const RESCAN_EVERY: Duration = Duration::from_secs(5 * 60);
 /// How long to wait after a change made through OwnNAS, so a burst of uploads is one scan.
 const SETTLE: Duration = Duration::from_secs(3);
-/// Rows written per transaction, so the database is never held for long.
-const BATCH: usize = 500;
 
 /// Photo libraries kept as one package (Apple Photos, Aperture) hold hundreds of thousands of
 /// files of their own. Their own name is indexed, what is inside them is not.
@@ -221,9 +219,7 @@ fn covers(scope: &str, rel: &str) -> bool {
 }
 
 fn open(db_path: &Path) -> Result<Connection, String> {
-    let conn = Connection::open(db_path).map_err(|err| format!("Could not open the database: {err}"))?;
-    conn.busy_timeout(Duration::from_secs(10)).map_err(|err| err.to_string())?;
-    Ok(conn)
+    crate::db::connect(db_path).map_err(|err| format!("Could not open the database: {err}"))
 }
 
 pub fn count(conn: &Connection) -> u64 {
@@ -265,21 +261,19 @@ fn scan(
     let sql = |err: rusqlite::Error| err.to_string();
     let mut queue = VecDeque::from([start.to_string()]);
     let (mut folders, mut read) = (0u64, 0u64);
-    let mut writes = 0usize;
-    // Looks are read-only. Before writing, the transaction starts again holding the write lock,
-    // so it waits its turn (a read turned write would fail at once if another write came first).
+    // One transaction per folder. Looks are read-only; before writing, the transaction starts
+    // again holding the write lock, so it waits its turn (a read turned write would fail at once
+    // if another write came first). None is kept open across folders, nor while resting between
+    // them: an open read stops SQLite from emptying its write-ahead log, which then grows
+    // without end while the other indexes write.
     let mut tx = conn.unchecked_transaction().map_err(sql)?;
-    let mut writing = false;
-    macro_rules! start_writing {
-        () => {
-            if !writing {
+    while let Some(rel) = queue.pop_front() {
+        macro_rules! start_writing {
+            () => {
                 tx.commit().map_err(sql)?;
                 tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate).map_err(sql)?;
-                writing = true;
-            }
-        };
-    }
-    while let Some(rel) = queue.pop_front() {
+            };
+        }
         if stop() {
             tx.commit().map_err(sql)?;
             return Ok(false);
@@ -340,7 +334,6 @@ fn scan(
             for (path, was_dir) in &known {
                 if !present.contains(&(path.as_str(), *was_dir)) {
                     forget(&tx, path)?;
-                    writes += 1;
                 }
             }
             {
@@ -358,7 +351,6 @@ fn scan(
                     stmt.execute(params![entry.rel, rel, name.to_lowercase(), entry.dir, entry.size, mtime, entry.kind]).map_err(sql)?;
                 }
             }
-            writes += found.len();
             // The folder's own row keeps the time it had when read: changed later, it is read again.
             tx.execute(
                 "INSERT INTO file_index(path, parent, name_lower, dir, size, mtime, kind) VALUES(?1, ?2, ?3, 1, 0, ?4, 'folder')
@@ -368,16 +360,12 @@ fn scan(
             .map_err(sql)?;
             queue.extend(found.into_iter().filter(|entry| entry.dir).map(|entry| entry.rel));
         }
-        if writes >= BATCH {
-            tx.commit().map_err(sql)?;
-            tx = conn.unchecked_transaction().map_err(sql)?;
-            writing = false;
-            writes = 0;
-        }
+        tx.commit().map_err(sql)?;
         if folders % 50 == 0 {
             progress(folders, read);
         }
         pace(worked);
+        tx = conn.unchecked_transaction().map_err(sql)?;
     }
     tx.commit().map_err(sql)?;
     progress(folders, read);

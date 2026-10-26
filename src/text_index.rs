@@ -65,8 +65,7 @@ impl TextIndex {
 
     /// Reads `rel` (and what is in it) again, as Reindex asks.
     pub fn reread(&self, db_path: &Path, rel: &str) {
-        if let Ok(conn) = Connection::open(db_path) {
-            let _ = conn.busy_timeout(Duration::from_secs(10));
+        if let Ok(conn) = crate::db::connect(db_path) {
             let _ = conn.execute(
                 "DELETE FROM content_text WHERE ?1 = '' OR path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/'",
                 params![rel],
@@ -85,7 +84,7 @@ impl TextIndex {
         names: Arc<crate::file_index::FileIndex>,
         speed: impl Fn() -> Speed + Send + 'static,
     ) {
-        let available = Connection::open(&db_path).map(|conn| ensure(&conn)).unwrap_or(false);
+        let available = crate::db::connect(&db_path).map(|conn| ensure(&conn)).unwrap_or(false);
         {
             let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());
             status.ocr = ocr;
@@ -113,8 +112,7 @@ impl TextIndex {
     }
 
     fn run(&self, db_path: &Path, root: &Path, cache_dir: &Path, ocr: bool, speed: &dyn Fn() -> Speed) {
-        let result = Connection::open(db_path).map_err(|err| err.to_string()).and_then(|conn| {
-            conn.busy_timeout(Duration::from_secs(10)).map_err(|err| err.to_string())?;
+        let result = crate::db::connect(db_path).map_err(|err| err.to_string()).and_then(|conn| {
             let waiting = count_waiting(&conn, ocr)?;
             {
                 let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());

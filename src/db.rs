@@ -29,10 +29,56 @@ pub fn open(path: &std::path::Path) -> Result<Connection, String> {
         .map_err(|_| "Could not configure SQLite".to_string())?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|_| "Could not enable SQLite WAL mode".to_string())?;
+    tune(&conn).map_err(|_| "Could not configure SQLite".to_string())?;
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(|_| "Could not enable SQLite foreign keys".to_string())?;
     migrate(&conn)?;
     Ok(conn)
+}
+
+/// The size the write-ahead log is cut back to once it has been copied into the database.
+/// Without a limit it stays as large as it ever grew.
+const WAL_LIMIT: i64 = 64 * 1024 * 1024;
+
+/// What every connection to OwnNAS's database is set up with: in WAL mode, `NORMAL` commits
+/// write the log without waiting for the disk each time (a power cut can lose the last commits,
+/// never corrupt the database), and the log is cut back to `WAL_LIMIT` when it is emptied.
+fn tune(conn: &Connection) -> rusqlite::Result<()> {
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "journal_size_limit", WAL_LIMIT)?;
+    Ok(())
+}
+
+/// A further connection to the database (already made by `open`), for background work and
+/// anything slow that should not hold up the shared one.
+pub fn connect(path: &std::path::Path) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
+    tune(&conn)?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(conn)
+}
+
+/// Copies the write-ahead log into the database and empties the log file, if no one is reading
+/// from it. Returns the log's size before, or `None` when it could not be emptied now (it is
+/// then copied as far as it can be, and tried again next time).
+pub fn checkpoint(path: &std::path::Path) -> Option<u64> {
+    let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+    let before = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    let conn = Connection::open(path).ok()?;
+    // Waits briefly for readers, holding up writers meanwhile: keep it short.
+    conn.busy_timeout(std::time::Duration::from_millis(500)).ok()?;
+    let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0)).ok()?;
+    (busy == 0).then_some(before)
+}
+
+/// Empties the write-ahead log every few minutes, so it cannot grow while a long read holds
+/// back SQLite's own checkpoints.
+pub fn start_checkpoints(path: std::path::PathBuf) {
+    let _ = std::thread::Builder::new().name("db-checkpoint".into()).spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(5 * 60));
+        checkpoint(&path);
+    });
 }
 
 fn migrate(conn: &Connection) -> Result<(), String> {

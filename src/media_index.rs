@@ -366,10 +366,7 @@ impl Indexer {
 }
 
 fn open(db_path: &Path) -> Result<Connection, String> {
-    let conn = Connection::open(db_path).map_err(|err| format!("Could not open the database: {err}"))?;
-    conn.busy_timeout(Duration::from_secs(10)).map_err(|err| err.to_string())?;
-    conn.pragma_update(None, "foreign_keys", "ON").map_err(|err| err.to_string())?;
-    Ok(conn)
+    crate::db::connect(db_path).map_err(|err| format!("Could not open the database: {err}"))
 }
 
 pub fn count(conn: &Connection) -> u64 {
