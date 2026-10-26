@@ -157,7 +157,7 @@ Opening a file opens the preview panel. Content streams from `/api/raw?path=…`
 | **DWG drawings** | Recognized as CAD files, but this build does not include a DWG decoder. Export the drawing to DXF in a CAD application to preview it. |
 | **XLSX spreadsheets** | In-browser workbook grid with sheet tabs, cell editing, formulas saved for recalculation by a spreadsheet app, and version-checked save. Protected workbooks open read-only. |
 | **Text / code / CSV / JSON / Markdown** | Fetched via `/api/meta` and rendered (tables, markdown, highlighted text as appropriate). When not readonly, **Edit** opens an in-browser editor (Markdown preview/edit, CSV grid, plain text). Save with the button or Ctrl/Cmd+S (1 MB max). |
-| **Archives (zip/tar/tar.gz)** | Browse folders and entries in the preview panel. Contents are read-only and stay compressed; nothing is extracted. RAR/7z and other unsupported formats can still be downloaded. |
+| **Archives (zip, tar, tar.gz/bz2/xz, 7z, RAR, ISO)** | Browse folders and entries in the preview panel without unpacking. **Extract here** in the preview unpacks the archive into its folder. |
 | **Other** | Meta panel + download. |
 
 ### Can you play videos and sound online?
@@ -249,6 +249,7 @@ Uploads, zip builds, and folder-size counts share a **Background jobs** panel (p
 | Convert image | Context menu on raster images: **Convert to** JPEG / PNG / WebP / GIF / BMP / TIFF (writes a sibling file; original kept). |
 | PDF tools | One PDF → **PDF…**: extract pages (`1,3,5-8` as one file or per page), split all pages, rotate 90/180/270°. Two or more PDFs → **Join PDFs**. Outputs are sibling files; originals kept. |
 | Compress | Context menu on a selection: **Compress to** ZIP / TAR / TAR.GZ / TAR.XZ (archive written beside the items). RAR/7z creation is not supported. |
+| Extract | Context menu on archives (ZIP, TAR, TAR.GZ/BZ2/XZ, 7z, RAR, ISO, and single .gz/.bz2/.xz files): **Extract here**. One file or folder at the top of the archive is put beside it as it is; more go into a new folder named after the archive. Nothing is overwritten (a taken name gets a number). Links, paths leading outside the folder, and macOS's `__MACOSX` / `._` files are left out; unpacking stops before the disk fills. Password-protected archives are not supported. |
 | Rename / Move / Copy / Duplicate | Context menu or preview actions. |
 | Bulk tag | Selection → Tag… chip editor: type a tag and press Enter to add; × removes pending tags. Existing tags on the selection appear with × to mark them for removal. Apply adds/removes across all selected paths. |
 | Rename | Selection → Rename. Edit the name directly, or optionally use `{name}`, `{ext}`, `{n}` / `{nn}` / `{nnn}`, `{parent}` for one or many items. |

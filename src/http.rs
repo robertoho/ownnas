@@ -358,6 +358,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/zip", get(zip_folder))
         .route("/api/download", post(download_selection))
         .route("/api/compress", post(compress_entries))
+        .route("/api/extract", post(extract_archive))
         .route("/api/move", post(move_item))
         .route("/api/undo-move", post(undo_move_item))
         .route("/api/copy", post(copy_item))
@@ -7800,6 +7801,40 @@ async fn compress_entries(
         "compress",
         &format!("{} → {created}", body.format),
     );
+    Ok(Json(json!({ "ok": true, "path": created })))
+}
+
+/// Unpacks an archive into the folder it is in.
+async fn extract_archive(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<PathBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let root = state.root.clone();
+    let requested = body.path;
+    let cancel = files::CancelFlag::new();
+    let _guard = CancelOnDrop(cancel.clone());
+    let created = tokio::task::spawn_blocking(move || -> Result<String, FileError> {
+        let resolved = files::resolve(&root, &requested)?;
+        if resolved.full.is_dir() {
+            return Err(FileError::IsADirectory);
+        }
+        if files::is_under_trash(&resolved.rel) {
+            return Err(FileError::Rejected("Restore the archive from the Trash to unpack it"));
+        }
+        let made = crate::archives::extract(&resolved.full, &cancel)?;
+        let name = made.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let parent = parent_rel_path(&resolved.rel);
+        Ok(if parent.is_empty() { name } else { format!("{parent}/{name}") })
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not unpack the archive"))?
+    .map_err(ApiError::from)?;
+    invalidate_sizes(&state, &parent_rel_path(&created));
+    record(&state, &user, "extract", &created);
     Ok(Json(json!({ "ok": true, "path": created })))
 }
 

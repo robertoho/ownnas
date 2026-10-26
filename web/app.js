@@ -884,6 +884,14 @@ const IMAGE_CONVERT_FORMATS = [
   ["bmp", "BMP"],
   ["tiff", "TIFF"],
 ];
+// What the server can unpack (src/archives.rs `extractable`).
+function isExtractable(entry) {
+  if (!entry || entry.dir) return false;
+  const name = String(entry.name || "").toLowerCase();
+  if (/\.(zip|cbz|tar|tgz|tbz2?|txz|7z|cb7|rar|cbr|iso)$/.test(name)) return true;
+  return /[^.]\.(gz|bz2|xz)$/.test(name);
+}
+
 const COMPRESS_FORMATS = [
   ["zip", "ZIP"],
   ["tar", "TAR"],
@@ -990,6 +998,7 @@ const MENU_ICONS = {
   pdfRotate: ICON_ROTATE,
   compressMenu: ICON_ARCHIVE,
   compress: ICON_ARCHIVE,
+  extract: `${ICON_ARCHIVE} M8 1.5v4 M6.3 3.8 8 5.5l1.7-1.7`,
   rename: ICON_RENAME,
   folder: ICON_FOLDER,
   edited: `${ICON_FILE} M6 8.5h4 M6 11h2.5`,
@@ -1359,6 +1368,9 @@ function openSelectionMenu(x, y, pasteInto) {
     }
     if (write && entries.length && !allInTrash) {
       buttons.push(`<button type="button" class="menu-has-sub" data-menu="compressMenu">Compress to…</button>`);
+    }
+    if (write && entries.length && entries.every(isExtractable) && !allInTrash) {
+      buttons.push(`<button type="button" data-menu="extract">Extract here</button>`);
     }
     if (write && entries.length >= 2 && !allInTrash) {
       buttons.push(`<button type="button" data-menu="folderWith">New folder with selection</button>`);
@@ -3032,6 +3044,19 @@ function mountArchiveBrowser(body, entries, truncated, archivePath) {
   const shell = document.createElement("section"); shell.className = "archive-browser";
   const notice = document.createElement("div"); notice.className = "archive-notice";
   notice.textContent = "Archived contents · read-only · files remain compressed";
+  const archiveName = String(archivePath || "").split("/").pop();
+  if (state.me && !state.me.readonly && isExtractable({ name: archiveName }) && !inTrashPath(archivePath)) {
+    const unpack = document.createElement("button");
+    unpack.type = "button";
+    unpack.className = "archive-extract";
+    unpack.textContent = "Extract here";
+    unpack.title = "Unpack into the folder the archive is in";
+    unpack.addEventListener("click", () => {
+      closePreview();
+      extractEntries([{ name: archiveName, path: archivePath }]);
+    });
+    notice.append(unpack);
+  }
   const breadcrumbs = document.createElement("nav"); breadcrumbs.className = "archive-breadcrumbs"; breadcrumbs.setAttribute("aria-label", "Archive folder path");
   const list = document.createElement("ul"); list.className = "archive-list";
   const footnote = document.createElement("p"); footnote.className = "muted archive-footnote";
@@ -5320,6 +5345,7 @@ function runMenuAction(button, entries, pasteInto) {
   if (action === "resize") resizeImages(entries.map((entry) => entry.path)).catch((err) => toast(err.message, true));
   if (action === "convertVideo") convertVideos(entries.map((entry) => entry.path)).catch((err) => toast(err.message, true));
   if (action === "compress") compressEntries(entries, format).catch((err) => toast(err.message, true));
+  if (action === "extract") extractEntries(entries).catch((err) => toast(err.message, true));
   if (action === "pdfExtract") pdfExtractPages(entries).catch((err) => toast(err.message, true));
   if (action === "pdfSplit") pdfSplitPages(entries).catch((err) => toast(err.message, true));
   if (action === "pdfRotate") pdfRotatePages(entries).catch((err) => toast(err.message, true));
@@ -6260,6 +6286,45 @@ async function compressEntries(entries, format) {
   } finally {
     removeJob(id);
   }
+}
+
+// Unpacks each archive beside itself, one after another.
+async function extractEntries(entries) {
+  const items = (entries || []).filter(isExtractable);
+  if (!items.length) return;
+  const id = `extract-${++jobState.seq}`;
+  const controller = new AbortController();
+  const made = [];
+  const failed = [];
+  let cancelled = false;
+  for (const [index, entry] of items.entries()) {
+    upsertJob(id, {
+      title: "Extract",
+      detail: items.length === 1 ? entry.name : `${entry.name} (${index + 1} of ${items.length})`,
+      percent: null,
+      cancelable: true,
+      onCancel: () => controller.abort(),
+    });
+    try {
+      const data = await api("/api/extract", { method: "POST", json: { path: entry.path }, signal: controller.signal });
+      made.push((data.path || "").split("/").pop());
+    } catch (err) {
+      if (isCancelError(err)) {
+        cancelled = true;
+        break;
+      }
+      failed.push(`${entry.name}: ${err.message}`);
+    }
+  }
+  removeJob(id);
+  if (made.length) {
+    invalidateFolderSizes();
+    await load(state.path);
+  }
+  const done = made.length === 1 ? `Extracted ${made[0]}.` : made.length ? `Extracted ${made.length} archives.` : "";
+  if (failed.length) toast([done, ...failed].filter(Boolean).join(" "), true);
+  else if (cancelled) toast(`${done} Extracting cancelled`.trim());
+  else toast(done.replace(/\.$/, ""));
 }
 
 async function pdfExtractPages(entries) {

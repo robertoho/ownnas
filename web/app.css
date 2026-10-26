@@ -2336,6 +2336,17 @@ input, select, textarea {
   padding-bottom: 0.3rem;
 }
 .archive-browser { padding: 0.5rem; }
+.archive-notice:has(.archive-extract) { display: flex; align-items: center; justify-content: space-between; gap: 0.6rem; }
+.archive-extract {
+  flex: none;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--line));
+  border-radius: 6px;
+  padding: 0.25rem 0.65rem;
+  background: var(--accent);
+  color: var(--accent-ink, #fff);
+  font: inherit;
+  cursor: pointer;
+}
 .archive-notice {
   margin: 0 0 0.7rem;
   border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
