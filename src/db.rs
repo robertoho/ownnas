@@ -42,10 +42,14 @@ const WAL_LIMIT: i64 = 64 * 1024 * 1024;
 
 /// What every connection to OwnNAS's database is set up with: in WAL mode, `NORMAL` commits
 /// write the log without waiting for the disk each time (a power cut can lose the last commits,
-/// never corrupt the database), and the log is cut back to `WAL_LIMIT` when it is emptied.
+/// never corrupt the database), and the log is cut back to `WAL_LIMIT` when it is emptied. A
+/// larger page cache than SQLite's 2 MB keeps the busy parts of a large index in memory, and
+/// sorting for big queries happens in memory rather than in temporary files.
 fn tune(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "journal_size_limit", WAL_LIMIT)?;
+    conn.pragma_update(None, "cache_size", -24_000)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
     Ok(())
 }
 
@@ -73,11 +77,23 @@ pub fn checkpoint(path: &std::path::Path) -> Option<u64> {
 }
 
 /// Empties the write-ahead log every few minutes, so it cannot grow while a long read holds
-/// back SQLite's own checkpoints.
+/// back SQLite's own checkpoints. And now and then brings the statistics SQLite plans queries
+/// with up to date, as the indexes grow (each table sampled, so it stays quick).
 pub fn start_checkpoints(path: std::path::PathBuf) {
-    let _ = std::thread::Builder::new().name("db-checkpoint".into()).spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(5 * 60));
-        checkpoint(&path);
+    let _ = std::thread::Builder::new().name("db-checkpoint".into()).spawn(move || {
+        let optimize = || {
+            if let Ok(conn) = connect(&path) {
+                let _ = conn.execute_batch("PRAGMA analysis_limit = 400; PRAGMA optimize = 0x10002;");
+            }
+        };
+        optimize();
+        for round in 1u64.. {
+            std::thread::sleep(std::time::Duration::from_secs(5 * 60));
+            checkpoint(&path);
+            if round % 12 == 0 {
+                optimize();
+            }
+        }
     });
 }
 
@@ -1042,10 +1058,6 @@ pub fn remove_comment(conn: &Connection, id: i64) -> Result<(), String> {
     Ok(())
 }
 
-fn path_like(prefix: &str) -> String {
-    format!("{prefix}/%")
-}
-
 /// Move tags/comments (and bookmarks/recents) from one path tree to another.
 pub fn rewrite_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), String> {
     if from.is_empty() || from == to {
@@ -1054,54 +1066,53 @@ pub fn rewrite_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), 
     delete_path_meta(conn, to)?;
     conn.execute(
         "UPDATE folder_appearance SET path = CASE WHEN path = ?1 THEN ?2 ELSE ?2 || substr(path, length(?1) + 1) END
-         WHERE path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/'",
+         WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
         params![from, to],
     ).map_err(|_| "Could not move folder appearance".to_string())?;
-    let like = path_like(from);
     let start = (from.len() + 1) as i64;
     conn.execute(
         "UPDATE file_tags SET path = CASE
             WHEN path = ?1 THEN ?2
-            ELSE ?2 || substr(path, ?4)
+            ELSE ?2 || substr(path, ?3)
          END
-         WHERE path = ?1 OR path LIKE ?3",
-        params![from, to, like, start],
+         WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![from, to, start],
     )
     .map_err(|_| "Could not update tags".to_string())?;
     conn.execute(
         "UPDATE file_comments SET path = CASE
             WHEN path = ?1 THEN ?2
-            ELSE ?2 || substr(path, ?4)
+            ELSE ?2 || substr(path, ?3)
          END
-         WHERE path = ?1 OR path LIKE ?3",
-        params![from, to, like, start],
+         WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![from, to, start],
     )
     .map_err(|_| "Could not update comments".to_string())?;
     conn.execute(
         "UPDATE file_fingerprints SET path = CASE
             WHEN path = ?1 THEN ?2
-            ELSE ?2 || substr(path, ?4)
+            ELSE ?2 || substr(path, ?3)
          END
-         WHERE path = ?1 OR path LIKE ?3",
-        params![from, to, like, start],
+         WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![from, to, start],
     )
     .map_err(|_| "Could not update fingerprints".to_string())?;
     conn.execute(
         "UPDATE bookmarks SET path = CASE
             WHEN path = ?1 THEN ?2
-            ELSE ?2 || substr(path, ?4)
+            ELSE ?2 || substr(path, ?3)
          END
-         WHERE path = ?1 OR path LIKE ?3",
-        params![from, to, like, start],
+         WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![from, to, start],
     )
     .map_err(|_| "Could not update bookmarks".to_string())?;
     conn.execute(
         "UPDATE recents SET path = CASE
             WHEN path = ?1 THEN ?2
-            ELSE ?2 || substr(path, ?4)
+            ELSE ?2 || substr(path, ?3)
          END
-         WHERE path = ?1 OR path LIKE ?3",
-        params![from, to, like, start],
+         WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![from, to, start],
     )
     .map_err(|_| "Could not update recent files".to_string())?;
     if let Some((_, name)) = to.rsplit_once('/') {
@@ -1120,7 +1131,7 @@ pub fn rewrite_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), 
         conn.execute(
             &format!(
                 "UPDATE OR REPLACE {table} SET {column} = CASE WHEN {column} = ?1 THEN ?2 ELSE ?2 || substr({column}, length(?1) + 1) END
-                 WHERE {column} = ?1 OR substr({column}, 1, length(?1) + 1) = ?1 || '/'"
+                 WHERE {column} = ?1 OR ({column} >= ?1 || '/' AND {column} < ?1 || '0')"
             ),
             params![from, to],
         )
@@ -1139,48 +1150,47 @@ pub fn copy_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), Str
     conn.execute(
         "INSERT INTO folder_appearance(path, color, icon)
          SELECT CASE WHEN path = ?1 THEN ?2 ELSE ?2 || substr(path, length(?1) + 1) END, color, icon
-         FROM folder_appearance WHERE path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/'
+         FROM folder_appearance WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')
          ON CONFLICT(path) DO UPDATE SET color = excluded.color, icon = excluded.icon",
         params![from, to],
     ).map_err(|_| "Could not copy folder appearance".to_string())?;
-    let like = path_like(from);
     let start = (from.len() + 1) as i64;
     conn.execute(
         "INSERT INTO file_tags(path, tag, created_at)
          SELECT CASE
             WHEN path = ?1 THEN ?2
-            ELSE ?2 || substr(path, ?4)
+            ELSE ?2 || substr(path, ?3)
          END, tag, created_at
          FROM file_tags
-         WHERE path = ?1 OR path LIKE ?3
+         WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')
          ON CONFLICT(path, tag) DO NOTHING",
-        params![from, to, like, start],
+        params![from, to, start],
     )
     .map_err(|_| "Could not copy tags".to_string())?;
     conn.execute(
         "INSERT INTO file_comments(path, user_id, username, body, created_at)
          SELECT CASE
             WHEN path = ?1 THEN ?2
-            ELSE ?2 || substr(path, ?4)
+            ELSE ?2 || substr(path, ?3)
          END, user_id, username, body, created_at
          FROM file_comments
-         WHERE path = ?1 OR path LIKE ?3",
-        params![from, to, like, start],
+         WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![from, to, start],
     )
     .map_err(|_| "Could not copy comments".to_string())?;
     conn.execute(
         "INSERT INTO file_fingerprints(path, size, modified, noted_at)
          SELECT CASE
             WHEN path = ?1 THEN ?2
-            ELSE ?2 || substr(path, ?4)
+            ELSE ?2 || substr(path, ?3)
          END, size, modified, noted_at
          FROM file_fingerprints
-         WHERE path = ?1 OR path LIKE ?3
+         WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')
          ON CONFLICT(path) DO UPDATE SET
             size = excluded.size,
             modified = excluded.modified,
             noted_at = excluded.noted_at",
-        params![from, to, like, start],
+        params![from, to, start],
     )
     .map_err(|_| "Could not copy fingerprints".to_string())?;
     // The copy shows in the timeline right away; it is not added to the original's albums.
@@ -1188,7 +1198,7 @@ pub fn copy_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), Str
         "INSERT OR REPLACE INTO media_index(path, kind, size, mtime, taken_at, date_source, width, height, indexed_at, lat, lon)
          SELECT CASE WHEN path = ?1 THEN ?2 ELSE ?2 || substr(path, length(?1) + 1) END,
                 kind, size, mtime, taken_at, date_source, width, height, indexed_at, lat, lon
-         FROM media_index WHERE path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/'",
+         FROM media_index WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
         params![from, to],
     )
     .map_err(|_| "Could not copy the photo index".to_string())?;
@@ -1390,44 +1400,43 @@ pub fn delete_path_meta(conn: &Connection, path: &str) -> Result<(), String> {
         return Ok(());
     }
     conn.execute(
-        "DELETE FROM folder_appearance WHERE path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/'",
+        "DELETE FROM folder_appearance WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
         params![path],
     ).map_err(|_| "Could not remove folder appearance".to_string())?;
-    let like = path_like(path);
     conn.execute(
-        "DELETE FROM file_tags WHERE path = ?1 OR path LIKE ?2",
-        params![path, like],
+        "DELETE FROM file_tags WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![path],
     )
     .map_err(|_| "Could not remove tags".to_string())?;
     conn.execute(
-        "DELETE FROM file_comments WHERE path = ?1 OR path LIKE ?2",
-        params![path, like],
+        "DELETE FROM file_comments WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![path],
     )
     .map_err(|_| "Could not remove comments".to_string())?;
     conn.execute(
-        "DELETE FROM file_fingerprints WHERE path = ?1 OR path LIKE ?2",
-        params![path, like],
+        "DELETE FROM file_fingerprints WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![path],
     )
     .map_err(|_| "Could not remove fingerprints".to_string())?;
     conn.execute(
-        "DELETE FROM bookmarks WHERE path = ?1 OR path LIKE ?2",
-        params![path, like],
+        "DELETE FROM bookmarks WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![path],
     )
     .map_err(|_| "Could not remove bookmarks".to_string())?;
     conn.execute(
-        "DELETE FROM recents WHERE path = ?1 OR path LIKE ?2",
-        params![path, like],
+        "DELETE FROM recents WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![path],
     )
     .map_err(|_| "Could not remove recent files".to_string())?;
     for (table, column) in [("album_items", "path"), ("media_index", "path"), ("timeline_hidden", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path"), ("file_hashes", "path"), ("content_text", "path"), ("file_versions", "path"), ("workspace_folders", "folder")] {
         conn.execute(
-            &format!("DELETE FROM {table} WHERE {column} = ?1 OR substr({column}, 1, length(?1) + 1) = ?1 || '/'"),
+            &format!("DELETE FROM {table} WHERE {column} = ?1 OR ({column} >= ?1 || '/' AND {column} < ?1 || '0')"),
             params![path],
         )
         .map_err(|_| "Could not remove album entries".to_string())?;
     }
     conn.execute(
-        "UPDATE albums SET cover_path = NULL WHERE cover_path = ?1 OR substr(cover_path, 1, length(?1) + 1) = ?1 || '/'",
+        "UPDATE albums SET cover_path = NULL WHERE cover_path = ?1 OR (cover_path >= ?1 || '/' AND cover_path < ?1 || '0')",
         params![path],
     )
     .map_err(|_| "Could not update album covers".to_string())?;
@@ -1523,10 +1532,9 @@ pub fn invalidate_folder_sizes(conn: &Connection, path: &str) -> Result<(), Stri
             .map_err(|_| "Could not clear folder sizes".to_string())?;
         return Ok(());
     }
-    let like = path_like(path);
     conn.execute(
-        "DELETE FROM folder_sizes WHERE path = ?1 OR path LIKE ?2",
-        params![path, like],
+        "DELETE FROM folder_sizes WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![path],
     )
     .map_err(|_| "Could not clear folder sizes".to_string())?;
     let mut cursor = folder_parent(path);

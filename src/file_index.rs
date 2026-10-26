@@ -379,7 +379,7 @@ fn forget(conn: &Connection, rel: &str) -> Result<(), String> {
         return Ok(());
     }
     conn.execute(
-        "DELETE FROM file_index WHERE path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/'",
+        "DELETE FROM file_index WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
         [rel],
     )
     .map_err(|err| err.to_string())?;
@@ -399,7 +399,7 @@ pub fn search_names(conn: &Connection, rel: &str, query: &str, limit: usize) -> 
         .prepare(
             "SELECT path, dir FROM file_index
              WHERE path != '' AND instr(name_lower, ?1) > 0
-               AND (?2 = '' OR substr(path, 1, length(?2) + 1) = ?2 || '/')
+               AND (?2 = '' OR (path >= ?2 || '/' AND path < ?2 || '0'))
              ORDER BY dir DESC, length(path) - length(replace(path, '/', '')), path
              LIMIT ?3",
         )

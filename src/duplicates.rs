@@ -56,9 +56,9 @@ pub fn find(conn: &Connection, root: &Path, rel: &str, cancel: &CancelFlag) -> R
     let mut stmt = conn
         .prepare(
             "SELECT path, size FROM file_index
-             WHERE dir = 0 AND size > 0 AND (?1 = '' OR substr(path, 1, length(?1) + 1) = ?1 || '/')
+             WHERE dir = 0 AND size > 0 AND (?1 = '' OR (path >= ?1 || '/' AND path < ?1 || '0'))
                AND size IN (SELECT size FROM file_index WHERE dir = 0 AND size > 0
-                            AND (?1 = '' OR substr(path, 1, length(?1) + 1) = ?1 || '/')
+                            AND (?1 = '' OR (path >= ?1 || '/' AND path < ?1 || '0'))
                             GROUP BY size HAVING count(*) > 1)",
         )
         .map_err(|_| FileError::Rejected("Could not read the search index"))?;

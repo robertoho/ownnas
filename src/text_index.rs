@@ -67,7 +67,7 @@ impl TextIndex {
     pub fn reread(&self, db_path: &Path, rel: &str) {
         if let Ok(conn) = crate::db::connect(db_path) {
             let _ = conn.execute(
-                "DELETE FROM content_text WHERE ?1 = '' OR path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/'",
+                "DELETE FROM content_text WHERE ?1 = '' OR path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
                 params![rel],
             );
         }
@@ -285,7 +285,7 @@ pub fn search(conn: &Connection, rel: &str, query: &str, limit: usize) -> Result
         .prepare(
             "SELECT c.path, c.body FROM content_fts x JOIN content_text c ON c.rowid = x.rowid
              WHERE (x.lower GLOB ?1 OR x.compact GLOB ?2)
-               AND (?3 = '' OR substr(c.path, 1, length(?3) + 1) = ?3 || '/')
+               AND (?3 = '' OR (c.path >= ?3 || '/' AND c.path < ?3 || '0'))
              LIMIT ?4",
         )
         .map_err(|err| err.to_string())?;
@@ -322,7 +322,7 @@ pub fn unread(conn: &Connection, rel: &str, kinds: &[&str], limit: usize) -> Vec
     let sql = format!(
         "SELECT f.path FROM file_index f LEFT JOIN content_text c ON c.path = f.path AND c.size = f.size AND c.mtime = f.mtime
          WHERE f.dir = 0 AND f.kind IN ({marks}) AND c.path IS NULL
-           AND (?1 = '' OR substr(f.path, 1, length(?1) + 1) = ?1 || '/')
+           AND (?1 = '' OR (f.path >= ?1 || '/' AND f.path < ?1 || '0'))
          ORDER BY length(f.path) - length(replace(f.path, '/', '')), f.path
          LIMIT ?2"
     );
