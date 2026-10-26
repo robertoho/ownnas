@@ -29,6 +29,8 @@ pub fn open(path: &std::path::Path) -> Result<Connection, String> {
         .map_err(|_| "Could not configure SQLite".to_string())?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|_| "Could not enable SQLite WAL mode".to_string())?;
+    attach_index(&conn, &index_path(path).to_string_lossy())
+        .map_err(|_| format!("Could not open the index database at {}", index_path(path).display()))?;
     tune(&conn).map_err(|_| "Could not configure SQLite".to_string())?;
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(|_| "Could not enable SQLite foreign keys".to_string())?;
@@ -36,21 +38,43 @@ pub fn open(path: &std::path::Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
-/// The size the write-ahead log is cut back to once it has been copied into the database.
-/// Without a limit it stays as large as it ever grew.
+/// The second database file, beside the first: what OwnNAS can build again by reading the
+/// library (the name and photo indexes, the words in files, photo descriptions, hashes, folder
+/// sizes). It takes nearly all the writing, so that can't slow down the rest; it can be deleted
+/// to be rebuilt; and backups leave it out. Connections see its tables as their own (it is
+/// attached as `idx`), so queries need not say where a table is.
+pub const INDEX_FILE: &str = "ownnas-index.db";
+
+/// The tables kept in `INDEX_FILE` (and the full-text table over `content_text`).
+const REBUILDABLE: [&str; 6] = ["file_index", "content_text", "media_index", "image_vectors", "file_hashes", "folder_sizes"];
+
+/// `INDEX_FILE` for OwnNAS's database; "<name>-index.db" for one named otherwise (in tests).
+pub fn index_path(db: &std::path::Path) -> std::path::PathBuf {
+    let stem = db.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    db.with_file_name(format!("{stem}-index.db"))
+}
+
+fn attach_index(conn: &Connection, file: &str) -> rusqlite::Result<()> {
+    conn.execute("ATTACH DATABASE ?1 AS idx", [file])?;
+    conn.query_row("PRAGMA idx.journal_mode = WAL", [], |_| Ok(()))
+}
+
+/// The size the write-ahead logs are cut back to once copied into their database. Without a
+/// limit a log stays as large as it ever grew.
 const WAL_LIMIT: i64 = 64 * 1024 * 1024;
 
-/// What every connection to OwnNAS's database is set up with: in WAL mode, `NORMAL` commits
+/// What every connection to OwnNAS's databases is set up with: in WAL mode, `NORMAL` commits
 /// write the log without waiting for the disk each time (a power cut can lose the last commits,
 /// never corrupt the database), and the log is cut back to `WAL_LIMIT` when it is emptied. A
-/// larger page cache than SQLite's 2 MB keeps the busy parts of a large index in memory, and
+/// larger page cache than SQLite's 2 MB keeps the busy parts of the indexes in memory, and
 /// sorting for big queries happens in memory rather than in temporary files.
 fn tune(conn: &Connection) -> rusqlite::Result<()> {
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.pragma_update(None, "journal_size_limit", WAL_LIMIT)?;
-    conn.pragma_update(None, "cache_size", -24_000)?;
-    conn.pragma_update(None, "temp_store", "MEMORY")?;
-    Ok(())
+    conn.execute_batch(&format!(
+        "PRAGMA main.synchronous = NORMAL; PRAGMA idx.synchronous = NORMAL;
+         PRAGMA main.journal_size_limit = {WAL_LIMIT}; PRAGMA idx.journal_size_limit = {WAL_LIMIT};
+         PRAGMA main.cache_size = -8000; PRAGMA idx.cache_size = -24000;
+         PRAGMA temp_store = MEMORY;"
+    ))
 }
 
 /// A further connection to the database (already made by `open`), for background work and
@@ -58,25 +82,81 @@ fn tune(conn: &Connection) -> rusqlite::Result<()> {
 pub fn connect(path: &std::path::Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.busy_timeout(std::time::Duration::from_secs(10))?;
+    attach_index(&conn, &index_path(path).to_string_lossy())?;
     tune(&conn)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     Ok(conn)
 }
 
-/// Copies the write-ahead log into the database and empties the log file, if no one is reading
-/// from it. Returns the log's size before, or `None` when it could not be emptied now (it is
-/// then copied as far as it can be, and tried again next time).
+/// The files that make up the databases, with their sizes (0 when missing): the database and
+/// its write-ahead log, then the index database and its log.
+pub fn file_sizes(path: &std::path::Path) -> [(std::path::PathBuf, u64); 4] {
+    let index = index_path(path);
+    [path.to_path_buf(), wal_of(path), index.clone(), wal_of(&index)]
+        .map(|file| {
+            let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+            (file, size)
+        })
+}
+
+/// A write-ahead log larger than this is worth a warning: something keeps it from being emptied.
+pub const WAL_WARN: u64 = 1024 * 1024 * 1024;
+
+/// One of the database files, for Settings → Health.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DbFile {
+    /// "data" (`ownnas.db`) or "index" (`INDEX_FILE`).
+    pub role: &'static str,
+    pub name: String,
+    pub size: u64,
+    /// Its write-ahead log.
+    pub wal: u64,
+    /// Space inside the file no longer used, which compacting gives back to the disk.
+    pub unused: u64,
+}
+
+pub fn file_report(conn: &Connection, path: &std::path::Path) -> Vec<DbFile> {
+    let [(data, size), (_, wal), (index, index_size), (_, index_wal)] = file_sizes(path);
+    let unused = |schema: &str| -> u64 {
+        let pages: i64 = conn.query_row(&format!("PRAGMA {schema}.freelist_count"), [], |row| row.get(0)).unwrap_or(0);
+        let page: i64 = conn.query_row(&format!("PRAGMA {schema}.page_size"), [], |row| row.get(0)).unwrap_or(0);
+        (pages * page).max(0) as u64
+    };
+    let name = |file: &std::path::Path| file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    vec![
+        DbFile { role: "data", name: name(&data), size, wal, unused: unused("main") },
+        DbFile { role: "index", name: name(&index), size: index_size, wal: index_wal, unused: unused("idx") },
+    ]
+}
+
+/// Rewrites both databases without their unused space, then empties the logs the rewrite
+/// filled. Needs as much free disk as the larger file, and holds up writing meanwhile.
+pub fn compact(conn: &Connection, path: &std::path::Path) -> Result<(), String> {
+    conn.execute_batch("VACUUM main; VACUUM idx;").map_err(|err| format!("Could not compact the database: {err}"))?;
+    checkpoint(path);
+    Ok(())
+}
+
+fn wal_of(path: &std::path::Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}-wal", path.display()))
+}
+
+/// Copies the write-ahead logs into their databases and empties the log files, if no one is
+/// reading from them. Returns the logs' size before, or `None` when they could not be emptied
+/// now (they are then copied as far as they can be, and tried again next time).
 pub fn checkpoint(path: &std::path::Path) -> Option<u64> {
-    let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
-    let before = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    let [_, (_, wal), _, (_, index_wal)] = file_sizes(path);
     let conn = Connection::open(path).ok()?;
     // Waits briefly for readers, holding up writers meanwhile: keep it short.
     conn.busy_timeout(std::time::Duration::from_millis(500)).ok()?;
+    attach_index(&conn, &index_path(path).to_string_lossy()).ok()?;
+    // With no database named, every attached one is checkpointed; busy if any could not be.
     let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0)).ok()?;
-    (busy == 0).then_some(before)
+    (busy == 0).then_some(wal + index_wal)
 }
 
-/// Empties the write-ahead log every few minutes, so it cannot grow while a long read holds
+/// Empties the write-ahead logs every few minutes, so they cannot grow while a long read holds
 /// back SQLite's own checkpoints. And now and then brings the statistics SQLite plans queries
 /// with up to date, as the indexes grow (each table sampled, so it stays quick).
 pub fn start_checkpoints(path: std::path::PathBuf) {
@@ -87,17 +167,150 @@ pub fn start_checkpoints(path: std::path::PathBuf) {
             }
         };
         optimize();
-        for round in 1u64.. {
+        // Every five minutes, and the statistics every hour.
+        for round in (1..=12).cycle() {
             std::thread::sleep(std::time::Duration::from_secs(5 * 60));
             checkpoint(&path);
-            if round % 12 == 0 {
+            if round == 12 {
                 optimize();
             }
         }
     });
 }
 
+/// Moves the rebuildable tables a database from before `INDEX_FILE` still has into it, with
+/// their rows (the words read from files and photo descriptions take long to make again), then
+/// shrinks the database to what is left. Table by table, each copied before it is dropped: if
+/// stopped part way, the next start begins that table again.
+fn move_to_index(conn: &Connection) -> Result<(), String> {
+    let sql_of = |kind: &str, name: &str| -> Option<String> {
+        conn.query_row("SELECT sql FROM main.sqlite_schema WHERE type = ?1 AND name = ?2", [kind, name], |row| row.get(0)).ok()
+    };
+    let waiting: Vec<&str> = REBUILDABLE.iter().copied().filter(|table| sql_of("table", table).is_some()).collect();
+    let fts = sql_of("table", "content_fts").is_some();
+    if waiting.is_empty() && !fts {
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    println!("Database: moving the search and photo indexes to {INDEX_FILE} (once; this can take a few minutes)…");
+    let fail = |err: rusqlite::Error| format!("Could not move the indexes to {INDEX_FILE}: {err}");
+    for table in waiting {
+        let create = sql_of("table", table).unwrap_or_default();
+        let Some(rest) = create.strip_prefix("CREATE TABLE ") else { continue };
+        let columns: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT name FROM pragma_table_info(?1, 'main')").map_err(fail)?;
+            let names = stmt.query_map([table], |row| row.get::<_, String>(0)).map_err(fail)?;
+            names.filter_map(Result::ok).map(|name| format!("\"{name}\"")).collect()
+        };
+        let indexes: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT sql FROM main.sqlite_schema WHERE type = 'index' AND tbl_name = ?1 AND sql IS NOT NULL")
+                .map_err(fail)?;
+            let found = stmt.query_map([table], |row| row.get::<_, String>(0)).map_err(fail)?;
+            found.filter_map(Result::ok).filter_map(|sql| sql.strip_prefix("CREATE INDEX ").map(|rest| format!("CREATE INDEX idx.{rest};"))).collect()
+        };
+        let columns = columns.join(", ");
+        conn.execute_batch(&format!(
+            "BEGIN;
+             DROP TABLE IF EXISTS idx.{table};
+             CREATE TABLE idx.{rest};
+             INSERT INTO idx.{table}(rowid, {columns}) SELECT rowid, {columns} FROM main.{table};
+             {}
+             DROP TABLE main.{table};
+             COMMIT;",
+            indexes.join("\n")
+        ))
+        .map_err(|err| {
+            let _ = conn.execute_batch("ROLLBACK");
+            fail(err)
+        })?;
+    }
+    if fts {
+        // Built again from its own words, which keeps it in step with `content_text`'s rows.
+        let moved = conn.execute_batch(
+            "BEGIN;
+             DROP TABLE IF EXISTS idx.content_fts;
+             CREATE VIRTUAL TABLE idx.content_fts USING fts5(lower, compact, tokenize = 'trigram');
+             INSERT INTO idx.content_fts(rowid, lower, compact) SELECT rowid, lower, compact FROM main.content_fts;
+             DROP TABLE main.content_fts;
+             COMMIT;",
+        );
+        if moved.is_err() {
+            let _ = conn.execute_batch("ROLLBACK");
+            // Not worth failing for: the words are read again into a new one.
+            let _ = conn.execute_batch("DROP TABLE IF EXISTS main.content_fts; DELETE FROM idx.content_text;");
+        }
+    }
+    // What the tables took is free space in the database file now: give it back to the disk.
+    conn.execute_batch("VACUUM main").map_err(fail)?;
+    println!("Database: indexes moved in {:.0?}", started.elapsed());
+    Ok(())
+}
+
+/// The tables in `INDEX_FILE`.
+fn index_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS idx.file_index (
+            path TEXT PRIMARY KEY,
+            parent TEXT,
+            name_lower TEXT NOT NULL,
+            dir INTEGER NOT NULL,
+            size INTEGER NOT NULL,
+            mtime INTEGER NOT NULL,
+            kind TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx.file_index_parent ON file_index(parent);
+        CREATE TABLE IF NOT EXISTS idx.content_text (
+            path TEXT NOT NULL UNIQUE,
+            size INTEGER NOT NULL,
+            mtime INTEGER NOT NULL,
+            body TEXT NOT NULL,
+            indexed_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS idx.media_index (
+            path TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime INTEGER NOT NULL,
+            taken_at INTEGER NOT NULL,
+            date_source TEXT NOT NULL,
+            width INTEGER,
+            height INTEGER,
+            indexed_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx.media_index_taken ON media_index(taken_at DESC, path DESC);
+        CREATE TABLE IF NOT EXISTS idx.image_vectors (
+            path TEXT PRIMARY KEY,
+            size INTEGER NOT NULL,
+            mtime INTEGER NOT NULL,
+            vector BLOB NOT NULL,
+            indexed_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS idx.file_hashes (
+            path TEXT PRIMARY KEY,
+            size INTEGER NOT NULL,
+            mtime INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            hashed_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS idx.folder_sizes (
+            path TEXT PRIMARY KEY,
+            bytes INTEGER NOT NULL,
+            files INTEGER NOT NULL,
+            truncated INTEGER NOT NULL,
+            max_mtime INTEGER NOT NULL,
+            fingerprint TEXT NOT NULL,
+            scanned_at INTEGER NOT NULL
+        );
+        ",
+    )
+    .map_err(|_| "Could not create the index database's schema".to_string())
+}
+
 fn migrate(conn: &Connection) -> Result<(), String> {
+    move_to_index(conn)?;
+    index_schema(conn)?;
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS users (
@@ -184,25 +397,6 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             PRIMARY KEY (album_id, path)
         );
         CREATE INDEX IF NOT EXISTS album_items_path ON album_items(path);
-        CREATE TABLE IF NOT EXISTS media_index (
-            path TEXT PRIMARY KEY,
-            kind TEXT NOT NULL,
-            size INTEGER NOT NULL,
-            mtime INTEGER NOT NULL,
-            taken_at INTEGER NOT NULL,
-            date_source TEXT NOT NULL,
-            width INTEGER,
-            height INTEGER,
-            indexed_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS media_index_taken ON media_index(taken_at DESC, path DESC);
-        CREATE TABLE IF NOT EXISTS image_vectors (
-            path TEXT PRIMARY KEY,
-            size INTEGER NOT NULL,
-            mtime INTEGER NOT NULL,
-            vector BLOB NOT NULL,
-            indexed_at INTEGER NOT NULL
-        );
         CREATE TABLE IF NOT EXISTS face_scans (
             path TEXT PRIMARY KEY,
             size INTEGER NOT NULL,
@@ -239,13 +433,6 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             hidden_at INTEGER NOT NULL,
             hidden_by TEXT NOT NULL DEFAULT ''
         );
-        CREATE TABLE IF NOT EXISTS file_hashes (
-            path TEXT PRIMARY KEY,
-            size INTEGER NOT NULL,
-            mtime INTEGER NOT NULL,
-            sha256 TEXT NOT NULL,
-            hashed_at INTEGER NOT NULL
-        );
         CREATE TABLE IF NOT EXISTS image_versions (
             sha256 TEXT NOT NULL,
             parent TEXT NOT NULL,
@@ -271,25 +458,6 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             blocked_at INTEGER NOT NULL,
             blocked_by TEXT NOT NULL DEFAULT ''
         );
-        CREATE TABLE IF NOT EXISTS folder_sizes (
-            path TEXT PRIMARY KEY,
-            bytes INTEGER NOT NULL,
-            files INTEGER NOT NULL,
-            truncated INTEGER NOT NULL,
-            max_mtime INTEGER NOT NULL,
-            fingerprint TEXT NOT NULL,
-            scanned_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS file_index (
-            path TEXT PRIMARY KEY,
-            parent TEXT,
-            name_lower TEXT NOT NULL,
-            dir INTEGER NOT NULL,
-            size INTEGER NOT NULL,
-            mtime INTEGER NOT NULL,
-            kind TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS file_index_parent ON file_index(parent);
         CREATE TABLE IF NOT EXISTS file_versions (
             id INTEGER PRIMARY KEY,
             path TEXT NOT NULL,
@@ -313,13 +481,6 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             PRIMARY KEY (workspace_id, folder)
         );
         CREATE INDEX IF NOT EXISTS workspace_folders_folder ON workspace_folders(folder);
-        CREATE TABLE IF NOT EXISTS content_text (
-            path TEXT NOT NULL UNIQUE,
-            size INTEGER NOT NULL,
-            mtime INTEGER NOT NULL,
-            body TEXT NOT NULL,
-            indexed_at INTEGER NOT NULL
-        );
         ",
     )
     .map_err(|_| "Could not create the database schema".to_string())?;
@@ -357,6 +518,12 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         conn.execute("UPDATE media_index SET mtime = -1", [])
             .map_err(|_| "Could not update the photo index".to_string())?;
     }
+    // An index database deleted to be rebuilt: the name index is not complete any more.
+    conn.execute(
+        "DELETE FROM settings WHERE key = ?1 AND NOT EXISTS (SELECT 1 FROM file_index)",
+        [crate::file_index::SETTING_COMPLETE],
+    )
+    .map_err(|_| "Could not update the settings".to_string())?;
     conn.execute(
         "INSERT INTO settings(key, value) VALUES('schema_version', '14')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1672,7 +1839,7 @@ mod appearance_tests {
     use super::*;
     #[test]
     fn appearance_follows_folder_trees_and_validates_values() {
-        let conn = Connection::open_in_memory().unwrap(); migrate(&conn).unwrap();
+        let conn = Connection::open_in_memory().unwrap(); attach_index(&conn, ":memory:").unwrap(); migrate(&conn).unwrap();
         let paths = vec!["żółć_100%".to_string(), "żółć_100%/child".to_string()];
         set_folder_appearance(&conn, &paths, "#AB12EF", "photos").unwrap();
         set_folder_appearance(&conn, &["żółćX100Y/child".into()], "#123456", "work").unwrap();

@@ -19,7 +19,7 @@ use crate::files;
 use crate::media_index::Speed;
 
 /// Set once a scan of the whole library has finished: until then, search walks the disk.
-const SETTING_COMPLETE: &str = "file_index_complete";
+pub(crate) const SETTING_COMPLETE: &str = "file_index_complete";
 /// How often the library is looked through for changes made outside OwnNAS.
 const RESCAN_EVERY: Duration = Duration::from_secs(5 * 60);
 /// How long to wait after a change made through OwnNAS, so a burst of uploads is one scan.

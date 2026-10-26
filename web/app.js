@@ -4911,6 +4911,7 @@ async function refreshHealth(fresh) {
     return row;
   }) : [healthNode("p", "muted", "No drive reports were found.")]));
   $("health-drives-note").textContent = data.drivesNote || "";
+  renderDatabaseHealth(data.database || []);
   const system = data.system || {};
   const facts = [];
   if (system.host) facts.push(["Name", system.host]);
@@ -4935,6 +4936,54 @@ async function refreshHealth(fresh) {
 
 $("health-refresh").addEventListener("click", () => refreshHealth(true).catch((err) => toast(err.message, true)));
 
+const WAL_WARN = 1024 ** 3;
+
+function renderDatabaseHealth(files) {
+  const labels = { data: "Your data", index: "Indexes" };
+  $("health-database").replaceChildren(...files.map((file) => {
+    const level = file.wal > 8 * WAL_WARN ? "full" : file.wal > WAL_WARN ? "low" : "ok";
+    const row = healthNode("div", `health-item level-${level}`);
+    const head = healthNode("div", "health-head");
+    head.append(healthNode("strong", "", labels[file.role] || file.role), healthNode("span", "health-tag", file.name));
+    const facts = [`${formatSize(file.size, false)}`, `log ${formatSize(file.wal, false)}`];
+    if (file.unused > 64 * 1024 ** 2) facts.push(`${formatSize(file.unused, false)} unused inside (Compact gives it back)`);
+    row.append(head, healthNode("p", "muted", facts.join(" · ")));
+    if (level !== "ok") row.append(healthNode("p", "health-warning", "The log is large: something keeps it from being emptied. Try Empty logs now; if it stays large, restart OwnNAS."));
+    return row;
+  }));
+  $("health-database-actions").hidden = !(state.me && state.me.admin && files.length);
+}
+
+$("health-db-checkpoint").addEventListener("click", async () => {
+  const button = $("health-db-checkpoint");
+  button.disabled = true;
+  try {
+    await api("/api/system/database/checkpoint", { method: "POST" });
+    toast("Logs emptied");
+    await refreshHealth(false);
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$("health-db-compact").addEventListener("click", async () => {
+  const ok = await askConfirm("Compact the database? OwnNAS rewrites both database files without their unused space. It needs as much free disk as the larger file, and changes wait until it is done (a large index can take a few minutes).", "Compact");
+  if (!ok) return;
+  const id = `compact-${++jobState.seq}`;
+  upsertJob(id, { title: "Compact database", detail: "Rewriting the database files…", percent: null, cancelable: false });
+  try {
+    await api("/api/system/database/compact", { method: "POST" });
+    toast("Database compacted");
+    await refreshHealth(false);
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    removeJob(id);
+  }
+});
+
 let healthAlertKey = "";
 let healthAlertTab = "health";
 let healthTimer = 0;
@@ -4949,6 +4998,7 @@ async function pollHealthAlerts() {
     return;
   }
   const texts = alerts.map((alert) => {
+    if (alert.kind === "database") return `OwnNAS's database log (${alert.name}) has grown to ${formatSize(alert.size, false)}.`;
     if (alert.kind === "disk") return `The disk with ${alert.what} is ${alert.level === "full" ? "nearly full" : "getting full"}: ${formatSize(alert.free, false)} free (${Math.round((alert.free / (alert.total || 1)) * 100)}%).`;
     if (alert.kind === "backup") {
       const since = alert.lastSuccess ? ` The last one that worked was on ${new Date(alert.lastSuccess * 1000).toLocaleDateString()}.` : "";

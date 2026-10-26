@@ -397,6 +397,8 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/versions", get(list_versions))
         .route("/api/system", get(health_report))
         .route("/api/system/alerts", get(health_alerts))
+        .route("/api/system/database/checkpoint", post(database_checkpoint))
+        .route("/api/system/database/compact", post(database_compact))
         .route("/api/duplicates/trash", post(trash_duplicates))
         .route("/api/versions/file", get(version_file))
         .route("/api/versions/restore", post(restore_version))
@@ -6687,6 +6689,7 @@ async fn health_report(
             "drivesNote": note,
             "sensors": crate::health::sensors(),
             "system": crate::health::system(),
+            "database": db::connect(&worker.db_path).map(|conn| db::file_report(&conn, &worker.db_path)).unwrap_or_default(),
             "checkedAt": db::now_secs(),
         })
     })
@@ -6711,6 +6714,10 @@ async fn health_alerts(State(state): State<std::sync::Arc<AppState>>, headers: H
             let what = if volume.holds.contains(&"library") { "the library" } else { "OwnNAS's data" };
             alerts.push(json!({ "level": volume.level, "kind": "disk", "mount": volume.mount, "free": volume.free, "total": volume.total, "what": what }));
         }
+        for file in db::file_sizes(&worker.db_path).into_iter().skip(1).step_by(2).filter(|(_, wal)| *wal > db::WAL_WARN) {
+            let name = file.0.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            alerts.push(json!({ "level": if file.1 > 8 * db::WAL_WARN { "full" } else { "low" }, "kind": "database", "name": name, "size": file.1 }));
+        }
         let (drives, _) = worker.health.drives(false);
         for drive in drives.into_iter().filter(|drive| drive.healthy == Some(false) || !drive.warnings.is_empty()) {
             alerts.push(json!({ "level": if drive.healthy == Some(false) { "full" } else { "low" }, "kind": "drive", "name": drive.name, "model": drive.model, "status": drive.status, "warnings": drive.warnings }));
@@ -6728,6 +6735,41 @@ async fn health_alerts(State(state): State<std::sync::Arc<AppState>>, headers: H
     .await
     .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not check the computer's health"))?;
     Ok(Json(json!({ "alerts": alerts })))
+}
+
+/// Empties the databases' write-ahead logs now, as is done every few minutes.
+async fn database_checkpoint(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let path = state.db_path.clone();
+    let emptied = tokio::task::spawn_blocking(move || db::checkpoint(&path))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not empty the logs"))?;
+    if emptied.is_none() {
+        return Err(ApiError::new(StatusCode::CONFLICT, "The database is busy: try again in a moment"));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Gives the unused space inside the database files back to the disk.
+async fn database_compact(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    require_write(&state)?;
+    let path = state.db_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = db::connect(&path).map_err(|_| "Could not open the database".to_string())?;
+        // Rewriting a large index waits for the writing in progress to finish.
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(120));
+        db::compact(&conn, &path)
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not compact the database"))?
+    .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    record(&state, &user, "compact-database", "");
+    Ok(Json(json!({ "ok": true })))
 }
 
 /// A connection for work that may take a while, so it does not hold up the shared one.

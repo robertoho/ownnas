@@ -276,7 +276,10 @@ Paths never escape `--root` (traversal, absolute paths, and drive letters are re
 
 ```
 ownnas-data/
-  ownnas.db          # users, sessions, bookmarks, recents, events, tags, comments, fingerprints
+  ownnas.db          # users, sessions, bookmarks, recents, events, tags, comments, albums, people, settings
+  ownnas-index.db    # what OwnNAS builds by reading the library: the name and photo indexes, the
+                     # words in files, photo descriptions, hashes, folder sizes. Rebuilt if deleted
+                     # (with OwnNAS stopped), and left out of backups.
   thumbs/
     <aa>/
       <sha256>.png   # cached thumbnails
@@ -287,6 +290,8 @@ ownnas-data/
   backup-cache/      # restic's cache of the backup's index
   backup-staging/    # the copy of ownnas.db made for each backup
 ```
+
+Both databases use SQLite's write-ahead log (`-wal` files beside them). OwnNAS empties the logs at startup and every five minutes, and Settings → Health shows the files' sizes, warns if a log grows past 1 GB, and has **Empty logs now** and **Compact** (gives unused space inside the files back to the disk) for administrators. A database from before `ownnas-index.db` existed has its index tables moved there on the first start.
 
 Inside `--root` (managed by OwnNAS):
 

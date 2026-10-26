@@ -486,7 +486,10 @@ impl Context {
             .iter()
             .map(|name| self.data.join(name).display().to_string())
             .collect();
-        if let Some(name) = self.db_path.file_name().and_then(|n| n.to_str()) {
+        // The database is backed up from a copy; the index database, which OwnNAS builds again
+        // by reading the library, not at all.
+        let index = crate::db::INDEX_FILE;
+        for name in self.db_path.file_name().and_then(|n| n.to_str()).into_iter().chain([index]) {
             for suffix in ["", "-wal", "-shm", "-journal"] {
                 out.push(self.data.join(format!("{name}{suffix}")).display().to_string());
             }

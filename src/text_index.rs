@@ -50,8 +50,8 @@ pub struct TextIndex {
 /// Creates the full-text table. Returns false when SQLite was built without FTS5.
 pub fn ensure(conn: &Connection) -> bool {
     conn.execute_batch(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(lower, compact, tokenize = 'trigram');
-         CREATE TRIGGER IF NOT EXISTS content_text_gone AFTER DELETE ON content_text BEGIN
+        "CREATE VIRTUAL TABLE IF NOT EXISTS idx.content_fts USING fts5(lower, compact, tokenize = 'trigram');
+         CREATE TRIGGER IF NOT EXISTS idx.content_text_gone AFTER DELETE ON content_text BEGIN
              DELETE FROM content_fts WHERE rowid = old.rowid;
          END;",
     )
