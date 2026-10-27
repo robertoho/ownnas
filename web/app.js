@@ -25,6 +25,7 @@ const state = {
   path: "",
   entries: [],
   truncated: false,
+  listed: false,
   total: 0,
   view: normalizeView(localStorage.getItem("ownnas-view")),
   groupBy: normalizeGroup(localStorage.getItem("ownnas-group")),
@@ -168,6 +169,7 @@ function tagColor(tag) {
 
 const $ = (id) => document.getElementById(id);
 let loadGen = 0;
+let loadingTimer = 0;
 let toastTimer = 0;
 let skipNextClick = false;
 let activeDownload = null;
@@ -660,7 +662,8 @@ function renderFiles() {
   ++columnGeneration;
   applyDetailWidths();
   const items = sortedEntries();
-  $("empty").hidden = items.length !== 0;
+  // Until the first listing arrives an empty list means "not loaded yet", not "empty folder".
+  $("empty").hidden = items.length !== 0 || !state.listed;
   $("empty").textContent = state.entries.length === 0 ? "This folder is empty." : "Nothing matches in this folder.";
   const banner = $("banner");
   if (banner) {
@@ -768,8 +771,20 @@ async function load(path, options = {}) {
   }
   const gen = ++loadGen;
   const hidden = state.hidden ? "&hidden=1" : "";
-  const data = await api(`/api/list?path=${encodeURIComponent(path)}${hidden}`);
+  // Quick listings show no spinner, so it doesn't flicker on every click.
+  clearTimeout(loadingTimer);
+  loadingTimer = setTimeout(() => showFilesLoading(true), 150);
+  let data;
+  try {
+    data = await api(`/api/list?path=${encodeURIComponent(path)}${hidden}`);
+  } finally {
+    if (gen === loadGen) {
+      clearTimeout(loadingTimer);
+      showFilesLoading(false);
+    }
+  }
   if (gen !== loadGen) return;
+  state.listed = true;
   const changedFolder = state.path !== (data.path || "");
   if (changedFolder || options.resetSearch) resetSearch();
   state.path = data.path || "";
@@ -790,6 +805,14 @@ async function load(path, options = {}) {
   syncBookmarkBtn();
   $("empty-trash-btn").hidden = !(state.me && !state.me.readonly && inTrashPath(state.path));
   scheduleFolderSizes();
+}
+
+/// While a folder loads: a spinner over the files, and the folder being left dimmed.
+function showFilesLoading(on) {
+  $("files-loading").hidden = !on;
+  $("files").classList.toggle("is-loading", on);
+  $("files").setAttribute("aria-busy", on ? "true" : "false");
+  if (on) $("empty").hidden = true;
 }
 
 function applyFolderSize(path, info) {
@@ -1112,7 +1135,7 @@ function entryKnownBytes(entry) {
 
 function updateSelectionSummary() {
   const visible = sortedEntries().length;
-  const itemCount = `${visible} ${visible === 1 ? "item" : "items"}`;
+  const itemCount = !state.listed ? "Loading…" : `${visible} ${visible === 1 ? "item" : "items"}`;
   const folderTotal = state.truncated ? state.total : state.entries.length;
   $("folder-summary").textContent = visible === folderTotal ? itemCount : `${itemCount} of ${folderTotal}`;
   const el = $("selection-summary");
