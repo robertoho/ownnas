@@ -15,10 +15,59 @@
 .docx-color { display: inline-flex; align-items: center; gap: 6px; font: 12px system-ui; }
 .docx-color input { width: 32px; height: 28px; padding: 2px; }
 .docx-toolbar button[aria-pressed=true] { outline: 2px solid var(--accent, #597eb8); }
-.odt-page { min-height: 600px; }
-.odt-page table { border-collapse: collapse; width: 100%; margin: 12px 0; }
-.odt-page td { border: 1px solid #bbb; padding: 8px; vertical-align: top; }
-.odt-page .odt-list { padding-left: 28px; }
-.odt-page [aria-level="1"] { font-size: 1.8em; font-weight: 700; }
-.odt-page [aria-level="2"] { font-size: 1.5em; font-weight: 700; }
-.odt-page [aria-level="3"] { font-size: 1.25em; font-weight: 700; }
+/* Office editors: a compact icon toolbar shared by the spreadsheet and document editors.
+   The colour variables are OwnNAS's theme; the fallbacks suit a light page elsewhere. */
+.office-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; padding: 4px; border: 1px solid var(--line, #d0d2cb); border-radius: 10px; background: var(--bg-2, #f4f4f2); }
+.office-tool { display: inline-grid; place-items: center; position: relative; min-width: 30px; height: 30px; padding: 0 6px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--text, #1d1d1d); cursor: pointer; }
+.office-tool:hover:not(:disabled) { background: var(--bg-3, #e6e7e2); border-color: transparent; }
+.office-tool:disabled, .office-color:has(input:disabled) { opacity: 0.4; cursor: default; }
+.office-tool[aria-pressed="true"] { background: color-mix(in srgb, var(--accent, #2f6fdf) 22%, transparent); border-color: color-mix(in srgb, var(--accent, #2f6fdf) 55%, transparent); color: var(--text, #1d1d1d); }
+.office-text-tool { font-size: 0.78rem; white-space: nowrap; }
+.office-color input { position: absolute; inset: 0; opacity: 0; width: 100%; height: 100%; cursor: pointer; padding: 0; border: 0; }
+.office-swatch { position: absolute; left: 7px; right: 7px; bottom: 4px; height: 3px; border-radius: 2px; pointer-events: none; }
+.office-color svg { margin-top: -3px; }
+.office-divider { width: 1px; height: 20px; margin: 0 4px; background: var(--line, #d0d2cb); }
+.office-spacer { flex: 1 1 auto; }
+.office-select { height: 30px; width: auto; max-width: 9.5rem; padding: 0 0.5rem; font-size: 0.8rem; border-radius: 7px; }
+.office-status { color: var(--muted, #6b6f66); font-size: 0.78rem; white-space: nowrap; padding: 0 0.4rem; }
+.office-save { display: inline-flex; align-items: center; gap: 0.35rem; height: 30px; padding: 0 0.8rem; border-radius: 7px; background: var(--accent, #2f6fdf); color: var(--accent-ink, #fff); border-color: var(--accent, #2f6fdf); font-weight: 650; }
+.office-save:disabled { background: transparent; color: var(--muted, #6b6f66); border-color: var(--line, #d0d2cb); opacity: 1; }
+
+
+/* OpenDocument editor: a page on a grey desk, edited directly. */
+.odt-editor { display: flex; flex-direction: column; gap: 6px; flex: 1 1 auto; min-height: 24rem; width: 100%; }
+.odt-editor > .office-toolbar { flex: none; }
+.odt-scroller { flex: 1 1 auto; min-height: 16rem; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: #e9eae6; padding: 18px 12px 40px; overscroll-behavior: contain; }
+.odt-page { box-sizing: border-box; width: 100%; max-width: 816px; min-height: 1056px; margin: 0 auto; padding: 72px clamp(20px, 9%, 96px); background: #fff; color: #1d1d1d; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18), 0 6px 22px rgba(0, 0, 0, 0.08); font: 16px/1.5 "Liberation Serif", "Times New Roman", Georgia, serif; white-space: pre-wrap; overflow-wrap: anywhere; outline: none; caret-color: #1a5fd0; tab-size: 4; }
+.odt-page:focus-visible { box-shadow: 0 0 0 2px rgba(26, 95, 208, 0.45), 0 6px 22px rgba(0, 0, 0, 0.08); }
+.odt-page p, .odt-page li { margin: 0 0 0.35em; min-height: 1.5em; }
+.odt-page h1, .odt-page h2, .odt-page h3, .odt-page h4, .odt-page h5, .odt-page h6 { margin: 0.9em 0 0.35em; line-height: 1.25; font-family: "Liberation Sans", Arial, "Helvetica Neue", sans-serif; font-weight: 700; }
+.odt-page h1 { font-size: 1.75em; }
+.odt-page h2 { font-size: 1.4em; }
+.odt-page h3 { font-size: 1.2em; }
+.odt-page h4, .odt-page h5, .odt-page h6 { font-size: 1.05em; }
+.odt-page > :first-child { margin-top: 0; }
+.odt-page ul, .odt-page ol { margin: 0 0 0.5em; padding-left: 2em; }
+.odt-page li > ul, .odt-page li > ol { margin: 0.2em 0 0; }
+.odt-page ul ul { list-style-type: circle; }
+.odt-page ul ul ul { list-style-type: square; }
+.odt-page ol ol { list-style-type: lower-alpha; }
+.odt-page ol ol ol { list-style-type: lower-roman; }
+.odt-page .odt-list-header { list-style: none; }
+.odt-page a { color: #1a5fd0; text-decoration: underline; cursor: text; }
+.odt-page .odt-table { margin: 0.6em 0; overflow-x: auto; }
+.odt-page table { border-collapse: collapse; width: 100%; }
+.odt-page td { border: 1px solid #b9bcb4; padding: 4px 8px; vertical-align: top; min-width: 2em; outline: none; }
+.odt-page td:focus-within { box-shadow: inset 0 0 0 2px rgba(26, 95, 208, 0.35); }
+.odt-page td > :last-child { margin-bottom: 0; }
+.odt-page td.odt-repeat { color: #8a8d85; }
+.odt-page .odt-section { margin: 0.3em 0; }
+.odt-page .odt-atom { user-select: all; -webkit-user-select: all; }
+.odt-page .odt-image img { display: inline-block; max-width: 100%; height: auto; vertical-align: bottom; }
+.odt-page .odt-object { display: inline-block; padding: 0 4px; border: 1px dashed #b9bcb4; border-radius: 4px; color: #6b6f66; }
+.odt-page .odt-field { padding: 0 2px; border-radius: 3px; background: #ececea; }
+.odt-page .odt-note { color: #1a5fd0; cursor: help; }
+.odt-page .odt-comment { font-size: 0.8em; cursor: help; }
+.odt-page .odt-marker { display: inline; }
+.odt-page .odt-locked { margin: 0.6em 0; padding: 8px 12px; border: 1px dashed #b9bcb4; border-radius: 6px; background: #f6f6f4; color: #555; font-size: 0.9em; white-space: normal; }
+.odt-page .odt-locked img { max-width: 100%; height: auto; }

@@ -2394,25 +2394,36 @@ input, select, textarea {
 .archive-parent-row { justify-content: flex-start; }
 .archive-empty { justify-content: flex-start; padding: 0.5rem 0; }
 .archive-footnote { margin: 0.65rem 0 0; font-size: 0.82rem; }
-.xlsx-editor { width: 100%; padding: 0.5rem; box-sizing: border-box; }
-.xlsx-toolbar { display: flex; align-items: center; gap: 0.45rem; min-height: 2.4rem; }
-.xlsx-tabs { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-right: auto; }
-.xlsx-tab { padding: 0.35rem 0.65rem; }
-.xlsx-tab[aria-selected="true"] { border-color: var(--accent); color: var(--accent); }
-.xlsx-status { color: var(--muted); font-size: 0.8rem; white-space: nowrap; }
-.xlsx-note { margin: 0.35rem 0 0.6rem; font-size: 0.8rem; }
-.xlsx-formula-row { display: grid; grid-template-columns: 5rem minmax(0, 1fr); gap: 0.4rem; margin: 0 0 0.5rem; }
-.xlsx-address { display: grid; place-items: center; min-height: 2rem; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); font: 0.8rem var(--mono); }
-.xlsx-formula { min-width: 0; width: 100%; box-sizing: border-box; font: 0.85rem var(--mono); }
-.xlsx-scroll { position: relative; overflow: auto; height: min(65vh, 720px); min-height: 260px; border: 1px solid var(--line); border-radius: 6px; background: #141610; outline-offset: 2px; }
-.xlsx-canvas { position: relative; box-sizing: border-box; }
-.xlsx-cell, .xlsx-col-head, .xlsx-row-head, .xlsx-corner { position: absolute; box-sizing: border-box; }
-.xlsx-cell { overflow: hidden; padding: 0 0.35rem; border: 0; border-right: 1px solid #34382e; border-bottom: 1px solid #34382e; border-radius: 0; background: #191b16; color: var(--text); text-align: left; text-overflow: ellipsis; white-space: nowrap; font: 0.8rem var(--mono); }
-.xlsx-cell:hover { background: #24271e; }
-.xlsx-cell.is-selected { z-index: 1; outline: 2px solid var(--accent); outline-offset: -2px; background: #24281c; }
-.xlsx-col-head, .xlsx-row-head, .xlsx-corner { display: grid; place-items: center; z-index: 2; border-right: 1px solid #44483a; border-bottom: 1px solid #44483a; background: #26291f; color: #b9c09f; font: 0.76rem var(--mono); }
-.xlsx-corner { z-index: 3; }
-.xlsx-row-head { font-variant-numeric: tabular-nums; }
+/* The sheet is drawn on light paper, like a printed page, whatever the app theme. */
+.xlsx-editor { --sheet-font: Calibri, Carlito, "Segoe UI", Arial, sans-serif; display: flex; flex-direction: column; gap: 6px; flex: 1 1 auto; min-height: 24rem; width: 100%; }
+.xlsx-editor > :not(.xlsx-scroll) { flex: none; }
+.xlsx-formula-row { display: flex; align-items: stretch; gap: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--input-bg); }
+.xlsx-address { display: grid; place-items: center; min-width: 5.5rem; padding: 0 0.5rem; border-right: 1px solid var(--line); color: var(--muted); font: 0.78rem var(--mono); white-space: nowrap; }
+.xlsx-fx { display: grid; place-items: center; padding: 0 0.55rem; border-right: 1px solid var(--line); color: var(--muted); font: italic 600 0.8rem Georgia, serif; }
+.xlsx-formula { flex: 1 1 auto; min-width: 0; height: 30px; border: 0; border-radius: 0; background: transparent; font: 0.84rem var(--mono); padding: 0 0.6rem; }
+.xlsx-formula:focus { outline: none; box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent); }
+.xlsx-scroll { position: relative; flex: 1 1 auto; min-height: 16rem; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: #fff; outline: none; overscroll-behavior: contain; }
+.xlsx-scroll:focus-visible { box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 60%, transparent); }
+.xlsx-canvas { position: relative; cursor: cell; user-select: none; -webkit-user-select: none; font: 13.5px/1.15 var(--sheet-font); color: #1f1f1f; }
+.xlsx-canvas > div > div, .xlsx-selection, .xlsx-active { position: absolute; box-sizing: border-box; }
+.xlsx-hline { height: 1px; background: #e3e3e3; }
+.xlsx-vline { width: 1px; background: #e3e3e3; }
+.xlsx-merge { background: #fff; border-right: 1px solid #e3e3e3; border-bottom: 1px solid #e3e3e3; }
+.xlsx-cell { display: flex; padding: 0 4px 1px; overflow: hidden; white-space: pre; text-overflow: clip; }
+.xlsx-cell.is-spilling { z-index: 1; background: #fff; }
+.xlsx-col-head, .xlsx-row-head, .xlsx-corner { z-index: 3; display: grid; place-items: center; background: #f3f4f1; color: #5b5f55; border-right: 1px solid #d5d7d0; border-bottom: 1px solid #d5d7d0; font: 12px/1 "Segoe UI", system-ui, sans-serif; font-variant-numeric: tabular-nums; overflow: hidden; }
+.xlsx-col-head.is-active, .xlsx-row-head.is-active { background: #dde6d2; color: #23331a; font-weight: 650; }
+.xlsx-corner { z-index: 4; cursor: pointer; }
+.xlsx-selection { z-index: 2; pointer-events: none; background: rgba(36, 120, 220, 0.1); border: 1px solid #2478dc; }
+.xlsx-active { z-index: 2; pointer-events: none; border: 2px solid #2478dc; }
+.xlsx-cell-editor { position: absolute; z-index: 5; box-sizing: border-box; margin: 0; padding: 2px 4px; resize: none; overflow: hidden; border: 2px solid #2478dc; border-radius: 0; background: #fff; color: #1f1f1f; font: inherit; line-height: 1.15; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25); outline: none; white-space: pre; }
+.xlsx-footer { display: flex; align-items: center; gap: 0.5rem; min-height: 30px; }
+.xlsx-tabs { display: flex; gap: 2px; flex: 1 1 auto; min-width: 0; overflow-x: auto; scrollbar-width: thin; }
+.xlsx-tab { flex: none; height: 28px; padding: 0 0.85rem; border-radius: 0 0 8px 8px; border: 1px solid var(--line); border-top-width: 0; background: transparent; color: var(--muted); font-size: 0.8rem; }
+.xlsx-tab[aria-selected="true"] { background: #fff; color: #1f1f1f; border-color: #c9ccc2; font-weight: 650; box-shadow: inset 0 2px 0 #2478dc; }
+.xlsx-summary { flex: none; color: var(--muted); font-size: 0.78rem; white-space: pre; font-variant-numeric: tabular-nums; }
+.xlsx-note { margin: 0; color: var(--muted); font-size: 0.78rem; }
+.xlsx-live { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
 .table-wrap { padding: 0.35rem; }
 table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
 td, th { border: 1px solid var(--line); padding: 0.3rem 0.45rem; text-align: left; }

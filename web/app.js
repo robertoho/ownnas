@@ -4295,6 +4295,7 @@ async function createFolder() {
 const NEW_FILE_KINDS = {
   docx: { label: "Word document", ext: "docx", defaultName: "Untitled" },
   odt: { label: "OpenDocument text", ext: "odt", defaultName: "Untitled" },
+  xlsx: { label: "Excel spreadsheet", ext: "xlsx", defaultName: "Untitled" },
   md: { label: "Markdown", ext: "md", defaultName: "Untitled" },
   txt: { label: "Text", ext: "txt", defaultName: "Untitled" },
   csv: { label: "CSV", ext: "csv", defaultName: "Untitled" },
