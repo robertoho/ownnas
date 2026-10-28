@@ -71,6 +71,21 @@ On the first start, when the database has no accounts, OwnNAS asks in the termin
 
 See `ownnas serve --help` for the full flag list and examples.
 
+### Starting the indexes again
+
+Search, the Gallery, and the duplicate finder use indexes in `ownnas-index.db`, which OwnNAS builds by reading the library. To delete them and have them built again, stop the server and run:
+
+```bash
+ownnas reset-index --data <data folder>          # the indexes only
+ownnas reset-index --data <data folder> --all    # also thumbnails and text read by OCR
+```
+
+Accounts, tags, albums, comments, people, and file versions are kept. The next `ownnas serve` rebuilds everything in the background; for a large library this takes hours.
+
+### Database log
+
+Problems with the database go to the console and to `database.log` in the data folder: statements that took more than 2 seconds, reads or transactions held open for more than a minute (with the thread and the SQL), and write-ahead logs that could not be emptied, with what was holding them.
+
 ## Android
 
 The `android/` project packages the same Rust server as a native Android

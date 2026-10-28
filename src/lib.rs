@@ -14,6 +14,7 @@ pub mod books;
 pub mod content_index;
 pub mod data_tables;
 pub mod db;
+pub mod db_watch;
 pub mod documents;
 pub mod ebook;
 pub mod file_index;

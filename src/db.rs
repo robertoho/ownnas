@@ -2,6 +2,7 @@ use rusqlite::{params, Connection};
 
 use crate::auth::{self, SESSION_SECS};
 
+#[derive(Clone)]
 pub struct User {
     pub id: i64,
     pub username: String,
@@ -25,6 +26,7 @@ pub fn open(path: &std::path::Path) -> Result<Connection, String> {
     }
     let conn = Connection::open(path)
         .map_err(|_| format!("Could not open the database at {}", path.display()))?;
+    crate::db_watch::watch(&conn);
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|_| "Could not configure SQLite".to_string())?;
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -81,6 +83,7 @@ fn tune(conn: &Connection) -> rusqlite::Result<()> {
 /// anything slow that should not hold up the shared one.
 pub fn connect(path: &std::path::Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
+    crate::db_watch::watch(&conn);
     conn.busy_timeout(std::time::Duration::from_secs(10))?;
     attach_index(&conn, &index_path(path).to_string_lossy())?;
     tune(&conn)?;
@@ -148,12 +151,38 @@ fn wal_of(path: &std::path::Path) -> std::path::PathBuf {
 pub fn checkpoint(path: &std::path::Path) -> Option<u64> {
     let [_, (_, wal), _, (_, index_wal)] = file_sizes(path);
     let conn = Connection::open(path).ok()?;
-    // Waits briefly for readers, holding up writers meanwhile: keep it short.
-    conn.busy_timeout(std::time::Duration::from_millis(500)).ok()?;
+    // Waits for readers, holding up writers meanwhile: briefly, unless a log has grown large.
+    let wait = if wal.max(index_wal) > WAL_LIMIT as u64 * 4 { 3000 } else { 500 };
+    conn.busy_timeout(std::time::Duration::from_millis(wait)).ok()?;
     attach_index(&conn, &index_path(path).to_string_lossy()).ok()?;
-    // With no database named, every attached one is checkpointed; busy if any could not be.
-    let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0)).ok()?;
-    (busy == 0).then_some(wal + index_wal)
+    let mut emptied = true;
+    for (schema, size) in [("main", wal), ("idx", index_wal)] {
+        // (busy, pages in the log, pages copied): pages not copied are held by an open read.
+        let (busy, pages, copied): (i64, i64, i64) = conn
+            .query_row(&format!("PRAGMA {schema}.wal_checkpoint(TRUNCATE)"), [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap_or((1, -1, -1));
+        if busy != 0 {
+            emptied = false;
+            if size > WAL_LIMIT as u64 * 4 {
+                let file = if schema == "main" { path.to_path_buf() } else { index_path(path) };
+                let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let mut text = format!(
+                    "could not empty the write-ahead log of {name} ({} MB, {copied} of {pages} pages copied); open now:",
+                    size / (1024 * 1024)
+                );
+                let open = crate::db_watch::held(std::time::Duration::from_secs(1));
+                if open.is_empty() {
+                    text.push_str(" nothing in OwnNAS for more than a second (another program, or many short reads one after another)");
+                }
+                for line in open {
+                    text.push_str("\n    ");
+                    text.push_str(&line);
+                }
+                crate::db_watch::log(&text);
+            }
+        }
+    }
+    emptied.then_some(wal + index_wal)
 }
 
 /// Empties the write-ahead logs every few minutes, so they cannot grow while a long read holds
@@ -167,11 +196,16 @@ pub fn start_checkpoints(path: std::path::PathBuf) {
             }
         };
         optimize();
-        // Every five minutes, and the statistics every hour.
-        for round in (1..=12).cycle() {
-            std::thread::sleep(std::time::Duration::from_secs(5 * 60));
-            checkpoint(&path);
-            if round == 12 {
+        // Each minute: a read held too long goes in the log, and a log grown large is emptied.
+        // Every five minutes the logs are emptied anyway, and the statistics every hour.
+        for round in (1..=60).cycle() {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            crate::db_watch::report_held();
+            let [_, (_, wal), _, (_, index_wal)] = file_sizes(&path);
+            if round % 5 == 0 || wal.max(index_wal) > WAL_LIMIT as u64 * 4 {
+                checkpoint(&path);
+            }
+            if round == 60 {
                 optimize();
             }
         }

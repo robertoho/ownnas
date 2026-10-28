@@ -26,7 +26,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 mime_guess = "2"
 rand = "0.8"
 rpassword = "7"
-rusqlite = { version = "0.40", default-features = false, features = ["bundled", "limits"] }
+rusqlite = { version = "0.40", default-features = false, features = ["bundled", "limits", "trace"] }
 self-replace = "1"
 semver = "1"
 serde = { version = "1", features = ["derive"] }

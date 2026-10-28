@@ -96,6 +96,9 @@ pub struct AppState {
     pub restart_requested: std::sync::atomic::AtomicBool,
     pub supervisor_restart: bool,
     pub attempts: Mutex<AttemptGate>,
+    /// Signed-in sessions seen lately, by token hash, so most requests need not wait for the
+    /// database to know who is asking. Emptied whenever sessions or accounts change.
+    pub sessions: Mutex<std::collections::HashMap<String, (db::User, std::time::Instant)>>,
     /// Served over native HTTPS (`--tls-cert`).
     pub https: bool,
     pub terminals: crate::terminal::Terminals,
@@ -176,10 +179,11 @@ pub fn new_state(
     update: crate::update::UpdateConfig,
 ) -> Result<AppState, String> {
     let db_path = data_dir.join("ownnas.db");
+    crate::db_watch::log_to(&data_dir);
     let conn = db::open(&db_path)?;
     // Before anything else reads it: a log left large by an earlier run is emptied and cut back.
     if let Some(before) = db::checkpoint(&db_path).filter(|&before| before > 256 * 1024 * 1024) {
-        println!("Database: emptied a {} MB write-ahead log", before / (1024 * 1024));
+        crate::db_watch::log(&format!("emptied a {} MB write-ahead log", before / (1024 * 1024)));
     }
     db::start_checkpoints(db_path.clone());
     let thumbs = crate::thumbs::prepare_cache(&data_dir.join("thumbs"))?;
@@ -203,6 +207,7 @@ pub fn new_state(
         restart_requested: std::sync::atomic::AtomicBool::new(false),
         supervisor_restart: false,
         attempts: Mutex::new(AttemptGate::new()),
+        sessions: Mutex::default(),
         https: false,
         terminals: crate::terminal::Terminals::default(),
         agent_url: std::sync::OnceLock::new(),
@@ -860,6 +865,10 @@ fn session_token(headers: &HeaderMap) -> Option<String> {
 fn require_user(state: &AppState, headers: &HeaderMap) -> Result<(User, String), ApiError> {
     let token = session_token(headers)
         .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "Sign in required"))?;
+    let key = auth::token_hash(&token);
+    if let Some((user, _)) = state.sessions.lock().unwrap_or_else(|err| err.into_inner()).get(&key).filter(|(_, seen)| seen.elapsed() < SESSION_RECHECK) {
+        return Ok((user.clone(), token));
+    }
     let user = state
         .db
         .lock()
@@ -867,7 +876,18 @@ fn require_user(state: &AppState, headers: &HeaderMap) -> Result<(User, String),
         .pipe(|conn| db::user_for_token(&conn, &token))
         .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?
         .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "Sign in required"))?;
+    let mut sessions = state.sessions.lock().unwrap_or_else(|err| err.into_inner());
+    sessions.retain(|_, (_, seen)| seen.elapsed() < SESSION_RECHECK);
+    sessions.insert(key, (user.clone(), std::time::Instant::now()));
     Ok((user, token))
+}
+
+/// How long a session found in the database is taken as still valid without asking again.
+const SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// After a sign-out or a change to accounts: every session is looked up again.
+fn forget_sessions(state: &AppState) {
+    state.sessions.lock().unwrap_or_else(|err| err.into_inner()).clear();
 }
 
 trait Pipe: Sized {
@@ -1159,6 +1179,7 @@ async fn logout(
             let _ = db::log_event(&conn, Some(user.id), &user.username, "sign-out", "");
         }
         let _ = db::delete_session(&conn, &token);
+        forget_sessions(&state);
         state.terminals.lock(Some(&auth::token_hash(&token)));
     }
     Ok((
@@ -1328,6 +1349,7 @@ async fn admin_set_password(
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     db::set_password(&conn, &body.username, &body.password)
         .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    forget_sessions(&state);
     record(&state, &user, "user-password", body.username.trim());
     Ok(Json(json!({ "ok": true })))
 }
@@ -1349,6 +1371,7 @@ async fn set_user_admin(
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     db::set_user_admin(&conn, &body.username, body.admin)
         .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    forget_sessions(&state);
     record(
         &state,
         &user,
@@ -1380,6 +1403,7 @@ async fn remove_managed_user(
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     db::delete_user(&conn, &body.username)
         .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    forget_sessions(&state);
     record(&state, &user, "user-remove", body.username.trim());
     Ok(Json(json!({ "ok": true })))
 }
@@ -1403,6 +1427,7 @@ async fn change_password(
     let new_token = db::create_session(&conn, user.id)
         .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     let _ = db::delete_session(&conn, &token);
+    forget_sessions(&state);
     Ok((
         [(
             header::SET_COOKIE,
@@ -1438,27 +1463,33 @@ async fn list(
         .map_err(ApiError::from)?;
     let paths: Vec<String> = listing.entries.iter().map(|entry| entry.path.clone()).collect();
     if !paths.is_empty() {
-        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-        if let Ok(map) = db::tags_for_paths(&conn, &paths) {
-            for entry in &mut listing.entries {
-                if let Some(tags) = map.get(&entry.path) {
-                    entry.tags = tags.clone();
+        // The sizes measured before, kept only for folders unchanged since: reading the folders
+        // to tell happens after, without holding the database.
+        let mut sizes = Vec::new();
+        {
+            let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+            if let Ok(map) = db::tags_for_paths(&conn, &paths) {
+                for entry in &mut listing.entries {
+                    if let Some(tags) = map.get(&entry.path) {
+                        entry.tags = tags.clone();
+                    }
+                }
+            }
+            for (index, entry) in listing.entries.iter().enumerate().filter(|(_, entry)| entry.dir) {
+                if let Ok(Some(row)) = db::get_folder_size(&conn, &entry.path) {
+                    sizes.push((index, entry.path.clone(), row));
                 }
             }
         }
-        for entry in &mut listing.entries {
-            if !entry.dir {
-                continue;
-            }
-            let Ok(stamp) = files::folder_stamp(&state.root, &entry.path) else {
-                continue;
-            };
-            if let Ok(Some(row)) = db::get_folder_size(&conn, &entry.path) {
-                if row.fingerprint == stamp {
-                    entry.measured_size = Some(row.bytes);
-                    entry.measured_truncated = Some(row.truncated);
-                }
-            }
+        let root = state.root.clone();
+        let unchanged = tokio::task::spawn_blocking(move || {
+            sizes.into_iter().filter(|(_, path, row)| files::folder_stamp(&root, path).is_ok_and(|stamp| stamp == row.fingerprint)).collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        for (index, _, row) in unchanged {
+            listing.entries[index].measured_size = Some(row.bytes);
+            listing.entries[index].measured_truncated = Some(row.truncated);
         }
     }
     let mut payload = serde_json::to_value(listing).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not list folder"))?;

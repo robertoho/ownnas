@@ -8,6 +8,7 @@ mod books;
 mod content_index;
 mod data_tables;
 mod db;
+mod db_watch;
 mod documents;
 mod ebook;
 mod file_index;
@@ -80,6 +81,10 @@ enum Command {
         #[command(subcommand)]
         command: UpdateCommand,
     },
+    /// Delete the indexes OwnNAS builds again by itself (file names, photos, the words in files,
+    /// hashes, folder sizes), and with --thumbs or --text-cache those caches too. Stop the server
+    /// first; the next start rebuilds them, which takes a while for a large library.
+    ResetIndex(ResetArgs),
     /// Forward a coding-agent hook event to the OwnNAS terminal it runs in (used by hooks)
     #[command(hide = true)]
     AgentHook { agent: String },
@@ -211,6 +216,21 @@ enum UserCommand {
 }
 
 #[derive(Parser)]
+struct ResetArgs {
+    #[command(flatten)]
+    data: DataArgs,
+    /// Also delete the thumbnail cache (faces found in photos are kept)
+    #[arg(long)]
+    thumbs: bool,
+    /// Also delete the text read from PDFs and photos (OCR), which is slow to read again
+    #[arg(long)]
+    text_cache: bool,
+    /// Both --thumbs and --text-cache
+    #[arg(long)]
+    all: bool,
+}
+
+#[derive(Parser)]
 struct DataArgs {
     #[arg(long, env = "OWNNAS_DATA", default_value = "ownnas-data")]
     data: PathBuf,
@@ -245,6 +265,7 @@ fn main() {
 fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Serve(args) => serve(args),
+        Command::ResetIndex(args) => reset_index(args),
         Command::AgentHook { agent } => {
             agents::run_hook(&agent);
             Ok(())
@@ -290,6 +311,87 @@ fn run(cli: Cli) -> Result<(), String> {
     }
 }
 
+/// Held while a server runs with the data folder, so a second one (or `reset-index`) can tell.
+/// Waits up to `wait` for one stopping, as an update restarting does.
+fn lock_data(data: &Path, wait: std::time::Duration) -> Result<std::fs::File, String> {
+    let path = data.join("ownnas.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|err| format!("Could not open {}: {err}", path.display()))?;
+    let started = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < wait => std::thread::sleep(std::time::Duration::from_millis(500)),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(format!("OwnNAS is running with the data folder {}. Stop it first.", data.display()))
+            }
+            // A disk that cannot lock files: go on without.
+            Err(std::fs::TryLockError::Error(_)) => return Ok(file),
+        }
+    }
+}
+
+fn reset_index(args: ResetArgs) -> Result<(), String> {
+    let data = args.data.data;
+    if !data.join("ownnas.db").is_file() {
+        return Err(format!("{} has no ownnas.db: pass the data folder with --data (or OWNNAS_DATA)", data.display()));
+    }
+    let _lock = lock_data(&data, std::time::Duration::ZERO)?;
+    let size_of = |path: &Path| -> u64 {
+        if path.is_dir() {
+            std::fs::read_dir(path).map(|entries| entries.flatten().map(|entry| size_tree(&entry.path())).sum()).unwrap_or(0)
+        } else {
+            std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+        }
+    };
+    let mut freed = 0;
+    let index = db::index_path(&data.join("ownnas.db"));
+    for suffix in ["", "-wal", "-shm"] {
+        let file = PathBuf::from(format!("{}{suffix}", index.display()));
+        if file.exists() {
+            freed += size_of(&file);
+            std::fs::remove_file(&file).map_err(|err| format!("Could not delete {}: {err}", file.display()))?;
+        }
+    }
+    println!("Deleted the indexes ({}).", db::INDEX_FILE);
+    if args.thumbs || args.all {
+        let thumbs = data.join("thumbs");
+        for entry in std::fs::read_dir(&thumbs).into_iter().flatten().flatten() {
+            // The faces' pictures belong to the people found, which are kept.
+            if entry.file_name() == "faces" {
+                continue;
+            }
+            freed += size_tree(&entry.path());
+            let path = entry.path();
+            let removed = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+            removed.map_err(|err| format!("Could not delete {}: {err}", path.display()))?;
+        }
+        println!("Deleted the thumbnails.");
+    }
+    if args.text_cache || args.all {
+        let cache = data.join("text-cache");
+        if cache.exists() {
+            freed += size_tree(&cache);
+            std::fs::remove_dir_all(&cache).map_err(|err| format!("Could not delete {}: {err}", cache.display()))?;
+        }
+        println!("Deleted the text read from PDFs and photos.");
+    }
+    println!("Freed {:.1} GB. The next `ownnas serve` builds the indexes again.", freed as f64 / 1e9);
+    Ok(())
+}
+
+fn size_tree(path: &Path) -> u64 {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => std::fs::read_dir(path).map(|entries| entries.flatten().map(|entry| size_tree(&entry.path())).sum()).unwrap_or(0),
+        Ok(meta) => meta.len(),
+        Err(_) => 0,
+    }
+}
+
 fn open_data(data: &std::path::Path) -> Result<rusqlite::Connection, String> {
     std::fs::create_dir_all(data)
         .map_err(|_| format!("Could not create the data folder: {}", data.display()))?;
@@ -303,6 +405,7 @@ fn serve(args: ServeArgs) -> Result<(), String> {
         None => first_run_root(&args.data, &mut announced)?,
     };
     let (root, data) = files::prepare_paths(&root, &args.data)?;
+    let _lock = lock_data(&data, std::time::Duration::from_secs(60))?;
     let update_url = args
         .update_url
         .map(|u| u.trim().to_string())
