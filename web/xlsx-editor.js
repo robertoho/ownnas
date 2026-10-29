@@ -179,6 +179,14 @@ function cellStyle(model, index) {
     if (pattern && pattern.getAttribute('patternType') && pattern.getAttribute('patternType') !== 'none') {
       style.fill = colorOf(direct(pattern, 'fgColor'), styles.theme) || colorOf(direct(pattern, 'bgColor'), styles.theme);
     }
+    const border = kids(direct(styles.root, 'borders'), 'border')[Number(xf.getAttribute('borderId') || 0)];
+    if (border) {
+      for (const side of ['left', 'right', 'top', 'bottom']) {
+        const node = direct(border, side) || direct(border, side === 'left' ? 'start' : side === 'right' ? 'end' : '');
+        const kind = node?.getAttribute('style');
+        if (kind && kind !== 'none') (style.borders ||= {})[side] = { kind, color: colorOf(direct(node, 'color'), styles.theme) || '#000000' };
+      }
+    }
     const align = direct(xf, 'alignment');
     if (align) {
       style.align = align.getAttribute('horizontal') || null;
@@ -229,7 +237,8 @@ function setFontChild(font, name, make) {
   font.insertBefore(node, before || null);
 }
 
-/** The style index for `base` with `change` applied: bold, italic, color, fill, align or numFmt. */
+/** The style index for `base` with `change` applied: bold, italic, underline, strike, color, size,
+ * font, fill, align, valign, wrap, borders ({ left, right, top, bottom }) or numFmt. */
 function restyle(model, base, change) {
   const styles = model.styles;
   if (!styles) return base;
@@ -237,12 +246,21 @@ function restyle(model, base, change) {
   const xfs = section(styles, 'cellXfs');
   const list = kids(xfs, 'xf');
   const xf = (list[Number(base) || 0] || list[0])?.cloneNode(true) || doc.createElementNS(MAIN, 'xf');
-  if ('bold' in change || 'italic' in change || 'color' in change) {
+  if (['bold', 'italic', 'color', 'underline', 'strike', 'size', 'font'].some(key => key in change)) {
     const fonts = section(styles, 'fonts');
     const font = (kids(fonts, 'font')[Number(xf.getAttribute('fontId') || 0)] || kids(fonts, 'font')[0])?.cloneNode(true) || doc.createElementNS(MAIN, 'font');
     if ('bold' in change) setFontChild(font, 'b', change.bold && (() => {}));
     if ('italic' in change) setFontChild(font, 'i', change.italic && (() => {}));
     if ('color' in change) setFontChild(font, 'color', change.color && (node => node.setAttribute('rgb', `FF${change.color.slice(1).toUpperCase()}`)));
+    if ('underline' in change) setFontChild(font, 'u', change.underline && (() => {}));
+    if ('strike' in change) setFontChild(font, 'strike', change.strike && (() => {}));
+    if ('size' in change) setFontChild(font, 'sz', node => node.setAttribute('val', String(change.size)));
+    if ('font' in change) {
+      setFontChild(font, 'name', node => node.setAttribute('val', change.font));
+      // A theme font ("scheme") would win over the name.
+      setFontChild(font, 'scheme', null);
+      setFontChild(font, 'family', null);
+    }
     xf.setAttribute('fontId', String(addUnique(fonts, 'font', font)));
     xf.setAttribute('applyFont', '1');
   }
@@ -263,18 +281,43 @@ function restyle(model, base, change) {
     }
     xf.setAttribute('applyFill', '1');
   }
-  if ('align' in change) {
+  for (const [key, attr, on] of [['align', 'horizontal', change.align], ['valign', 'vertical', change.valign], ['wrap', 'wrapText', change.wrap ? '1' : null]]) {
+    if (!(key in change)) continue;
     let align = direct(xf, 'alignment');
-    if (!align && change.align) {
+    if (!align && on) {
       align = doc.createElementNS(MAIN, 'alignment');
       xf.insertBefore(align, xf.firstChild);
     }
     if (align) {
-      if (change.align) align.setAttribute('horizontal', change.align);
-      else align.removeAttribute('horizontal');
+      if (on) align.setAttribute(attr, on);
+      else align.removeAttribute(attr);
       if (!align.attributes.length) align.remove();
     }
     xf.setAttribute('applyAlignment', '1');
+  }
+  if ('borders' in change) {
+    // Sides to draw (true), clear (false), or keep (left out).
+    const borders = section(styles, 'borders');
+    const old = kids(borders, 'border')[Number(xf.getAttribute('borderId') || 0)];
+    const border = doc.createElementNS(MAIN, 'border');
+    for (const side of ['left', 'right', 'top', 'bottom', 'diagonal']) {
+      const want = change.borders[side];
+      const keep = old && direct(old, side);
+      let node;
+      if (want === undefined && keep) node = keep.cloneNode(true);
+      else {
+        node = doc.createElementNS(MAIN, side);
+        if (want) {
+          node.setAttribute('style', 'thin');
+          const color = doc.createElementNS(MAIN, 'color');
+          color.setAttribute('auto', '1');
+          node.append(color);
+        }
+      }
+      border.append(node);
+    }
+    xf.setAttribute('borderId', String(addUnique(borders, 'border', border)));
+    xf.setAttribute('applyBorder', '1');
   }
   if ('numFmt' in change) {
     xf.setAttribute('numFmtId', String(numFmtId(model, change.numFmt)));
@@ -969,6 +1012,57 @@ export function setRows(sheet, r1, r2, change, { existingOnly = false } = {}) {
   rereadSheet(sheet);
 }
 
+/** The order <worksheet>'s children must come in. */
+const WORKSHEET_ORDER = ['sheetPr', 'dimension', 'sheetViews', 'sheetFormatPr', 'cols', 'sheetData', 'sheetCalcPr', 'sheetProtection',
+  'protectedRanges', 'scenarios', 'autoFilter', 'sortState', 'dataConsolidate', 'customSheetViews', 'mergeCells', 'phoneticPr',
+  'conditionalFormatting', 'dataValidations', 'hyperlinks', 'printOptions', 'pageMargins', 'pageSetup', 'headerFooter', 'rowBreaks',
+  'colBreaks', 'customProperties', 'cellWatches', 'ignoredErrors', 'smartTags', 'drawing', 'legacyDrawing', 'legacyDrawingHF',
+  'drawingHF', 'picture', 'oleObjects', 'controls', 'webPublishItems', 'tableParts', 'extLst'];
+
+/** A child of the worksheet element, added in its place if missing. */
+function worksheetChild(sheet, name) {
+  let node = direct(sheet.root, name);
+  if (node) return node;
+  node = sheet.xml.createElementNS(MAIN, name);
+  const after = WORKSHEET_ORDER.slice(WORKSHEET_ORDER.indexOf(name) + 1);
+  sheet.root.insertBefore(node, [...sheet.root.children].find(child => after.includes(child.localName)) || null);
+  return node;
+}
+
+/** Merges a range into one cell (keeping the top-left value, as Excel does), taking in merged
+ * cells inside it; or with `merge` false, unmerges the merged cells it touches. */
+export function mergeRange(sheet, range, merge) {
+  const list = worksheetChild(sheet, 'mergeCells');
+  const overlaps = item => {
+    const [a, b] = (item.getAttribute('ref') || '').split(':').map(parseRef);
+    return a && b && !(Math.max(a.row, b.row) < range.r1 || Math.min(a.row, b.row) > range.r2 || Math.max(a.col, b.col) < range.c1 || Math.min(a.col, b.col) > range.c2);
+  };
+  for (const item of kids(list, 'mergeCell')) {
+    if (!overlaps(item)) continue;
+    if (merge) {
+      const [a, b] = item.getAttribute('ref').split(':').map(parseRef);
+      const inside = Math.min(a.row, b.row) >= range.r1 && Math.max(a.row, b.row) <= range.r2 && Math.min(a.col, b.col) >= range.c1 && Math.max(a.col, b.col) <= range.c2;
+      if (!inside) throw new Error('The selection overlaps part of merged cells: select all of them, or unmerge them first.');
+    }
+    item.remove();
+  }
+  if (merge) {
+    for (const [ref, cell] of [...sheet.cells]) {
+      const { row, col } = parseRef(ref);
+      if (row < range.r1 || row > range.r2 || col < range.c1 || col > range.c2 || (row === range.r1 && col === range.c1)) continue;
+      // Other cells keep their formatting, not their contents.
+      for (const child of [...cell.children]) child.remove();
+      cell.removeAttribute('t');
+    }
+    const item = sheet.xml.createElementNS(MAIN, 'mergeCell');
+    item.setAttribute('ref', `${refName(range.r1, range.c1)}:${refName(range.r2, range.c2)}`);
+    list.append(item);
+  }
+  const left = kids(list, 'mergeCell').length;
+  if (left) list.setAttribute('count', String(left)); else list.remove();
+  rereadSheet(sheet);
+}
+
 // --- Filling ------------------------------------------------------------------------------------
 
 const FILL_LISTS = [
@@ -1072,7 +1166,15 @@ const ICONS = {
   fill: '<path d="M3 9 8 4l4 4-5 5z"/><path d="M12.5 10.5s1.5 1.6 1.5 2.5a1.5 1.5 0 0 1-3 0c0-.9 1.5-2.5 1.5-2.5z"/>',
   color: '<path d="M4.5 12 8 3l3.5 9M6 9h4"/>',
   save: '<path d="M3 3h8l2 2v8H3z"/><path d="M5 3v3h5V3M5 13V9h6v4"/>',
+  underline: '<path d="M5 3v4a3 3 0 0 0 6 0V3M4 13h8"/>',
+  strike: '<path d="M3 8h10M10.5 4.5C10 3.6 9 3 7.8 3 6.3 3 5 3.9 5 5.2c0 .9.5 1.5 1.3 1.9M5.5 11.3c.5.9 1.5 1.7 2.9 1.7 1.6 0 2.8-.9 2.8-2.3 0-.6-.2-1.1-.6-1.5"/>',
+  wrap: '<path d="M3 4h10M3 8h8a2 2 0 0 1 0 4H8"/><path d="M9.5 10.5 8 12l1.5 1.5M3 12h3"/>',
+  merge: '<path d="M2.5 3.5h11v9h-11z"/><path d="M5 8h6M6.5 6.5 5 8l1.5 1.5M9.5 6.5 11 8l-1.5 1.5"/>',
+  border: '<path d="M2.5 2.5h11v11h-11zM8 2.5v11M2.5 8h11" stroke-dasharray="1.5 1.5"/><path d="M2.5 13.5h11"/>',
 };
+
+const FONTS = ['Calibri', 'Aptos', 'Arial', 'Cambria', 'Consolas', 'Courier New', 'Georgia', 'Segoe UI', 'Tahoma', 'Times New Roman', 'Trebuchet MS', 'Verdana'];
+const SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48, 72];
 
 function icon(name) {
   return `<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
@@ -1089,6 +1191,13 @@ function* generalFits(value) {
 }
 
 const SHEET_FONT = 'Calibri, Carlito, "Segoe UI", Arial, sans-serif';
+
+/** CSS for an Excel border style. */
+const BORDER_CSS = {
+  thin: '1px solid', hair: '1px solid', medium: '2px solid', thick: '3px solid', double: '3px double', dashed: '1px dashed',
+  dotted: '1px dotted', mediumDashed: '2px dashed', dashDot: '1px dashed', mediumDashDot: '2px dashed', dashDotDot: '1px dotted',
+  mediumDashDotDot: '2px dotted', slantDashDot: '2px dashed',
+};
 
 /** The CSS font a cell's text is drawn in. */
 function cellFont(style) {
@@ -1295,12 +1404,47 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     buttons[name] = input;
   }
   const formatSelect = document.createElement('select');
+  function selectTool(label, options, action) {
+    const select = document.createElement('select');
+    select.className = 'office-select';
+    select.title = label;
+    select.setAttribute('aria-label', label);
+    for (const [value, text] of options) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = text;
+      select.append(option);
+    }
+    select.addEventListener('change', () => {
+      if (select.value !== '') action(select.value);
+      scroll.focus({ preventScroll: true });
+    });
+    toolbar.append(select);
+    return select;
+  }
+  /** Makes sure a select can show `value`, adding it as an option if it is not one. */
+  function showValue(select, value) {
+    if (value !== '' && ![...select.options].some(option => option.value === value)) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = value;
+      select.append(option);
+    }
+    select.value = value;
+  }
+  let fontSelect = null, sizeSelect = null, valignSelect = null;
   if (!readonly) {
     tool('undo', 'Undo (Ctrl+Z)', () => step(-1));
     tool('redo', 'Redo (Ctrl+Y)', () => step(1));
     divider();
     tool('bold', 'Bold (Ctrl+B)', () => formatSelection({ bold: !activeStyle().bold }), { toggle: true });
     tool('italic', 'Italic (Ctrl+I)', () => formatSelection({ italic: !activeStyle().italic }), { toggle: true });
+    tool('underline', 'Underline (Ctrl+U)', () => formatSelection({ underline: !activeStyle().underline }), { toggle: true });
+    tool('strike', 'Strikethrough (Ctrl+5)', () => formatSelection({ strike: !activeStyle().strike }), { toggle: true });
+    fontSelect = selectTool('Font', [['', 'Font'], ...FONTS.map(name => [name, name])], value => formatSelection({ font: value }));
+    fontSelect.classList.add('xlsx-font-select');
+    sizeSelect = selectTool('Font size', SIZES.map(size => [String(size), String(size)]), value => formatSelection({ size: Number(value) }));
+    sizeSelect.classList.add('xlsx-size-select');
     colorTool('color', 'Text colour', value => formatSelection({ color: value }));
     colorTool('fill', 'Fill colour', value => formatSelection({ fill: value }));
     const noFill = document.createElement('button');
@@ -1315,6 +1459,19 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     tool('left', 'Align left', () => formatSelection({ align: activeStyle().align === 'left' ? null : 'left' }), { toggle: true });
     tool('center', 'Align centre', () => formatSelection({ align: activeStyle().align === 'center' ? null : 'center' }), { toggle: true });
     tool('right', 'Align right', () => formatSelection({ align: activeStyle().align === 'right' ? null : 'right' }), { toggle: true });
+    valignSelect = selectTool('Vertical alignment', [['bottom', 'Bottom'], ['center', 'Middle'], ['top', 'Top']], value => formatSelection({ valign: value === 'bottom' ? null : value }));
+    tool('wrap', 'Wrap text', () => formatSelection({ wrap: !activeStyle().wrap }), { toggle: true });
+    tool('merge', 'Merge and centre, or unmerge', toggleMerge, { toggle: true });
+    tool('border', 'Borders', () => {
+      const box = buttons.border.getBoundingClientRect();
+      openMenu(box.left, box.bottom + 4, [
+        ['All borders', () => borderSelection('all')], ['Outside borders', () => borderSelection('outside')],
+        ['Bottom border', () => borderSelection('bottom')], ['Top border', () => borderSelection('top')],
+        ['Left border', () => borderSelection('left')], ['Right border', () => borderSelection('right')], '-',
+        ['No borders', () => borderSelection('none')],
+      ]);
+    });
+    buttons.border.setAttribute('aria-haspopup', 'menu');
     divider();
     formatSelect.className = 'office-select';
     formatSelect.setAttribute('aria-label', 'Number format');
@@ -1355,10 +1512,18 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     buttons.redo.disabled = saving || historyAt === history.length;
     buttons.bold.setAttribute('aria-pressed', String(!!style.bold));
     buttons.italic.setAttribute('aria-pressed', String(!!style.italic));
+    buttons.underline.setAttribute('aria-pressed', String(!!style.underline));
+    buttons.strike.setAttribute('aria-pressed', String(!!style.strike));
+    buttons.wrap.setAttribute('aria-pressed', String(!!style.wrap));
+    buttons.merge.setAttribute('aria-pressed', String(sheet().covered.has(refName(anchor.row, anchor.col))));
+    showValue(fontSelect, style.font || '');
+    showValue(sizeSelect, String(style.size || 11));
+    valignSelect.value = style.valign === 'center' || style.valign === 'top' ? style.valign : 'bottom';
+    for (const select of [fontSelect, sizeSelect, valignSelect]) select.disabled = !writable || !model.styles;
     for (const side of ['left', 'center', 'right']) buttons[side].setAttribute('aria-pressed', String(style.align === side));
     const known = FORMATS.find(([code]) => code === style.numFmt);
     formatSelect.value = known ? known[0] : '';
-    if (!model.styles) for (const name of ['bold', 'italic', 'left', 'center', 'right', 'color', 'fill', 'nofill']) buttons[name].disabled = true;
+    if (!model.styles) for (const name of ['bold', 'italic', 'underline', 'strike', 'left', 'center', 'right', 'wrap', 'border', 'color', 'fill', 'nofill']) buttons[name].disabled = true;
     saveButton.disabled = saving || !dirty() || !onSave;
     status.textContent = saving ? 'Saving…' : dirty() ? 'Unsaved changes' : 'Saved';
   }
@@ -1534,6 +1699,13 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       if (style.indent) css.push(`padding-left:${4 + style.indent * 9}px`);
       el.style.cssText = css.join(';');
       fragment.append(el);
+      if (style.borders) {
+        const edge = document.createElement('div');
+        edge.className = 'xlsx-border';
+        edge.style.cssText = [`left:${box.left - 1}px`, `top:${box.top - 1}px`, `width:${box.width + 1}px`, `height:${box.height + 1}px`,
+          ...Object.entries(style.borders).map(([side, { kind, color }]) => `border-${side}:${BORDER_CSS[kind] || '1px solid'} ${color}`)].join(';');
+        fragment.append(edge);
+      }
     };
     for (let r = r1; r <= r2; r++) {
       if (!rowPx(s, r)) continue;
@@ -1923,14 +2095,54 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const s = sheet();
     transaction(touch => {
       for (const { row, col } of selectionCells({ create: true })) {
+        const wanted = typeof change === 'function' ? change(row, col) : change;
+        if (!wanted) continue;
         const ref = refName(row, col);
         touch(ref);
         const cell = cellElement(s, row, col);
-        const index = restyle(model, cell.getAttribute('s'), change);
+        const index = restyle(model, cell.getAttribute('s'), wanted);
         if (index) cell.setAttribute('s', String(index)); else cell.removeAttribute('s');
       }
     });
     scroll.focus({ preventScroll: true });
+  }
+  /** Borders on the selection: "all", "outside", "none", or one side. */
+  function borderSelection(kind) {
+    const s = sheet();
+    const range = expandForMerges(selectedRange());
+    const r2 = Math.min(range.r2, Math.max(s.maxRow, range.r1)), c2 = Math.min(range.c2, Math.max(s.maxCol, range.c1));
+    formatSelection((row, col) => {
+      const merge = s.covered.get(refName(row, col));
+      const bottom = merge ? merge.r2 : row, right = merge ? merge.c2 : col;
+      if (kind === 'all') return { borders: { left: true, right: true, top: true, bottom: true } };
+      if (kind === 'none') return { borders: { left: false, right: false, top: false, bottom: false } };
+      const sides = {};
+      if ((kind === 'outside' || kind === 'left') && col === range.c1) sides.left = true;
+      if ((kind === 'outside' || kind === 'right') && right >= c2) sides.right = true;
+      if ((kind === 'outside' || kind === 'top') && row === range.r1) sides.top = true;
+      if ((kind === 'outside' || kind === 'bottom') && bottom >= r2) sides.bottom = true;
+      return Object.keys(sides).length ? { borders: sides } : null;
+    });
+  }
+  /** Merges the selection and centres it, or unmerges merged cells in it. */
+  function toggleMerge() {
+    const range = selectedRange();
+    const s = sheet();
+    const merged = s.merges.some(m => !(m.r2 < range.r1 || m.r1 > range.r2 || m.c2 < range.c1 || m.c1 > range.c2));
+    if (!merged && range.r1 === range.r2 && range.c1 === range.c2) return;
+    if (!merged && (range.r2 >= LAST_ROW || range.c2 >= LAST_COL)) { notice('Whole rows or columns cannot be merged.'); return; }
+    const lost = !merged && [...s.cells].some(([ref, cell]) => {
+      const { row, col } = parseRef(ref);
+      return row >= range.r1 && row <= range.r2 && col >= range.c1 && col <= range.c2 && !(row === range.r1 && col === range.c1) && (direct(cell, 'v') || direct(cell, 'f') || direct(cell, 'is'));
+    });
+    const done = structural(sheetNow => {
+      mergeRange(sheetNow, range, !merged);
+      if (!merged && model.styles) {
+        const cell = cellElement(sheetNow, range.r1, range.c1);
+        cell.setAttribute('s', String(restyle(model, cell.getAttribute('s'), { align: 'center' })));
+      }
+    });
+    if (done && lost) notice('Merged: only the top-left cell kept its contents (Undo brings the others back).');
   }
   function clearSelection() {
     if (!canWrite()) return;
@@ -2630,8 +2842,8 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     }
     return items;
   }
-  function openMenu(x, y) {
-    const items = menuItems().filter((item, i, all) => item !== '-' || (i > 0 && all[i - 1] !== '-' && i < all.length - 1));
+  function openMenu(x, y, list = menuItems()) {
+    const items = list.filter((item, i, all) => item !== '-' || (i > 0 && all[i - 1] !== '-' && i < all.length - 1));
     menu.replaceChildren(...items.map(item => {
       if (item === '-') {
         const line = document.createElement('div');
@@ -2795,6 +3007,8 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     else if (key === 'Delete' || key === 'Backspace') { event.preventDefault(); clearSelection(); }
     else if (mod && key.toLowerCase() === 'a') { event.preventDefault(); anchor = { row: 1, col: 1 }; focus = { row: LAST_ROW, col: LAST_COL }; selectionChanged(); }
     else if (mod && key.toLowerCase() === 'd') { event.preventDefault(); fillDown(); }
+    else if (mod && key.toLowerCase() === 'u') { event.preventDefault(); formatSelection({ underline: !activeStyle().underline }); }
+    else if (mod && key === '5') { event.preventDefault(); formatSelection({ strike: !activeStyle().strike }); }
     else if (key === 'ContextMenu' || (key === 'F10' && event.shiftKey)) {
       event.preventDefault();
       const box = rect(anchor.row, anchor.col, anchor.row, anchor.col);

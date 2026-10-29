@@ -373,6 +373,50 @@ editor.destroy();
   again.destroy();
 }
 
+// Formatting: underline, strikethrough, font and size, wrap, vertical alignment, borders, merging.
+{
+  const editor5 = mountXlsxEditor(container, bytes, { onSave: async data => { saved = data; } });
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const grid = container.querySelector('.xlsx-scroll');
+  const canvas = container.querySelector('.xlsx-canvas');
+  const toolbar = container.querySelector('.xlsx-toolbar');
+  const menu = container.querySelector('.xlsx-menu');
+  const tool = label => [...toolbar.querySelectorAll('button')].find(button => button.title.startsWith(label));
+  const pick = (label, value) => { const select = toolbar.querySelector(`select[aria-label="${label}"]`); select.value = value; select.dispatchEvent(new Event('change')); };
+  const mouse = (type, col, row, extra = {}) => canvas.dispatchEvent(new window.MouseEvent(type, { button: 0, bubbles: true, cancelable: true, clientX: 46 + 64 * (col - 1) + 10, clientY: 24 + 20 * (row - 1) + 8, ...extra }));
+  const select = (c1, r1, c2, r2) => { mouse('pointerdown', c1, r1); mouse('pointermove', c2, r2); mouse('pointerup', c2, r2); };
+  grid.focus();
+  select(1, 1, 2, 2);
+  tool('Underline').click();
+  tool('Strikethrough').click();
+  pick('Font', 'Georgia');
+  pick('Font size', '14');
+  pick('Vertical alignment', 'top');
+  tool('Wrap text').click();
+  assert.equal(tool('Underline').getAttribute('aria-pressed'), 'true');
+  assert.equal(toolbar.querySelector('select[aria-label="Font"]').value, 'Georgia');
+  tool('Borders').click();
+  assert.equal(menu.hidden, false, 'borders open a menu');
+  [...menu.querySelectorAll('button')].find(button => button.textContent === 'Outside borders').click();
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  assert.ok(container.querySelectorAll('.xlsx-border').length >= 4, 'borders are drawn');
+  select(4, 5, 5, 6);
+  tool('Merge').click();
+  assert.equal(tool('Merge').getAttribute('aria-pressed'), 'true', 'merged');
+  await editor5.save();
+  const out = unzipSync(saved);
+  const sheetXml = strFromU8(out['xl/worksheets/sheet1.xml']);
+  const stylesXml = strFromU8(out['xl/styles.xml']);
+  assert.match(sheetXml, /<mergeCells count="1"><mergeCell ref="D5:E6"\/><\/mergeCells>/);
+  assert.ok(sheetXml.indexOf('<sheetProtection') < sheetXml.indexOf('<mergeCells'), 'in its place among the sheet parts (after sheetProtection)');
+  assert.match(stylesXml, /<font><strike\/><u\/><sz val="14"\/><name val="Georgia"\/><\/font>/);
+  assert.match(stylesXml, /<alignment vertical="top" wrapText="1"\/>/);
+  assert.match(stylesXml, /<border><left style="thin"><color auto="1"\/><\/left><right\/><top style="thin"><color auto="1"\/><\/top><bottom\/><diagonal\/><\/border>/, 'the top-left cell has its outside edges');
+  tool('Merge').click();
+  assert.equal(tool('Merge').getAttribute('aria-pressed'), 'false', 'and unmerged');
+  editor5.destroy();
+}
+
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });
 assert.equal(container.querySelector('.office-save'), null);
 readonly.destroy();
