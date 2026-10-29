@@ -74,6 +74,8 @@ pub struct Entry {
     pub dir: bool,
     pub size: u64,
     pub modified: i64,
+    /// `modified` to the millisecond: the version sync clients compare (as `/api/sync/*` does).
+    pub mtime_ms: i64,
     pub created: i64,
     pub kind: String,
     pub thumb: bool,
@@ -229,6 +231,7 @@ pub fn list_dir(root: &Path, rel: &str, show_hidden: bool, ffmpeg: bool) -> Resu
             dir,
             size: if dir { 0 } else { meta.len() },
             modified: modified_secs(&meta),
+            mtime_ms: sync_stamp(&meta).mtime,
             created: created_secs(&meta),
             original,
             tags: Vec::new(),

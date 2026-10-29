@@ -139,11 +139,22 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
                     path = try call { try server().rename(path: renamed, name: item.filename) }
                     ids.moved(from: renamed, to: path)
                 }
+                var serverWon = false
                 if changedFields.contains(.contents), let newContents {
-                    let parent = (path as NSString).deletingLastPathComponent
-                    try upload(newContents, to: parent, name: (path as NSString).lastPathComponent, modified: item.contentModificationDate ?? nil, conflict: .overwrite, tracker: tracker, progress: progress)
+                    let modified = item.contentModificationDate ?? nil
+                    do {
+                        // Only over the version this edit started from: never over an edit made
+                        // on the server (or another device) meanwhile.
+                        try save(newContents, at: path, modified: modified, base: FileItem.stamp(version), tracker: tracker, progress: progress)
+                    } catch ClientError.Conflict {
+                        // Both changed: this edit is kept next to it as a copy, and the file
+                        // takes the server's version (as the sync client does).
+                        let parent = (path as NSString).deletingLastPathComponent
+                        try upload(newContents, to: parent, name: Self.conflictName((path as NSString).lastPathComponent), modified: modified, conflict: .keepBoth, tracker: tracker, progress: progress)
+                        serverWon = true
+                    }
                 }
-                completionHandler(try lookUp(path), [], false, nil)
+                completionHandler(try lookUp(path), [], serverWon, nil)
             } catch {
                 completionHandler(nil, [], false, Self.fileError(error))
             }
@@ -166,6 +177,31 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
             }
         }
         return progress
+    }
+
+    /// Saves a file's new contents if the server still has `base` there.
+    private func save(_ url: URL, at path: String, modified: Date?, base: (size: UInt64, modified: Int64)?, tracker: Cancel, progress: Progress) throws {
+        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.uint64Value ?? 0
+        let fd = open(url.path, O_RDONLY)
+        guard fd >= 0 else { throw NSFileProviderError(.noSuchItem) }
+        let mtime = Int64(((modified ?? Date()).timeIntervalSince1970 * 1000).rounded())
+        let watch = Watch(tracker) { done in progress.completedUnitCount = Int64(min(100, done * 100 / max(size, 1))) }
+        _ = try call { try server().uploadIfUnchanged(path: path, fd: fd, size: size, mtimeMs: mtime, baseSize: base?.size, baseMtimeMs: base?.modified, transfer: watch) }
+    }
+
+    /// "Report (conflict Ana's Mac 2026-10-30 09.15).xlsx": the name a conflicting edit is kept under.
+    static func conflictName(_ name: String) -> String {
+        #if os(macOS)
+        let device = Host.current().localizedName ?? "Mac"
+        #else
+        let device = ProcessInfo.processInfo.hostName
+        #endif
+        let stamp = DateFormatter()
+        stamp.dateFormat = "yyyy-MM-dd HH.mm"
+        let ext = (name as NSString).pathExtension
+        let stem = (name as NSString).deletingPathExtension
+        let suffix = " (conflict \(device) \(stamp.string(from: Date())))"
+        return ext.isEmpty ? stem + suffix : "\(stem)\(suffix).\(ext)"
     }
 
     private func upload(_ url: URL?, to parent: String, name: String, modified: Date?, conflict: Conflict?, tracker: Cancel, progress: Progress) throws {
@@ -303,6 +339,14 @@ final class FileItem: NSObject, NSFileProviderItem {
             if !path.isEmpty { can.formUnion([.allowsRenaming, .allowsReparenting, .allowsDeleting]) }
         }
         return can
+    }
+
+    /// The server's version (size and modified time) a version given back by the system stands for.
+    static func stamp(_ version: NSFileProviderItemVersion) -> (size: UInt64, modified: Int64)? {
+        guard let text = String(data: version.contentVersion, encoding: .utf8) else { return nil }
+        let parts = text.split(separator: "-")
+        guard parts.count == 2, let modified = Int64(parts[0]), let size = UInt64(parts[1]) else { return nil }
+        return (size, modified)
     }
 
     var itemVersion: NSFileProviderItemVersion {

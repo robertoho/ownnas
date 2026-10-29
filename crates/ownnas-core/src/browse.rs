@@ -34,6 +34,9 @@ pub struct Entry {
     pub size: u64,
     /// Seconds since the Unix epoch.
     pub modified: i64,
+    /// The same to the millisecond (0 from servers before it), the version sync compares.
+    #[serde(default)]
+    pub mtime_ms: i64,
     /// The server's file kind, such as "image", "video", "audio", "text", or "pdf".
     pub kind: String,
     /// The server can make a thumbnail for it.

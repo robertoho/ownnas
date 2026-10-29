@@ -271,7 +271,9 @@ impl Server {
                     path: entry.path,
                     dir: entry.dir,
                     size: entry.size,
-                    modified: entry.modified.saturating_mul(1000),
+                    // To the millisecond when the server says, so it matches the change feed and
+                    // the version an upload checks.
+                    modified: if entry.mtime_ms > 0 { entry.mtime_ms } else { entry.modified.saturating_mul(1000) },
                     kind: entry.kind,
                     thumb: entry.thumb,
                 })
@@ -368,6 +370,60 @@ impl Server {
             manage::Uploaded::Skipped => UploadResult::Skipped,
             manage::Uploaded::Exists(existing) => UploadResult::Exists { existing: existing.into() },
         })
+    }
+
+    /// Saves a file at `path` only if the server still has the version the caller started from
+    /// (`base_size` and `base_mtime_ms`; both `None`: nothing may be there yet), as sync clients
+    /// do so that an edit on one side never silently replaces one on the other. Returns what
+    /// is there now; [`ClientError::Conflict`] when it changed on the server meanwhile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_if_unchanged(
+        &self,
+        path: String,
+        fd: i32,
+        size: u64,
+        mtime_ms: i64,
+        base_size: Option<u64>,
+        base_mtime_ms: Option<i64>,
+        transfer: Arc<dyn Transfer>,
+    ) -> Result<Change, ClientError> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        if fd < 0 {
+            return Err(failed("The file could not be opened".into()));
+        }
+        // SAFETY: the caller hands over an open descriptor it no longer uses.
+        let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        let base = match (base_size, base_mtime_ms) {
+            (Some(size), Some(mtime)) => Some(ownnas_core::model::Stamp { size, mtime }),
+            _ => None,
+        };
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body = Counting { inner: file, done: 0, transfer, cancelled: cancelled.clone() };
+        match self.api.upload(&path, base, mtime_ms, size, body) {
+            Ok(stamp) => Ok(Change { path, deleted: false, dir: false, size: stamp.size, modified: stamp.mtime }),
+            Err(_) if cancelled.load(std::sync::atomic::Ordering::Relaxed) => Err(ClientError::Cancelled),
+            Err(err) => Err(err.into()),
+        }
+    }
+}
+
+/// A file being sent, telling `transfer` how far it got (and stopping when told to).
+struct Counting {
+    inner: std::fs::File,
+    done: u64,
+    transfer: Arc<dyn Transfer>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl std::io::Read for Counting {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.done += read as u64;
+        if !self.transfer.keep_going(self.done) {
+            self.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+        }
+        Ok(read)
     }
 }
 

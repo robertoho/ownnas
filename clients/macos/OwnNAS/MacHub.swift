@@ -29,6 +29,11 @@ final class MacHub: ObservableObject {
             #if DEBUG
             // Tests sign in without the window: OWNNAS_TEST_ADDRESS, _USER and _PASSWORD.
             let env = ProcessInfo.processInfo.environment
+            // And sign out of a test server again: OWNNAS_TEST_SIGN_OUT is its address.
+            if let address = env["OWNNAS_TEST_SIGN_OUT"] {
+                for server in servers where server.address == address { signOut(server.id) }
+                return
+            }
             if let address = env["OWNNAS_TEST_ADDRESS"], let user = env["OWNNAS_TEST_USER"], let password = env["OWNNAS_TEST_PASSWORD"] {
                 do { try await signIn(address: address, username: user, password: password, caPem: nil, pinned: []) }
                 catch { NSLog("OwnNAS test sign-in failed: %@", userMessage(error)) }
