@@ -5828,12 +5828,14 @@ window.addEventListener("keydown", (event) => {
     }
     return;
   }
-  // Enter in the name dialog should confirm, not hit Cancel (first submit button).
-  if (event.key === "Enter" && event.target && (event.target.id === "text-input" || event.target.id === "create-file-name")) {
-    event.preventDefault();
-    if (event.target.id === "create-file-name") $("create-file-ok").click();
-    else $("text-ok").click();
-    return;
+  // Enter in a dialog's text field confirms, not Cancel (the form's first submit button).
+  if (event.key === "Enter" && !event.isComposing && !event.shiftKey && event.target && event.target.matches && event.target.matches("dialog form input:not([type=checkbox], [type=radio], [type=button], [type=submit])")) {
+    const confirm = [...event.target.form.querySelectorAll("button[type=submit]:not([value=cancel])")].filter((button) => !button.hidden && !button.disabled).pop();
+    if (confirm) {
+      event.preventDefault();
+      confirm.click();
+      return;
+    }
   }
   if (document.querySelector("dialog[open]")) return;
   const typing = event.target.closest("input, textarea, select, [contenteditable]:not([contenteditable=\"false\"])");
