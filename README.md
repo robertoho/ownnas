@@ -101,6 +101,10 @@ for the storage model and build details.
 `clients/android`. It covers folders, search, uploads, the Gallery (workspaces, places, On this
 day), and terminals. See [clients/ios/README.md](clients/ios/README.md) to build it with Xcode.
 
+`clients/macos` is a menu bar app for the Mac that puts each server in Finder's sidebar, as
+Dropbox does: files show without being downloaded, download when opened, and changes go both ways
+within seconds. See [clients/macos/README.md](clients/macos/README.md).
+
 ## Sync a folder with your computer
 
 `ownnas-sync` is a separate command-line client (in `clients/desktop`) that keeps a local

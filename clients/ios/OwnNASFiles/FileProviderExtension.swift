@@ -27,7 +27,12 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         defer { lock.unlock() }
         if let connection { return connection }
         let id = domain.identifier.rawValue
-        guard let saved = store.load().first(where: { $0.id == id }), let token = store.token(id) else {
+        var token = store.token(id)
+        #if os(macOS)
+        // On the Mac the app hands the token over with the domain.
+        if token == nil { token = domain.userInfo?["token"] as? String }
+        #endif
+        guard let saved = store.load().first(where: { $0.id == id }), let token, !token.isEmpty else {
             throw NSFileProviderError(.notAuthenticated)
         }
         let made = try Server(address: saved.address, token: token, caPem: saved.caPem.map { Data($0.utf8) }, pinned: saved.pinned)

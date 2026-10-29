@@ -1,0 +1,567 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		1559440026634F519DF6810D /* OwnNASCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 928AE3C0126BC1ABA1DEC5F2 /* OwnNASCore.xcframework */; };
+		25C16A926C20F2924D9908E1 /* OwnNASFiles.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = EB0BD4B1B50C206BAA75C117 /* OwnNASFiles.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		5070C8488EC0955B5B70CBCD /* ownnas_ffi.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04AA69F933C6090E0AE462DC /* ownnas_ffi.swift */; };
+		5326BE77B2E0517444C8505B /* FileProviderExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84F4DCE50B99BA2D5ADC98A9 /* FileProviderExtension.swift */; };
+		7E994E8F5C3A7A59BE0E11BB /* SignInView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8610BB03CF3B539129516725 /* SignInView.swift */; };
+		8C4ECEAA4610156A7567F1DE /* MacHub.swift in Sources */ = {isa = PBXBuildFile; fileRef = ECF48F2E3B8E28C62EFC6034 /* MacHub.swift */; };
+		90CE6B143A81BC022C302486 /* ServerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F571EC2CEC1266E622DBDA6B /* ServerStore.swift */; };
+		97CB8FAE87ADAD790EFE9104 /* OwnNASCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 928AE3C0126BC1ABA1DEC5F2 /* OwnNASCore.xcframework */; };
+		A70AEA8B47BA5631053744E4 /* OwnNASApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = BAEAF5CDE1B66B842C0689A0 /* OwnNASApp.swift */; };
+		B388B4C872C6C308DA22661A /* ItemIds.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A6FA63E8D7911CEE6FE1140 /* ItemIds.swift */; };
+		BF45262C6F8469F6846E63B3 /* ownnas_ffi.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04AA69F933C6090E0AE462DC /* ownnas_ffi.swift */; };
+		C0A888123E890A9EE5EF8FCA /* ServerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F571EC2CEC1266E622DBDA6B /* ServerStore.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		EC5724A97D440BFE208C93DA /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 12722B38F2003112429070CC /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 17B970AAF2BF47C37F9059A8;
+			remoteInfo = OwnNASFiles;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		E7D66068B245082E5B912916 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				25C16A926C20F2924D9908E1 /* OwnNASFiles.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		04AA69F933C6090E0AE462DC /* ownnas_ffi.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ownnas_ffi.swift; sourceTree = "<group>"; };
+		0F80043E30B73B1A00B12A8D /* OwnNAS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = OwnNAS.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		325060305FF2FCA1E785F8DA /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		4A6FA63E8D7911CEE6FE1140 /* ItemIds.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ItemIds.swift; sourceTree = "<group>"; };
+		84F4DCE50B99BA2D5ADC98A9 /* FileProviderExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileProviderExtension.swift; sourceTree = "<group>"; };
+		8610BB03CF3B539129516725 /* SignInView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignInView.swift; sourceTree = "<group>"; };
+		928AE3C0126BC1ABA1DEC5F2 /* OwnNASCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = OwnNASCore.xcframework; path = Generated/OwnNASCore.xcframework; sourceTree = "<group>"; };
+		BAEAF5CDE1B66B842C0689A0 /* OwnNASApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OwnNASApp.swift; sourceTree = "<group>"; };
+		EB0BD4B1B50C206BAA75C117 /* OwnNASFiles.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = OwnNASFiles.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		ECF48F2E3B8E28C62EFC6034 /* MacHub.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacHub.swift; sourceTree = "<group>"; };
+		F5249859B6A73AF340C3C0E1 /* OwnNAS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = OwnNAS.entitlements; sourceTree = "<group>"; };
+		F571EC2CEC1266E622DBDA6B /* ServerStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerStore.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		04688FE8297DC24B72302BD0 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				97CB8FAE87ADAD790EFE9104 /* OwnNASCore.xcframework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		0623BEB6D517A9D99D6A39B9 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				1559440026634F519DF6810D /* OwnNASCore.xcframework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		13B0A2DB8E86BE5D51DA28BA /* OwnNASFiles */ = {
+			isa = PBXGroup;
+			children = (
+				84F4DCE50B99BA2D5ADC98A9 /* FileProviderExtension.swift */,
+				4A6FA63E8D7911CEE6FE1140 /* ItemIds.swift */,
+			);
+			path = OwnNASFiles;
+			sourceTree = "<group>";
+		};
+		3F24F839B145A891D2D84E5F /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				928AE3C0126BC1ABA1DEC5F2 /* OwnNASCore.xcframework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		893AA0E7A88A5ACDBE2C1E81 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				0F80043E30B73B1A00B12A8D /* OwnNAS.app */,
+				EB0BD4B1B50C206BAA75C117 /* OwnNASFiles.appex */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		A65DE76753622D7771B8412C /* Data */ = {
+			isa = PBXGroup;
+			children = (
+				F571EC2CEC1266E622DBDA6B /* ServerStore.swift */,
+			);
+			path = Data;
+			sourceTree = "<group>";
+		};
+		B13F28C431F3FA91232FAFD3 /* OwnNAS */ = {
+			isa = PBXGroup;
+			children = (
+				325060305FF2FCA1E785F8DA /* Info.plist */,
+				ECF48F2E3B8E28C62EFC6034 /* MacHub.swift */,
+				F5249859B6A73AF340C3C0E1 /* OwnNAS.entitlements */,
+				BAEAF5CDE1B66B842C0689A0 /* OwnNASApp.swift */,
+				8610BB03CF3B539129516725 /* SignInView.swift */,
+			);
+			path = OwnNAS;
+			sourceTree = "<group>";
+		};
+		BC1FA450BDF930136DB39219 /* OwnNAS */ = {
+			isa = PBXGroup;
+			children = (
+				A65DE76753622D7771B8412C /* Data */,
+			);
+			path = OwnNAS;
+			sourceTree = "<group>";
+		};
+		C2CB179F63A844AB3D15C144 /* clients */ = {
+			isa = PBXGroup;
+			children = (
+				E401961ED7161BBC98F914A4 /* ios */,
+			);
+			name = clients;
+			path = ..;
+			sourceTree = "<group>";
+		};
+		CFF87A2ABCE74F47309876A5 /* Generated */ = {
+			isa = PBXGroup;
+			children = (
+				04AA69F933C6090E0AE462DC /* ownnas_ffi.swift */,
+			);
+			path = Generated;
+			sourceTree = "<group>";
+		};
+		E401961ED7161BBC98F914A4 /* ios */ = {
+			isa = PBXGroup;
+			children = (
+				BC1FA450BDF930136DB39219 /* OwnNAS */,
+				13B0A2DB8E86BE5D51DA28BA /* OwnNASFiles */,
+			);
+			path = ios;
+			sourceTree = "<group>";
+		};
+		F66D2C00E8D766AE658DB562 = {
+			isa = PBXGroup;
+			children = (
+				C2CB179F63A844AB3D15C144 /* clients */,
+				CFF87A2ABCE74F47309876A5 /* Generated */,
+				B13F28C431F3FA91232FAFD3 /* OwnNAS */,
+				3F24F839B145A891D2D84E5F /* Frameworks */,
+				893AA0E7A88A5ACDBE2C1E81 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		17B970AAF2BF47C37F9059A8 /* OwnNASFiles */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = CE504EE481974C691BA565AE /* Build configuration list for PBXNativeTarget "OwnNASFiles" */;
+			buildPhases = (
+				7863181E296B81EF7F099668 /* Build the Rust client library */,
+				926432E2669A8C7AAF355C22 /* Sources */,
+				0623BEB6D517A9D99D6A39B9 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = OwnNASFiles;
+			packageProductDependencies = (
+			);
+			productName = OwnNASFiles;
+			productReference = EB0BD4B1B50C206BAA75C117 /* OwnNASFiles.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		D4627E18DE473B94820C2847 /* OwnNAS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 53AA3E2A47BEAECA878DB7A0 /* Build configuration list for PBXNativeTarget "OwnNAS" */;
+			buildPhases = (
+				2E28D623AFDB147DB1EFA5F0 /* Sources */,
+				04688FE8297DC24B72302BD0 /* Frameworks */,
+				E7D66068B245082E5B912916 /* Embed Foundation Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				1541658A029E79BED98E811E /* PBXTargetDependency */,
+			);
+			name = OwnNAS;
+			packageProductDependencies = (
+			);
+			productName = OwnNAS;
+			productReference = 0F80043E30B73B1A00B12A8D /* OwnNAS.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		12722B38F2003112429070CC /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					17B970AAF2BF47C37F9059A8 = {
+						DevelopmentTeam = K27HXR2Q62;
+						ProvisioningStyle = Manual;
+					};
+					D4627E18DE473B94820C2847 = {
+						DevelopmentTeam = K27HXR2Q62;
+						ProvisioningStyle = Manual;
+					};
+				};
+			};
+			buildConfigurationList = 262B87CEC703545696479EB4 /* Build configuration list for PBXProject "OwnNAS" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = F66D2C00E8D766AE658DB562;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 893AA0E7A88A5ACDBE2C1E81 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				D4627E18DE473B94820C2847 /* OwnNAS */,
+				17B970AAF2BF47C37F9059A8 /* OwnNASFiles */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		7863181E296B81EF7F099668 /* Build the Rust client library */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build the Rust client library";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(SRCROOT)/Generated/ownnas_ffi.swift",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"$SRCROOT/build-rust.sh\"";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		2E28D623AFDB147DB1EFA5F0 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				8C4ECEAA4610156A7567F1DE /* MacHub.swift in Sources */,
+				A70AEA8B47BA5631053744E4 /* OwnNASApp.swift in Sources */,
+				C0A888123E890A9EE5EF8FCA /* ServerStore.swift in Sources */,
+				7E994E8F5C3A7A59BE0E11BB /* SignInView.swift in Sources */,
+				BF45262C6F8469F6846E63B3 /* ownnas_ffi.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		926432E2669A8C7AAF355C22 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				5326BE77B2E0517444C8505B /* FileProviderExtension.swift in Sources */,
+				B388B4C872C6C308DA22661A /* ItemIds.swift in Sources */,
+				90CE6B143A81BC022C302486 /* ServerStore.swift in Sources */,
+				5070C8488EC0955B5B70CBCD /* ownnas_ffi.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		1541658A029E79BED98E811E /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 17B970AAF2BF47C37F9059A8 /* OwnNASFiles */;
+			targetProxy = EC5724A97D440BFE208C93DA /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		2154AB585FE02E151833D63B /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = OwnNASFiles/OwnNASFiles.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"Generated\"",
+				);
+				INFOPLIST_FILE = OwnNASFiles/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = app.ownnas.mac.files;
+				PRODUCT_NAME = OwnNASFiles;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		4C7B1B8118FEC2218D9EE306 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = OwnNAS/OwnNAS.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"Generated\"",
+				);
+				INFOPLIST_FILE = OwnNAS/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = app.ownnas.mac;
+				PRODUCT_NAME = OwnNAS;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		BA6E6033DB6CB111F8277FBE /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_IDENTITY = "Developer ID Application";
+				CODE_SIGN_STYLE = Manual;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = K27HXR2Q62;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 0.7.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				OWNNAS_APP_GROUP = K27HXR2Q62.app.ownnas;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		BE371C3753CC1CF865DCE8D7 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = OwnNASFiles/OwnNASFiles.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"Generated\"",
+				);
+				INFOPLIST_FILE = OwnNASFiles/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = app.ownnas.mac.files;
+				PRODUCT_NAME = OwnNASFiles;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		E0B28B290300D868BEDF5AEF /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_IDENTITY = "Developer ID Application";
+				CODE_SIGN_STYLE = Manual;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = K27HXR2Q62;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 0.7.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				OWNNAS_APP_GROUP = K27HXR2Q62.app.ownnas;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		E973B43CB43326D2D9704E81 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = OwnNAS/OwnNAS.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"Generated\"",
+				);
+				INFOPLIST_FILE = OwnNAS/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = app.ownnas.mac;
+				PRODUCT_NAME = OwnNAS;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		262B87CEC703545696479EB4 /* Build configuration list for PBXProject "OwnNAS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				E0B28B290300D868BEDF5AEF /* Debug */,
+				BA6E6033DB6CB111F8277FBE /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		53AA3E2A47BEAECA878DB7A0 /* Build configuration list for PBXNativeTarget "OwnNAS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				E973B43CB43326D2D9704E81 /* Debug */,
+				4C7B1B8118FEC2218D9EE306 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		CE504EE481974C691BA565AE /* Build configuration list for PBXNativeTarget "OwnNASFiles" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				2154AB585FE02E151833D63B /* Debug */,
+				BE371C3753CC1CF865DCE8D7 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 12722B38F2003112429070CC /* Project object */;
+}

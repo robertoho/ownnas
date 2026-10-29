@@ -75,12 +75,9 @@ final class ServerStore {
 
     private func keychainQuery(_ id: String) -> [String: Any] {
         var query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "app.ownnas.token", kSecAttrAccount as String: id]
-        #if os(macOS)
-        // On the Mac the app and its Finder extension share the tokens through the App Group,
-        // in the data protection Keychain (as on iOS), which needs no provisioning profile.
-        query[kSecUseDataProtectionKeychain as String] = true
-        if let group = ServerStore.appGroup { query[kSecAttrAccessGroup as String] = group }
-        #endif
+        // On the Mac the token stays in the app's own (login) Keychain item; its Finder extension
+        // gets it with the place in Finder (the domain's userInfo), as a Developer ID app may not
+        // share Keychain items without a provisioning profile.
         return query
     }
 

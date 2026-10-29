@@ -31,8 +31,9 @@ for target in "${targets[@]}"; do
   cargo build -q -p ownnas-ffi --lib --target "$target" ${flags[@]+"${flags[@]}"}
 done
 
-# Bindings come from a host build of the same library (UniFFI reads its metadata).
-cargo build -q -p ownnas-ffi --lib
+# Bindings come from a host build of the same library (UniFFI reads its metadata), with the
+# macOS headers (inside Xcode the C compiler would not find them on its own).
+SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" cargo build -q -p ownnas-ffi --lib
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 cargo run -q -p ownnas-ffi --features cli --bin uniffi-bindgen -- \
