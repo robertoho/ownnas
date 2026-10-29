@@ -80,7 +80,7 @@ export function tokenize(formula) {
     else if (ref) tokens.push({ t: 'ref', ...splitRef(ref), start, text });
     else if (num) tokens.push({ t: 'num', v: Number(num), start, text });
     else if (err) tokens.push({ t: 'err', v: err.toUpperCase(), start, text });
-    else if (fn) tokens.push({ t: 'fn', v: fn.toUpperCase().replace(/^_XLFN\.|^_XLWS\./, ''), start, text });
+    else if (fn) tokens.push({ t: 'fn', v: fn.toUpperCase().replace(/^(_XLFN\.)?(_XLWS\.)?/, ''), start, text });
     else if (op) tokens.push({ t: 'op', v: op, start, text });
     else if (/^(TRUE|FALSE)$/i.test(name)) tokens.push({ t: 'bool', v: name.toUpperCase() === 'TRUE', start, text });
     else tokens.push({ t: 'name', v: name, start, text });
@@ -179,6 +179,30 @@ export function moveSqref(sqref, axis, at, count) {
     const moved = moveParts(a, b, axis, at, count);
     return moved ? partText(moved.a) + (moved.b ? `:${partText(moved.b)}` : '') : '';
   }).filter(Boolean).join(' ');
+}
+
+/** Functions newer than Excel 2007, which files name with a prefix (Excel shows #NAME? without it). */
+const FILE_PREFIX = {
+  CONCAT: '_xlfn.', TEXTJOIN: '_xlfn.', IFNA: '_xlfn.', XOR: '_xlfn.', XLOOKUP: '_xlfn.', 'STDEV.S': '_xlfn.', 'STDEV.P': '_xlfn.',
+  'RANK.EQ': '_xlfn.', UNIQUE: '_xlfn.', SORT: '_xlfn._xlws.', FILTER: '_xlfn._xlws.', DAYS: '_xlfn.',
+};
+
+/** A formula as files store it: newer functions with their prefix. */
+export function toFileFormula(formula) {
+  let tokens;
+  try { tokens = tokenize(formula); } catch { return formula; }
+  let out = '', from = 0;
+  for (const token of tokens) {
+    if (token.t !== 'fn' || !FILE_PREFIX[token.v] || token.text.toLowerCase().startsWith('_xlfn.')) continue;
+    out += formula.slice(from, token.start) + FILE_PREFIX[token.v] + token.text;
+    from = token.start + token.text.length;
+  }
+  return out + formula.slice(from);
+}
+
+/** A formula as people type it: without those prefixes. */
+export function fromFileFormula(formula) {
+  return /_xlfn\./i.test(formula) ? formula.replace(/_xlfn\.(_xlws\.)?/gi, '') : formula;
 }
 
 // --- Parser -------------------------------------------------------------------------------------
@@ -329,9 +353,14 @@ function finite(value) {
  * for the formula's own sheet), `size(sheet)` for a sheet's used rows and columns, `row` and `col`
  * for the formula's cell, and `date1904`.
  */
-export function evaluate(tree, context) {
+export function evaluate(tree, context, { array = false } = {}) {
   try {
-    const value = scalar(run(tree, context));
+    const result = run(tree, context);
+    // With `array`, a result of several cells comes back whole (as rows of values), to spill.
+    if (array && result instanceof Range && (result.height > 1 || result.width > 1)) {
+      return { rows: result.rows.map(row => row.map(value => (value == null ? 0 : value))) };
+    }
+    const value = scalar(result);
     if (typeof value === 'number' && !Number.isFinite(value)) return new CellError('#NUM!');
     return value == null ? 0 : value;
   } catch (error) {
@@ -345,11 +374,8 @@ function run(node, context) {
     case 'value': return node.v;
     case 'missing': return null;
     case 'ref': return reference(node, context);
-    case 'unary': {
-      const value = num(run(node.x, context));
-      return node.op === '-' ? -value : value;
-    }
-    case 'percent': return num(run(node.x, context)) / 100;
+    case 'unary': return each(run(node.x, context), value => (node.op === '-' ? -num(value) : num(value)));
+    case 'percent': return each(run(node.x, context), value => num(value) / 100);
     case 'binary': return binary(node, context);
     case 'call': {
       const fn = FUNCTIONS[node.name];
@@ -379,11 +405,40 @@ function reference(node, context) {
   return new Range(rows);
 }
 
+/** `fn` of a value, or of each value of a range (a failure becoming that cell's error). */
+function each(value, fn) {
+  if (!(value instanceof Range)) return fn(value);
+  return new Range(value.rows.map(row => row.map(item => attempt(() => fn(item)))));
+}
+
+function attempt(fn) {
+  try { return fn(); } catch (error) { if (error instanceof Fail) return new CellError(error.code); throw error; }
+}
+
+/** An operator between ranges works cell by cell, a single row or column or value repeating. */
 function binary(node, context) {
-  const a = scalar(run(node.a, context)), b = scalar(run(node.b, context));
+  const left = run(node.a, context), right = run(node.b, context);
+  if (!(left instanceof Range) && !(right instanceof Range)) return operate(node.op, scalar(left), scalar(right));
+  const grid = value => (value instanceof Range ? value : new Range([[value]]));
+  const a = grid(left), b = grid(right);
+  const height = Math.max(a.height, b.height), width = Math.max(a.width, b.width);
+  const pick = (range, row, col) => {
+    const r = range.height === 1 ? 0 : row, c = range.width === 1 ? 0 : col;
+    return r < range.height && c < range.width ? range.rows[r][c] : new CellError('#N/A');
+  };
+  const rows = [];
+  for (let row = 0; row < height; row++) {
+    const line = [];
+    for (let col = 0; col < width; col++) line.push(attempt(() => operate(node.op, pick(a, row, col), pick(b, row, col))));
+    rows.push(line);
+  }
+  return new Range(rows);
+}
+
+function operate(op, a, b) {
   if (a instanceof CellError) throw new Fail(a.code);
   if (b instanceof CellError) throw new Fail(b.code);
-  switch (node.op) {
+  switch (op) {
     case '+': return num(a) + num(b);
     case '-': return num(a) - num(b);
     case '*': return num(a) * num(b);
@@ -400,7 +455,7 @@ function binary(node, context) {
     case '>': return compare(a, b) > 0;
     case '<=': return compare(a, b) <= 0;
     case '>=': return compare(a, b) >= 0;
-    default: throw new Unsupported(node.op);
+    default: throw new Unsupported(op);
   }
 }
 
@@ -506,6 +561,36 @@ function lookupIndex(list, target, mode) {
   }
   return found;
 }
+
+const daysInMonth = (year, month) => new Date(Date.UTC(year, month, 0)).getUTCDate();
+
+/** The date `months` months after a date's parts: the same day (or the month's last, if shorter),
+ * or with `end` the last day of that month. */
+function addMonths(parts, months, end, context) {
+  const total = parts.year * 12 + parts.month - 1 + months;
+  const year = Math.floor(total / 12), month = (total % 12) + 1;
+  const last = daysInMonth(year, month);
+  return dateSerial(year, month, end ? last : Math.min(parts.day, last), context.date1904);
+}
+
+function deviation(list, sample) {
+  if (list.length < (sample ? 2 : 1)) fail('#DIV/0!');
+  const mean = list.reduce((a, b) => a + b, 0) / list.length;
+  return Math.sqrt(list.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (list.length - (sample ? 1 : 0)));
+}
+
+function transpose(range) {
+  return new Range(Array.from({ length: range.width }, (_, col) => range.rows.map(row => row[col])));
+}
+
+function rankOf(args, c) {
+  need(args, 2, 3);
+  const value = argNum(args, 0, c), list = numbers([args[1]], c), ascending = argNum(args, 2, c, 0) !== 0;
+  if (!list.includes(value)) fail('#N/A');
+  return 1 + list.filter(item => (ascending ? item < value : item > value)).length;
+}
+
+const now = context => (context.now ? context.now() : new Date());
 
 const FUNCTIONS = {
   SUM: (args, c) => numbers(args, c).reduce((a, b) => a + b, 0),
@@ -702,6 +787,126 @@ const FUNCTIONS = {
     }
     return back.height === 1 ? back.rows[0][index] : back.rows[index][0];
   },
+  TODAY: (args, c) => { const day = now(c); return dateSerial(day.getFullYear(), day.getMonth() + 1, day.getDate(), c.date1904); },
+  NOW: (args, c) => {
+    const moment = now(c);
+    return dateSerial(moment.getFullYear(), moment.getMonth() + 1, moment.getDate(), c.date1904) + (moment.getHours() * 3600 + moment.getMinutes() * 60 + moment.getSeconds()) / 86400;
+  },
+  RAND: () => Math.random(),
+  RANDBETWEEN: (args, c) => {
+    need(args, 2);
+    const low = Math.ceil(argNum(args, 0, c)), high = Math.floor(argNum(args, 1, c));
+    if (high < low) fail('#NUM!');
+    return low + Math.floor(Math.random() * (high - low + 1));
+  },
+  SUMPRODUCT: (args, c) => {
+    if (!args.length) fail('#VALUE!');
+    const arrays = args.map(arg => range(arg, c));
+    const { height, width } = arrays[0];
+    if (arrays.some(array => array.height !== height || array.width !== width)) fail('#VALUE!');
+    let total = 0;
+    for (let row = 0; row < height; row++) {
+      for (let col = 0; col < width; col++) {
+        let product = 1;
+        for (const array of arrays) {
+          const value = array.rows[row][col];
+          if (value instanceof CellError) throw new Fail(value.code);
+          product *= typeof value === 'number' ? value : 0;
+        }
+        total += product;
+      }
+    }
+    return total;
+  },
+  EDATE: (args, c) => { need(args, 2); return addMonths(serialParts(argNum(args, 0, c), c.date1904), Math.trunc(argNum(args, 1, c)), false, c); },
+  EOMONTH: (args, c) => { need(args, 2); return addMonths(serialParts(argNum(args, 0, c), c.date1904), Math.trunc(argNum(args, 1, c)), true, c); },
+  NETWORKDAYS: (args, c) => {
+    need(args, 2, 3);
+    const start = Math.floor(argNum(args, 0, c)), end = Math.floor(argNum(args, 1, c));
+    const holidays = new Set(args[2] && args[2].k !== 'missing' ? numbers([args[2]], c).map(Math.floor) : []);
+    const [from, to] = start <= end ? [start, end] : [end, start];
+    if (to - from > 400000) fail('#NUM!');
+    let weekday = serialParts(from, c.date1904).weekday, count = 0;
+    for (let day = from; day <= to; day++, weekday = (weekday + 1) % 7) {
+      if (weekday !== 0 && weekday !== 6 && !holidays.has(day)) count++;
+    }
+    return start <= end ? count : -count;
+  },
+  DATEDIF: (args, c) => {
+    need(args, 3);
+    const start = Math.floor(argNum(args, 0, c)), end = Math.floor(argNum(args, 1, c)), unit = argText(args, 2, c).toUpperCase();
+    if (start > end) fail('#NUM!');
+    const a = serialParts(start, c.date1904), b = serialParts(end, c.date1904);
+    const months = (b.year - a.year) * 12 + b.month - a.month - (b.day < a.day ? 1 : 0);
+    if (unit === 'D') return end - start;
+    if (unit === 'M') return months;
+    if (unit === 'Y') return Math.floor(months / 12);
+    if (unit === 'YM') return months % 12;
+    if (unit === 'MD') return b.day >= a.day ? b.day - a.day : daysInMonth(b.month === 1 ? b.year - 1 : b.year, b.month === 1 ? 12 : b.month - 1) - a.day + b.day;
+    if (unit === 'YD') {
+      let anniversary = dateSerial(b.year, a.month, Math.min(a.day, daysInMonth(b.year, a.month)), c.date1904);
+      if (anniversary > end) anniversary = dateSerial(b.year - 1, a.month, Math.min(a.day, daysInMonth(b.year - 1, a.month)), c.date1904);
+      return end - anniversary;
+    }
+    return fail('#NUM!');
+  },
+  STDEV: (args, c) => deviation(numbers(args, c), true),
+  'STDEV.S': (args, c) => deviation(numbers(args, c), true),
+  STDEVP: (args, c) => deviation(numbers(args, c), false),
+  'STDEV.P': (args, c) => deviation(numbers(args, c), false),
+  RANK: rankOf,
+  'RANK.EQ': rankOf,
+  UNIQUE: (args, c) => {
+    need(args, 1, 3);
+    const byCol = args[1] && args[1].k !== 'missing' && bool(run(args[1], c));
+    const once = args[2] && args[2].k !== 'missing' && bool(run(args[2], c));
+    let source = range(args[0], c);
+    if (byCol) source = transpose(source);
+    const key = row => row.map(value => (typeof value === 'string' ? `s${value.toLowerCase()}` : `${typeof value}${value instanceof CellError ? value.code : value}`)).join('\u0000');
+    const counts = new Map();
+    for (const row of source.rows) counts.set(key(row), (counts.get(key(row)) || 0) + 1);
+    const seen = new Set(), rows = [];
+    for (const row of source.rows) {
+      const k = key(row);
+      if (seen.has(k) || (once && counts.get(k) > 1)) continue;
+      seen.add(k);
+      rows.push(row);
+    }
+    if (!rows.length) fail('#CALC!');
+    const result = new Range(rows);
+    return byCol ? transpose(result) : result;
+  },
+  SORT: (args, c) => {
+    need(args, 1, 4);
+    const byCol = args[3] && args[3].k !== 'missing' && bool(run(args[3], c));
+    let source = range(args[0], c);
+    if (byCol) source = transpose(source);
+    const index = Math.trunc(argNum(args, 1, c, 1)), order = argNum(args, 2, c, 1);
+    if (index < 1 || index > source.width || (order !== 1 && order !== -1)) fail('#VALUE!');
+    const rows = source.rows.map((row, at) => ({ row, at }))
+      .sort((x, y) => order * compare(x.row[index - 1], y.row[index - 1]) || x.at - y.at)
+      .map(item => item.row);
+    const result = new Range(rows);
+    return byCol ? transpose(result) : result;
+  },
+  FILTER: (args, c) => {
+    need(args, 2, 3);
+    const source = range(args[0], c), include = range(args[1], c);
+    const keep = value => { if (value instanceof CellError) throw new Fail(value.code); return bool(value); };
+    let result;
+    if (include.width === 1 && include.height === source.height) {
+      result = source.rows.filter((row, i) => keep(include.rows[i][0]));
+      result = result.length ? new Range(result) : null;
+    } else if (include.height === 1 && include.width === source.width) {
+      const cols = include.rows[0].map((value, i) => (keep(value) ? i : -1)).filter(i => i >= 0);
+      result = cols.length ? new Range(source.rows.map(row => cols.map(i => row[i]))) : null;
+    } else {
+      fail('#VALUE!');
+    }
+    if (result) return result;
+    if (args[2] && args[2].k !== 'missing') return run(args[2], c);
+    return fail('#CALC!');
+  },
 };
 
 /** The functions above: [arguments, what it does, category, example], for suggestions while typing
@@ -787,6 +992,24 @@ export const FUNCTION_HELP = {
   MATCH: ['value, range, [type]', 'The position of a value in a range', 'Lookup', '=MATCH("Rent", A2:A20, 0)'],
   INDEX: ['range, row, [column]', 'The value at a row and column of a range', 'Lookup', '=INDEX(A2:C20, 5, 2)'],
   XLOOKUP: ['value, lookup_range, return_range, [if_not_found]', 'Finds a value, returns from another range', 'Lookup', '=XLOOKUP(A2, D2:D50, F2:F50, "Not found")'],
+  TODAY: ['', "Today's date (changes every day)", 'Date and time', '=TODAY() - A2'],
+  NOW: ['', 'The date and time now', 'Date and time', '=NOW()'],
+  RAND: ['', 'A random number from 0 to 1 (new on every change)', 'Math', '=RAND()'],
+  RANDBETWEEN: ['low, high', 'A random whole number between two numbers', 'Math', '=RANDBETWEEN(1, 6)'],
+  SUMPRODUCT: ['array1, [array2], …', 'Multiplies ranges cell by cell and adds the results', 'Math', '=SUMPRODUCT(B2:B10, C2:C10)'],
+  EDATE: ['date, months', 'The date some months before or after', 'Date and time', '=EDATE(A2, 3)'],
+  EOMONTH: ['date, months', 'The last day of the month, some months away', 'Date and time', '=EOMONTH(A2, 0)'],
+  NETWORKDAYS: ['start, end, [holidays]', 'Working days (Monday to Friday) between two dates', 'Date and time', '=NETWORKDAYS(A2, B2, H2:H10)'],
+  DATEDIF: ['start, end, unit', 'Time between dates in "Y" years, "M" months, "D" days, or "YM", "MD", "YD"', 'Date and time', '=DATEDIF(A2, TODAY(), "Y")'],
+  STDEV: ['number1, [number2], …', 'Standard deviation of a sample', 'Statistics', '=STDEV(B2:B20)'],
+  'STDEV.S': ['number1, [number2], …', 'Standard deviation of a sample', 'Statistics', '=STDEV.S(B2:B20)'],
+  STDEVP: ['number1, [number2], …', 'Standard deviation of a whole population', 'Statistics', '=STDEVP(B2:B20)'],
+  'STDEV.P': ['number1, [number2], …', 'Standard deviation of a whole population', 'Statistics', '=STDEV.P(B2:B20)'],
+  RANK: ['number, range, [ascending]', 'Where a number ranks in a list (1 = largest)', 'Statistics', '=RANK(B2, B$2:B$20)'],
+  'RANK.EQ': ['number, range, [ascending]', 'Where a number ranks in a list (1 = largest)', 'Statistics', '=RANK.EQ(B2, B$2:B$20)'],
+  UNIQUE: ['range, [by_column], [exactly_once]', 'The distinct rows of a range; spills into the cells below', 'Lookup', '=UNIQUE(A2:A100)'],
+  SORT: ['range, [sort_column], [order], [by_column]', 'A range sorted (order 1 up, -1 down); spills', 'Lookup', '=SORT(A2:C20, 2, -1)'],
+  FILTER: ['range, include, [if_empty]', 'The rows where a test is true; spills', 'Lookup', '=FILTER(A2:C20, B2:B20 > 100, "None")'],
 };
 
 // --- Typing a formula ---------------------------------------------------------------------------

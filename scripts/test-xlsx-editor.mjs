@@ -104,9 +104,9 @@ editor.destroy();
   type('su');
   const names = () => [...assist.querySelectorAll('.xlsx-assist-name')].map(item => item.textContent);
   assert.equal(assist.hidden, false, 'functions are suggested');
-  assert.deepEqual(names(), ['SUM', 'SUMIF', 'SUMIFS', 'SUBSTITUTE'], 'shortest first');
+  assert.deepEqual(names(), ['SUM', 'SUMIF', 'SUMIFS', 'SUBSTITUTE', 'SUMPRODUCT'], 'shortest first');
   type('m');
-  assert.deepEqual(names(), ['SUM', 'SUMIF', 'SUMIFS']);
+  assert.deepEqual(names(), ['SUM', 'SUMIF', 'SUMIFS', 'SUMPRODUCT']);
   key(input, 'ArrowDown');
   assert.equal(assist.querySelector('[aria-selected="true"]').textContent.startsWith('SUMIF'), true, 'arrows choose');
   key(input, 'ArrowUp');
@@ -296,7 +296,7 @@ editor.destroy();
   fx.click();
   assert.equal(panel.hidden, false, 'fx opens the list');
   assert.equal(document.activeElement, filter, 'with the filter ready to type in');
-  assert.equal(names().length, 80);
+  assert.equal(names().length, Object.keys((await import('../web/sheet-formula.js')).FUNCTION_HELP).length);
   assert.deepEqual([...panel.querySelectorAll('.xlsx-functions-group')].map(item => item.textContent).slice(0, 2), ['Math', 'Statistics'], 'grouped');
   assert.match(panel.textContent, /Example: =VLOOKUP\(A2, D2:F50, 3, FALSE\)/, 'each has an example');
   filter.value = 'look';
@@ -328,6 +328,49 @@ editor.destroy();
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(input.hidden, false, 'still being typed');
   editor3.destroy();
+}
+
+// Formulas returning several cells spill, and are saved as dynamic arrays; newer functions get
+// the prefix Excel needs.
+{
+  const editor4 = mountXlsxEditor(container, bytes, { onSave: async data => { saved = data; } });
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const grid = container.querySelector('.xlsx-scroll');
+  const input = container.querySelector('.xlsx-cell-editor');
+  const bar = container.querySelector('.xlsx-formula');
+  const key = (target, name, extra = {}) => target.dispatchEvent(new KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true, ...extra }));
+  const go = ref => { const { row, col } = { row: Number(ref.slice(1)), col: ref.charCodeAt(0) - 64 }; key(grid, 'Home', { ctrlKey: true }); for (let i = 1; i < row; i++) key(grid, 'ArrowDown'); for (let i = 1; i < col; i++) key(grid, 'ArrowRight'); };
+  const enter = text => { key(grid, text[0]); input.value = text; input.dispatchEvent(new Event('input')); key(input, 'Enter'); };
+  const texts = () => [...container.querySelectorAll('.xlsx-cell')].map(cell => cell.textContent);
+  grid.focus();
+  go('D1'); enter('=SORT(A1:A2,1,-1)');
+  go('E1'); enter('=SUM(D1:D2)');
+  go('F1'); enter('=XLOOKUP(20,A1:A2,B1:B2)');
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  go('D2');
+  assert.equal(bar.value, '', 'a spilled cell has nothing typed in it');
+  go('E1');
+  assert.equal(container.querySelector('.xlsx-live').textContent, 'E1, 30', 'other formulas read spilled cells');
+  go('F1');
+  assert.equal(bar.value, '=XLOOKUP(20,A1:A2,B1:B2)', 'prefixes stay out of sight');
+  go('G2'); enter('x');
+  go('G1'); enter('=UNIQUE(A1:A2)');
+  go('G1');
+  assert.match(container.querySelector('.xlsx-live').textContent, /#SPILL!/, 'nothing spills over other cells');
+  await editor4.save();
+  const out = unzipSync(saved);
+  const xml = strFromU8(out['xl/worksheets/sheet1.xml']);
+  assert.match(xml, /<c r="D1"[^>]* cm="1"[^>]*><f t="array" ref="D1:D2">_xlfn\._xlws\.SORT\(A1:A2,1,-1\)<\/f>/, 'a spilling formula is saved as a dynamic array');
+  assert.match(xml, /<f>_xlfn\.XLOOKUP\(20,A1:A2,B1:B2\)<\/f>/);
+  assert.ok(out['xl/metadata.xml'] && strFromU8(out['xl/metadata.xml']).includes('fDynamic="1"'));
+  assert.match(strFromU8(out['[Content_Types].xml']), /\/xl\/metadata\.xml/);
+  assert.match(strFromU8(out['xl/_rels/workbook.xml.rels']), /sheetMetadata/);
+  editor4.destroy();
+  // Opened again, it spills as before.
+  const again = mountXlsxEditor(container, saved, {});
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  assert.ok(texts().includes('20') && texts().filter(text => text === '10').length >= 2, texts().join('|'));
+  again.destroy();
 }
 
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });

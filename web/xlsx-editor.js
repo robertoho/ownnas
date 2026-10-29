@@ -7,7 +7,7 @@
 import { unzipSync, zipSync, strFromU8, strToU8 } from './vendor/three/addons/libs/fflate.module.js';
 import {
   BUILTIN_FORMATS, CellError, FUNCTION_HELP, Unsupported, callAt, canPointAt, columnName, dateSerial, evaluate,
-  formatGeneral, formatValue, formulaWordAt, localeSeparators, moveFormula, moveSpan, moveSqref, parseFormula, parseRef,
+  formatGeneral, formatValue, formulaWordAt, fromFileFormula, toFileFormula, localeSeparators, moveFormula, moveSpan, moveSqref, parseFormula, parseRef,
   refName, serialParts, shiftFormula,
 } from './sheet-formula.js';
 
@@ -414,6 +414,7 @@ function exportWorkbook(model) {
       writeResult(sheet, cell, value);
       model.touched.add(sheet);
     }
+    markDynamicArrays(model);
     // Excel rebuilds the calculation chain; a stale one makes it "repair" the file.
     if (parts['xl/calcChain.xml']) {
       delete parts['xl/calcChain.xml'];
@@ -444,6 +445,66 @@ function exportWorkbook(model) {
   for (const sheet of model.touched) parts[sheet.path] = strToU8(serialize(sheet.xml));
   if (model.stylesTouched && model.styles) parts['xl/styles.xml'] = strToU8(serialize(model.styles.xml));
   return zipSync(parts, { level: 6 });
+}
+
+/** Saves formulas that spill as dynamic arrays, as Excel does: an array formula over the cells
+ * it fills, marked by the workbook's metadata as dynamic so Excel resizes it as it recalculates. */
+function markDynamicArrays(model) {
+  let mark;
+  model.sheets.forEach((sheet, index) => {
+    const spilled = new Map((model.spills?.get(index) || []).map(spill => [refName(spill.r1, spill.c1), spill]));
+    for (const [ref, cell] of sheet.cells) {
+      const f = direct(cell, 'f');
+      if (!f || f.getAttribute('t') === 'dataTable' || !spills(cell, formulaOf(sheet, cell) || '')) continue;
+      const spill = spilled.get(ref);
+      const range = spill ? `${ref}:${refName(spill.r2, spill.c2)}` : ref;
+      if (f.getAttribute('t') === 'array' && f.getAttribute('ref') === range && cell.hasAttribute('cm')) continue;
+      mark ??= dynamicArrayMark(model);
+      if (f.getAttribute('t') === 'shared') continue;
+      f.setAttribute('t', 'array');
+      f.setAttribute('ref', range);
+      if (mark) cell.setAttribute('cm', mark);
+      model.touched.add(sheet);
+    }
+  });
+}
+
+/** The cell metadata index that marks a dynamic array, adding the metadata part if the workbook
+ * has none. Null when it has metadata of its own without that mark (the formula is then saved as
+ * a fixed-size array). */
+function dynamicArrayMark(model) {
+  const { parts } = model;
+  const rel = [...model.relsXml.getElementsByTagNameNS(PKG_REL, 'Relationship')].find(item => (item.getAttribute('Type') || '').endsWith('/sheetMetadata'));
+  if (rel) {
+    let path;
+    try { path = normalizePart(rel.getAttribute('Target') || ''); } catch { return null; }
+    if (!parts[path]) return null;
+    const xml = parseXml(strFromU8(parts[path]), 'Metadata');
+    const types = kids(direct(xml.documentElement, 'metadataTypes'), 'metadataType');
+    const type = types.findIndex(item => item.getAttribute('name') === 'XLDAPR') + 1;
+    if (!type) return null;
+    const blocks = kids(direct(xml.documentElement, 'cellMetadata'), 'bk');
+    const block = blocks.findIndex(bk => kids(bk, 'rc').some(rc => rc.getAttribute('t') === String(type))) + 1;
+    return block ? String(block) : null;
+  }
+  parts['xl/metadata.xml'] = strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<metadata xmlns="${MAIN}" xmlns:xda="http://schemas.microsoft.com/office/spreadsheetml/2017/dynamicarray"><metadataTypes count="1"><metadataType name="XLDAPR" minSupportedVersion="120000" copy="1" pasteAll="1" pasteValues="1" merge="1" splitFirst="1" rowColShift="1" clearFormats="1" clearComments="1" assign="1" coerce="1" cellMeta="1"/></metadataTypes><futureMetadata name="XLDAPR" count="1"><bk><extLst><ext uri="{bdbb8cdc-fa1e-496e-a857-3c3f30c029c3}"><xda:dynamicArrayProperties fDynamic="1" fCollapsed="0"/></ext></extLst></bk></futureMetadata><cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata></metadata>`);
+  const ids = new Set([...model.relsXml.getElementsByTagNameNS(PKG_REL, 'Relationship')].map(item => item.getAttribute('Id')));
+  let id = 1;
+  while (ids.has(`rId${id}`)) id++;
+  const link = model.relsXml.createElementNS(PKG_REL, 'Relationship');
+  link.setAttribute('Id', `rId${id}`);
+  link.setAttribute('Type', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/sheetMetadata');
+  link.setAttribute('Target', 'metadata.xml');
+  model.relsXml.documentElement.append(link);
+  parts['xl/_rels/workbook.xml.rels'] = strToU8(serialize(model.relsXml));
+  const types = parseXml(strFromU8(parts['[Content_Types].xml']), 'Content types');
+  const override = types.createElementNS(CONTENT_TYPES, 'Override');
+  override.setAttribute('PartName', '/xl/metadata.xml');
+  override.setAttribute('ContentType', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml');
+  types.documentElement.append(override);
+  parts['[Content_Types].xml'] = strToU8(serialize(types));
+  return '1';
 }
 
 function writeResult(sheet, cell, value) {
@@ -500,67 +561,138 @@ function valueAt(model, index, row, col) {
   const sheet = model.sheets[index];
   const ref = refName(row, col);
   const cell = sheet.cells.get(ref);
+  const spilled = spillAt(model, index, row, col);
+  if (spilled !== undefined && (!cell || spilled.member)) return spilled.value;
   if (!cell) return null;
   const key = `${index}!${ref}`;
   return model.computed.has(key) ? model.computed.get(key) : cachedValue(model, cell);
 }
 
+/** A formula that can return several cells, spilling them below and to the right: one of the
+ * newer array functions, or one saved as a dynamic array. Older array formulas ({=…}) keep the
+ * values the file saved. */
+function spills(cell, formula) {
+  return cell.hasAttribute('cm') || /\b(?:_xlfn\.)?(?:_xlws\.)?(?:UNIQUE|SORT|FILTER)\s*\(/i.test(formula);
+}
+
+/** The cells of a dynamic array saved by a spreadsheet app hold its last values: they are the
+ * array's own, not in its way. */
+function arrayMember(sheet, row, col) {
+  for (const spill of sheet.arrays || []) {
+    if (row >= spill.r1 && row <= spill.r2 && col >= spill.c1 && col <= spill.c2 && !(row === spill.r1 && col === spill.c1)) return true;
+  }
+  return false;
+}
+
+/** The value a spilling formula puts at a cell: { value, member } or undefined. */
+function spillAt(model, index, row, col) {
+  for (const spill of model.spills?.get(index) || []) {
+    if (row < spill.r1 || row > spill.r2 || col < spill.c1 || col > spill.c2 || (row === spill.r1 && col === spill.c1)) continue;
+    return { value: spill.rows[row - spill.r1][col - spill.c1], member: true };
+  }
+  return undefined;
+}
+
 /** Recalculates every formula the engine understands; the others keep their saved values. */
 function recalc(model, { onlyMissing = false } = {}) {
-  const results = new Map(), busy = new Set(), failed = new Set();
   const byName = new Map(model.sheets.map((sheet, index) => [sheet.name.toLowerCase(), index]));
-  function cellValue(index, row, col) {
-    const sheet = model.sheets[index];
-    const ref = refName(row, col);
-    const cell = sheet.cells.get(ref);
-    if (!cell) return null;
-    const f = direct(cell, 'f');
-    const formula = f && !['array', 'dataTable'].includes(f.getAttribute('t')) ? formulaOf(sheet, cell) : null;
-    if (formula == null) return cachedValue(model, cell);
-    const key = `${index}!${ref}`;
-    if (results.has(key)) return results.get(key);
-    if (busy.has(key)) throw new Unsupported('Circular reference');
-    busy.add(key);
-    let value;
-    try {
-      let tree = model.trees.get(formula);
-      if (!tree) { tree = parseFormula(formula); model.trees.set(formula, tree); }
-      value = evaluate(tree, {
-        row, col, date1904: model.date1904,
-        size: name => {
-          const target = name == null ? index : byName.get(name.toLowerCase());
-          if (target === undefined) return null;
-          return { rows: model.sheets[target].maxRow, cols: model.sheets[target].maxCol };
-        },
-        cell: (name, r, c) => {
-          const target = name == null ? index : byName.get(name.toLowerCase());
-          if (target === undefined) throw new Unsupported('Unknown sheet');
-          return cellValue(target, r, c);
-        },
-      });
-    } catch (error) {
-      if (!(error instanceof Unsupported)) throw error;
-      failed.add(key);
-      value = cachedValue(model, cell);
-    } finally {
-      busy.delete(key);
+  for (const sheet of model.sheets) {
+    // Ranges dynamic arrays saved by spreadsheet apps cover.
+    sheet.arrays = [];
+    for (const cell of sheet.cells.values()) {
+      const f = direct(cell, 'f');
+      if (f?.getAttribute('t') !== 'array' || !cell.hasAttribute('cm')) continue;
+      const [a, b] = (f.getAttribute('ref') || '').split(':').map(parseRef);
+      if (a) sheet.arrays.push({ r1: a.row, c1: a.col, r2: (b || a).row, c2: (b || a).col });
     }
-    results.set(key, value);
-    return value;
   }
-  model.sheets.forEach((sheet, index) => {
-    for (const [ref, cell] of sheet.cells) {
-      if (!direct(cell, 'f')) continue;
-      if (onlyMissing && direct(cell, 'v')) continue;
-      const { row, col } = parseRef(ref);
-      const value = cellValue(index, row, col);
-      if (onlyMissing) model.computed.set(`${index}!${ref}`, value);
+  // A formula reading cells another one spills into needs that one's results first: when a pass
+  // finds spills, a second pass runs knowing them.
+  function pass(known) {
+    const results = new Map(), busy = new Set(), failed = new Set(), found = new Map();
+    const view = { ...model, spills: known };
+    function cellValue(index, row, col) {
+      const sheet = model.sheets[index];
+      const ref = refName(row, col);
+      const cell = sheet.cells.get(ref);
+      const spilled = spillAt(view, index, row, col);
+      if (spilled !== undefined && (!cell || arrayMember(sheet, row, col))) return spilled.value;
+      if (!cell) return null;
+      const f = direct(cell, 'f');
+      const text = f && f.getAttribute('t') !== 'dataTable' ? formulaOf(sheet, cell) : null;
+      const formula = text != null && (f.getAttribute('t') !== 'array' || spills(cell, text)) ? text : null;
+      if (formula == null) return cachedValue(model, cell);
+      const key = `${index}!${ref}`;
+      if (results.has(key)) return results.get(key);
+      if (busy.has(key)) throw new Unsupported('Circular reference');
+      busy.add(key);
+      let value;
+      try {
+        let tree = model.trees.get(formula);
+        if (!tree) { tree = parseFormula(formula); model.trees.set(formula, tree); }
+        value = evaluate(tree, {
+          row, col, date1904: model.date1904,
+          size: name => {
+            const target = name == null ? index : byName.get(name.toLowerCase());
+            if (target === undefined) return null;
+            return { rows: model.sheets[target].maxRow, cols: model.sheets[target].maxCol };
+          },
+          cell: (name, r, c) => {
+            const target = name == null ? index : byName.get(name.toLowerCase());
+            if (target === undefined) throw new Unsupported('Unknown sheet');
+            return cellValue(target, r, c);
+          },
+        }, { array: spills(cell, formula) });
+        if (value?.rows) value = spill(index, row, col, value.rows);
+      } catch (error) {
+        if (!(error instanceof Unsupported)) throw error;
+        failed.add(key);
+        value = cachedValue(model, cell);
+      } finally {
+        busy.delete(key);
+      }
+      results.set(key, value);
+      return value;
     }
-  });
+    /** Spills rows from a formula at row, col, unless other cells are in the way (#SPILL!). */
+    function spill(index, row, col, rows) {
+      const sheet = model.sheets[index];
+      const r2 = row + rows.length - 1, c2 = col + rows[0].length - 1;
+      if (r2 > LAST_ROW || c2 > LAST_COL) return new CellError('#SPILL!');
+      for (let r = row; r <= r2; r++) {
+        for (let c = col; c <= c2; c++) {
+          if (r === row && c === col) continue;
+          const other = sheet.cells.get(refName(r, c));
+          const empty = !other || (!direct(other, 'f') && !direct(other, 'v') && !direct(other, 'is'));
+          if (!empty && !arrayMember(sheet, r, c)) return new CellError('#SPILL!');
+          if (sheet.covered.has(refName(r, c))) return new CellError('#SPILL!');
+        }
+      }
+      for (const other of found.get(index) || []) {
+        if (!(r2 < other.r1 || row > other.r2 || c2 < other.c1 || col > other.c2)) return new CellError('#SPILL!');
+      }
+      if (!found.has(index)) found.set(index, []);
+      found.get(index).push({ r1: row, c1: col, r2, c2, rows });
+      return rows[0][0];
+    }
+    model.sheets.forEach((sheet, index) => {
+      for (const [ref, cell] of sheet.cells) {
+        if (!direct(cell, 'f')) continue;
+        if (onlyMissing && direct(cell, 'v') && !spills(cell, formulaOf(sheet, cell) || '')) continue;
+        const { row, col } = parseRef(ref);
+        const value = cellValue(index, row, col);
+        if (onlyMissing) model.computed.set(`${index}!${ref}`, value);
+      }
+    });
+    return { results, failed, found };
+  }
+  let outcome = pass(new Map());
+  if (outcome.found.size) outcome = pass(outcome.found);
+  model.spills = outcome.found;
   if (!onlyMissing) {
-    model.computed = results;
-    model.failed = failed;
-  } else for (const key of failed) model.failed.add(key);
+    model.computed = outcome.results;
+    model.failed = outcome.failed;
+  } else for (const key of outcome.failed) model.failed.add(key);
 }
 
 // --- Cell edits ---------------------------------------------------------------------------------
@@ -1319,9 +1451,10 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   function shown(row, col) {
     const s = sheet();
     const cell = s.cells.get(refName(row, col));
-    if (!cell) return null;
+    const spilled = spillAt(model, active, row, col);
+    if (!cell && spilled === undefined) return null;
     const value = valueAt(model, active, row, col);
-    const style = cellStyle(model, cell.getAttribute('s'));
+    const style = cellStyle(model, cell?.getAttribute('s'));
     const formatted = formatValue(value, style.numFmt, formatOptions);
     let align = style.align;
     if (!align || align === 'general') align = typeof value === 'number' ? 'right' : typeof value === 'boolean' || value instanceof CellError ? 'center' : 'left';
@@ -1495,7 +1628,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const cell = s.cells.get(refName(row, col));
     if (!cell) return '';
     const formula = formulaOf(s, cell);
-    if (formula != null) return `=${formula}`;
+    if (formula != null) return `=${fromFileFormula(formula)}`;
     const value = cachedValue(model, cell);
     if (value == null) return '';
     if (value instanceof CellError) return value.code;
@@ -1737,7 +1870,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const doc = s.xml;
     if (parsed.kind === 'formula') {
       const f = doc.createElementNS(MAIN, 'f');
-      f.textContent = parsed.value;
+      f.textContent = toFileFormula(parsed.value);
       cell.append(f);
     } else if (parsed.kind === 'number') {
       const v = doc.createElementNS(MAIN, 'v');
