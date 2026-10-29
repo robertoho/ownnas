@@ -925,6 +925,44 @@ editor.destroy();
   editor12.destroy();
 }
 
+// Number formats: decimals, currency, percent, a custom code with a preview.
+{
+  const { changeDecimals } = await import('../web/sheet-formula.js');
+  assert.equal(changeDecimals('#,##0.00 "€"', 1), '#,##0.000 "€"');
+  assert.equal(changeDecimals('0.0%', -1), '0%');
+  assert.equal(changeDecimals('#,##0;[Red]-#,##0', 2), '#,##0.00;[Red]-#,##0.00');
+  assert.equal(changeDecimals('yyyy-mm-dd', 1), 'yyyy-mm-dd', 'dates are left alone');
+  const editor13 = mountXlsxEditor(container, bytes, {});
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const grid = container.querySelector('.xlsx-scroll');
+  const live = container.querySelector('.xlsx-live');
+  const menu = container.querySelector('.xlsx-menu');
+  const tool = title => [...container.querySelectorAll('.xlsx-toolbar button')].find(button => button.title === title);
+  grid.focus();
+  grid.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', ctrlKey: true, bubbles: true }));
+  tool('More decimal places').click();
+  assert.equal(live.textContent, 'A1, 10.0', 'from General, one decimal more than shown');
+  tool('More decimal places').click();
+  tool('Fewer decimal places').click();
+  assert.equal(live.textContent, 'A1, 10.0');
+  tool('Currency').click();
+  [...menu.querySelectorAll('button')].find(button => button.textContent.startsWith('Dollar')).click();
+  assert.equal(live.textContent, 'A1, $10.00');
+  tool('Percent').click();
+  assert.equal(live.textContent, 'A1, 1000%');
+  const select = container.querySelector('.xlsx-toolbar select[aria-label="Number format"]');
+  select.value = 'custom';
+  select.dispatchEvent(new Event('change'));
+  const code = menu.querySelector('.xlsx-format-code');
+  assert.equal(code.value, '0%', 'the custom panel starts from the format the cell has');
+  code.value = '0.0 "kg"';
+  code.dispatchEvent(new Event('input'));
+  assert.equal(menu.querySelector('.xlsx-format-preview').textContent, '10 shows as: 10.0 kg', 'with a preview');
+  code.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  assert.equal(live.textContent, 'A1, 10.0 kg');
+  editor13.destroy();
+}
+
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });
 assert.equal(container.querySelector('.office-save'), null);
 readonly.destroy();

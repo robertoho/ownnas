@@ -6,7 +6,7 @@
  */
 import { unzipSync, zipSync, strFromU8, strToU8 } from './vendor/three/addons/libs/fflate.module.js';
 import {
-  BUILTIN_FORMATS, CellError, FUNCTION_HELP, Unsupported, callAt, canPointAt, columnName, dateSerial, evaluate,
+  BUILTIN_FORMATS, CellError, FUNCTION_HELP, changeDecimals, Unsupported, callAt, canPointAt, columnName, dateSerial, evaluate,
   formatGeneral, formatValue, formulaWordAt, fromFileFormula, quoteSheet, renameSheet, toFileFormula, localeSeparators, moveFormula, moveSpan, moveSqref, parseFormula, parseRef,
   refName, serialParts, shiftFormula,
 } from './sheet-formula.js';
@@ -2056,6 +2056,15 @@ const ICONS = {
   border: '<path d="M2.5 2.5h11v11h-11zM8 2.5v11M2.5 8h11" stroke-dasharray="1.5 1.5"/><path d="M2.5 13.5h11"/>',
 };
 
+const CURRENCIES = [
+  ['Euro (1,234.50 €)', '#,##0.00 "€"'], ['Dollar ($1,234.50)', '"$"#,##0.00'], ['Pound (£1,234.50)', '"£"#,##0.00'],
+  ['Yen (¥1,235)', '"¥"#,##0'], ['Franc (CHF 1,234.50)', '"CHF" #,##0.00'], ['Złoty (1,234.50 zł)', '#,##0.00 "zł"'],
+];
+const CUSTOM_EXAMPLES = [
+  ['0.00', 'Two decimals'], ['#,##0', 'Thousands'], ['0.0%', 'Percent'], ['0.00E+00', 'Scientific'], ['# ?/?', 'Fraction'],
+  ['dd/mm/yyyy', 'Day/month/year'], ['d mmm yyyy', '1 Jan 2026'], ['dddd', 'Weekday'], ['hh:mm:ss', 'Time'], ['[h]:mm', 'Hours over 24'],
+  ['#,##0.00;[Red]-#,##0.00', 'Negative in red'], ['0;-0;"–"', 'Dash for zero'], ['@', 'Text'],
+];
 const FONTS = ['Calibri', 'Aptos', 'Arial', 'Cambria', 'Consolas', 'Courier New', 'Georgia', 'Segoe UI', 'Tahoma', 'Times New Roman', 'Trebuchet MS', 'Verdana'];
 const SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48, 72];
 
@@ -2444,17 +2453,39 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     formatSelect.className = 'office-select';
     formatSelect.setAttribute('aria-label', 'Number format');
     formatSelect.title = 'Number format';
-    for (const [code, label] of [['', 'Format…'], ...FORMATS]) {
+    for (const [code, label] of [['', 'Format…'], ...FORMATS, ['custom', 'Custom…']]) {
       const option = document.createElement('option');
       option.value = code;
       option.textContent = label;
       formatSelect.append(option);
     }
     formatSelect.addEventListener('change', () => {
+      if (formatSelect.value === 'custom') { openFormatPanel(); return; }
       if (formatSelect.value) formatSelection({ numFmt: formatSelect.value });
       scroll.focus({ preventScroll: true });
     });
     toolbar.append(formatSelect);
+    const textTool = (name, label, title, action) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'office-tool office-text-tool xlsx-number-tool';
+      button.textContent = label;
+      button.title = title;
+      button.setAttribute('aria-label', title);
+      button.addEventListener('mousedown', event => event.preventDefault());
+      button.addEventListener('click', action);
+      toolbar.append(button);
+      buttons[name] = button;
+    };
+    textTool('currency', '¤▾', 'Currency', () => {
+      const box = buttons.currency.getBoundingClientRect();
+      openMenu(box.left, box.bottom + 4, CURRENCIES.map(([label, code]) => [label, () => formatSelection({ numFmt: code })]));
+    });
+    buttons.currency.setAttribute('aria-haspopup', 'menu');
+    textTool('percent', '%', 'Percent', () => formatSelection({ numFmt: '0%' }));
+    textTool('thousands', '000', 'Thousands separator', () => formatSelection({ numFmt: '#,##0.00' }));
+    textTool('fewer', '.0←', 'Fewer decimal places', () => stepDecimals(-1));
+    textTool('more', '.00→', 'More decimal places', () => stepDecimals(1));
   }
   const spacer = document.createElement('span');
   spacer.className = 'office-spacer';
@@ -2492,7 +2523,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     for (const side of ['left', 'center', 'right']) buttons[side].setAttribute('aria-pressed', String(style.align === side));
     const known = FORMATS.find(([code]) => code === style.numFmt);
     formatSelect.value = known ? known[0] : '';
-    if (!model.styles) for (const name of ['bold', 'italic', 'underline', 'strike', 'left', 'center', 'right', 'wrap', 'border', 'color', 'fill', 'nofill']) buttons[name].disabled = true;
+    if (!model.styles) for (const name of ['bold', 'italic', 'underline', 'strike', 'left', 'center', 'right', 'wrap', 'border', 'color', 'fill', 'nofill', 'currency', 'percent', 'thousands', 'fewer', 'more']) buttons[name].disabled = true;
     saveButton.disabled = saving || !dirty() || !onSave;
     status.textContent = saving ? 'Saving…' : dirty() ? 'Unsaved changes' : 'Saved';
   }
@@ -3379,6 +3410,67 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       }
     });
     scroll.focus({ preventScroll: true });
+  }
+  /** One more or fewer decimal place in each selected cell's number format. */
+  function stepDecimals(delta) {
+    formatSelection((row, col) => {
+      const code = cellStyle(model, sheet().cells.get(refName(row, col))?.getAttribute('s')).numFmt;
+      let base = code;
+      if (/^general$/i.test(code.trim())) {
+        // From General, start from the decimals the number shows.
+        const value = valueAt(model, active, row, col);
+        if (typeof value !== 'number') return null;
+        const places = (formatGeneral(value).split('.')[1] || '').length;
+        base = places ? `0.${'0'.repeat(places)}` : '0';
+      }
+      const next = changeDecimals(base, delta);
+      return next === code ? null : { numFmt: next };
+    });
+  }
+  /** A number format typed out, with a preview on the selected cell and common examples. */
+  function openFormatPanel() {
+    if (!canWrite() || !model.styles) return;
+    const current = activeStyle().numFmt || 'General';
+    const value = valueAt(model, active, anchor.row, anchor.col);
+    const sample = typeof value === 'number' ? value : 1234.5;
+    const make = (tag, className, text) => { const node = document.createElement(tag); if (className) node.className = className; if (text != null) node.textContent = text; return node; };
+    const input = make('input', 'xlsx-format-code');
+    input.value = current;
+    input.setAttribute('aria-label', 'Number format code');
+    input.spellcheck = false;
+    const preview = make('p', 'xlsx-format-preview');
+    const update = () => {
+      try { preview.textContent = `${formatGeneral(sample, separators)} shows as: ${formatValue(sample, input.value || 'General', formatOptions).text}`; } catch { preview.textContent = 'This code cannot be read.'; }
+    };
+    const list = make('div', 'xlsx-format-examples');
+    for (const [code, label] of CUSTOM_EXAMPLES) {
+      const item = make('button', '');
+      item.type = 'button';
+      item.append(make('code', '', code), make('span', '', label));
+      item.addEventListener('click', () => { input.value = code; update(); input.focus(); });
+      list.append(item);
+    }
+    const actions = make('div', 'xlsx-filter-actions');
+    const cancel = make('button', '', 'Cancel');
+    cancel.type = 'button';
+    const apply = make('button', 'xlsx-filter-ok', 'Apply');
+    apply.type = 'button';
+    const close = () => { menu.hidden = true; menu.classList.remove('xlsx-format-panel'); formatSelect.value = ''; scroll.focus({ preventScroll: true }); };
+    cancel.addEventListener('click', close);
+    apply.addEventListener('click', () => { const code = input.value.trim(); close(); if (code) formatSelection({ numFmt: code }); });
+    input.addEventListener('input', update);
+    input.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); apply.click(); } });
+    actions.append(cancel, apply);
+    const help = make('p', 'xlsx-format-help', '0 a digit, # a digit if needed, . decimals, , thousands, % percent, "text" as is; sections for positive;negative;zero;text.');
+    menu.replaceChildren(make('div', 'menu-label', 'Custom number format'), input, preview, help, list, actions);
+    menu.classList.add('xlsx-format-panel');
+    menu.hidden = false;
+    const box = formatSelect.getBoundingClientRect();
+    menu.style.left = `${Math.max(8, Math.min(box.left, window.innerWidth - menu.offsetWidth - 8))}px`;
+    menu.style.top = `${Math.max(8, Math.min(box.bottom + 4, window.innerHeight - menu.offsetHeight - 8))}px`;
+    update();
+    input.focus();
+    input.select();
   }
   /** Borders on the selection: "all", "outside", "none", or one side. */
   function borderSelection(kind) {
@@ -4614,6 +4706,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     return items;
   }
   function openMenu(x, y, list = menuItems()) {
+    menu.classList.remove('xlsx-format-panel');
     const items = list.filter((item, i, all) => item !== '-' || (i > 0 && all[i - 1] !== '-' && i < all.length - 1));
     menu.replaceChildren(...items.map(item => {
       if (item === '-') {
@@ -4646,7 +4739,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const buttons = [...menu.querySelectorAll('button:not(:disabled)')];
     const at = buttons.indexOf(document.activeElement);
     if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeMenu(); scroll.focus({ preventScroll: true }); }
-    else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    else if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && event.target.tagName !== 'INPUT') {
       event.preventDefault();
       buttons[(at + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length]?.focus();
     }

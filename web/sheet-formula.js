@@ -1154,6 +1154,27 @@ function isDateFormat(body) {
   return tokens.some(token => /^(\[(h+|m+|s+)\]|[yY]+|[dD]+|[hH]+|[sS]+|[mM]+)$/.test(token)) && !tokens.some(token => /^[eE][-+]$/.test(token));
 }
 
+/** A number format with `delta` more (or fewer) decimal places, in each section that shows a
+ * number; text in quotes and dates are left as they are. */
+export function changeDecimals(code, delta) {
+  return String(code || 'General').split(';').map(section => {
+    // Mask what is literal (quoted text, escaped characters, [colours]) so it is not read as digits.
+    const masked = section.replace(/"[^"]*"|\\.|\[[^\]]*\]/g, part => '\u0001'.repeat(part.length));
+    if (/[dmyhs]/i.test(masked.replace(/E[+-]/gi, '')) && !/[0#?]/.test(masked)) return section;
+    const match = /[#0?,]*[0#?](\.[0#?]*)?/.exec(masked);
+    if (!match) return section;
+    const end = match.index + match[0].length;
+    if (delta > 0) {
+      const add = '0'.repeat(delta);
+      return section.slice(0, end) + (match[1] ? add : `.${add}`) + section.slice(end);
+    }
+    if (!match[1]) return section;
+    const places = match[1].length - 1, keep = Math.max(0, places + delta);
+    const start = end - match[1].length;
+    return section.slice(0, start) + (keep ? `.${match[1].slice(1, 1 + keep)}` : '') + section.slice(end);
+  }).join(';');
+}
+
 /** Locale separators for showing numbers, read once from the browser. */
 export function localeSeparators(locale) {
   try {
