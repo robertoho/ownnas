@@ -505,12 +505,15 @@ editor.destroy();
   assert.match(xml, /<row r="3"[^>]* hidden="1"/);
   assert.match(xml, /<autoFilter ref="A1:C4"><filterColumn colId="0"><filters><filter val="Ana"\/><filter val="Cara"\/><\/filters><\/filterColumn><\/autoFilter>/);
   assert.match(strFromU8(out['xl/workbook.xml']), /<definedNames><definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">'Data'!\$A\$1:\$C\$4<\/definedName><\/definedNames>/);
-  // Sorting a filtered table filters again: Bob stays hidden wherever he goes.
+  // Sorting a filtered table sorts the rows shown, among themselves; Bob stays hidden in his place.
   show(2, 2);
-  tool('Sort Z to A').click();
+  tool('Sort A to Z').click();
   await new Promise(resolve => requestAnimationFrame(resolve));
   const after = [...container.querySelectorAll('.xlsx-row-head')].map(head => head.textContent);
-  assert.ok(after.includes('2') && after.includes('3') && !after.includes('4'), `Bob (now last) is hidden: ${after.slice(0, 5)}`);
+  assert.ok(after.includes('2') && !after.includes('3') && after.includes('4'), `row 3 still hidden: ${after.slice(0, 5)}`);
+  // Row 3 is hidden, so row 4 is drawn where row 3 would be.
+  assert.deepEqual([2, 3].map(row => show(1, row)), ['Cara', 'Ana'], 'the shown rows sorted by score');
+  assert.equal(container.querySelector('.xlsx-address').textContent, 'A4');
   tool('Filter').click();
   await new Promise(resolve => requestAnimationFrame(resolve));
   assert.ok([...container.querySelectorAll('.xlsx-row-head')].some(head => head.textContent === '4'), 'removing the filter shows every row');

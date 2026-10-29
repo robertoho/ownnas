@@ -1459,6 +1459,39 @@ function relinkSheets(model) {
   }
 }
 
+/** Moves the comments in columns c1…c2 from row to row as `rows` (from → to) says, in their list
+ * and their VML, as sorting moves their cells. */
+function remapCommentRows(model, sheet, rows, c1, c2) {
+  for (const link of sheetLinks(model, sheet)) {
+    if (!model.parts[link.path]) continue;
+    if (link.type === 'comments') {
+      const xml = parseXml(strFromU8(model.parts[link.path]), 'Comments');
+      for (const node of xml.getElementsByTagNameNS(MAIN, 'comment')) {
+        const place = parseRef(node.getAttribute('ref'));
+        if (place && rows.has(place.row) && place.col >= c1 && place.col <= c2) node.setAttribute('ref', refName(rows.get(place.row), place.col));
+      }
+      model.parts[link.path] = strToU8(serialize(xml));
+    } else if (link.type === 'vmlDrawing') {
+      const text = strFromU8(model.parts[link.path]);
+      const moved = text.replace(/<((?:\w+:)?)shape\b[\s\S]*?<\/\1shape>/g, shape => {
+        const row = /<(?:\w+:)?Row>(\d+)</.exec(shape), col = /<(?:\w+:)?Column>(\d+)</.exec(shape);
+        if (!/ObjectType="Note"/.test(shape) || !row || !col) return shape;
+        const from = Number(row[1]) + 1, column = Number(col[1]) + 1;
+        if (!rows.has(from) || column < c1 || column > c2) return shape;
+        const step = rows.get(from) - from;
+        return shape
+          .replace(/(<(?:\w+:)?Row>)(\d+)(<)/, (all, open, number, close) => `${open}${Number(number) + step}${close}`)
+          .replace(/(<(?:\w+:)?Anchor>)([^<]*)(<)/, (all, open, list, close) => {
+            const values = list.split(',').map(item => item.trim());
+            for (const i of [2, 6]) values[i] = String(Number(values[i]) + step);
+            return `${open}${values.join(', ')}${close}`;
+          });
+      });
+      if (moved !== text) model.parts[link.path] = strToU8(moved);
+    }
+  }
+}
+
 // --- Links, comments, pictures -----------------------------------------------------------------
 
 const CHART = 'http://schemas.openxmlformats.org/drawingml/2006/chart';
@@ -3800,6 +3833,9 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     if (filter && anchor.row >= filter.r1 && anchor.row <= filter.r2 && anchor.col >= filter.c1 && anchor.col <= filter.c2) {
       return { r1: filter.r1, c1: filter.c1, r2: Math.max(filter.r2, currentRegion(anchor.row, anchor.col).r2), c2: filter.c2, header: true };
     }
+    // In an Excel table, the table (its totals row aside).
+    const table = loose && sheetExtras(model, sheet()).tables.find(item => anchor.row >= item.area.r1 && anchor.row <= item.area.r2 && anchor.col >= item.area.c1 && anchor.col <= item.area.c2);
+    if (table) return { ...table.area, r2: table.area.r2 - table.totals, header: table.header };
     const target = loose ? currentRegion(anchor.row, anchor.col) : range;
     return { ...target, header: hasHeader(target) };
   }
@@ -3817,8 +3853,12 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     }
     const collator = new Intl.Collator(locale, { sensitivity: 'base', numeric: true });
     const kind = value => (value == null || value === '' ? 4 : typeof value === 'number' ? 0 : typeof value === 'string' ? 1 : typeof value === 'boolean' ? 2 : 3);
+    const filter = autoFilterOf(s);
+    // In a filtered table only the rows shown are sorted, among themselves; hidden ones stay put.
+    const onlyShown = !!filter && target.r1 >= filter.r1 && target.c1 >= filter.c1 && target.c2 <= filter.c2;
     const rows = [];
-    for (let r = top; r <= target.r2; r++) rows.push({ r, key: valueAt(model, active, r, col) });
+    for (let r = top; r <= target.r2; r++) if (!onlyShown || !s.hiddenRows.has(r)) rows.push({ r, key: valueAt(model, active, r, col) });
+    const places = rows.map(row => row.r);
     rows.sort((a, b) => {
       const ka = kind(a.key), kb = kind(b.key);
       if (ka === 4 || kb === 4) return ka - kb || a.r - b.r;
@@ -3826,26 +3866,27 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       if (!order) order = ka === 0 ? a.key - b.key : ka === 1 ? collator.compare(a.key, b.key) : ka === 2 ? Number(a.key) - Number(b.key) : 0;
       return (descending ? -order : order) || a.r - b.r;
     });
-    if (rows.every((row, i) => row.r === top + i)) { notice(''); return; }
-    const filter = autoFilterOf(s);
+    if (rows.every((row, i) => row.r === places[i])) { notice(''); return; }
     // What the filter's cells will show once sorted, to filter again afterwards.
     const texts = new Map();
     if (filter) {
       rows.forEach((row, i) => {
-        for (let c = filter.c1; c <= filter.c2; c++) texts.set(`${top + i}:${c}`, shown(row.r, c)?.text ?? '');
+        for (let c = filter.c1; c <= filter.c2; c++) texts.set(`${places[i]}:${c}`, shown(row.r, c)?.text ?? '');
       });
     }
     structural(sh => {
       const ignore = () => {};
-      for (let r = top; r <= target.r2; r++) {
+      for (const r of places) {
         for (let c = target.c1; c <= target.c2; c++) {
           const cell = sh.cells.get(refName(r, c));
           if (cell) unshare(sh, cell, ignore);
         }
       }
+      // Comments go with their rows.
+      remapCommentRows(model, sh, new Map(rows.map(({ r: from }, i) => [from, places[i]])), target.c1, target.c2);
       const copies = rows.map(({ r }) => Array.from({ length: target.c2 - target.c1 + 1 }, (_, k) => sh.cells.get(refName(r, target.c1 + k))?.cloneNode(true) || null));
       rows.forEach(({ r: from }, i) => {
-        const to = top + i;
+        const to = places[i];
         copies[i].forEach((copy, k) => {
           const ref = refName(to, target.c1 + k);
           if (!copy) {

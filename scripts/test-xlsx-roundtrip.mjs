@@ -62,6 +62,9 @@ async function edit(bytes) {
   type(3, 3, '3');
   type(4, 3, '=B3*C3');
   type(5, 2, 'Yes');
+  // Sort the table by quantity, largest first: the comment on Ink goes with it.
+  go(2, 2);
+  container.querySelector('.xlsx-toolbar button[title^="Sort Z to A"]').click();
   // Summary: one more formula, then renamed.
   tab('Summary').click();
   type(1, 3, 'Check');
@@ -164,7 +167,7 @@ for (const [label, source] of [['openpyxl', path.join(work, 'rich.xlsx')], ['Lib
   assert.deepEqual(view.merged, ['F6:G7'], `${label}: merged cells moved down`);
   assert.deepEqual(view.conditional, ['A2:A6', 'B2:B6', 'C2:C6'], `${label}: conditional formatting grew`);
   assert.deepEqual(view.validation, ['E2:E6'], `${label}: validation grew`);
-  assert.deepEqual(view.comments, ['A4'], `${label}: the comment moved with its cell`);
+  assert.deepEqual(view.comments, ['A3'], `${label}: the comment moved with its cell, and its row when sorted`);
   assert.deepEqual(view.links, ['F4'], `${label}: the link moved`);
   assert.equal(view.images, 1, `${label}: the picture kept`);
   assert.equal(view.names.Grand.replace(/'/g, ''), 'Sales!$G$1', `${label}: names kept`);
@@ -177,8 +180,8 @@ for (const [label, source] of [['openpyxl', path.join(work, 'rich.xlsx')], ['Lib
     const col = ref.charCodeAt(0) - 65, row = Number(ref.slice(1)) - 1;
     return values[sheet]?.[row]?.[col];
   };
-  assert.equal(cell('Sales', 'A3'), 'Mug', `${label}: LibreOffice reads the new row`);
-  assert.equal(Number(cell('Sales', 'D3')), 12);
+  assert.deepEqual(['A2', 'A3', 'A4', 'A5', 'A6'].map(ref => cell('Sales', ref)), ['Cap', 'Ink', 'Mug', 'Pen', 'Pad'], `${label}: LibreOffice reads the new row, sorted`);
+  assert.deepEqual(['D2', 'D3', 'D4'].map(ref => Number(cell('Sales', ref))), [3.5, 20, 12], `${label}: formulas moved with their rows`);
   assert.equal(Number(cell('Sales', 'G1')), 44.5, `${label}: and recalculates the total over it`);
   assert.equal(Number(cell('Overview', 'B1')), 44.5, `${label}: a renamed sheet's formulas`);
   assert.equal(Number(cell('Overview', 'B2')), 5);
