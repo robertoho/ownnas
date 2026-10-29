@@ -448,6 +448,76 @@ editor.destroy();
   editor6.destroy();
 }
 
+// Sorting moves whole rows (formulas with them) and keeps the header; filtering hides rows.
+{
+  const table = `<worksheet xmlns="${NS}"><sheetData>
+<row r="1"><c r="A1" t="inlineStr"><is><t>Name</t></is></c><c r="B1" t="inlineStr"><is><t>Score</t></is></c><c r="C1" t="inlineStr"><is><t>Double</t></is></c></row>
+<row r="2"><c r="A2" t="inlineStr"><is><t>Cara</t></is></c><c r="B2"><v>7</v></c><c r="C2"><f>B2*2</f><v>14</v></c></row>
+<row r="3"><c r="A3" t="inlineStr"><is><t>Ana</t></is></c><c r="B3"><v>9</v></c><c r="C3"><f>B3*2</f><v>18</v></c></row>
+<row r="4"><c r="A4" t="inlineStr"><is><t>Bob</t></is></c><c r="B4"><v>3</v></c><c r="C4"><f>B4*2</f><v>6</v></c></row>
+</sheetData></worksheet>`;
+  const tableBytes = zipSync(Object.fromEntries(Object.entries({ ...files, 'xl/worksheets/sheet1.xml': table }).map(([name, text]) => [name, strToU8(text)])));
+  const editor7 = mountXlsxEditor(container, tableBytes, { onSave: async data => { saved = data; } });
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const grid = container.querySelector('.xlsx-scroll');
+  const canvas = container.querySelector('.xlsx-canvas');
+  const toolbar = container.querySelector('.xlsx-toolbar');
+  const bar = container.querySelector('.xlsx-formula');
+  const tool = label => [...toolbar.querySelectorAll('button')].find(button => button.title.startsWith(label));
+  const mouse = (type, col, row) => canvas.dispatchEvent(new window.MouseEvent(type, { button: 0, bubbles: true, cancelable: true, clientX: 46 + 64 * (col - 1) + 10, clientY: 24 + 20 * (row - 1) + 8 }));
+  const show = (col, row) => { mouse('pointerdown', col, row); mouse('pointerup', col, row); return bar.value; };
+  grid.focus();
+  show(2, 3);
+  tool('Sort Z to A').click();
+  assert.deepEqual([2, 3, 4].map(row => show(1, row)), ['Ana', 'Cara', 'Bob'], 'sorted by score, largest first, under the header');
+  assert.equal(show(1, 1), 'Name', 'the header stays');
+  assert.deepEqual([2, 3, 4].map(row => show(3, row)), ['=B2*2', '=B3*2', '=B4*2'], 'formulas move with their rows');
+  show(1, 2);
+  tool('Sort A to Z').click();
+  assert.deepEqual([2, 3, 4].map(row => show(1, row)), ['Ana', 'Bob', 'Cara'], 'by name');
+
+  tool('Filter').click();
+  assert.equal(tool('Filter').getAttribute('aria-pressed'), 'true');
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const buttons = container.querySelectorAll('.xlsx-filter-button');
+  assert.equal(buttons.length, 3, 'a dropdown on each header');
+  buttons[0].dispatchEvent(new window.MouseEvent('pointerdown', { button: 0, bubbles: true, cancelable: true }));
+  const panel = container.querySelector('.xlsx-filter-panel');
+  assert.equal(panel.hidden, false);
+  const items = () => [...panel.querySelectorAll('.xlsx-filter-item:not(.xlsx-filter-all)')];
+  assert.deepEqual(items().map(item => item.textContent.trim()), ['Ana', 'Bob', 'Cara']);
+  const search = panel.querySelector('.xlsx-filter-search');
+  search.value = 'bo';
+  search.dispatchEvent(new Event('input'));
+  assert.deepEqual(items().map(item => item.textContent.trim()), ['Bob'], 'the search narrows the list');
+  items()[0].querySelector('input').click();
+  search.value = '';
+  search.dispatchEvent(new Event('input'));
+  [...panel.querySelectorAll('button')].find(button => button.textContent === 'OK').click();
+  assert.equal(panel.hidden, true);
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const rowHeads = [...container.querySelectorAll('.xlsx-row-head')].map(head => head.textContent);
+  assert.ok(rowHeads.includes('2') && !rowHeads.includes('3') && rowHeads.includes('4'), `Bob's row is hidden: ${rowHeads.slice(0, 5)}`);
+  assert.ok(container.querySelector('.xlsx-filter-button.is-active'), 'the filtered column shows it');
+  await editor7.save();
+  const out = unzipSync(saved);
+  const xml = strFromU8(out['xl/worksheets/sheet1.xml']);
+  assert.match(xml, /<row r="3"[^>]* hidden="1"/);
+  assert.match(xml, /<autoFilter ref="A1:C4"><filterColumn colId="0"><filters><filter val="Ana"\/><filter val="Cara"\/><\/filters><\/filterColumn><\/autoFilter>/);
+  assert.match(strFromU8(out['xl/workbook.xml']), /<definedNames><definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">'Data'!\$A\$1:\$C\$4<\/definedName><\/definedNames>/);
+  // Sorting a filtered table filters again: Bob stays hidden wherever he goes.
+  show(2, 2);
+  tool('Sort Z to A').click();
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const after = [...container.querySelectorAll('.xlsx-row-head')].map(head => head.textContent);
+  assert.ok(after.includes('2') && after.includes('3') && !after.includes('4'), `Bob (now last) is hidden: ${after.slice(0, 5)}`);
+  tool('Filter').click();
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  assert.ok([...container.querySelectorAll('.xlsx-row-head')].some(head => head.textContent === '4'), 'removing the filter shows every row');
+  assert.equal(container.querySelectorAll('.xlsx-filter-button').length, 0);
+  editor7.destroy();
+}
+
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });
 assert.equal(container.querySelector('.office-save'), null);
 readonly.destroy();

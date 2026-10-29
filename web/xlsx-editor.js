@@ -435,6 +435,9 @@ export function openXlsx(bytes) {
     const name = sheetNode.getAttribute('name') || `Sheet ${sheets.length + 1}`;
     const xml = parseXml(strFromU8(parts[path]), `Worksheet ${name}`);
     const sheet = readSheet(name, path, xml, ['hidden', 'veryHidden'].includes(sheetNode.getAttribute('state')), counter);
+    // Its <sheet> in the workbook, which names it and gives its place (local names count by it).
+    sheet.node = sheetNode;
+    sheet.relId = relId;
     sheets.push(sheet);
   }
   if (!sheets.length) throw new Error('No readable worksheets were found.');
@@ -1093,6 +1096,118 @@ export function freezePanes(sheet, rows, cols) {
   rereadSheet(sheet);
 }
 
+/** Each sheet's <sheet> in the workbook, found again after the workbook XML was read anew. */
+function relinkSheets(model) {
+  const nodes = [...model.workbookXml.getElementsByTagNameNS(MAIN, 'sheet')];
+  for (const sheet of model.sheets) {
+    sheet.node = nodes.find(node => (node.getAttributeNS(DOC_REL, 'id') || node.getAttribute('r:id')) === sheet.relId) || sheet.node;
+  }
+}
+
+// --- Sorting and filtering ----------------------------------------------------------------------
+
+/** A sheet's filter: its range (header row first) and element, or null. */
+export function autoFilterOf(sheet) {
+  const node = direct(sheet.root, 'autoFilter');
+  const [a, b] = (node?.getAttribute('ref') || '').split(':').map(parseRef);
+  return a ? { r1: a.row, c1: a.col, r2: (b || a).row, c2: (b || a).col, node } : null;
+}
+
+/** What a filter column lets through: a set of shown texts ('' for blank cells), or null for
+ * kinds of filter this editor does not read (those columns hide nothing here). */
+function filterValues(column) {
+  const filters = direct(column, 'filters');
+  if (!filters) return null;
+  const values = new Set(kids(filters, 'filter').map(node => (node.getAttribute('val') || '').toLowerCase()));
+  if (flag(filters.getAttribute('blank'))) values.add('');
+  return values;
+}
+
+/** The workbook's hidden name Excel keeps for a sheet's filter range, set or removed. */
+function filterName(model, sheet, range) {
+  const doc = model.workbookXml, root = doc.documentElement;
+  const position = String([...doc.getElementsByTagNameNS(MAIN, 'sheet')].indexOf(sheet.node));
+  let names = direct(root, 'definedNames');
+  for (const node of kids(names, 'definedName')) {
+    if (node.getAttribute('name') === '_xlnm._FilterDatabase' && node.getAttribute('localSheetId') === position) node.remove();
+  }
+  if (range && position !== '-1') {
+    if (!names) {
+      names = doc.createElementNS(MAIN, 'definedNames');
+      const after = ['calcPr', 'oleSize', 'customWorkbookViews', 'pivotCaches', 'smartTagPr', 'smartTagTypes', 'webPublishing', 'fileRecoveryPr', 'webPublishObjects', 'extLst'];
+      root.insertBefore(names, [...root.children].find(child => after.includes(child.localName)) || null);
+    }
+    const node = doc.createElementNS(MAIN, 'definedName');
+    node.setAttribute('name', '_xlnm._FilterDatabase');
+    node.setAttribute('localSheetId', position);
+    node.setAttribute('hidden', '1');
+    const abs = (row, col) => `$${columnName(col)}$${row}`;
+    node.textContent = `'${sheet.name.replace(/'/g, "''")}'!${abs(range.r1, range.c1)}:${abs(range.r2, range.c2)}`;
+    names.append(node);
+  } else if (names && !kids(names, 'definedName').length) {
+    names.remove();
+  }
+  model.workbookTouched = true;
+}
+
+/** Puts a filter on a range, its first row the headers. */
+export function setAutoFilter(model, sheet, range) {
+  const node = worksheetChild(sheet, 'autoFilter');
+  node.replaceChildren();
+  node.setAttribute('ref', `${refName(range.r1, range.c1)}:${refName(range.r2, range.c2)}`);
+  filterName(model, sheet, range);
+}
+
+/** Takes the filter off, showing the rows it hid. */
+export function removeAutoFilter(model, sheet) {
+  const filter = autoFilterOf(sheet);
+  if (!filter) return;
+  for (const [r, row] of sheet.rows) if (r > filter.r1 && r <= filter.r2) row.removeAttribute('hidden');
+  filter.node.remove();
+  filterName(model, sheet, null);
+  rereadSheet(sheet);
+}
+
+/** Hides the rows of the filter range that some column's filter does not let through, and shows
+ * the others. `textAt(row, col)` is what a cell shows. */
+export function applyAutoFilter(model, sheet, textAt) {
+  const filter = autoFilterOf(sheet);
+  if (!filter) return;
+  const tests = kids(filter.node, 'filterColumn')
+    .map(column => ({ col: filter.c1 + Number(column.getAttribute('colId') || 0), values: filterValues(column) }))
+    .filter(test => test.values);
+  for (let r = filter.r1 + 1; r <= filter.r2; r++) {
+    const hide = tests.some(test => !test.values.has(String(textAt(r, test.col) ?? '').toLowerCase()));
+    if (hide) rowElement(sheet, r).setAttribute('hidden', '1');
+    else sheet.rows.get(r)?.removeAttribute('hidden');
+  }
+  filterName(model, sheet, filter);
+  rereadSheet(sheet);
+}
+
+/** Sets which shown texts column `col` of the filter lets through (null: all of them). */
+export function setFilterColumn(sheet, col, allowed) {
+  const filter = autoFilterOf(sheet);
+  if (!filter) return;
+  const colId = String(col - filter.c1);
+  for (const column of kids(filter.node, 'filterColumn')) if (column.getAttribute('colId') === colId) column.remove();
+  if (!allowed) return;
+  const doc = sheet.xml;
+  const column = doc.createElementNS(MAIN, 'filterColumn');
+  column.setAttribute('colId', colId);
+  const filters = doc.createElementNS(MAIN, 'filters');
+  if (allowed.has('')) filters.setAttribute('blank', '1');
+  for (const value of allowed) {
+    if (value === '') continue;
+    const node = doc.createElementNS(MAIN, 'filter');
+    node.setAttribute('val', value);
+    filters.append(node);
+  }
+  column.append(filters);
+  const after = kids(filter.node, 'filterColumn').find(other => Number(other.getAttribute('colId')) > Number(colId));
+  filter.node.insertBefore(column, after || kids(filter.node, 'sortState')[0] || null);
+}
+
 // --- Filling ------------------------------------------------------------------------------------
 
 const FILL_LISTS = [
@@ -1197,6 +1312,9 @@ const ICONS = {
   color: '<path d="M4.5 12 8 3l3.5 9M6 9h4"/>',
   save: '<path d="M3 3h8l2 2v8H3z"/><path d="M5 3v3h5V3M5 13V9h6v4"/>',
   freeze: '<path d="M2.5 2.5h11v11h-11z"/><path d="M2.5 6.5h11M6.5 2.5v11" stroke-width="2.4"/>',
+  sortUp: '<path d="M4.5 3v10M2.5 11l2 2 2-2"/><path d="M9 4h2M9 8h3.5M9 12h5"/>',
+  sortDown: '<path d="M4.5 3v10M2.5 11l2 2 2-2"/><path d="M9 4h5M9 8h3.5M9 12h2"/>',
+  filter: '<path d="M2.5 3h11l-4.3 5.2v4.3l-2.4 1.2V8.2z"/>',
   underline: '<path d="M5 3v4a3 3 0 0 0 6 0V3M4 13h8"/>',
   strike: '<path d="M3 8h10M10.5 4.5C10 3.6 9 3 7.8 3 6.3 3 5 3.9 5 5.2c0 .9.5 1.5 1.3 1.9M5.5 11.3c.5.9 1.5 1.7 2.9 1.7 1.6 0 2.8-.9 2.8-2.3 0-.6-.2-1.1-.6-1.5"/>',
   wrap: '<path d="M3 4h10M3 8h8a2 2 0 0 1 0 4H8"/><path d="M9.5 10.5 8 12l1.5 1.5M3 12h3"/>',
@@ -1334,6 +1452,11 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   const assist = document.createElement('div');
   assist.className = 'xlsx-assist';
   assist.hidden = true;
+  // A filter column's choices: sorting, a search, and the values to show.
+  const filterPanel = document.createElement('div');
+  filterPanel.className = 'menu xlsx-filter-panel';
+  filterPanel.setAttribute('role', 'dialog');
+  filterPanel.hidden = true;
   const menu = document.createElement('div');
   menu.className = 'menu xlsx-menu';
   menu.setAttribute('role', 'menu');
@@ -1392,7 +1515,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   functionsList.setAttribute('role', 'listbox');
   functionsList.setAttribute('aria-label', 'Functions');
   functionsPanel.append(functionsHead, functionsFilter, functionsHelp, functionsCount, functionsList);
-  root.append(toolbar, formulaRow, scroll, footer, note, live, assist, menu, functionsPanel);
+  root.append(toolbar, formulaRow, scroll, footer, note, live, assist, menu, filterPanel, functionsPanel);
   container.replaceChildren(root);
 
   const sheet = () => model.sheets[active];
@@ -1516,6 +1639,9 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       ]);
     });
     buttons.freeze.setAttribute('aria-haspopup', 'menu');
+    tool('sortUp', 'Sort A to Z (smallest first), by the selected column', () => sortRange(sortTarget(), anchor.col, false));
+    tool('sortDown', 'Sort Z to A (largest first), by the selected column', () => sortRange(sortTarget(), anchor.col, true));
+    tool('filter', 'Filter: dropdowns on the header row', toggleFilter, { toggle: true });
     divider();
     formatSelect.className = 'office-select';
     formatSelect.setAttribute('aria-label', 'Number format');
@@ -1559,6 +1685,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     buttons.underline.setAttribute('aria-pressed', String(!!style.underline));
     buttons.strike.setAttribute('aria-pressed', String(!!style.strike));
     buttons.wrap.setAttribute('aria-pressed', String(!!style.wrap));
+    buttons.filter.setAttribute('aria-pressed', String(!!autoFilterOf(sheet())));
     buttons.merge.setAttribute('aria-pressed', String(sheet().covered.has(refName(anchor.row, anchor.col))));
     showValue(fontSelect, style.font || '');
     showValue(sizeSelect, String(style.size || 11));
@@ -1812,6 +1939,23 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     dy = top; dx = left;
     area(1, fr, 1, fc);
     pinned = false; dx = 0; dy = 0;
+    // The filter's dropdowns, on its header row.
+    const filter = autoFilterOf(s);
+    if (filter && rowPx(s, filter.r1) && (filter.r1 <= fr || (filter.r1 >= r1 && filter.r1 <= r2))) {
+      const active = new Set(kids(filter.node, 'filterColumn').map(column => filter.c1 + Number(column.getAttribute('colId') || 0)));
+      for (let c = filter.c1; c <= filter.c2; c++) {
+        if (!(c <= fc || (c >= c1 && c <= c2)) || !colPx(s, c)) continue;
+        const box = onScreen(filter.r1, c, filter.r1, c);
+        const button = document.createElement('div');
+        button.className = active.has(c) ? 'xlsx-filter-button is-active' : 'xlsx-filter-button';
+        button.dataset.col = String(c);
+        button.title = active.has(c) ? `Filtered: ${columnName(c)}` : `Filter or sort by ${columnName(c)}`;
+        button.textContent = active.has(c) ? '⏷' : '▾';
+        const size = Math.min(16, box.height - 2);
+        button.style.cssText = `left:${box.left + box.width - size - 2}px;top:${box.top + (box.height - size) / 2}px;width:${size}px;height:${size}px`;
+        fragment.append(button);
+      }
+    }
     // The edge of the frozen part, as in spreadsheet apps.
     if (fr) {
       const line = document.createElement('div');
@@ -2082,6 +2226,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     if (state.workbook != null) {
       model.workbookXml = parseXml(state.workbook, 'Workbook XML');
       model.workbookTouched = true;
+      relinkSheets(model);
     }
     Object.assign(model.parts, state.parts);
   }
@@ -2236,6 +2381,243 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       return Object.keys(sides).length ? { borders: sides } : null;
     });
   }
+  // Sorting and filtering
+  /** The block of filled cells around a cell, as spreadsheet apps pick what to sort or filter. */
+  function currentRegion(row, col) {
+    let r1 = row, r2 = row, c1 = col, c2 = col;
+    const across = (r, a, b) => { for (let c = Math.max(1, a); c <= b; c++) if (filled(r, c)) return true; return false; };
+    const down = (c, a, b) => { for (let r = Math.max(1, a); r <= b; r++) if (filled(r, c)) return true; return false; };
+    for (let grew = true; grew;) {
+      grew = false;
+      if (r1 > 1 && across(r1 - 1, c1 - 1, c2 + 1)) { r1--; grew = true; }
+      if (r2 < LAST_ROW && across(r2 + 1, c1 - 1, c2 + 1)) { r2++; grew = true; }
+      if (c1 > 1 && down(c1 - 1, r1 - 1, r2 + 1)) { c1--; grew = true; }
+      if (c2 < LAST_COL && down(c2 + 1, r1 - 1, r2 + 1)) { c2++; grew = true; }
+    }
+    return { r1, c1, r2, c2 };
+  }
+  /** Whether a range's first row looks like headers: text over other kinds of values, or bold. */
+  function hasHeader(range) {
+    if (range.r1 >= range.r2) return false;
+    let headers = 0, differs = false;
+    for (let c = range.c1; c <= range.c2; c++) {
+      const top = valueAt(model, active, range.r1, c);
+      if (top == null || top === '') continue;
+      if (typeof top !== 'string') return false;
+      headers++;
+      const below = valueAt(model, active, range.r1 + 1, c);
+      if (below != null && typeof below !== 'string') differs = true;
+    }
+    const bold = cellStyle(model, sheet().cells.get(refName(range.r1, range.c1))?.getAttribute('s')).bold;
+    return headers > 0 && (differs || !!bold);
+  }
+  /** What sorting sorts: the filter's range, the selection, or the block around the cell. */
+  function sortTarget() {
+    const range = selectedRange();
+    const filter = autoFilterOf(sheet());
+    const loose = (range.r1 === range.r2 && range.c1 === range.c2) || range.r2 >= LAST_ROW || range.c2 >= LAST_COL;
+    if (filter && anchor.row >= filter.r1 && anchor.row <= filter.r2 && anchor.col >= filter.c1 && anchor.col <= filter.c2) {
+      return { r1: filter.r1, c1: filter.c1, r2: Math.max(filter.r2, currentRegion(anchor.row, anchor.col).r2), c2: filter.c2, header: true };
+    }
+    const target = loose ? currentRegion(anchor.row, anchor.col) : range;
+    return { ...target, header: hasHeader(target) };
+  }
+  /** Sorts the rows of a range by one column; blank cells go last either way, and formulas move
+   * with their rows. */
+  function sortRange(target, col, descending) {
+    if (!canWrite()) return;
+    commitEdit();
+    const s = sheet();
+    const top = target.header ? target.r1 + 1 : target.r1;
+    if (top >= target.r2) { notice('There is nothing to sort here: select a table, or a cell in one.'); return; }
+    if (s.merges.some(m => !(m.r2 < top || m.r1 > target.r2 || m.c2 < target.c1 || m.c1 > target.c2))) {
+      notice('Ranges with merged cells cannot be sorted.');
+      return;
+    }
+    const collator = new Intl.Collator(locale, { sensitivity: 'base', numeric: true });
+    const kind = value => (value == null || value === '' ? 4 : typeof value === 'number' ? 0 : typeof value === 'string' ? 1 : typeof value === 'boolean' ? 2 : 3);
+    const rows = [];
+    for (let r = top; r <= target.r2; r++) rows.push({ r, key: valueAt(model, active, r, col) });
+    rows.sort((a, b) => {
+      const ka = kind(a.key), kb = kind(b.key);
+      if (ka === 4 || kb === 4) return ka - kb || a.r - b.r;
+      let order = ka - kb;
+      if (!order) order = ka === 0 ? a.key - b.key : ka === 1 ? collator.compare(a.key, b.key) : ka === 2 ? Number(a.key) - Number(b.key) : 0;
+      return (descending ? -order : order) || a.r - b.r;
+    });
+    if (rows.every((row, i) => row.r === top + i)) { notice(''); return; }
+    const filter = autoFilterOf(s);
+    // What the filter's cells will show once sorted, to filter again afterwards.
+    const texts = new Map();
+    if (filter) {
+      rows.forEach((row, i) => {
+        for (let c = filter.c1; c <= filter.c2; c++) texts.set(`${top + i}:${c}`, shown(row.r, c)?.text ?? '');
+      });
+    }
+    structural(sh => {
+      const ignore = () => {};
+      for (let r = top; r <= target.r2; r++) {
+        for (let c = target.c1; c <= target.c2; c++) {
+          const cell = sh.cells.get(refName(r, c));
+          if (cell) unshare(sh, cell, ignore);
+        }
+      }
+      const copies = rows.map(({ r }) => Array.from({ length: target.c2 - target.c1 + 1 }, (_, k) => sh.cells.get(refName(r, target.c1 + k))?.cloneNode(true) || null));
+      rows.forEach(({ r: from }, i) => {
+        const to = top + i;
+        copies[i].forEach((copy, k) => {
+          const ref = refName(to, target.c1 + k);
+          if (!copy) {
+            sh.cells.get(ref)?.remove();
+            sh.cells.delete(ref);
+            return;
+          }
+          copy.setAttribute('r', ref);
+          const f = direct(copy, 'f');
+          if (f && to !== from) {
+            f.textContent = shiftFormula(f.textContent, to - from, 0);
+            if (f.hasAttribute('ref')) f.setAttribute('ref', f.getAttribute('ref').replace(/(\$?[A-Z]{1,3}\$?)(\d+)/gi, (all, letters, number) => letters + (Number(number) + to - from)));
+          }
+          placeCell(sh, ref, copy);
+        });
+      });
+      if (filter) {
+        const filterRange = autoFilterOf(sh);
+        if (target.r2 > filterRange.r2) filterRange.node.setAttribute('ref', `${refName(filterRange.r1, filterRange.c1)}:${refName(target.r2, filterRange.c2)}`);
+        applyAutoFilter(model, sh, (r, c) => texts.get(`${r}:${c}`) ?? shown(r, c)?.text ?? '');
+      }
+      rereadSheet(sh);
+    });
+  }
+  function toggleFilter() {
+    if (!canWrite()) return;
+    commitEdit();
+    if (autoFilterOf(sheet())) {
+      structural(sh => removeAutoFilter(model, sh));
+      return;
+    }
+    const range = selectedRange();
+    const loose = (range.r1 === range.r2 && range.c1 === range.c2) || range.r2 >= LAST_ROW || range.c2 >= LAST_COL;
+    const target = loose ? currentRegion(anchor.row, anchor.col) : range;
+    if (target.r1 === target.r2) { notice('Select a table with a header row, or a cell in one, to filter it.'); return; }
+    structural(sh => setAutoFilter(model, sh, target));
+  }
+  let filterState = null;
+  /** The choices for filtering a column of the filter: sort, search, and which values to show. */
+  function openFilterPanel(col, at) {
+    closeMenu();
+    const s = sheet();
+    const filter = autoFilterOf(s);
+    if (!filter) return;
+    // Rows added under the table belong to it.
+    const bottom = Math.max(filter.r2, currentRegion(filter.r1, col).r2);
+    const counts = new Map();
+    for (let r = filter.r1 + 1; r <= bottom; r++) {
+      const text = shown(r, col)?.text ?? '';
+      counts.set(text, (counts.get(text) || 0) + 1);
+    }
+    const collator = new Intl.Collator(locale, { sensitivity: 'base', numeric: true });
+    const values = [...counts.keys()].sort((a, b) => (a === '') - (b === '') || collator.compare(a, b));
+    const column = kids(filter.node, 'filterColumn').find(node => filter.c1 + Number(node.getAttribute('colId') || 0) === col);
+    const allowed = column ? filterValues(column) : null;
+    filterState = { col, bottom, checked: new Set(values.filter(value => !allowed || allowed.has(value.toLowerCase()))), values };
+    const doc = document;
+    const make = (tag, className, text) => { const node = doc.createElement(tag); if (className) node.className = className; if (text != null) node.textContent = text; return node; };
+    const sortUp = make('button', '', 'Sort A to Z');
+    const sortDown = make('button', '', 'Sort Z to A');
+    for (const [button, descending] of [[sortUp, false], [sortDown, true]]) {
+      button.type = 'button';
+      button.addEventListener('click', () => {
+        closeFilterPanel();
+        sortRange({ r1: filter.r1, c1: filter.c1, r2: bottom, c2: filter.c2, header: true }, col, descending);
+      });
+    }
+    const search = make('input', 'xlsx-filter-search');
+    search.type = 'search';
+    search.placeholder = 'Search';
+    search.setAttribute('aria-label', 'Search the values');
+    const list = make('div', 'xlsx-filter-list');
+    const all = make('label', 'xlsx-filter-item xlsx-filter-all');
+    const allBox = make('input');
+    allBox.type = 'checkbox';
+    all.append(allBox, ' (Select all)');
+    const LIMIT = 1000;
+    const drawList = () => {
+      const query = search.value.trim().toLowerCase();
+      const visible = values.filter(value => !query || (value || '(blanks)').toLowerCase().includes(query));
+      allBox.checked = visible.length > 0 && visible.every(value => filterState.checked.has(value));
+      allBox.indeterminate = !allBox.checked && visible.some(value => filterState.checked.has(value));
+      list.replaceChildren(all, ...visible.slice(0, LIMIT).map(value => {
+        const item = make('label', 'xlsx-filter-item');
+        const box = make('input');
+        box.type = 'checkbox';
+        box.checked = filterState.checked.has(value);
+        box.addEventListener('change', () => {
+          if (box.checked) filterState.checked.add(value); else filterState.checked.delete(value);
+          drawList();
+        });
+        item.append(box, value === '' ? make('em', '', '(Blanks)') : ` ${value}`);
+        return item;
+      }));
+      if (visible.length > LIMIT) list.append(make('p', 'xlsx-filter-more', `${visible.length - LIMIT} more: search to find them.`));
+      ok.disabled = !filterState.checked.size;
+    };
+    allBox.addEventListener('change', () => {
+      const query = search.value.trim().toLowerCase();
+      for (const value of values) {
+        if (query && !(value || '(blanks)').toLowerCase().includes(query)) continue;
+        if (allBox.checked) filterState.checked.add(value); else filterState.checked.delete(value);
+      }
+      drawList();
+    });
+    const actions = make('div', 'xlsx-filter-actions');
+    const clear = make('button', '', 'Clear filter');
+    clear.type = 'button';
+    clear.disabled = !column;
+    clear.addEventListener('click', () => { closeFilterPanel(); filterColumn(col, null, bottom); });
+    const cancel = make('button', '', 'Cancel');
+    cancel.type = 'button';
+    cancel.addEventListener('click', () => closeFilterPanel());
+    const ok = make('button', 'xlsx-filter-ok', 'OK');
+    ok.type = 'button';
+    ok.addEventListener('click', () => {
+      const chosen = filterState.checked.size === values.length ? null : new Set(filterState.checked);
+      closeFilterPanel();
+      filterColumn(col, chosen, bottom);
+    });
+    actions.append(clear, cancel, ok);
+    search.addEventListener('input', drawList);
+    search.addEventListener('keydown', event => { if (event.key === 'Enter' && !ok.disabled) { event.preventDefault(); ok.click(); } });
+    filterPanel.replaceChildren(make('div', 'menu-label', `Filter ${columnName(col)}`), sortUp, sortDown, make('div', 'menu-separator'), search, list, actions);
+    drawList();
+    filterPanel.hidden = false;
+    filterPanel.style.left = `${Math.max(8, Math.min(at.left, window.innerWidth - filterPanel.offsetWidth - 8))}px`;
+    filterPanel.style.top = `${Math.max(8, Math.min(at.bottom + 4, window.innerHeight - filterPanel.offsetHeight - 8))}px`;
+    search.focus({ preventScroll: true });
+  }
+  function closeFilterPanel() {
+    filterPanel.hidden = true;
+    filterState = null;
+    scroll.focus({ preventScroll: true });
+  }
+  /** Sets which values a column of the filter shows (null: all), and hides the other rows. */
+  function filterColumn(col, allowed, bottom) {
+    structural(sh => {
+      const filter = autoFilterOf(sh);
+      if (bottom > filter.r2) filter.node.setAttribute('ref', `${refName(filter.r1, filter.c1)}:${refName(bottom, filter.c2)}`);
+      setFilterColumn(sh, col, allowed);
+      applyAutoFilter(model, sh, (r, c) => shown(r, c)?.text ?? '');
+    });
+  }
+  filterPanel.addEventListener('keydown', event => {
+    event.stopPropagation();
+    if (event.key === 'Escape') { event.preventDefault(); closeFilterPanel(); }
+  });
+  const outsideFilter = event => {
+    if (!filterPanel.hidden && !filterPanel.contains(event.target) && !event.target.closest?.('.xlsx-filter-button')) closeFilterPanel();
+  };
+  document.addEventListener('pointerdown', outsideFilter, true);
+
   function freeze(rows, cols) {
     if (rows >= LAST_ROW || cols >= LAST_COL) return;
     if (structural(s => freezePanes(s, rows, cols))) {
@@ -2688,6 +3070,13 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   }
   canvas.addEventListener('pointerdown', event => {
     if (event.button !== 0 || event.target === cellEditor) return;
+    const filterButton = event.target.closest?.('.xlsx-filter-button');
+    if (filterButton) {
+      event.preventDefault();
+      if (editing) commitEdit();
+      openFilterPanel(Number(filterButton.dataset.col), filterButton.getBoundingClientRect());
+      return;
+    }
     layout();
     const p = pointAt(event);
     // Typing a formula where a reference can go: the cell clicked goes into it.
@@ -2963,6 +3352,8 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     if (!wholeRows && !wholeCols) {
       if (rows > 1) items.push([`Fill down${IS_MAC ? ' (⌘D)' : ' (Ctrl+D)'}`, fillDown]);
       items.push(['Clear contents', clearSelection]);
+      items.push('-', ['Sort A to Z', () => sortRange(sortTarget(), anchor.col, false)], ['Sort Z to A', () => sortRange(sortTarget(), anchor.col, true)]);
+      items.push([autoFilterOf(sheet()) ? 'Remove filter' : 'Filter', toggleFilter]);
     }
     return items;
   }
@@ -3289,6 +3680,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       document.removeEventListener('cut', onCut);
       document.removeEventListener('paste', onPaste);
       document.removeEventListener('pointerdown', outsideMenu, true);
+      document.removeEventListener('pointerdown', outsideFilter, true);
       document.removeEventListener('pointerdown', outsideFunctions, true);
       if (frame) cancelAnimationFrame(frame);
       root.remove();

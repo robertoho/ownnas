@@ -2432,6 +2432,19 @@ input, select, textarea {
 .xlsx-canvas .is-frozen { z-index: 2; }
 .xlsx-canvas .xlsx-col-head.is-frozen, .xlsx-canvas .xlsx-row-head.is-frozen { z-index: 4; }
 .xlsx-canvas .xlsx-corner { z-index: 5; }
+.xlsx-filter-button { z-index: 2; box-sizing: border-box; display: grid; place-items: center; border: 1px solid #b9bdb4; border-radius: 3px; background: #f7f8f5; color: #4a4f45; font: 10px/1 system-ui, sans-serif; cursor: pointer; }
+.xlsx-filter-button:hover { background: #e8ebe3; }
+.xlsx-filter-button.is-active { background: #2478dc; border-color: #2478dc; color: #fff; }
+.xlsx-filter-panel { z-index: 60; width: 15rem; max-height: min(26rem, calc(100vh - 16px)); grid-template-rows: auto auto auto auto auto minmax(0, 1fr) auto; }
+.xlsx-filter-search { margin: 0.25rem 0.3rem; }
+.xlsx-filter-list { min-height: 4rem; overflow: auto; padding: 0.15rem 0.3rem; border: 1px solid var(--line); border-radius: 8px; margin: 0 0.3rem; }
+.xlsx-filter-item { display: flex; align-items: center; gap: 0.45rem; padding: 0.2rem 0.25rem; font-size: 0.82rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+.xlsx-filter-item input { margin: 0; flex: none; }
+.xlsx-filter-all { font-weight: 600; }
+.xlsx-filter-more { margin: 0.3rem; color: var(--muted); font-size: 0.75rem; }
+.xlsx-filter-actions { display: flex; gap: 0.35rem; justify-content: flex-end; padding: 0.45rem 0.3rem 0.1rem; }
+.xlsx-filter-actions button { width: auto; justify-content: center; }
+.xlsx-filter-actions .xlsx-filter-ok { background: var(--accent); color: var(--accent-ink, #000); }
 .xlsx-freeze-line { z-index: 3; background: #9aa09a; pointer-events: none; }
 .xlsx-font-select { max-width: 8.5rem; }
 .xlsx-size-select { width: 4.4rem; }
