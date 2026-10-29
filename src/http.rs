@@ -592,6 +592,16 @@ where
         .map_err(|_| "The server stopped because of a network error".to_string())
 }
 
+/// A path as people write it: Windows' long-path prefix (`\\?\`) left off.
+fn shown_path(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{share}")
+    } else {
+        text.strip_prefix(r"\\?\").map_or(text.clone(), str::to_string)
+    }
+}
+
 fn print_banner(state: &AppState, bound: SocketAddr, scheme: &str) {
     let local = match bound.ip() {
         std::net::IpAddr::V4(ip) if ip.is_unspecified() => format!("{scheme}://127.0.0.1:{}", bound.port()),
@@ -600,11 +610,8 @@ fn print_banner(state: &AppState, bound: SocketAddr, scheme: &str) {
     };
     println!("OwnNAS is listening on {scheme}://{bound}");
     println!("On this machine: {local}");
-    println!("Sharing: {}", state.root.display());
-    println!(
-        "Database: {}",
-        state.thumbs.parent().unwrap_or(&state.thumbs).join("ownnas.db").display()
-    );
+    println!("Sharing: {}", shown_path(&state.root));
+    println!("Database: {}", shown_path(&state.db_path));
     if state.readonly {
         println!("Mode: read-only");
     }
