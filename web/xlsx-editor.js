@@ -1400,6 +1400,57 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   formulaInput.autocomplete = 'off';
   formulaInput.spellcheck = false;
   formulaRow.append(address, fx, formulaInput);
+  // Find and replace, under the formula bar.
+  const findBar = document.createElement('div');
+  findBar.className = 'xlsx-find';
+  findBar.setAttribute('role', 'search');
+  findBar.hidden = true;
+  const findInput = document.createElement('input');
+  findInput.type = 'text';
+  findInput.placeholder = 'Find';
+  findInput.setAttribute('aria-label', 'Find');
+  const replaceInput = document.createElement('input');
+  replaceInput.type = 'text';
+  replaceInput.placeholder = 'Replace with';
+  replaceInput.setAttribute('aria-label', 'Replace with');
+  const findOption = (label, title) => {
+    const wrap = document.createElement('label');
+    wrap.className = 'xlsx-find-option';
+    wrap.title = title;
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    wrap.append(box, ` ${label}`);
+    return [wrap, box];
+  };
+  const [caseLabel, caseBox] = findOption('Aa', 'Match case');
+  const [wholeLabel, wholeBox] = findOption('Whole cell', 'Match the whole cell');
+  const scopeSelect = document.createElement('select');
+  scopeSelect.className = 'office-select';
+  scopeSelect.setAttribute('aria-label', 'Where to look');
+  for (const [value, label] of [['sheet', 'This sheet'], ['book', 'All sheets']]) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    scopeSelect.append(option);
+  }
+  const findButton = (label, title) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'office-tool office-text-tool';
+    button.textContent = label;
+    button.title = title;
+    button.addEventListener('mousedown', event => event.preventDefault());
+    return button;
+  };
+  const prevButton = findButton('↑', 'Previous (Shift+Enter)');
+  const nextButton = findButton('↓', 'Next (Enter)');
+  const replaceButton = findButton('Replace', 'Replace in this cell, then find the next');
+  const replaceAllButton = findButton('Replace all', 'Replace everywhere it is found');
+  const findCount = document.createElement('span');
+  findCount.className = 'xlsx-find-count';
+  findCount.setAttribute('aria-live', 'polite');
+  const findClose = findButton('✕', 'Close (Escape)');
+  findBar.append(findInput, prevButton, nextButton, findCount, replaceInput, replaceButton, replaceAllButton, caseLabel, wholeLabel, scopeSelect, findClose);
   const scroll = document.createElement('div');
   scroll.className = 'xlsx-scroll';
   scroll.tabIndex = 0;
@@ -1515,7 +1566,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   functionsList.setAttribute('role', 'listbox');
   functionsList.setAttribute('aria-label', 'Functions');
   functionsPanel.append(functionsHead, functionsFilter, functionsHelp, functionsCount, functionsList);
-  root.append(toolbar, formulaRow, scroll, footer, note, live, assist, menu, filterPanel, functionsPanel);
+  root.append(toolbar, formulaRow, findBar, scroll, footer, note, live, assist, menu, filterPanel, functionsPanel);
   container.replaceChildren(root);
 
   const sheet = () => model.sheets[active];
@@ -2044,8 +2095,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const corner = range.r1 === range.r2 && range.c1 === range.c2 ? cellBox : box;
     fillHandle.style.cssText = `left:${corner.left + corner.width - 4}px;top:${corner.top + corner.height - 4}px`;
   }
-  function editText(row, col) {
-    const s = sheet();
+  function editText(row, col, s = sheet()) {
     const cell = s.cells.get(refName(row, col));
     if (!cell) return '';
     const formula = formulaOf(s, cell);
@@ -2381,6 +2431,122 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       return Object.keys(sides).length ? { borders: sides } : null;
     });
   }
+  // Find and replace
+  function openFind(replacing) {
+    closeMenu();
+    findBar.hidden = false;
+    // A word selected in a cell being edited is what to find.
+    if (!findInput.value && editing) {
+      const input = editorInput();
+      const picked = input.value.slice(input.selectionStart, input.selectionEnd);
+      if (picked && !picked.includes('\n')) findInput.value = picked;
+    }
+    const target = replacing ? replaceInput : findInput;
+    target.focus();
+    target.select();
+    countMatches();
+  }
+  function closeFind() {
+    findBar.hidden = true;
+    findCount.textContent = '';
+    scroll.focus({ preventScroll: true });
+  }
+  /** What a cell shows, on any sheet. */
+  function displayText(index, row, col) {
+    const s = model.sheets[index];
+    const value = valueAt(model, index, row, col);
+    return formatValue(value, cellStyle(model, s.cells.get(refName(row, col))?.getAttribute('s')).numFmt, formatOptions).text;
+  }
+  function findTest() {
+    const query = findInput.value;
+    if (!query) return null;
+    const norm = text => (caseBox.checked ? text : text.toLocaleLowerCase());
+    const wanted = norm(query);
+    return text => (wholeBox.checked ? norm(text) === wanted : norm(text).includes(wanted));
+  }
+  /** The cells matching, sheet by sheet, row by row: by what they show or what is typed in them. */
+  function findMatches({ typedOnly = false } = {}) {
+    const test = findTest();
+    if (!test) return [];
+    const indexes = scopeSelect.value === 'book' ? model.sheets.map((s, i) => i).filter(i => !model.sheets[i].hidden) : [active];
+    const out = [];
+    for (const index of indexes) {
+      const s = model.sheets[index];
+      const places = [...s.cells.keys()].map(parseRef).sort((a, b) => a.row - b.row || a.col - b.col);
+      for (const { row, col } of places) {
+        const merge = s.covered.get(refName(row, col));
+        if (merge && (merge.r1 !== row || merge.c1 !== col)) continue;
+        if (test(editText(row, col, s)) || (!typedOnly && test(displayText(index, row, col)))) out.push({ index, row, col });
+      }
+    }
+    return out;
+  }
+  const findKey = m => m.index * 1e12 + m.row * 1e5 + m.col;
+  function countMatches() {
+    if (!findInput.value) { findCount.textContent = ''; return; }
+    const list = findMatches();
+    const here = list.findIndex(m => m.index === active && m.row === anchor.row && m.col === anchor.col);
+    findCount.textContent = !list.length ? 'No matches' : here >= 0 ? `${here + 1} of ${list.length}` : `${list.length} found`;
+  }
+  /** Goes to the next (or previous) match after the selected cell, round to the start. */
+  function findNext(direction) {
+    const list = findMatches();
+    if (!list.length) { findCount.textContent = findInput.value ? 'No matches' : ''; return; }
+    const here = findKey({ index: active, row: anchor.row, col: anchor.col });
+    let i = direction > 0 ? list.findIndex(m => findKey(m) > here) : list.findLastIndex(m => findKey(m) < here);
+    if (i < 0) i = direction > 0 ? 0 : list.length - 1;
+    const match = list[i];
+    if (match.index !== active) showSheet(match.index);
+    select(match.row, match.col);
+    findCount.textContent = `${i + 1} of ${list.length}`;
+  }
+  /** What is typed in a cell with the matches replaced. */
+  function replaced(text) {
+    if (wholeBox.checked) return replaceInput.value;
+    const pattern = new RegExp(findInput.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), caseBox.checked ? 'g' : 'gi');
+    return text.replace(pattern, () => replaceInput.value);
+  }
+  function replaceOne() {
+    const test = findTest();
+    if (!test || !canWrite()) return;
+    const text = editText(anchor.row, anchor.col);
+    if (!test(text)) { findNext(1); return; }
+    const s = sheet();
+    transaction(touch => writeInput(s, anchor.row, anchor.col, replaced(text), touch));
+    findNext(1);
+  }
+  function replaceAll() {
+    const list = findMatches({ typedOnly: true }).filter(m => !model.sheets[m.index].protected);
+    if (!list.length || readonly) { findCount.textContent = 'No matches'; return; }
+    const ignore = () => {};
+    const done = structural(() => {
+      for (const { index, row, col } of list) {
+        const s = model.sheets[index];
+        writeInput(s, row, col, replaced(editText(row, col, s)), ignore);
+        model.touched.add(s);
+      }
+    });
+    if (done) {
+      findCount.textContent = `Replaced ${list.length}`;
+      notice(`Replaced ${list.length} cell${list.length === 1 ? '' : 's'}.`);
+    }
+  }
+  findInput.addEventListener('input', countMatches);
+  for (const control of [caseBox, wholeBox, scopeSelect]) control.addEventListener('change', countMatches);
+  nextButton.addEventListener('click', () => findNext(1));
+  prevButton.addEventListener('click', () => findNext(-1));
+  replaceButton.addEventListener('click', replaceOne);
+  replaceAllButton.addEventListener('click', replaceAll);
+  findClose.addEventListener('click', closeFind);
+  findBar.addEventListener('keydown', event => {
+    // The grid's and page's keys stay out, save and undo aside.
+    if (!((event.ctrlKey || event.metaKey) && ['s', 'z', 'y'].includes(event.key.toLowerCase()))) event.stopPropagation();
+    if (event.key === 'Escape') { event.preventDefault(); closeFind(); }
+    else if (event.key === 'Enter' && event.target === findInput) { event.preventDefault(); findNext(event.shiftKey ? -1 : 1); }
+    else if (event.key === 'Enter' && event.target === replaceInput) { event.preventDefault(); replaceOne(); }
+    else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f') { event.preventDefault(); findInput.focus(); findInput.select(); }
+  });
+
   // Sorting and filtering
   /** The block of filled cells around a cell, as spreadsheet apps pick what to sort or filter. */
   function currentRegion(row, col) {
@@ -3522,6 +3688,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     else if (key === 'Delete' || key === 'Backspace') { event.preventDefault(); clearSelection(); }
     else if (mod && key.toLowerCase() === 'a') { event.preventDefault(); anchor = { row: 1, col: 1 }; focus = { row: LAST_ROW, col: LAST_COL }; selectionChanged(); }
     else if (mod && key.toLowerCase() === 'd') { event.preventDefault(); fillDown(); }
+    else if (mod && (key.toLowerCase() === 'f' || key.toLowerCase() === 'h')) { event.preventDefault(); openFind(key.toLowerCase() === 'h'); }
     else if (mod && key.toLowerCase() === 'u') { event.preventDefault(); formatSelection({ underline: !activeStyle().underline }); }
     else if (mod && key === '5') { event.preventDefault(); formatSelection({ strike: !activeStyle().strike }); }
     else if (key === 'ContextMenu' || (key === 'F10' && event.shiftKey)) {
@@ -3547,7 +3714,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       event.preventDefault(); event.stopPropagation();
       if (editing) commitEdit();
       persist().catch(() => {});
-    } else if ((key === 'z' || key === 'y') && !editing && event.target !== formulaInput) {
+    } else if ((key === 'z' || key === 'y') && !editing && event.target !== formulaInput && !findBar.contains(event.target)) {
       event.preventDefault(); event.stopPropagation();
       step(key === 'y' || event.shiftKey ? 1 : -1);
     }

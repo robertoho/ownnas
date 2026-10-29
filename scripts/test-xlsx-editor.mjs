@@ -518,6 +518,56 @@ editor.destroy();
   editor7.destroy();
 }
 
+// Find and replace.
+{
+  const editor8 = mountXlsxEditor(container, bytes, { onSave: async data => { saved = data; } });
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const grid = container.querySelector('.xlsx-scroll');
+  const find = container.querySelector('.xlsx-find');
+  const [findInput, replaceInput] = find.querySelectorAll('input[type="text"]');
+  const count = find.querySelector('.xlsx-find-count');
+  const address = container.querySelector('.xlsx-address');
+  const key = (target, name, extra = {}) => target.dispatchEvent(new KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true, ...extra }));
+  const type = (input, text) => { input.value = text; input.dispatchEvent(new Event('input')); };
+  grid.focus();
+  key(grid, 'f', { ctrlKey: true });
+  assert.equal(find.hidden, false, 'Ctrl+F opens it');
+  assert.equal(document.activeElement, findInput);
+  type(findInput, 'A1');
+  assert.equal(count.textContent, '2 found', 'B1 (=A1*2) and A3 (=SUM(A1:A2)) have it typed in them');
+  key(findInput, 'Enter');
+  assert.equal(address.textContent, 'B1');
+  assert.equal(count.textContent, '1 of 2');
+  key(findInput, 'Enter');
+  assert.equal(address.textContent, 'A3');
+  key(findInput, 'Enter');
+  assert.equal(address.textContent, 'B1', 'and round again');
+  key(findInput, 'Enter', { shiftKey: true });
+  assert.equal(address.textContent, 'A3', 'Shift+Enter goes back');
+  type(findInput, '30.00');
+  assert.equal(count.textContent, '1 of 1', 'what cells show is found too (A3 shows 30.00 €)');
+  type(findInput, 'note');
+  key(findInput, 'Enter');
+  assert.equal(address.textContent, 'B3', 'case is ignored unless asked');
+  type(replaceInput, 'Memo');
+  key(replaceInput, 'Enter');
+  assert.equal(container.querySelector('.xlsx-formula').value, 'Memo', 'Enter in the replacement replaces');
+  type(findInput, 'A1');
+  [...find.querySelectorAll('button')].find(button => button.textContent === 'Replace all').click();
+  type(replaceInput, '');
+  assert.equal(count.textContent, 'Replaced 2');
+  key(grid, 'ArrowUp');
+  grid.focus();
+  key(grid, 'Home', { ctrlKey: true });
+  key(grid, 'ArrowRight');
+  assert.equal(container.querySelector('.xlsx-formula').value, '=Memo*2', 'formulas are replaced in too');
+  key(grid, 'z', { ctrlKey: true });
+  assert.equal(container.querySelector('.xlsx-formula').value, '=A1*2', 'and Replace all undoes in one step');
+  key(findInput, 'Escape');
+  assert.equal(find.hidden, true);
+  editor8.destroy();
+}
+
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });
 assert.equal(container.querySelector('.office-save'), null);
 readonly.destroy();

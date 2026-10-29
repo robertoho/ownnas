@@ -2445,6 +2445,10 @@ input, select, textarea {
 .xlsx-filter-actions { display: flex; gap: 0.35rem; justify-content: flex-end; padding: 0.45rem 0.3rem 0.1rem; }
 .xlsx-filter-actions button { width: auto; justify-content: center; }
 .xlsx-filter-actions .xlsx-filter-ok { background: var(--accent); color: var(--accent-ink, #000); }
+.xlsx-find { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem; padding: 0.35rem 0.45rem; border: 1px solid var(--line); border-radius: 8px; background: var(--input-bg); }
+.xlsx-find input[type="text"] { flex: 1 1 9rem; min-width: 7rem; height: 30px; }
+.xlsx-find-option { display: inline-flex; align-items: center; gap: 0.25rem; color: var(--muted); font-size: 0.8rem; white-space: nowrap; }
+.xlsx-find-count { min-width: 4.5rem; color: var(--muted); font-size: 0.78rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .xlsx-freeze-line { z-index: 3; background: #9aa09a; pointer-events: none; }
 .xlsx-font-select { max-width: 8.5rem; }
 .xlsx-size-select { width: 4.4rem; }
