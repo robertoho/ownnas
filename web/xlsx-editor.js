@@ -1129,7 +1129,6 @@ function sheetLinks(model, sheet) {
 /** Why rows or columns cannot be inserted into or deleted from a sheet, or null when they can. */
 export function structureBlocked(model, sheet) {
   const types = new Set(sheetLinks(model, sheet).map(link => link.type));
-  if (types.has('table')) return 'This sheet has tables; rows and columns cannot be inserted or deleted in it here yet.';
   if (types.has('pivotTable')) return 'This sheet has pivot tables; rows and columns cannot be inserted or deleted in it here yet.';
   if (types.has('comments') || types.has('threadedComment')) return 'This sheet has comments; rows and columns cannot be inserted or deleted in it here yet.';
   return null;
@@ -1164,6 +1163,20 @@ export function restructure(model, index, axis, at, count) {
   const last = axis === 'row' ? LAST_ROW : LAST_COL;
   if (count > 0 && (axis === 'row' ? sheet.maxRow : sheet.maxCol) + count > last) {
     throw new Error(`There is no room to insert ${axis === 'row' ? 'rows' : 'columns'}: cells would be pushed off the end of the sheet.`);
+  }
+  // Tables: rows may come and go (a table grows or shrinks), but not their headers, and columns
+  // only around them.
+  const tables = sheetLinks(model, sheet).filter(link => link.type === 'table' && model.parts[link.path])
+    .map(link => ({ path: link.path, xml: parseXml(strFromU8(model.parts[link.path]), 'Table') }));
+  for (const table of tables) {
+    const area = parseArea(table.xml.documentElement.getAttribute('ref') || '');
+    if (!area) continue;
+    const name = table.xml.documentElement.getAttribute('displayName') || 'a table';
+    const end = at - count - 1;
+    if (axis === 'row' && count < 0 && at <= area.r1 && end >= area.r1) throw new Error(`That would delete the header row of ${name}.`);
+    if (axis === 'col' && (count > 0 ? at > area.c1 && at <= area.c2 : !(end < area.c1 || at > area.c2))) {
+      throw new Error(`Columns inside ${name} cannot be inserted or deleted here yet; rows can.`);
+    }
   }
   unshareAll(model);
   const { root } = sheet;
@@ -1238,6 +1251,13 @@ export function restructure(model, index, axis, at, count) {
     if (f.getAttribute('t') !== 'array' || !f.hasAttribute('ref')) continue;
     const next = moveSqref(f.getAttribute('ref'), axis, at, count);
     if (next) f.setAttribute('ref', next); else f.removeAttribute('ref');
+  }
+  for (const table of tables) {
+    for (const node of [table.xml.documentElement, ...table.xml.documentElement.getElementsByTagNameNS(MAIN, 'autoFilter')]) {
+      const next = moveSqref(node.getAttribute('ref') || '', axis, at, count);
+      if (next) node.setAttribute('ref', next);
+    }
+    model.parts[table.path] = strToU8(serialize(table.xml));
   }
   // Pictures and charts are anchored to cells (counted from 0).
   for (const link of sheetLinks(model, sheet)) {
@@ -1446,7 +1466,20 @@ function sheetExtras(model, sheet) {
       drawings.push(...readDrawing(model, target.path));
     }
   }
-  sheet.extras = { links, comments, drawings };
+  const tables = [];
+  for (const target of rels.values()) {
+    if (target.type !== 'table' || !target.path || !model.parts[target.path]) continue;
+    const xml = parseXml(strFromU8(model.parts[target.path]), 'Table').documentElement;
+    const area = parseArea(xml.getAttribute('ref') || '');
+    const info = direct(xml, 'tableStyleInfo');
+    if (area) {
+      tables.push({
+        area, header: xml.getAttribute('headerRowCount') !== '0', totals: Number(xml.getAttribute('totalsRowCount') || 0),
+        style: info?.getAttribute('name') || '', stripes: info ? flag(info.getAttribute('showRowStripes')) : false, name: xml.getAttribute('displayName') || '',
+      });
+    }
+  }
+  sheet.extras = { links, comments, drawings, tables };
   return sheet.extras;
 }
 
@@ -1502,6 +1535,30 @@ export function safeLink(url) {
   } catch {
     return null;
   }
+}
+
+/** How a table's built-in style colours a cell: { fill, color, bold }, or null. An approximation
+ * of Excel's styles: Light, Medium and Dark, in the theme's accent colours. */
+function tableLook(model, table, row) {
+  const match = /^TableStyle(Light|Medium|Dark)(\d+)$/.exec(table.style);
+  if (!match) return null;
+  const [, family, number] = match;
+  const theme = model.styles?.theme || [];
+  const accent = n => `#${(n === 0 ? '404040' : theme[3 + n] || '4472C4').toUpperCase()}`;
+  // Each family runs through black (or grey) and the six accents, again and again.
+  const base = accent((Number(number) - 1) % 7);
+  const light = (hex, amount) => mixColor(hex, '#FFFFFF', amount);
+  const { area } = table;
+  const headerRow = table.header ? area.r1 : null;
+  const totalsRow = table.totals ? area.r2 : null;
+  if (row === headerRow) {
+    if (family === 'Light' && Number(number) <= 7) return { bold: true };
+    return { fill: family === 'Light' ? base : family === 'Dark' ? mixColor(base, '#000000', 0.25) : base, color: '#FFFFFF', bold: true };
+  }
+  if (row === totalsRow) return { bold: true };
+  const bodyRow = row - area.r1 - (table.header ? 1 : 0);
+  if (table.stripes && bodyRow % 2 === 0) return { fill: light(base, family === 'Dark' ? 0.4 : 0.8) };
+  return null;
 }
 
 // --- Clipboard HTML -----------------------------------------------------------------------------
@@ -2574,11 +2631,15 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const s = sheet();
     const cell = s.cells.get(refName(row, col));
     const spilled = spillAt(model, active, row, col);
-    if (!cell && spilled === undefined) return null;
+    // Empty cells are not drawn, except inside a table, which colours them.
+    if (!cell && spilled === undefined && !sheetExtras(model, s).tables.some(item => row >= item.area.r1 && row <= item.area.r2 && col >= item.area.c1 && col <= item.area.c2)) return null;
     const value = valueAt(model, active, row, col);
     let style = cellStyle(model, cell?.getAttribute('s'));
     const conditional = model.conditional?.get(active)?.get(refName(row, col));
     if (conditional) style = { ...style, ...conditional };
+    const table = sheetExtras(model, s).tables.find(item => row >= item.area.r1 && row <= item.area.r2 && col >= item.area.c1 && col <= item.area.c2);
+    const look = table && !style.fill ? tableLook(model, table, row) : null;
+    if (look) style = { ...look, ...style, fill: look.fill ?? style.fill, color: style.color || look.color, bold: style.bold || look.bold };
     const link = sheetExtras(model, s).links.get(refName(row, col));
     // Links look like links, unless the file styles them otherwise.
     if (link && !style.color) style = { ...style, color: '#0563C1', underline: true };
@@ -3020,7 +3081,8 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   function structural(work) {
     if (!canWrite()) return false;
     commitEdit();
-    const drawings = sheetLinks(model, sheet()).filter(link => link.type === 'drawing').map(link => link.path);
+    // Parts a structural change rewrites along with the sheet: its drawings and tables.
+    const drawings = sheetLinks(model, sheet()).filter(link => link.type === 'drawing' || link.type === 'table').map(link => link.path);
     const capture = () => ({
       sheets: model.sheets.map(s => serialize(s.xml)),
       workbook: serialize(model.workbookXml),

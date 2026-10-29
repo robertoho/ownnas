@@ -854,6 +854,43 @@ editor.destroy();
   editor10.destroy();
 }
 
+// Tables: drawn in their style; rows can be inserted and deleted, the table following.
+{
+  const REL = 'http://schemas.openxmlformats.org/package/2006/relationships';
+  const R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+  const data = `<worksheet xmlns="${NS}" xmlns:r="${R}"><sheetData>
+<row r="1"><c r="A1" t="inlineStr"><is><t>Name</t></is></c><c r="B1" t="inlineStr"><is><t>Qty</t></is></c></row>
+<row r="2"><c r="A2" t="inlineStr"><is><t>Pen</t></is></c><c r="B2"><v>3</v></c></row>
+<row r="3"><c r="A3" t="inlineStr"><is><t>Ink</t></is></c><c r="B3"><v>5</v></c></row>
+</sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts></worksheet>`;
+  const parts = { ...files, 'xl/worksheets/sheet1.xml': data,
+    'xl/worksheets/_rels/sheet1.xml.rels': `<Relationships xmlns="${REL}"><Relationship Id="rId1" Type="${R}/table" Target="../tables/table1.xml"/></Relationships>`,
+    'xl/tables/table1.xml': `<table xmlns="${NS}" id="1" name="Stock" displayName="Stock" ref="A1:B3"><autoFilter ref="A1:B3"/><tableColumns count="2"><tableColumn id="1" name="Name"/><tableColumn id="2" name="Qty"/></tableColumns><tableStyleInfo name="TableStyleMedium2" showRowStripes="1"/></table>` };
+  const editor11 = mountXlsxEditor(container, zipSync(Object.fromEntries(Object.entries(parts).map(([name, text]) => [name, strToU8(text)]))), { onSave: async out => { saved = out; } });
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const canvas = container.querySelector('.xlsx-canvas');
+  const menu = container.querySelector('.xlsx-menu');
+  const header = [...container.querySelectorAll('.xlsx-cell')].find(cell => cell.textContent === 'Name');
+  assert.match(header.style.cssText, /background: (rgb\(68, 114, 196\)|#4472c4)/i, 'headers in the style colour');
+  assert.match(header.style.cssText, /color: (rgb\(255, 255, 255\)|#fff)/i);
+  const row = (label, r) => {
+    canvas.dispatchEvent(new window.MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 20, clientY: 24 + 20 * (r - 1) + 8 }));
+    [...menu.querySelectorAll('button')].find(item => item.textContent === label).click();
+  };
+  row('Insert row above', 3);
+  await editor11.save();
+  assert.match(strFromU8(unzipSync(saved)['xl/tables/table1.xml']), /ref="A1:B4"><autoFilter ref="A1:B4"\/>/, 'a row inserted inside grows the table');
+  row('Delete row', 1);
+  assert.match(container.querySelector('.xlsx-note').textContent, /header row of Stock/, 'but its header row stays');
+  canvas.dispatchEvent(new window.MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 46 + 64 + 10, clientY: 12 }));
+  [...menu.querySelectorAll('button')].find(item => item.textContent === 'Delete column').click();
+  assert.match(container.querySelector('.xlsx-note').textContent, /Columns inside Stock/);
+  container.querySelector('.xlsx-scroll').dispatchEvent(new KeyboardEvent('keydown', { key: 'z', ctrlKey: true, bubbles: true }));
+  await editor11.save();
+  assert.match(strFromU8(unzipSync(saved)['xl/tables/table1.xml']), /ref="A1:B3"/, 'undo puts the table back as it was');
+  editor11.destroy();
+}
+
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });
 assert.equal(container.querySelector('.office-save'), null);
 readonly.destroy();
