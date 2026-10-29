@@ -172,7 +172,10 @@ pub fn checkpoint(path: &std::path::Path) -> Option<u64> {
                 );
                 let open = crate::db_watch::held(std::time::Duration::from_secs(1));
                 if open.is_empty() {
-                    text.push_str(" nothing in OwnNAS for more than a second (another program, or many short reads one after another)");
+                    text.push_str(
+                        " no read in OwnNAS. If the pages copied stay the same, another program has this file open \
+                         (a SQLite viewer, or a backup, sync, or antivirus tool): close it, or keep it away from the data folder",
+                    );
                 }
                 for line in open {
                     text.push_str("\n    ");

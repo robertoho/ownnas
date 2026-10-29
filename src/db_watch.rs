@@ -155,7 +155,8 @@ pub fn log(line: &str) {
         let _ = std::fs::rename(path, path.with_extension("log.old"));
     }
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{line}");
+        // In one write, so lines from different threads do not run into each other.
+        let _ = file.write_all(format!("{line}\n").as_bytes());
     }
 }
 
