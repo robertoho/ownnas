@@ -6,8 +6,8 @@
  */
 import { unzipSync, zipSync, strFromU8, strToU8 } from './vendor/three/addons/libs/fflate.module.js';
 import {
-  BUILTIN_FORMATS, CellError, Unsupported, columnName, dateSerial, evaluate, formatGeneral, formatValue,
-  localeSeparators, parseFormula, parseRef, refName, serialParts, shiftFormula,
+  BUILTIN_FORMATS, CellError, FUNCTION_HELP, Unsupported, callAt, canPointAt, columnName, dateSerial, evaluate,
+  formatGeneral, formatValue, formulaWordAt, localeSeparators, parseFormula, parseRef, refName, serialParts, shiftFormula,
 } from './sheet-formula.js';
 
 const MAIN = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
@@ -751,7 +751,11 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   cellEditor.hidden = true;
   cellEditor.spellcheck = false;
   cellEditor.setAttribute('aria-label', 'Edit cell');
-  canvas.append(layer, selectionBox, activeBox, cellEditor);
+  // The cells a formula being typed points at (clicked, dragged over, or reached with arrows).
+  const pointBox = document.createElement('div');
+  pointBox.className = 'xlsx-point';
+  pointBox.hidden = true;
+  canvas.append(layer, selectionBox, activeBox, pointBox, cellEditor);
   scroll.append(canvas);
   const footer = document.createElement('div');
   footer.className = 'xlsx-footer';
@@ -767,7 +771,11 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   const live = document.createElement('span');
   live.className = 'xlsx-live';
   live.setAttribute('aria-live', 'polite');
-  root.append(toolbar, formulaRow, scroll, footer, note, live);
+  // Function suggestions while a formula is typed, or the arguments of the call it is in.
+  const assist = document.createElement('div');
+  assist.className = 'xlsx-assist';
+  assist.hidden = true;
+  root.append(toolbar, formulaRow, scroll, footer, note, live, assist);
   container.replaceChildren(root);
 
   const sheet = () => model.sheets[active];
@@ -1095,6 +1103,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     fragment.append(corner);
     layer.replaceChildren(fragment);
     placeSelection();
+    placePoint();
   }
   const schedule = () => { if (!frame) frame = requestAnimationFrame(render); };
 
@@ -1412,6 +1421,8 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const value = source.value;
     editing = null;
     cellEditor.hidden = true;
+    hideAssist();
+    placePoint();
     if (value !== original && index === active) {
       const s = sheet();
       transaction(touch => writeInput(s, row, col, value, touch));
@@ -1423,11 +1434,177 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     if (!editing) return;
     editing = null;
     cellEditor.hidden = true;
+    hideAssist();
+    placePoint();
     formulaInput.value = editText(anchor.row, anchor.col);
     scroll.focus({ preventScroll: true });
   }
-  cellEditor.addEventListener('input', () => { formulaInput.value = cellEditor.value; fitEditor(); });
+  // Typing a formula: suggestions, argument hints, and references put in by pointing at cells.
+  // Shortest first, so the common ones (SUM before SUBSTITUTE) come first.
+  const FUNCTION_NAMES = Object.keys(FUNCTION_HELP).sort((a, b) => a.length - b.length || a.localeCompare(b));
+  let suggestions = [], suggested = 0, suggestionMoved = false;
+  const editorInput = () => (document.activeElement === formulaInput || editing?.bar ? formulaInput : cellEditor);
+  /** Copies what `input` holds to the other place the edit shows. */
+  function syncEditors(input) {
+    if (input === cellEditor) formulaInput.value = cellEditor.value;
+    else if (!editing?.bar) cellEditor.value = formulaInput.value;
+    if (!cellEditor.hidden) fitEditor();
+  }
+  function hideAssist() {
+    assist.hidden = true;
+    suggestions = [];
+    suggested = 0;
+    suggestionMoved = false;
+  }
+  function updateAssist() {
+    const input = editorInput();
+    if (!editing || document.activeElement !== input || input.selectionStart !== input.selectionEnd) { hideAssist(); return; }
+    const caret = input.selectionStart;
+    const typed = formulaWordAt(input.value, caret);
+    const word = typed ? typed.word.toUpperCase() : '';
+    const found = typed ? FUNCTION_NAMES.filter(name => name.startsWith(word) && !(name === word && input.value[caret] === '(')) : [];
+    if (found.join() !== suggestions.join()) { suggested = 0; suggestionMoved = false; }
+    suggestions = found;
+    const call = suggestions.length ? null : callAt(input.value, caret);
+    const help = call && FUNCTION_HELP[call.name];
+    if (!suggestions.length && !help) { assist.hidden = true; return; }
+    if (suggestions.length) {
+      assist.setAttribute('role', 'listbox');
+      assist.replaceChildren(...suggestions.map((name, index) => {
+        const item = document.createElement('div');
+        item.className = 'xlsx-assist-item';
+        item.setAttribute('role', 'option');
+        item.setAttribute('aria-selected', String(index === suggested));
+        const label = document.createElement('span');
+        label.className = 'xlsx-assist-name';
+        label.textContent = name;
+        const about = document.createElement('span');
+        about.className = 'xlsx-assist-about';
+        about.textContent = FUNCTION_HELP[name][1];
+        item.append(label, about);
+        item.addEventListener('pointerdown', event => {
+          event.preventDefault();
+          suggested = index;
+          acceptSuggestion();
+        });
+        return item;
+      }));
+    } else {
+      assist.setAttribute('role', 'tooltip');
+      const [args, about] = help;
+      const parts = args ? args.split(', ') : [];
+      // Past the last named argument, the one before "…" repeats.
+      let current = Math.min(call.arg, parts.length - 1);
+      if (parts[current] === '…') current--;
+      const line = document.createElement('div');
+      line.className = 'xlsx-assist-call';
+      line.append(`${call.name}(`);
+      parts.forEach((part, index) => {
+        if (index) line.append(', ');
+        const shown = document.createElement(index === current ? 'b' : 'span');
+        shown.textContent = part;
+        line.append(shown);
+      });
+      line.append(')');
+      const text = document.createElement('p');
+      text.textContent = about;
+      line.append(text);
+      assist.replaceChildren(line);
+    }
+    assist.hidden = false;
+    const box = input.getBoundingClientRect();
+    const width = assist.offsetWidth, height = assist.offsetHeight;
+    assist.style.left = `${Math.max(8, Math.min(box.left, window.innerWidth - width - 8))}px`;
+    assist.style.top = `${box.bottom + 4 + height > window.innerHeight - 8 ? Math.max(8, box.top - height - 4) : box.bottom + 4}px`;
+    assist.querySelector('[aria-selected="true"]')?.scrollIntoView?.({ block: 'nearest' });
+  }
+  function acceptSuggestion() {
+    const input = editorInput();
+    const caret = input.selectionStart;
+    const typed = formulaWordAt(input.value, caret);
+    const name = suggestions[suggested];
+    if (!typed || !name) return;
+    const paren = input.value[caret] === '(';
+    input.setRangeText(paren ? name : `${name}(`, typed.start, caret, 'end');
+    if (paren) input.setSelectionRange(input.selectionEnd + 1, input.selectionEnd + 1);
+    syncEditors(input);
+    hideAssist();
+    updateAssist();
+  }
+  /** Keys for the suggestions: arrows choose, Tab (or Enter, once one was chosen) puts it in. */
+  function assistKey(event) {
+    if (assist.hidden || !suggestions.length) return false;
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      suggested = (suggested + (event.key === 'ArrowDown' ? 1 : -1) + suggestions.length) % suggestions.length;
+      suggestionMoved = true;
+      updateAssist();
+    } else if (event.key === 'Tab' || (event.key === 'Enter' && suggestionMoved)) {
+      acceptSuggestion();
+    } else if (event.key === 'Escape') {
+      event.stopPropagation();
+      hideAssist();
+    } else {
+      return false;
+    }
+    event.preventDefault();
+    return true;
+  }
+
+  /** The reference last put in by pointing, while the caret is still just after it. */
+  function activePoint() {
+    const point = editing?.point;
+    if (!point) return null;
+    const input = editorInput();
+    return input.selectionStart === point.end && input.selectionEnd === point.end && input.value.slice(point.start, point.end) === point.text ? point : null;
+  }
+  const canPoint = () => editing && editing.sheet === active && (activePoint() || canPointAt(editorInput().value, editorInput().selectionStart));
+  /** Puts the reference of a cell (or, extending, of the range from where pointing started) at
+   * the caret, in place of the one pointed at before. */
+  function pointTo(row, col, extend = false) {
+    const input = editorInput();
+    const before = activePoint();
+    row = Math.max(1, Math.min(LAST_ROW, row));
+    col = Math.max(1, Math.min(LAST_COL, col));
+    const merge = !extend && sheet().covered.get(refName(row, col));
+    if (merge) { row = merge.r1; col = merge.c1; }
+    const from = extend && before ? before.from : { row, col };
+    const range = { r1: Math.min(from.row, row), c1: Math.min(from.col, col), r2: Math.max(from.row, row), c2: Math.max(from.col, col) };
+    const text = range.r1 === range.r2 && range.c1 === range.c2 ? refName(row, col) : `${refName(range.r1, range.c1)}:${refName(range.r2, range.c2)}`;
+    const start = before ? before.start : input.selectionStart;
+    input.setRangeText(text, start, before ? before.end : input.selectionEnd, 'end');
+    editing.point = { start, end: start + text.length, text, from, cell: { row, col }, range };
+    syncEditors(input);
+    input.focus({ preventScroll: true });
+    placePoint();
+    scrollIntoView(row, col);
+    updateAssist();
+  }
+  function placePoint() {
+    const point = editing && editing.sheet === active ? activePoint() : null;
+    if (!point || !geo) { pointBox.hidden = true; return; }
+    const { r1, c1, r2, c2 } = point.range;
+    const box = rect(Math.min(r1, geo.rows), Math.min(c1, geo.cols), Math.min(r2, geo.rows), Math.min(c2, geo.cols));
+    pointBox.style.cssText = `left:${box.left - 1}px;top:${box.top - 1}px;width:${box.width + 1}px;height:${box.height + 1}px`;
+    pointBox.hidden = false;
+  }
+  for (const input of [cellEditor, formulaInput]) {
+    input.addEventListener('keyup', event => { if (event.key !== 'Escape') { updateAssist(); placePoint(); } });
+    input.addEventListener('click', () => { updateAssist(); placePoint(); });
+    input.addEventListener('blur', () => setTimeout(() => { if (document.activeElement !== cellEditor && document.activeElement !== formulaInput) hideAssist(); }, 0));
+  }
+
+  cellEditor.addEventListener('input', () => { formulaInput.value = cellEditor.value; fitEditor(); placePoint(); updateAssist(); });
   cellEditor.addEventListener('keydown', event => {
+    if (assistKey(event)) return;
+    const arrow = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1] }[event.key];
+    // Arrows put a reference in, as clicking does, where one can go in a formula typed afresh
+    // (or move the one just put in).
+    if (arrow && !event.altKey && !event.ctrlKey && !event.metaKey && (editing?.typed || activePoint()) && canPoint()) {
+      event.preventDefault();
+      const from = activePoint()?.cell || { row: editing.row, col: editing.col };
+      pointTo(from.row + arrow[0], from.col + arrow[1], event.shiftKey && !!activePoint());
+      return;
+    }
     if (event.key === 'Enter' && event.altKey) {
       event.preventDefault();
       cellEditor.setRangeText('\n', cellEditor.selectionStart, cellEditor.selectionEnd, 'end');
@@ -1451,9 +1628,12 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   });
   formulaInput.addEventListener('input', () => {
     if (editing && !editing.bar) { cellEditor.value = formulaInput.value; fitEditor(); }
+    placePoint();
+    updateAssist();
   });
   formulaInput.addEventListener('keydown', event => {
     if (!editing) return;
+    if (assistKey(event)) return;
     if (event.key === 'Enter') { event.preventDefault(); commitEdit(event.shiftKey ? -1 : 1, 0); }
     else if (event.key === 'Tab') { event.preventDefault(); commitEdit(0, event.shiftKey ? -1 : 1); }
     else if (event.key === 'Escape') { event.preventDefault(); cancelEdit(); }
@@ -1475,9 +1655,17 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   }
   canvas.addEventListener('pointerdown', event => {
     if (event.button !== 0 || event.target === cellEditor) return;
-    if (editing) commitEdit();
     layout();
     const p = pointAt(event);
+    // Typing a formula where a reference can go: the cell clicked goes into it.
+    if (editing && !p.head.row && !p.head.col && canPoint()) {
+      event.preventDefault();
+      pointTo(p.row, p.col, event.shiftKey);
+      dragging = 'point';
+      canvas.setPointerCapture?.(event.pointerId);
+      return;
+    }
+    if (editing) commitEdit();
     if (p.head.col && p.head.row) {
       anchor = { row: 1, col: 1 }; focus = { row: LAST_ROW, col: LAST_COL };
       dragging = null;
@@ -1501,12 +1689,19 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   canvas.addEventListener('pointermove', event => {
     if (!dragging) return;
     const p = pointAt(event);
+    if (dragging === 'point') {
+      const point = activePoint();
+      if (point && (point.cell.row !== p.row || point.cell.col !== p.col)) pointTo(p.row, p.col, true);
+      return;
+    }
     if (dragging === 'cell') focus = { row: p.row, col: p.col };
     else if (dragging === 'col') focus = { row: LAST_ROW, col: p.col };
     else focus = { row: p.row, col: LAST_COL };
     selectionChanged();
   });
   const stopDrag = () => { dragging = null; };
+  // Pointing keeps the keyboard in the formula.
+  canvas.addEventListener('mousedown', event => { if (dragging === 'point') event.preventDefault(); });
   canvas.addEventListener('pointerup', stopDrag);
   canvas.addEventListener('pointercancel', stopDrag);
   canvas.addEventListener('dblclick', event => {

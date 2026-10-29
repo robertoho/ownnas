@@ -651,6 +651,134 @@ const FUNCTIONS = {
   },
 };
 
+/** The functions above with their arguments and what they do, for suggestions while typing. */
+export const FUNCTION_HELP = {
+  SUM: ['number1, [number2], …', 'Adds numbers'],
+  PRODUCT: ['number1, [number2], …', 'Multiplies numbers'],
+  AVERAGE: ['number1, [number2], …', 'The average of numbers'],
+  AVERAGEA: ['value1, [value2], …', 'The average, counting text as 0 and TRUE as 1'],
+  MIN: ['number1, [number2], …', 'The smallest number'],
+  MAX: ['number1, [number2], …', 'The largest number'],
+  MEDIAN: ['number1, [number2], …', 'The middle number'],
+  LARGE: ['array, k', 'The k-th largest number'],
+  SMALL: ['array, k', 'The k-th smallest number'],
+  COUNT: ['value1, [value2], …', 'How many numbers'],
+  COUNTA: ['value1, [value2], …', 'How many cells are not empty'],
+  COUNTBLANK: ['range', 'How many cells are empty'],
+  ABS: ['number', 'The number without its sign'],
+  INT: ['number', 'Rounds down to a whole number'],
+  TRUNC: ['number, [digits]', 'Cuts off decimals'],
+  ROUND: ['number, digits', 'Rounds to a number of digits'],
+  ROUNDUP: ['number, digits', 'Rounds away from zero'],
+  ROUNDDOWN: ['number, digits', 'Rounds towards zero'],
+  MOD: ['number, divisor', 'The remainder of a division'],
+  POWER: ['number, power', 'A number raised to a power'],
+  SQRT: ['number', 'The square root'],
+  SIGN: ['number', '1, 0 or -1, by the sign'],
+  PI: ['', 'The number π'],
+  CEILING: ['number, [significance]', 'Rounds up to a multiple'],
+  FLOOR: ['number, [significance]', 'Rounds down to a multiple'],
+  IF: ['test, value_if_true, [value_if_false]', 'One value if a test is true, another if not'],
+  IFERROR: ['value, value_if_error', 'A value, or another if it is an error'],
+  IFNA: ['value, value_if_na', 'A value, or another if it is #N/A'],
+  AND: ['test1, [test2], …', 'TRUE if all are true'],
+  OR: ['test1, [test2], …', 'TRUE if any is true'],
+  XOR: ['test1, [test2], …', 'TRUE if an odd number are true'],
+  NOT: ['test', 'The opposite of a test'],
+  TRUE: ['', 'The value TRUE'],
+  FALSE: ['', 'The value FALSE'],
+  NA: ['', 'The error #N/A'],
+  CHOOSE: ['index, value1, [value2], …', 'The value at a position in the list'],
+  CONCATENATE: ['text1, [text2], …', 'Joins texts'],
+  CONCAT: ['text1, [text2], …', 'Joins texts and ranges'],
+  TEXTJOIN: ['separator, skip_empty, text1, [text2], …', 'Joins texts with a separator'],
+  LEN: ['text', 'The number of characters'],
+  LEFT: ['text, [count]', 'Characters from the start'],
+  RIGHT: ['text, [count]', 'Characters from the end'],
+  MID: ['text, start, count', 'Characters from the middle'],
+  UPPER: ['text', 'Text in capitals'],
+  LOWER: ['text', 'Text in small letters'],
+  PROPER: ['text', 'Text With Each Word Capitalized'],
+  TRIM: ['text', 'Text without extra spaces'],
+  REPT: ['text, times', 'Text repeated'],
+  EXACT: ['text1, text2', 'TRUE if two texts are the same, case included'],
+  SUBSTITUTE: ['text, old, new, [which]', 'Replaces text with other text'],
+  FIND: ['find, within, [start]', 'Where text is found, case counted'],
+  SEARCH: ['find, within, [start]', 'Where text is found, case ignored'],
+  VALUE: ['text', 'Text as a number'],
+  TEXT: ['value, format', 'A value as text in a number format'],
+  ISBLANK: ['value', 'TRUE if empty'],
+  ISNUMBER: ['value', 'TRUE if a number'],
+  ISTEXT: ['value', 'TRUE if text'],
+  ISLOGICAL: ['value', 'TRUE if TRUE or FALSE'],
+  ISERROR: ['value', 'TRUE if an error'],
+  ISNA: ['value', 'TRUE if #N/A'],
+  DATE: ['year, month, day', 'A date'],
+  YEAR: ['date', 'The year of a date'],
+  MONTH: ['date', 'The month of a date'],
+  DAY: ['date', 'The day of a date'],
+  HOUR: ['time', 'The hour of a time'],
+  MINUTE: ['time', 'The minutes of a time'],
+  SECOND: ['time', 'The seconds of a time'],
+  WEEKDAY: ['date, [type]', 'The day of the week, as a number'],
+  ROW: ['[reference]', 'The row number'],
+  COLUMN: ['[reference]', 'The column number'],
+  SUMIF: ['range, criteria, [sum_range]', 'Adds the cells that match'],
+  SUMIFS: ['sum_range, range1, criteria1, …', 'Adds the cells that match every test'],
+  COUNTIF: ['range, criteria', 'Counts the cells that match'],
+  COUNTIFS: ['range1, criteria1, …', 'Counts the cells that match every test'],
+  AVERAGEIF: ['range, criteria, [average_range]', 'The average of the cells that match'],
+  VLOOKUP: ['value, table, column, [approximate]', 'Looks down the first column, returns from another'],
+  HLOOKUP: ['value, table, row, [approximate]', 'Looks along the first row, returns from another'],
+  MATCH: ['value, range, [type]', 'The position of a value in a range'],
+  INDEX: ['range, row, [column]', 'The value at a row and column of a range'],
+  XLOOKUP: ['value, lookup_range, return_range, [if_not_found]', 'Finds a value, returns from another range'],
+};
+
+// --- Typing a formula ---------------------------------------------------------------------------
+
+/** `text` before `caret` with what is inside quotes blanked out, or null when it is not a formula. */
+function formulaBefore(text, caret) {
+  if (!text.startsWith('=')) return null;
+  let out = '', quote = '';
+  for (const char of text.slice(0, caret)) {
+    if (quote) { if (char === quote) quote = ''; out += ' '; continue; }
+    if (char === '"' || char === "'") { quote = char; out += ' '; continue; }
+    out += char;
+  }
+  return quote ? null : out;
+}
+
+/** The function name being typed just before `caret`, as { start, word }, or null. */
+export function formulaWordAt(text, caret) {
+  const before = formulaBefore(text, caret);
+  const match = before && /(^=|[=(,;+\-*/^&<>:\s])([A-Za-z][A-Za-z0-9.]*)$/.exec(before);
+  return match ? { start: caret - match[2].length, word: match[2] } : null;
+}
+
+/** The function call `caret` is inside, as { name, arg } (arg counted from 0), or null. */
+export function callAt(text, caret) {
+  const before = formulaBefore(text, caret);
+  if (!before) return null;
+  let depth = 0, arg = 0;
+  for (let i = before.length - 1; i > 0; i--) {
+    const char = before[i];
+    if (char === ')') depth++;
+    else if (char === '(') {
+      if (depth) { depth--; continue; }
+      const name = /([A-Za-z][A-Za-z0-9.]*)$/.exec(before.slice(0, i));
+      return name ? { name: name[1].toUpperCase(), arg } : null;
+    } else if ((char === ',' || char === ';') && !depth) arg++;
+  }
+  return null;
+}
+
+/** Whether a reference can go at `caret`: after `=`, an operator, `(` or a separator. */
+export function canPointAt(text, caret) {
+  const before = formulaBefore(text, caret);
+  return !!before && /[=(,;+\-*/^&<>:]\s*$/.test(before);
+}
+
 // --- Dates --------------------------------------------------------------------------------------
 
 const DAY_MS = 86400000;

@@ -85,6 +85,72 @@ assert.equal(value('B1'), '30');
 assert.equal(cell('B2').getElementsByTagNameNS(NS, 'f')[0].getAttribute('t'), 'shared', 'untouched shared formulas stay shared');
 editor.destroy();
 
+// Typing a formula: function suggestions, argument hints, and cells clicked or reached with arrows.
+{
+  const typing = mountXlsxEditor(container, bytes, {});
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const grid = container.querySelector('.xlsx-scroll');
+  const canvas = container.querySelector('.xlsx-canvas');
+  const input = container.querySelector('.xlsx-cell-editor');
+  const assist = container.querySelector('.xlsx-assist');
+  const key = (target, name, extra = {}) => target.dispatchEvent(new KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true, ...extra }));
+  const type = text => { input.setRangeText(text, input.selectionStart, input.selectionEnd, 'end'); input.dispatchEvent(new Event('input', { bubbles: true })); };
+  // Cell centres: row headers are 46 px wide, column headers 24 px high.
+  const at = (type, col, row) => canvas.dispatchEvent(new window.MouseEvent(type, { button: 0, bubbles: true, cancelable: true, clientX: 46 + 64 * (col - 1) + 10, clientY: 24 + 20 * (row - 1) + 8 }));
+  grid.focus();
+  key(grid, 'Home', { ctrlKey: true });
+  key(grid, 'ArrowRight'); key(grid, 'ArrowRight');
+  key(grid, '=');
+  type('su');
+  const names = () => [...assist.querySelectorAll('.xlsx-assist-name')].map(item => item.textContent);
+  assert.equal(assist.hidden, false, 'functions are suggested');
+  assert.deepEqual(names(), ['SUM', 'SUMIF', 'SUMIFS', 'SUBSTITUTE'], 'shortest first');
+  type('m');
+  assert.deepEqual(names(), ['SUM', 'SUMIF', 'SUMIFS']);
+  key(input, 'ArrowDown');
+  assert.equal(assist.querySelector('[aria-selected="true"]').textContent.startsWith('SUMIF'), true, 'arrows choose');
+  key(input, 'ArrowUp');
+  key(input, 'Tab');
+  assert.equal(input.value, '=SUM(', 'Tab puts the function in');
+  assert.equal(container.querySelector('.xlsx-address').textContent, 'C1', 'and does not leave the cell');
+  assert.match(assist.textContent, /^SUM\(number1, \[number2\], …\)/, 'its arguments are shown');
+  assert.equal(assist.querySelector('b').textContent, 'number1');
+  at('pointerdown', 1, 1);
+  assert.equal(input.value, '=SUM(A1', 'a click puts the cell in');
+  assert.equal(input.hidden, false, 'and keeps editing');
+  at('pointermove', 1, 2);
+  at('pointerup', 1, 2);
+  assert.equal(input.value, '=SUM(A1:A2', 'dragging makes it a range');
+  assert.equal(container.querySelector('.xlsx-point').hidden, false, 'the range pointed at is marked');
+  type(',');
+  assert.equal(assist.querySelector('b').textContent, '[number2]', 'the argument typed is the one shown');
+  at('pointerdown', 2, 1);
+  at('pointerup', 2, 1);
+  at('pointerdown', 2, 2);
+  at('pointerup', 2, 2);
+  assert.equal(input.value, '=SUM(A1:A2,B2', 'clicking again replaces the cell just put in');
+  type(')');
+  at('pointerdown', 1, 3);
+  assert.equal(input.hidden, true, 'a click where no reference can go ends the edit');
+  at('pointerup', 1, 3);
+  key(grid, 'ArrowUp'); key(grid, 'ArrowUp'); key(grid, 'ArrowRight'); key(grid, 'ArrowRight');
+  assert.equal(container.querySelector('.xlsx-address').textContent, 'C1');
+  assert.equal(container.querySelector('.xlsx-formula').value, '=SUM(A1:A2,B2)');
+
+  key(grid, 'ArrowDown');
+  key(grid, '=');
+  key(input, 'ArrowLeft');
+  assert.equal(input.value, '=B2', 'an arrow puts the cell beside in');
+  key(input, 'ArrowUp');
+  assert.equal(input.value, '=B1', 'and moves it');
+  key(input, 'ArrowLeft', { shiftKey: true });
+  assert.equal(input.value, '=A1:B1', 'Shift+arrow makes it a range');
+  type('+1');
+  key(input, 'ArrowUp');
+  assert.equal(input.value, '=A1:B1+1', 'where no reference can go, arrows move in the text as before');
+  typing.destroy();
+}
+
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });
 assert.equal(container.querySelector('.office-save'), null);
 readonly.destroy();
