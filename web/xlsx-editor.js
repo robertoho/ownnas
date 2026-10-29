@@ -337,7 +337,7 @@ function readSheet(name, path, xml, hidden, counter = { cells: 0 }) {
   const sheetData = direct(root, 'sheetData');
   if (!sheetData) throw new Error('Worksheet data is missing.');
   const sheet = {
-    name, path, xml, root, sheetData, cells: new Map(), rows: new Map(), shared: new Map(),
+    name, path, xml, root, sheetData, cells: new Map(), rows: new Map(), shared: new Map(), extras: null,
     maxRow: 0, maxCol: 0, rowHeights: new Map(), hiddenRows: new Set(), cols: [], merges: [], covered: new Map(),
     hidden,
     protected: flag(direct(root, 'sheetProtection')?.getAttribute('sheet')),
@@ -1399,6 +1399,111 @@ function relinkSheets(model) {
   }
 }
 
+// --- Links, comments, pictures -----------------------------------------------------------------
+
+const CHART = 'http://schemas.openxmlformats.org/drawingml/2006/chart';
+const EMU_PER_PX = 9525;
+const IMAGE_TYPES = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', bmp: 'image/bmp', webp: 'image/webp', svg: 'image/svg+xml' };
+
+/** The relationships of a part, by id: { type, path } inside the package or { type, url } outside. */
+function relTargets(model, part) {
+  const rels = model.parts[part.replace(/([^/]+)$/, '_rels/$1.rels')];
+  const out = new Map();
+  if (!rels) return out;
+  const folder = part.replace(/\/[^/]+$/, '');
+  for (const rel of parseXml(strFromU8(rels), 'Relationships').getElementsByTagNameNS(PKG_REL, 'Relationship')) {
+    const type = (rel.getAttribute('Type') || '').split('/').pop(), target = rel.getAttribute('Target') || '';
+    if (rel.getAttribute('TargetMode') === 'External') out.set(rel.getAttribute('Id'), { type, url: target });
+    else { try { out.set(rel.getAttribute('Id'), { type, path: normalizePart(target, folder) }); } catch { /* outside the package */ } }
+  }
+  return out;
+}
+
+/** A sheet's hyperlinks, comments and drawings, read once (until the sheet is read again). */
+function sheetExtras(model, sheet) {
+  if (sheet.extras) return sheet.extras;
+  const rels = relTargets(model, sheet.path);
+  const links = new Map();
+  for (const node of kids(direct(sheet.root, 'hyperlinks'), 'hyperlink')) {
+    const area = parseArea(node.getAttribute('ref') || '');
+    if (!area) continue;
+    const target = rels.get(node.getAttributeNS(DOC_REL, 'id') || node.getAttribute('r:id'));
+    const link = { url: target?.url || null, location: node.getAttribute('location') || null, tip: node.getAttribute('tooltip') || '' };
+    if (!link.url && !link.location) continue;
+    for (let r = area.r1; r <= Math.min(area.r2, area.r1 + 999); r++) for (let c = area.c1; c <= Math.min(area.c2, area.c1 + 99); c++) links.set(refName(r, c), link);
+  }
+  const comments = new Map(), drawings = [];
+  for (const target of rels.values()) {
+    if (!target.path || !model.parts[target.path]) continue;
+    if (target.type === 'comments') {
+      const xml = parseXml(strFromU8(model.parts[target.path]), 'Comments').documentElement;
+      const authors = kids(direct(xml, 'authors'), 'author').map(node => node.textContent || '');
+      for (const node of kids(direct(xml, 'commentList'), 'comment')) {
+        const text = direct(node, 'text');
+        comments.set(node.getAttribute('ref'), { author: authors[Number(node.getAttribute('authorId') || 0)] || '', text: text ? textOf(text) : '' });
+      }
+    } else if (target.type === 'drawing') {
+      drawings.push(...readDrawing(model, target.path));
+    }
+  }
+  sheet.extras = { links, comments, drawings };
+  return sheet.extras;
+}
+
+/** The pictures, charts and shapes of a drawing part, with where they are anchored. */
+function readDrawing(model, path) {
+  const xml = parseXml(strFromU8(model.parts[path]), 'Drawing');
+  const rels = relTargets(model, path);
+  const items = [];
+  for (const anchor of [...xml.documentElement.children]) {
+    if (!['twoCellAnchor', 'oneCellAnchor', 'absoluteAnchor'].includes(anchor.localName)) continue;
+    const marker = name => {
+      const node = kids(anchor, name, SHEET_DRAWING)[0];
+      if (!node) return null;
+      const get = key => Number(kids(node, key, SHEET_DRAWING)[0]?.textContent || 0);
+      return { col: get('col'), colOff: get('colOff'), row: get('row'), rowOff: get('rowOff') };
+    };
+    const ext = kids(anchor, 'ext', SHEET_DRAWING)[0], pos = kids(anchor, 'pos', SHEET_DRAWING)[0];
+    const item = {
+      from: marker('from'), to: anchor.localName === 'twoCellAnchor' ? marker('to') : null,
+      size: ext ? { cx: Number(ext.getAttribute('cx')) || 0, cy: Number(ext.getAttribute('cy')) || 0 } : null,
+      pos: pos ? { x: Number(pos.getAttribute('x')) || 0, y: Number(pos.getAttribute('y')) || 0 } : null,
+      name: anchor.getElementsByTagNameNS(SHEET_DRAWING, 'cNvPr')[0]?.getAttribute('name') || '',
+    };
+    const pic = kids(anchor, 'pic', SHEET_DRAWING)[0];
+    const frame = kids(anchor, 'graphicFrame', SHEET_DRAWING)[0];
+    if (pic) {
+      const blip = pic.getElementsByTagNameNS(DRAWING, 'blip')[0];
+      const image = rels.get(blip?.getAttributeNS(DOC_REL, 'embed') || blip?.getAttribute('r:embed'));
+      const type = IMAGE_TYPES[(image?.path || '').split('.').pop().toLowerCase()];
+      if (image?.path && model.parts[image.path] && type) items.push({ ...item, kind: 'picture', path: image.path, type });
+    } else if (frame) {
+      const chart = frame.getElementsByTagNameNS(CHART, 'chart')[0];
+      const part = rels.get(chart?.getAttributeNS(DOC_REL, 'id') || chart?.getAttribute('r:id'));
+      let title = '';
+      if (part?.path && model.parts[part.path]) {
+        const titleNode = parseXml(strFromU8(model.parts[part.path]), 'Chart').getElementsByTagNameNS(CHART, 'title')[0];
+        title = titleNode ? [...titleNode.getElementsByTagNameNS(DRAWING, 't')].map(node => node.textContent).join('') : '';
+      }
+      items.push({ ...item, kind: 'chart', title });
+    } else {
+      const text = [...anchor.getElementsByTagNameNS(DRAWING, 't')].map(node => node.textContent).join(' ');
+      items.push({ ...item, kind: 'shape', text });
+    }
+  }
+  return items;
+}
+
+/** Only links that are safe to open: web pages and e-mail. */
+export function safeLink(url) {
+  try {
+    const parsed = new URL(url);
+    return ['http:', 'https:', 'mailto:'].includes(parsed.protocol) ? parsed.href : null;
+  } catch {
+    return null;
+  }
+}
+
 // --- Sheets -------------------------------------------------------------------------------------
 
 const WORKSHEET_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet';
@@ -2400,12 +2505,15 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     let style = cellStyle(model, cell?.getAttribute('s'));
     const conditional = model.conditional?.get(active)?.get(refName(row, col));
     if (conditional) style = { ...style, ...conditional };
+    const link = sheetExtras(model, s).links.get(refName(row, col));
+    // Links look like links, unless the file styles them otherwise.
+    if (link && !style.color) style = { ...style, color: '#0563C1', underline: true };
     const formatted = formatValue(value, style.numFmt, formatOptions);
     let align = style.align;
     if (!align || align === 'general') align = typeof value === 'number' ? 'right' : typeof value === 'boolean' || value instanceof CellError ? 'center' : 'left';
     if (align === 'centerContinuous') align = 'center';
     if (!['left', 'center', 'right'].includes(align)) align = 'left';
-    return { value, style, text: formatted.text, color: formatted.color, align };
+    return { value, style, text: formatted.text, color: formatted.color, align, link };
   }
 
   function render() {
@@ -2476,6 +2584,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
         else text = '#'.repeat(Math.max(1, Math.floor((width - 8) / textWidth('#', font))));
       }
       el.textContent = text;
+      if (info.link) el.title = `${info.link.tip || info.link.url || info.link.location}\n${IS_MAC ? '⌘' : 'Ctrl'}+click to open`;
       const css = [`left:${box.left}px`, `top:${box.top}px`, `width:${width}px`, `height:${box.height}px`, `justify-content:${info.align === 'right' ? 'flex-end' : info.align === 'center' ? 'center' : 'flex-start'}`, `text-align:${info.align}`];
       if (style.fill) css.push(`background:${style.fill}`);
       // A data bar, as long as the value is far between the rule's least and most.
@@ -2538,6 +2647,37 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     dy = top; dx = left;
     area(1, fr, 1, fc);
     pinned = false; dx = 0; dy = 0;
+    // Comments are marked with a corner; pictures, charts and shapes float over the cells.
+    const extras = sheetExtras(model, s);
+    const inView = (row, col) => (row <= fr || (row >= r1 && row <= r2)) && (col <= fc || (col >= c1 && col <= c2));
+    for (const ref of extras.comments.keys()) {
+      const place = parseRef(ref);
+      if (!place || !inView(place.row, place.col)) continue;
+      const merge = s.covered.get(ref);
+      const box = merge ? onScreen(merge.r1, merge.c1, merge.r2, merge.c2) : onScreen(place.row, place.col, place.row, place.col);
+      const mark = document.createElement('div');
+      mark.className = 'xlsx-comment-mark';
+      mark.style.cssText = `left:${box.left + box.width - 7}px;top:${box.top}px`;
+      fragment.append(mark);
+    }
+    for (const item of extras.drawings) {
+      const box = drawingBox(item);
+      if (!box || box.left > left + width || box.left + box.width < left || box.top > top + height || box.top + box.height < top) continue;
+      let node;
+      if (item.kind === 'picture') {
+        node = document.createElement('img');
+        node.src = pictureUrl(item);
+        node.alt = item.name || 'Picture';
+        node.draggable = false;
+      } else {
+        node = document.createElement('div');
+        node.textContent = item.kind === 'chart' ? `📊 ${item.title || 'Chart'}` : item.text;
+        if (item.kind === 'chart') node.title = 'Charts are kept in the file, but not drawn here yet';
+      }
+      node.className = `xlsx-drawing xlsx-${item.kind}`;
+      node.style.cssText = `left:${box.left}px;top:${box.top}px;width:${box.width}px;height:${box.height}px`;
+      fragment.append(node);
+    }
     // The filter's dropdowns, on its header row.
     const filter = autoFilterOf(s);
     if (filter && rowPx(s, filter.r1) && (filter.r1 <= fr || (filter.r1 >= r1 && filter.r1 <= r2))) {
@@ -3061,6 +3201,62 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       return Object.keys(sides).length ? { borders: sides } : null;
     });
   }
+  // Links, comments, pictures
+  const pictureUrls = new Map();
+  function pictureUrl(item) {
+    if (!pictureUrls.has(item.path)) pictureUrls.set(item.path, URL.createObjectURL(new Blob([model.parts[item.path]], { type: item.type })));
+    return pictureUrls.get(item.path);
+  }
+  /** Where a drawing sits on the canvas, from its anchor (offsets are in EMU). */
+  function drawingBox(item) {
+    const px = emu => emu / EMU_PER_PX;
+    const at = marker => ({
+      x: geo.colX[Math.min(marker.col + 1, geo.cols + 1)] + px(marker.colOff),
+      y: geo.rowY[Math.min(marker.row + 1, geo.rows + 1)] + px(marker.rowOff),
+    });
+    if (item.from) {
+      const a = at(item.from);
+      if (item.to) { const b = at(item.to); return { left: a.x, top: a.y, width: Math.max(1, b.x - a.x), height: Math.max(1, b.y - a.y) }; }
+      if (item.size) return { left: a.x, top: a.y, width: px(item.size.cx), height: px(item.size.cy) };
+    }
+    if (item.pos && item.size) return { left: HEAD_W + px(item.pos.x), top: HEAD_H + px(item.pos.y), width: px(item.size.cx), height: px(item.size.cy) };
+    return null;
+  }
+  function openLink(link) {
+    if (link.url) {
+      const url = safeLink(link.url);
+      if (url) window.open(url, '_blank', 'noopener,noreferrer');
+      else notice(`Only web and e-mail links open from here: ${link.url}`);
+      return;
+    }
+    // A place in the workbook: "Sheet!A1", "'My sheet'!B2:C3", or "A1" here.
+    const match = /^(?:'((?:[^']|'')+)'|([^!]+))?!?\$?([A-Z]{1,3})\$?(\d+)/i.exec(link.location || '');
+    if (!match) { notice(`This link goes to ${link.location}, which this editor cannot find.`); return; }
+    const name = (match[1] || match[2] || '').replace(/''/g, "'");
+    const index = name ? model.sheets.findIndex(item => item.name.toLowerCase() === name.toLowerCase()) : active;
+    if (index < 0) { notice(`This link goes to a sheet called "${name}", which is not in the workbook.`); return; }
+    showSheet(index);
+    const place = parseRef(`${match[3]}${match[4]}`);
+    if (place) select(place.row, place.col);
+  }
+  const commentTip = document.createElement('div');
+  commentTip.className = 'xlsx-comment-tip';
+  commentTip.hidden = true;
+  canvas.append(commentTip);
+  function showComment(p) {
+    const ref = p && !p.head.row && !p.head.col ? refName(p.row, p.col) : null;
+    const merge = ref && sheet().covered.get(ref);
+    const comment = ref && sheetExtras(model, sheet()).comments.get(merge ? refName(merge.r1, merge.c1) : ref);
+    if (!comment) { commentTip.hidden = true; return; }
+    const box = merge ? onScreen(merge.r1, merge.c1, merge.r2, merge.c2) : onScreen(p.row, p.col, p.row, p.col);
+    commentTip.replaceChildren();
+    if (comment.author) { const author = document.createElement('strong'); author.textContent = comment.author; commentTip.append(author); }
+    commentTip.append(comment.text);
+    commentTip.style.cssText = `left:${box.left + box.width + 6}px;top:${box.top}px`;
+    commentTip.hidden = false;
+  }
+  canvas.addEventListener('pointerleave', () => { commentTip.hidden = true; });
+
   // Find and replace
   function openFind(replacing) {
     closeMenu();
@@ -3952,6 +4148,13 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       focus = { row: p.row, col: LAST_COL };
       dragging = 'row';
     } else {
+      const link = (event.ctrlKey || event.metaKey) && sheetExtras(model, sheet()).links.get(refName(p.row, p.col));
+      if (link) {
+        event.preventDefault();
+        select(p.row, p.col);
+        openLink(link);
+        return;
+      }
       select(p.row, p.col, event.shiftKey);
       dragging = 'cell';
     }
@@ -3967,6 +4170,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       // Over a header's edge, show that it can be dragged.
       const cursor = !canWrite() || (p.head.row && p.head.col) ? '' : p.head.row && colEdge(p.x) ? 'col-resize' : p.head.col && rowEdge(p.y) ? 'row-resize' : '';
       if (canvas.style.cursor !== cursor) canvas.style.cursor = cursor;
+      showComment(p);
       return;
     }
     if (dragging.kind === 'size') {
@@ -4161,6 +4365,8 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const wholeRows = range.c1 === 1 && range.c2 >= LAST_COL, wholeCols = range.r1 === 1 && range.r2 >= LAST_ROW;
     const count = (n, word) => (n === 1 ? `${word}` : `${n} ${word}s`);
     const items = [];
+    const link = sheetExtras(model, sheet()).links.get(refName(anchor.row, anchor.col));
+    if (link) items.push([link.url ? 'Open link' : 'Go to link', () => openLink(link), true], '-');
     if (!wholeCols) {
       items.push([`Insert ${count(rows, 'row')} above`, () => insertOrDelete('row', range.r1, rows)]);
       items.push([`Insert ${count(rows, 'row')} below`, () => insertOrDelete('row', range.r2 + 1, rows)]);
@@ -4199,12 +4405,12 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
         line.className = 'menu-separator';
         return line;
       }
-      const [label, action] = item;
+      const [label, action, always = false] = item;
       const button = document.createElement('button');
       button.type = 'button';
       button.setAttribute('role', 'menuitem');
       button.textContent = label;
-      button.disabled = !canWrite();
+      button.disabled = !always && !canWrite();
       button.addEventListener('click', () => {
         closeMenu();
         action();
@@ -4516,6 +4722,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       document.removeEventListener('cut', onCut);
       document.removeEventListener('paste', onPaste);
       document.removeEventListener('pointerdown', outsideMenu, true);
+      for (const url of pictureUrls.values()) URL.revokeObjectURL(url);
       document.removeEventListener('pointerdown', outsideFilter, true);
       document.removeEventListener('pointerdown', outsideFunctions, true);
       if (frame) cancelAnimationFrame(frame);

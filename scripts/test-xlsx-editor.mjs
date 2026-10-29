@@ -730,6 +730,61 @@ editor.destroy();
   valid.destroy();
 }
 
+// Links, comments, pictures and charts are shown.
+{
+  const REL = 'http://schemas.openxmlformats.org/package/2006/relationships';
+  const R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+  const XDR = 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing';
+  const A = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+  const sheetXml = `<worksheet xmlns="${NS}" xmlns:r="${R}"><sheetData>
+<row r="1"><c r="A1" t="inlineStr"><is><t>Site</t></is></c><c r="B1" t="inlineStr"><is><t>Bad</t></is></c><c r="C1" t="inlineStr"><is><t>Jump</t></is></c></row>
+</sheetData><hyperlinks><hyperlink ref="A1" r:id="rId1" tooltip="Our site"/><hyperlink ref="B1" r:id="rId2"/><hyperlink ref="C1" location="'Data'!B3"/></hyperlinks><drawing r:id="rId3"/></worksheet>`;
+  const anchor = (from, to, inner) => `<xdr:twoCellAnchor><xdr:from><xdr:col>${from[0]}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${from[1]}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>${to[0]}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${to[1]}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>${inner}<xdr:clientData/></xdr:twoCellAnchor>`;
+  const parts = {
+    ...files,
+    'xl/worksheets/sheet1.xml': sheetXml,
+    'xl/worksheets/_rels/sheet1.xml.rels': `<Relationships xmlns="${REL}"><Relationship Id="rId1" Type="${R}/hyperlink" Target="https://example.com/" TargetMode="External"/><Relationship Id="rId2" Type="${R}/hyperlink" Target="javascript:alert(1)" TargetMode="External"/><Relationship Id="rId3" Type="${R}/drawing" Target="../drawings/drawing1.xml"/><Relationship Id="rId4" Type="${R}/comments" Target="../comments1.xml"/></Relationships>`,
+    'xl/comments1.xml': `<comments xmlns="${NS}"><authors><author>Ana</author></authors><commentList><comment ref="B2" authorId="0"><text><r><t>Check this</t></r></text></comment></commentList></comments>`,
+    'xl/drawings/drawing1.xml': `<xdr:wsDr xmlns:xdr="${XDR}" xmlns:a="${A}" xmlns:r="${R}">${anchor([3, 1], [5, 6], `<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="Logo"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill><xdr:spPr/></xdr:pic>`)}${anchor([6, 1], [9, 8], `<xdr:graphicFrame><xdr:nvGraphicFramePr><xdr:cNvPr id="3" name="Chart 1"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rId2"/></a:graphicData></a:graphic></xdr:graphicFrame>`)}</xdr:wsDr>`,
+    'xl/drawings/_rels/drawing1.xml.rels': `<Relationships xmlns="${REL}"><Relationship Id="rId1" Type="${R}/image" Target="../media/image1.png"/><Relationship Id="rId2" Type="${R}/chart" Target="../charts/chart1.xml"/></Relationships>`,
+    'xl/charts/chart1.xml': `<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="${A}"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>Sales</a:t></a:r></a:p></c:rich></c:tx></c:title></c:chart></c:chartSpace>`,
+  };
+  const encoded = Object.fromEntries(Object.entries(parts).map(([name, text]) => [name, strToU8(text)]));
+  encoded['xl/media/image1.png'] = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  if (!window.URL.createObjectURL) window.URL.createObjectURL = () => 'blob:picture';
+  globalThis.URL.createObjectURL ||= window.URL.createObjectURL;
+  globalThis.URL.revokeObjectURL ||= () => {};
+  globalThis.Blob ||= window.Blob;
+  const opened = [];
+  window.open = (url, target, features) => { opened.push([url, target, features]); return null; };
+  globalThis.window.open = window.open;
+  const view = mountXlsxEditor(container, zipSync(encoded), {});
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const canvas = container.querySelector('.xlsx-canvas');
+  const mouse = (type, col, row, extra = {}) => canvas.dispatchEvent(new window.MouseEvent(type, { button: 0, bubbles: true, cancelable: true, clientX: 46 + 64 * (col - 1) + 10, clientY: 24 + 20 * (row - 1) + 8, ...extra }));
+  const site = [...container.querySelectorAll('.xlsx-cell')].find(cell => cell.textContent === 'Site');
+  assert.match(site.style.cssText, /underline/, 'links look like links');
+  assert.match(site.title, /Our site/);
+  mouse('pointerdown', 1, 1, { ctrlKey: true });
+  assert.deepEqual(opened, [['https://example.com/', '_blank', 'noopener,noreferrer']], 'Ctrl+click opens it in a new tab');
+  mouse('pointerdown', 2, 1, { ctrlKey: true });
+  assert.equal(opened.length, 1, 'but not a script link');
+  assert.match(container.querySelector('.xlsx-note').textContent, /Only web and e-mail links/);
+  mouse('pointerdown', 3, 1, { ctrlKey: true });
+  assert.equal(container.querySelector('.xlsx-address').textContent, 'B3', 'a link to a place goes there');
+  assert.ok(container.querySelector('.xlsx-comment-mark'), 'comments are marked');
+  mouse('pointermove', 2, 2);
+  const tip = container.querySelector('.xlsx-comment-tip');
+  assert.equal(tip.hidden, false);
+  assert.equal(tip.textContent, 'AnaCheck this', 'and shown on hover');
+  const picture = container.querySelector('img.xlsx-picture');
+  assert.ok(picture && picture.alt === 'Logo', 'pictures are drawn');
+  assert.equal(picture.style.left, `${46 + 64 * 3}px`, 'where they are anchored');
+  assert.equal(picture.style.width, `${64 * 2}px`);
+  assert.match(container.querySelector('.xlsx-chart').textContent, /Sales/, 'charts show where they are, with their title');
+  view.destroy();
+}
+
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });
 assert.equal(container.querySelector('.office-save'), null);
 readonly.destroy();
