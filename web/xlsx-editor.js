@@ -1130,7 +1130,7 @@ function sheetLinks(model, sheet) {
 export function structureBlocked(model, sheet) {
   const types = new Set(sheetLinks(model, sheet).map(link => link.type));
   if (types.has('pivotTable')) return 'This sheet has pivot tables; rows and columns cannot be inserted or deleted in it here yet.';
-  if (types.has('comments') || types.has('threadedComment')) return 'This sheet has comments; rows and columns cannot be inserted or deleted in it here yet.';
+  if (types.has('threadedComment')) return 'This sheet has threaded comments; rows and columns cannot be inserted or deleted in it here yet.';
   return null;
 }
 
@@ -1258,6 +1258,42 @@ export function restructure(model, index, axis, at, count) {
       if (next) node.setAttribute('ref', next);
     }
     model.parts[table.path] = strToU8(serialize(table.xml));
+  }
+  // Comments move with their cells (and go with them): in their list, and in the VML Excel draws
+  // them with, which is edited as text (Excel's VML is not always well-formed XML).
+  for (const link of sheetLinks(model, sheet)) {
+    if (!model.parts[link.path]) continue;
+    if (link.type === 'comments') {
+      const xml = parseXml(strFromU8(model.parts[link.path]), 'Comments');
+      for (const node of [...xml.getElementsByTagNameNS(MAIN, 'comment')]) {
+        const next = moveSqref(node.getAttribute('ref') || '', axis, at, count);
+        if (next) node.setAttribute('ref', next); else node.remove();
+      }
+      model.parts[link.path] = strToU8(serialize(xml));
+    } else if (link.type === 'vmlDrawing') {
+      const text = strFromU8(model.parts[link.path]);
+      const moved = text.replace(/<((?:\w+:)?)shape\b[\s\S]*?<\/\1shape>/g, shape => {
+        if (!/ObjectType="Note"/.test(shape)) return shape;
+        const row = /<(?:\w+:)?Row>(\d+)</.exec(shape), col = /<(?:\w+:)?Column>(\d+)</.exec(shape);
+        if (!row || !col) return shape;
+        const position = Number(axis === 'row' ? row[1] : col[1]) + 1;
+        const span = moveSpan(position, position, at, count);
+        if (!span) return '';
+        const tag = axis === 'row' ? /(<(?:\w+:)?Row>)(\d+)(<)/ : /(<(?:\w+:)?Column>)(\d+)(<)/;
+        return shape
+          .replace(tag, (all, open, number, close) => `${open}${span[0] - 1}${close}`)
+          .replace(/(<(?:\w+:)?Anchor>)([^<]*)(<)/, (all, open, list, close) => {
+            const values = list.split(',').map(item => item.trim());
+            for (const i of axis === 'row' ? [2, 6] : [0, 4]) {
+              const spot = Number(values[i]) + 1;
+              const moved = moveSpan(spot, spot, at, count);
+              values[i] = String((moved ? moved[0] : at) - 1);
+            }
+            return `${open}${values.join(', ')}${close}`;
+          });
+      });
+      if (moved !== text) model.parts[link.path] = strToU8(moved);
+    }
   }
   // Pictures and charts are anchored to cells (counted from 0).
   for (const link of sheetLinks(model, sheet)) {
@@ -3082,7 +3118,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     if (!canWrite()) return false;
     commitEdit();
     // Parts a structural change rewrites along with the sheet: its drawings and tables.
-    const drawings = sheetLinks(model, sheet()).filter(link => link.type === 'drawing' || link.type === 'table').map(link => link.path);
+    const drawings = sheetLinks(model, sheet()).filter(link => ['drawing', 'table', 'comments', 'vmlDrawing'].includes(link.type)).map(link => link.path);
     const capture = () => ({
       sheets: model.sheets.map(s => serialize(s.xml)),
       workbook: serialize(model.workbookXml),
@@ -3628,6 +3664,9 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const loose = (range.r1 === range.r2 && range.c1 === range.c2) || range.r2 >= LAST_ROW || range.c2 >= LAST_COL;
     const target = loose ? currentRegion(anchor.row, anchor.col) : range;
     if (target.r1 === target.r2) { notice('Select a table with a header row, or a cell in one, to filter it.'); return; }
+    // Excel tables have a filter of their own; a sheet's filter may not overlap one.
+    const table = sheetExtras(model, sheet()).tables.find(item => !(item.area.r2 < target.r1 || item.area.r1 > target.r2 || item.area.c2 < target.c1 || item.area.c1 > target.c2));
+    if (table) { notice(`${table.name || 'This table'} is a table, with a filter of its own (not editable here yet).`); return; }
     structural(sh => setAutoFilter(model, sh, target));
   }
   let filterState = null;
