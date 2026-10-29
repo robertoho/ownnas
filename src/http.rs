@@ -340,7 +340,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/write", post(write_entry))
         .route("/api/write-docx", post(write_docx_entry).layer(DefaultBodyLimit::max(36 * 1024 * 1024)))
         .route("/api/write-odt", post(write_odt_entry).layer(DefaultBodyLimit::max(36 * 1024 * 1024)))
-        .route("/api/write-xlsx", post(write_xlsx_entry).layer(DefaultBodyLimit::max(36 * 1024 * 1024)))
+        .route("/api/write-xlsx", post(write_xlsx_entry).layer(DefaultBodyLimit::max(files::XLSX_MAX_BYTES + 12 * 1024 * 1024)))
         .route("/api/write-image", post(write_image_entry))
         .route("/api/convert-image", post(convert_image_entry))
         .route("/api/pdf/info", get(pdf_info))
@@ -1608,9 +1608,9 @@ async fn read_xlsx(
     }
     let mut file = tokio::fs::File::open(target.full).await.map_err(|_| ApiError::from(FileError::NotFound))?;
     let mut bytes = Vec::new();
-    (&mut file).take(25 * 1024 * 1024 + 1).read_to_end(&mut bytes).await
+    (&mut file).take(files::XLSX_MAX_BYTES as u64 + 1).read_to_end(&mut bytes).await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read spreadsheet"))?;
-    if bytes.len() > 25 * 1024 * 1024 { return Err(ApiError::new(StatusCode::BAD_REQUEST, "Spreadsheets up to 25 MB are supported")); }
+    if bytes.len() > files::XLSX_MAX_BYTES { return Err(ApiError::new(StatusCode::BAD_REQUEST, "Spreadsheets up to 50 MB are supported")); }
     let hash = hex::encode(sha2::Sha256::digest(&bytes));
     Ok(([(header::CONTENT_TYPE.as_str(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
         ("x-xlsx-hash", hash.as_str()), ("cache-control", "no-store")], bytes).into_response())

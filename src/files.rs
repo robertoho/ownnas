@@ -3515,11 +3515,14 @@ pub fn write_docx_bytes(root: &Path, rel: &str, bytes: &[u8], expected_hash: &st
 }
 
 /// Save an existing XLSX package, validating its workbook parts and guarding against stale writes.
+/// The largest spreadsheet the browser editor opens and saves (they are larger once unpacked).
+pub const XLSX_MAX_BYTES: usize = 50 * 1024 * 1024;
+
 pub fn write_xlsx_bytes(root: &Path, rel: &str, bytes: &[u8], expected_hash: &str) -> Result<String, FileError> {
     static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = SAVE_LOCK.lock().map_err(|_| FileError::Io("Spreadsheet save lock failed"))?;
-    if bytes.is_empty() || bytes.len() > 25 * 1024 * 1024 {
-        return Err(FileError::Rejected("Spreadsheet must be between 1 byte and 25 MB"));
+    if bytes.is_empty() || bytes.len() > XLSX_MAX_BYTES {
+        return Err(FileError::Rejected("Spreadsheet must be between 1 byte and 50 MB"));
     }
     let target = resolve(root, rel)?;
     if !target.full.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("xlsx")) || is_under_trash(&target.rel) {

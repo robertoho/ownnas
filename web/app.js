@@ -2526,7 +2526,7 @@ async function openEntry(entry) {
   } else if (/\.xlsx$/i.test(entry.name)) {
     body.innerHTML = '<p class="muted">Loading spreadsheet…</p>';
     try {
-      if (entry.size > 25 * 1024 * 1024) throw new Error('Spreadsheets up to 25 MB are supported.');
+      if (entry.size > 50 * 1024 * 1024) throw new Error('Spreadsheets up to 50 MB are supported.');
       const [module, response] = await Promise.all([import('/assets/xlsx-editor.js'), fetch(`/api/xlsx?path=${encodeURIComponent(entry.path)}`, { credentials: 'same-origin', cache: 'no-store' })]);
       if (!response.ok) throw new Error('Could not load spreadsheet.');
       const bytes = new Uint8Array(await response.arrayBuffer());

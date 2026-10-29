@@ -18,10 +18,10 @@ const CONTENT_TYPES = 'http://schemas.openxmlformats.org/package/2006/content-ty
 const DRAWING = 'http://schemas.openxmlformats.org/drawingml/2006/main';
 const SHEET_DRAWING = 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing';
 const XML = 'http://www.w3.org/XML/1998/namespace';
-const MAX_COMPRESSED = 25 * 1024 * 1024;
-const MAX_EXPANDED = 100 * 1024 * 1024;
+const MAX_COMPRESSED = 50 * 1024 * 1024;
+const MAX_EXPANDED = 250 * 1024 * 1024;
 const MAX_PARTS = 4096;
-const MAX_CELLS = 200000;
+const MAX_CELLS = 1000000;
 const LAST_ROW = 1048576;
 const LAST_COL = 16384;
 const HEAD_H = 24;
@@ -49,8 +49,20 @@ function parseXml(source, label) {
 }
 
 const serialize = node => new XMLSerializer().serializeToString(node);
-const kids = (node, local, ns = MAIN) => (node ? [...node.children].filter(child => child.namespaceURI === ns && child.localName === local) : []);
-const direct = (node, local) => kids(node, local)[0] || null;
+// Walking siblings is much quicker than copying `children`, read for every cell.
+function kids(node, local, ns = MAIN) {
+  const out = [];
+  for (let child = node?.firstElementChild; child; child = child.nextElementSibling) {
+    if (child.localName === local && child.namespaceURI === ns) out.push(child);
+  }
+  return out;
+}
+function direct(node, local) {
+  for (let child = node?.firstElementChild; child; child = child.nextElementSibling) {
+    if (child.localName === local && child.namespaceURI === MAIN) return child;
+  }
+  return null;
+}
 const flag = value => value === '1' || value === 'true';
 
 function textOf(node) {
@@ -337,7 +349,7 @@ function readSheet(name, path, xml, hidden, counter = { cells: 0 }) {
   const sheetData = direct(root, 'sheetData');
   if (!sheetData) throw new Error('Worksheet data is missing.');
   const sheet = {
-    name, path, xml, root, sheetData, cells: new Map(), rows: new Map(), shared: new Map(), extras: null,
+    name, path, xml, root, sheetData, cells: new Map(), rows: new Map(), shared: new Map(), extras: null, rules: null, arrays: [],
     maxRow: 0, maxCol: 0, rowHeights: new Map(), hiddenRows: new Set(), cols: [], merges: [], covered: new Map(),
     hidden,
     protected: flag(direct(root, 'sheetProtection')?.getAttribute('sheet')),
@@ -401,7 +413,7 @@ function readSheet(name, path, xml, hidden, counter = { cells: 0 }) {
 
 export function openXlsx(bytes) {
   if (!(bytes instanceof Uint8Array) || bytes.length === 0 || bytes.length > MAX_COMPRESSED) {
-    throw new Error('Spreadsheets must be between 1 byte and 25 MB.');
+    throw new Error('Spreadsheets must be between 1 byte and 50 MB.');
   }
   let expanded = 0, count = 0;
   const parts = unzipSync(bytes, { filter(part) {
@@ -649,9 +661,91 @@ function spillAt(model, index, row, col) {
 }
 
 /** Recalculates every formula the engine understands; the others keep their saved values. */
-function recalc(model, { onlyMissing = false } = {}) {
+/** Which formulas read which cells: single cells by key ("0!A1"), ranges by sheet, and the
+ * formulas to work out on every change (volatile functions, names). Keys are "sheet!ref". */
+function buildDependencies(model) {
   const byName = new Map(model.sheets.map((sheet, index) => [sheet.name.toLowerCase(), index]));
-  for (const sheet of model.sheets) {
+  const singles = new Map(), ranges = new Map(), always = new Set();
+  model.refCache ||= new Map();
+  model.sheets.forEach((sheet, index) => {
+    for (const [ref, cell] of sheet.cells) {
+      if (!direct(cell, 'f')) continue;
+      const key = `${index}!${ref}`;
+      const formula = formulaOf(sheet, cell);
+      if (formula == null) continue;
+      let refs = model.refCache.get(formula);
+      if (!refs) {
+        try {
+          const tokens = tokenize(formula);
+          refs = {
+            volatile: tokens.some(token => (token.t === 'fn' && VOLATILE.has(token.v)) || token.t === 'name'),
+            list: tokens.filter(token => token.t === 'ref' && token.a).map(token => ({ sheet: token.sheet, a: token.a, b: token.b })),
+          };
+        } catch {
+          refs = { volatile: true, list: [] };
+        }
+        model.refCache.set(formula, refs);
+      }
+      if (refs.volatile) always.add(key);
+      for (const item of refs.list) {
+        const target = item.sheet == null ? index : byName.get(item.sheet.toLowerCase());
+        if (target === undefined) continue;
+        if (!item.b && item.a.row != null && item.a.col != null) {
+          const cellKey = `${target}!${refName(item.a.row, item.a.col)}`;
+          if (!singles.has(cellKey)) singles.set(cellKey, []);
+          singles.get(cellKey).push(key);
+          continue;
+        }
+        const b = item.b || item.a;
+        if (!ranges.has(target)) ranges.set(target, []);
+        ranges.get(target).push({
+          key, r1: Math.min(item.a.row ?? 1, b.row ?? 1), r2: Math.max(item.a.row ?? LAST_ROW, b.row ?? LAST_ROW),
+          c1: Math.min(item.a.col ?? 1, b.col ?? 1), c2: Math.max(item.a.col ?? LAST_COL, b.col ?? LAST_COL),
+        });
+      }
+    }
+  });
+  return { singles, ranges, always };
+}
+
+const VOLATILE = new Set(['TODAY', 'NOW', 'RAND', 'RANDBETWEEN', 'ROW', 'COLUMN']);
+
+/** The formulas to work out again after cells changed: those reading them, and so on; null when
+ * that is too much to follow (then everything is worked out). */
+function dirtyFormulas(model, changed) {
+  const deps = model.dependencies ||= buildDependencies(model);
+  const dirty = new Set();
+  const queue = [];
+  const mark = key => { if (!dirty.has(key)) { dirty.add(key); queue.push(key); } };
+  for (const key of deps.always) mark(key);
+  for (const key of changed) {
+    const [index, ref] = key.split('!');
+    if (direct(model.sheets[Number(index)]?.cells.get(ref), 'f')) mark(key);
+    queue.push(key);
+  }
+  let budget = 5_000_000;
+  while (queue.length) {
+    const key = queue.pop();
+    for (const reader of deps.singles.get(key) || []) mark(reader);
+    const at = key.indexOf('!');
+    const index = Number(key.slice(0, at));
+    const place = parseRef(key.slice(at + 1));
+    if (!place) continue;
+    for (const range of deps.ranges.get(index) || []) {
+      if (--budget < 0) return null;
+      if (place.row >= range.r1 && place.row <= range.r2 && place.col >= range.c1 && place.col <= range.c2) mark(range.key);
+    }
+  }
+  return dirty;
+}
+
+/** Recalculates formulas the engine understands; the others keep their saved values. With
+ * `changed` (keys of cells edited), only the formulas depending on them are worked out again. */
+function recalc(model, { onlyMissing = false, changed = null } = {}) {
+  const byName = new Map(model.sheets.map((sheet, index) => [sheet.name.toLowerCase(), index]));
+  // Spilling formulas move what other cells read: those workbooks are worked out whole.
+  const dirty = changed && !onlyMissing && !model.spills?.size ? dirtyFormulas(model, changed) : null;
+  for (const sheet of dirty ? [] : model.sheets) {
     // Ranges dynamic arrays saved by spreadsheet apps cover.
     sheet.arrays = [];
     for (const cell of sheet.cells.values()) {
@@ -664,7 +758,11 @@ function recalc(model, { onlyMissing = false } = {}) {
   // A formula reading cells another one spills into needs that one's results first: when a pass
   // finds spills, a second pass runs knowing them.
   function pass(known) {
-    const results = new Map(), busy = new Set(), failed = new Set(), found = new Map();
+    const busy = new Set(), found = new Map();
+    // Working out only some formulas, the others keep what they were.
+    const results = dirty ? new Map(model.computed) : new Map();
+    const failed = dirty ? new Set(model.failed) : new Set();
+    if (dirty) for (const key of dirty) { results.delete(key); failed.delete(key); }
     const view = { ...model, spills: known };
     function cellValue(index, row, col) {
       const sheet = model.sheets[index];
@@ -730,6 +828,14 @@ function recalc(model, { onlyMissing = false } = {}) {
       found.get(index).push({ r1: row, c1: col, r2, c2, rows });
       return rows[0][0];
     }
+    if (dirty) {
+      for (const key of dirty) {
+        const at = key.indexOf('!');
+        const place = parseRef(key.slice(at + 1));
+        if (place && model.sheets[Number(key.slice(0, at))]) cellValue(Number(key.slice(0, at)), place.row, place.col);
+      }
+      return { results, failed, found };
+    }
     model.sheets.forEach((sheet, index) => {
       for (const [ref, cell] of sheet.cells) {
         if (!direct(cell, 'f')) continue;
@@ -743,7 +849,11 @@ function recalc(model, { onlyMissing = false } = {}) {
     return { results, failed, found };
   }
   let outcome = pass(new Map());
-  if (outcome.found.size) outcome = pass(outcome.found);
+  if (outcome.found.size) {
+    // A formula spilled: work everything out again, knowing what it spills.
+    if (dirty) { recalc(model); return; }
+    outcome = pass(outcome.found);
+  }
   model.spills = outcome.found;
   if (!onlyMissing) {
     model.computed = outcome.results;
@@ -778,6 +888,7 @@ const XM = 'http://schemas.microsoft.com/office/excel/2006/main';
 /** The validation rules of a sheet: those in <dataValidations>, and the newer ones Excel keeps in
  * an extension (lists from other sheets). */
 function validations(sheet) {
+  if (sheet.rules) return sheet.rules;
   const read = (node, formula, sqref) => ({
     type: node.getAttribute('type') || 'any', operator: node.getAttribute('operator') || 'between',
     allowBlank: flag(node.getAttribute('allowBlank')), showError: node.getAttribute('showErrorMessage') !== '0',
@@ -788,10 +899,13 @@ function validations(sheet) {
   });
   const list = kids(direct(sheet.root, 'dataValidations'), 'dataValidation')
     .map(node => read(node, n => direct(node, `formula${n}`)?.textContent ?? null, node.getAttribute('sqref') || ''));
-  for (const node of sheet.root.getElementsByTagNameNS(X14, 'dataValidation')) {
+  // Only the extension block at the end holds them: not the whole sheet to search.
+  for (const node of direct(sheet.root, 'extLst')?.getElementsByTagNameNS(X14, 'dataValidation') || []) {
     const sqref = node.getElementsByTagNameNS(XM, 'sqref')[0]?.textContent || '';
     list.push(read(node, n => node.getElementsByTagNameNS(X14, `formula${n}`)[0]?.getElementsByTagNameNS(XM, 'f')[0]?.textContent ?? null, sqref));
   }
+  // Kept until the sheet is read again (rules only change with its structure).
+  sheet.rules = list;
   return list;
 }
 
@@ -2121,8 +2235,9 @@ function icon(name) {
 }
 
 /** Shorter ways to show a General number: fewer decimals, then scientific notation. */
+const LOCALE_DECIMAL = localeSeparators(typeof navigator !== 'undefined' ? navigator.language : 'en-US').decimal;
 function* generalFits(value) {
-  const { decimal } = localeSeparators(typeof navigator !== 'undefined' ? navigator.language : 'en-US');
+  const decimal = LOCALE_DECIMAL;
   const local = text => (decimal === '.' ? text : text.replace('.', decimal));
   if (Math.abs(value) < 1e11) for (let places = 9; places >= 0; places--) yield local(String(Number(value.toFixed(places))));
   for (let digits = 5; digits >= 0; digits--) {
@@ -3287,7 +3402,9 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       .filter(item => (item.before ? serialize(item.before) : '') !== (item.after ? serialize(item.after) : ''));
     if (!items.length) return;
     record({ sheet: active, items });
-    changed();
+    // A formula written or removed changes who reads what.
+    if (items.some(item => (item.before && direct(item.before, 'f')) || (item.after && direct(item.after, 'f')))) model.dependencies = null;
+    changed(items.map(item => `${active}!${item.ref}`));
   }
   function record(entry) {
     if (savedAt > historyAt) savedAt = -1;
@@ -3401,12 +3518,15 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     live.textContent = text;
     updateNote();
   }
-  function changed() {
+  /** After an edit: `cells` (keys) when only those changed, so only what depends on them is worked
+   * out again; nothing for changes to the structure, which work out everything. */
+  function changed(cells = null) {
     message = '';
     model.edited = true;
     model.touched.add(sheet());
     geo = null;
-    recalc(model);
+    if (!cells) model.dependencies = null;
+    recalc(model, { changed: cells });
     onChange(dirty());
     updateNote();
     selectionChanged();
@@ -3438,7 +3558,8 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const first = parseRef(entry.items[0].ref);
     anchor = { row: first.row, col: first.col }; focus = { ...anchor };
     model.touched.add(s);
-    changed();
+    model.dependencies = null;
+    changed(entry.items.map(item => `${active}!${item.ref}`));
     scrollIntoView(anchor.row, anchor.col);
   }
   /** Turns a shared formula group into plain formulas, so one of its cells can change alone. */

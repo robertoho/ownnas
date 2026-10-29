@@ -1031,6 +1031,36 @@ editor.destroy();
   editor16.destroy();
 }
 
+// Edits work out only what depends on them; the results are those of working out everything.
+{
+  const data = `<worksheet xmlns="${NS}"><sheetData>
+<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f>A1*2</f></c><c r="C1"><f>B1+A2</f></c><c r="D1"><f>SUM(B1:C1)</f></c><c r="E1"><v>7</v></c><c r="F1"><f>E1</f></c></row>
+<row r="2"><c r="A2"><v>10</v></c><c r="B2"><f>D1*A2</f></c></row>
+</sheetData></worksheet>`;
+  const chain = mountXlsxEditor(container, zipSync(Object.fromEntries(Object.entries({ ...files, 'xl/worksheets/sheet1.xml': data }).map(([name, text]) => [name, strToU8(text)]))), {});
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const grid = container.querySelector('.xlsx-scroll');
+  const input = container.querySelector('.xlsx-cell-editor');
+  const live = container.querySelector('.xlsx-live');
+  const key = (target, name, extra = {}) => target.dispatchEvent(new KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true, ...extra }));
+  const go = (col, row) => { key(grid, 'Home', { ctrlKey: true }); for (let i = 1; i < row; i++) key(grid, 'ArrowDown'); for (let i = 1; i < col; i++) key(grid, 'ArrowRight'); };
+  const enter = (col, row, text) => { go(col, row); key(grid, text[0]); input.value = text; input.dispatchEvent(new Event('input')); key(input, 'Enter'); };
+  const shown = (col, row) => { go(col, row); return live.textContent.split(', ')[1]; };
+  grid.focus();
+  assert.deepEqual([shown(2, 1), shown(3, 1), shown(4, 1), shown(2, 2)], ['2', '12', '14', '140']);
+  enter(1, 1, '5');
+  assert.deepEqual([shown(2, 1), shown(3, 1), shown(4, 1), shown(2, 2)], ['10', '20', '30', '300'], 'a change runs through everything that reads it');
+  enter(1, 2, '1');
+  assert.deepEqual([shown(3, 1), shown(4, 1), shown(2, 2)], ['11', '21', '21'], 'down every path');
+  enter(5, 1, '8');
+  assert.equal(shown(6, 1), '8');
+  enter(3, 1, '=B1*3');
+  assert.deepEqual([shown(4, 1), shown(2, 2)], ['40', '40'], 'a new formula is followed too');
+  key(grid, 'z', { ctrlKey: true });
+  assert.deepEqual([shown(4, 1), shown(2, 2)], ['21', '21'], 'and undoing it');
+  chain.destroy();
+}
+
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });
 assert.equal(container.querySelector('.office-save'), null);
 readonly.destroy();
