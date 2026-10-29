@@ -417,6 +417,37 @@ editor.destroy();
   editor5.destroy();
 }
 
+// Freeze panes: the top row stays while the rest scrolls, and is saved.
+{
+  const editor6 = mountXlsxEditor(container, bytes, { onSave: async data => { saved = data; } });
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const grid = container.querySelector('.xlsx-scroll');
+  const canvas = container.querySelector('.xlsx-canvas');
+  const menu = container.querySelector('.xlsx-menu');
+  const toolbar = container.querySelector('.xlsx-toolbar');
+  const freezeButton = [...toolbar.querySelectorAll('button')].find(button => button.title === 'Freeze panes');
+  grid.focus();
+  freezeButton.click();
+  [...menu.querySelectorAll('button')].find(button => button.textContent === 'Freeze top row').click();
+  grid.scrollTop = 400;
+  grid.dispatchEvent(new Event('scroll'));
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const pinnedHead = [...container.querySelectorAll('.xlsx-row-head.is-frozen')].map(head => head.textContent);
+  assert.deepEqual(pinnedHead, ['1'], 'row 1 stays in view');
+  assert.ok(container.querySelector('.xlsx-freeze-line'), 'its edge is drawn');
+  // A click just under the column headers lands on row 1, though the sheet is scrolled.
+  canvas.dispatchEvent(new window.MouseEvent('pointerdown', { button: 0, bubbles: true, cancelable: true, clientX: 46 + 10, clientY: 400 + 24 + 8 }));
+  canvas.dispatchEvent(new window.MouseEvent('pointerup', { button: 0, bubbles: true, cancelable: true, clientX: 46 + 10, clientY: 400 + 24 + 8 }));
+  assert.equal(container.querySelector('.xlsx-address').textContent, 'A1');
+  await editor6.save();
+  assert.match(strFromU8(unzipSync(saved)['xl/worksheets/sheet1.xml']), /<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"\/><\/sheetView><\/sheetViews><sheetData>/, 'saved before the data, as the format wants');
+  freezeButton.click();
+  [...menu.querySelectorAll('button')].find(button => button.textContent === 'Unfreeze').click();
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  assert.equal(container.querySelectorAll('.xlsx-row-head.is-frozen').length, 0, 'unfrozen');
+  editor6.destroy();
+}
+
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });
 assert.equal(container.querySelector('.office-save'), null);
 readonly.destroy();

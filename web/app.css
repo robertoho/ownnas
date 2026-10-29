@@ -2428,6 +2428,11 @@ input, select, textarea {
 .xlsx-assist-call b { color: var(--accent); }
 .xlsx-assist-call p { margin: 0.2rem 0 0; color: var(--muted); font: 0.76rem/1.3 system-ui, sans-serif; }
 .xlsx-border { z-index: 1; box-sizing: border-box; pointer-events: none; }
+.xlsx-frozen { z-index: 2; background: #fff; }
+.xlsx-canvas .is-frozen { z-index: 2; }
+.xlsx-canvas .xlsx-col-head.is-frozen, .xlsx-canvas .xlsx-row-head.is-frozen { z-index: 4; }
+.xlsx-canvas .xlsx-corner { z-index: 5; }
+.xlsx-freeze-line { z-index: 3; background: #9aa09a; pointer-events: none; }
 .xlsx-font-select { max-width: 8.5rem; }
 .xlsx-size-select { width: 4.4rem; }
 .xlsx-fill-handle { position: absolute; z-index: 2; box-sizing: border-box; width: 8px; height: 8px; background: #2478dc; border: 1px solid #fff; cursor: crosshair; touch-action: none; }

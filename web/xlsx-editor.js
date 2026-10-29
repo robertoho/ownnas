@@ -369,6 +369,12 @@ function readSheet(name, path, xml, hidden, counter = { cells: 0 }) {
       }
     }
   }
+  const pane = direct(direct(direct(root, 'sheetViews'), 'sheetView'), 'pane');
+  const frozen = ['frozen', 'frozenSplit'].includes(pane?.getAttribute('state'));
+  sheet.frozen = {
+    rows: frozen ? Math.max(0, Math.round(Number(pane.getAttribute('ySplit')) || 0)) : 0,
+    cols: frozen ? Math.max(0, Math.round(Number(pane.getAttribute('xSplit')) || 0)) : 0,
+  };
   const format = direct(root, 'sheetFormatPr');
   sheet.defaultColPx = Math.round((Number(format?.getAttribute('defaultColWidth')) || (Number(format?.getAttribute('baseColWidth')) || 8) + 1.14) * 7);
   sheet.defaultRowPx = Math.round((Number(format?.getAttribute('defaultRowHeight')) || 15) * 4 / 3);
@@ -1063,6 +1069,30 @@ export function mergeRange(sheet, range, merge) {
   rereadSheet(sheet);
 }
 
+/** Keeps the first `rows` rows and `cols` columns in view while the rest scrolls (0 and 0 unfreezes). */
+export function freezePanes(sheet, rows, cols) {
+  const views = worksheetChild(sheet, 'sheetViews');
+  let view = kids(views, 'sheetView')[0];
+  if (!view) {
+    view = sheet.xml.createElementNS(MAIN, 'sheetView');
+    view.setAttribute('workbookViewId', '0');
+    views.append(view);
+  }
+  for (const pane of kids(view, 'pane')) pane.remove();
+  // Selections belong to panes; the one for the top-left pane (no "pane") stays.
+  for (const selection of kids(view, 'selection')) if (selection.hasAttribute('pane')) selection.remove();
+  if (rows || cols) {
+    const pane = sheet.xml.createElementNS(MAIN, 'pane');
+    if (cols) pane.setAttribute('xSplit', String(cols));
+    if (rows) pane.setAttribute('ySplit', String(rows));
+    pane.setAttribute('topLeftCell', refName(rows + 1, cols + 1));
+    pane.setAttribute('activePane', rows && cols ? 'bottomRight' : rows ? 'bottomLeft' : 'topRight');
+    pane.setAttribute('state', 'frozen');
+    view.insertBefore(pane, view.firstChild);
+  }
+  rereadSheet(sheet);
+}
+
 // --- Filling ------------------------------------------------------------------------------------
 
 const FILL_LISTS = [
@@ -1166,6 +1196,7 @@ const ICONS = {
   fill: '<path d="M3 9 8 4l4 4-5 5z"/><path d="M12.5 10.5s1.5 1.6 1.5 2.5a1.5 1.5 0 0 1-3 0c0-.9 1.5-2.5 1.5-2.5z"/>',
   color: '<path d="M4.5 12 8 3l3.5 9M6 9h4"/>',
   save: '<path d="M3 3h8l2 2v8H3z"/><path d="M5 3v3h5V3M5 13V9h6v4"/>',
+  freeze: '<path d="M2.5 2.5h11v11h-11z"/><path d="M2.5 6.5h11M6.5 2.5v11" stroke-width="2.4"/>',
   underline: '<path d="M5 3v4a3 3 0 0 0 6 0V3M4 13h8"/>',
   strike: '<path d="M3 8h10M10.5 4.5C10 3.6 9 3 7.8 3 6.3 3 5 3.9 5 5.2c0 .9.5 1.5 1.3 1.9M5.5 11.3c.5.9 1.5 1.7 2.9 1.7 1.6 0 2.8-.9 2.8-2.3 0-.6-.2-1.1-.6-1.5"/>',
   wrap: '<path d="M3 4h10M3 8h8a2 2 0 0 1 0 4H8"/><path d="M9.5 10.5 8 12l1.5 1.5M3 12h3"/>',
@@ -1473,6 +1504,19 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     });
     buttons.border.setAttribute('aria-haspopup', 'menu');
     divider();
+    tool('freeze', 'Freeze panes', () => {
+      const box = buttons.freeze.getBoundingClientRect();
+      const f = sheet().frozen || { rows: 0, cols: 0 };
+      const at = { rows: anchor.row - 1, cols: anchor.col - 1 };
+      openMenu(box.left, box.bottom + 4, [
+        ['Freeze top row', () => freeze(1, 0)],
+        ['Freeze first column', () => freeze(0, 1)],
+        [at.rows || at.cols ? `Freeze above and left of ${refName(anchor.row, anchor.col)}` : 'Freeze above and left of the selection', () => freeze(at.rows, at.cols)],
+        ...(f.rows || f.cols ? ['-', ['Unfreeze', () => freeze(0, 0)]] : []),
+      ]);
+    });
+    buttons.freeze.setAttribute('aria-haspopup', 'menu');
+    divider();
     formatSelect.className = 'office-select';
     formatSelect.setAttribute('aria-label', 'Number format');
     formatSelect.title = 'Number format';
@@ -1607,6 +1651,18 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     left: geo.colX[c1], top: geo.rowY[r1],
     width: geo.colX[Math.min(c2, geo.cols) + 1] - geo.colX[c1], height: geo.rowY[Math.min(r2, geo.rows) + 1] - geo.rowY[r1],
   });
+  const frozen = () => {
+    const f = sheet().frozen || { rows: 0, cols: 0 };
+    return { rows: Math.min(f.rows, geo ? geo.rows - 1 : f.rows), cols: Math.min(f.cols, geo ? geo.cols - 1 : f.cols) };
+  };
+  /** Where a range is drawn: inside the frozen rows or columns, it moves with the scroll. */
+  function onScreen(r1, c1, r2, c2) {
+    const box = rect(r1, c1, r2, c2);
+    const f = frozen();
+    if (f.rows && r2 <= f.rows) box.top += scroll.scrollTop;
+    if (f.cols && c2 <= f.cols) box.left += scroll.scrollLeft;
+    return box;
+  }
 
   // Display
   function activeStyle() {
@@ -1635,31 +1691,39 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const s = sheet();
     const top = scroll.scrollTop, left = scroll.scrollLeft;
     const height = scroll.clientHeight || 600, width = scroll.clientWidth || 800;
-    const r1 = find(geo.rowY, geo.rows, top + HEAD_H), r2 = Math.min(geo.rows, find(geo.rowY, geo.rows, top + height) + 1);
-    const c1 = find(geo.colX, geo.cols, left + HEAD_W), c2 = Math.min(geo.cols, find(geo.colX, geo.cols, left + width) + 1);
+    // Frozen rows and columns stay in place: drawn over the rest, shifted by the scroll.
+    const { rows: fr, cols: fc } = frozen();
+    const frozenH = geo.rowY[fr + 1] - HEAD_H, frozenW = geo.colX[fc + 1] - HEAD_W;
+    const r1 = Math.max(fr + 1, find(geo.rowY, geo.rows, top + HEAD_H + frozenH)), r2 = Math.min(geo.rows, find(geo.rowY, geo.rows, top + height) + 1);
+    const c1 = Math.max(fc + 1, find(geo.colX, geo.cols, left + HEAD_W + frozenW)), c2 = Math.min(geo.cols, find(geo.colX, geo.cols, left + width) + 1);
     const fragment = document.createDocumentFragment();
-    const right = geo.colX[c2 + 1], bottom = geo.rowY[r2 + 1];
-    for (let r = r1; r <= r2 + 1; r++) {
-      const line = document.createElement('div');
-      line.className = 'xlsx-hline';
-      line.style.cssText = `top:${geo.rowY[r] - 1}px;left:${HEAD_W}px;width:${right - HEAD_W}px`;
-      fragment.append(line);
-    }
-    for (let c = c1; c <= c2 + 1; c++) {
-      const line = document.createElement('div');
-      line.className = 'xlsx-vline';
-      line.style.cssText = `left:${geo.colX[c] - 1}px;top:${HEAD_H}px;height:${bottom - HEAD_H}px`;
-      fragment.append(line);
-    }
+    let dx = 0, dy = 0, pinned = false;
+    const lines = (rowFrom, rowTo, colFrom, colTo) => {
+      const x1 = geo.colX[colFrom], x2 = geo.colX[colTo + 1], y1 = geo.rowY[rowFrom], y2 = geo.rowY[rowTo + 1];
+      for (let r = rowFrom; r <= rowTo + 1; r++) {
+        const line = document.createElement('div');
+        line.className = pinned ? 'xlsx-hline is-frozen' : 'xlsx-hline';
+        line.style.cssText = `top:${geo.rowY[r] - 1 + dy}px;left:${x1 + dx}px;width:${x2 - x1}px`;
+        fragment.append(line);
+      }
+      for (let c = colFrom; c <= colTo + 1; c++) {
+        const line = document.createElement('div');
+        line.className = pinned ? 'xlsx-vline is-frozen' : 'xlsx-vline';
+        line.style.cssText = `left:${geo.colX[c] - 1 + dx}px;top:${y1 + dy}px;height:${y2 - y1}px`;
+        fragment.append(line);
+      }
+    };
     const drawn = new Set();
     const drawCell = (row, col, merge) => {
       const info = shown(row, col);
       if (!info) return;
       const { style } = info;
       const box = merge ? rect(merge.r1, merge.c1, merge.r2, merge.c2) : rect(row, col, row, col);
+      box.left += dx;
+      box.top += dy;
       if (!box.width || !box.height) return;
       const el = document.createElement('div');
-      el.className = 'xlsx-cell';
+      el.className = pinned ? 'xlsx-cell is-frozen' : 'xlsx-cell';
       let width = box.width;
       const px = (style.size || 11) * 4 / 3 * FONT_SCALE;
       const font = cellFont(style);
@@ -1701,50 +1765,86 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       fragment.append(el);
       if (style.borders) {
         const edge = document.createElement('div');
-        edge.className = 'xlsx-border';
+        edge.className = pinned ? 'xlsx-border is-frozen' : 'xlsx-border';
         edge.style.cssText = [`left:${box.left - 1}px`, `top:${box.top - 1}px`, `width:${box.width + 1}px`, `height:${box.height + 1}px`,
           ...Object.entries(style.borders).map(([side, { kind, color }]) => `border-${side}:${BORDER_CSS[kind] || '1px solid'} ${color}`)].join(';');
         fragment.append(edge);
       }
     };
-    for (let r = r1; r <= r2; r++) {
-      if (!rowPx(s, r)) continue;
-      for (let c = c1; c <= c2; c++) {
-        const ref = refName(r, c);
-        const merge = s.covered.get(ref);
-        if (merge) {
-          const key = `${merge.r1}:${merge.c1}`;
-          if (drawn.has(key)) continue;
-          drawn.add(key);
-          const box = rect(merge.r1, merge.c1, merge.r2, merge.c2);
-          const blank = document.createElement('div');
-          blank.className = 'xlsx-merge';
-          blank.style.cssText = `left:${box.left}px;top:${box.top}px;width:${box.width}px;height:${box.height}px`;
-          fragment.append(blank);
-          drawCell(merge.r1, merge.c1, merge);
-          continue;
-        }
-        drawCell(r, c, null);
+    const area = (rowFrom, rowTo, colFrom, colTo) => {
+      if (rowFrom > rowTo || colFrom > colTo) return;
+      if (pinned) {
+        // The frozen part hides what scrolls under it.
+        const band = document.createElement('div');
+        band.className = 'xlsx-frozen';
+        const x1 = geo.colX[colFrom], y1 = geo.rowY[rowFrom];
+        band.style.cssText = `left:${x1 + dx}px;top:${y1 + dy}px;width:${geo.colX[colTo + 1] - x1}px;height:${geo.rowY[rowTo + 1] - y1}px`;
+        fragment.append(band);
       }
+      lines(rowFrom, rowTo, colFrom, colTo);
+      for (let r = rowFrom; r <= rowTo; r++) {
+        if (!rowPx(s, r)) continue;
+        for (let c = colFrom; c <= colTo; c++) {
+          const ref = refName(r, c);
+          const merge = s.covered.get(ref);
+          if (merge) {
+            const key = `${merge.r1}:${merge.c1}`;
+            if (drawn.has(key)) continue;
+            drawn.add(key);
+            const box = rect(merge.r1, merge.c1, merge.r2, merge.c2);
+            const blank = document.createElement('div');
+            blank.className = pinned ? 'xlsx-merge is-frozen' : 'xlsx-merge';
+            blank.style.cssText = `left:${box.left + dx}px;top:${box.top + dy}px;width:${box.width}px;height:${box.height}px`;
+            fragment.append(blank);
+            drawCell(merge.r1, merge.c1, merge);
+            continue;
+          }
+          drawCell(r, c, null);
+        }
+      }
+    };
+    area(r1, r2, c1, c2);
+    pinned = true;
+    dy = top; dx = 0;
+    area(1, fr, c1, c2);
+    dy = 0; dx = left;
+    area(r1, r2, 1, fc);
+    dy = top; dx = left;
+    area(1, fr, 1, fc);
+    pinned = false; dx = 0; dy = 0;
+    // The edge of the frozen part, as in spreadsheet apps.
+    if (fr) {
+      const line = document.createElement('div');
+      line.className = 'xlsx-freeze-line';
+      line.style.cssText = `left:${left}px;top:${geo.rowY[fr + 1] + top - 1}px;width:${width}px;height:2px`;
+      fragment.append(line);
+    }
+    if (fc) {
+      const line = document.createElement('div');
+      line.className = 'xlsx-freeze-line';
+      line.style.cssText = `left:${geo.colX[fc + 1] + left - 1}px;top:${top}px;width:2px;height:${height}px`;
+      fragment.append(line);
     }
     // Headers stay pinned to the top and left edges.
     const range = selectedRange();
-    for (let c = c1; c <= c2; c++) {
+    for (const c of [...Array.from({ length: Math.max(0, c2 - c1 + 1) }, (_, i) => c1 + i), ...Array.from({ length: fc }, (_, i) => i + 1)]) {
+      const w = geo.colX[c + 1] - geo.colX[c];
+      if (!w) continue;
       const head = document.createElement('div');
-      head.className = 'xlsx-col-head';
+      head.className = c <= fc ? 'xlsx-col-head is-frozen' : 'xlsx-col-head';
       if (c >= range.c1 && c <= range.c2) head.classList.add('is-active');
       head.textContent = columnName(c);
-      head.style.cssText = `left:${geo.colX[c]}px;top:${top}px;width:${geo.colX[c + 1] - geo.colX[c]}px;height:${HEAD_H}px`;
+      head.style.cssText = `left:${geo.colX[c] + (c <= fc ? left : 0)}px;top:${top}px;width:${w}px;height:${HEAD_H}px`;
       fragment.append(head);
     }
-    for (let r = r1; r <= r2; r++) {
+    for (const r of [...Array.from({ length: Math.max(0, r2 - r1 + 1) }, (_, i) => r1 + i), ...Array.from({ length: fr }, (_, i) => i + 1)]) {
       const h = geo.rowY[r + 1] - geo.rowY[r];
       if (!h) continue;
       const head = document.createElement('div');
-      head.className = 'xlsx-row-head';
+      head.className = r <= fr ? 'xlsx-row-head is-frozen' : 'xlsx-row-head';
       if (r >= range.r1 && r <= range.r2) head.classList.add('is-active');
       head.textContent = String(r);
-      head.style.cssText = `left:${left}px;top:${geo.rowY[r]}px;width:${HEAD_W}px;height:${h}px`;
+      head.style.cssText = `left:${left}px;top:${geo.rowY[r] + (r <= fr ? top : 0)}px;width:${HEAD_W}px;height:${h}px`;
       fragment.append(head);
     }
     const corner = document.createElement('div');
@@ -1755,6 +1855,11 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     layer.replaceChildren(fragment);
     placeSelection();
     placePoint();
+    if (editing && !cellEditor.hidden) {
+      const box = onScreen(editing.row, editing.col, editing.row, editing.col);
+      cellEditor.style.left = `${box.left}px`;
+      cellEditor.style.top = `${box.top}px`;
+    }
   }
   const schedule = () => { if (!frame) frame = requestAnimationFrame(render); };
 
@@ -1784,11 +1889,11 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   function placeSelection() {
     if (!geo) return;
     const range = expandForMerges(selectedRange());
-    const box = rect(range.r1, range.c1, Math.min(range.r2, geo.rows), Math.min(range.c2, geo.cols));
+    const box = onScreen(range.r1, range.c1, Math.min(range.r2, geo.rows), Math.min(range.c2, geo.cols));
     selectionBox.style.cssText = `left:${box.left - 1}px;top:${box.top - 1}px;width:${box.width + 1}px;height:${box.height + 1}px`;
     selectionBox.hidden = range.r1 === range.r2 && range.c1 === range.c2 && !sheet().covered.has(refName(anchor.row, anchor.col));
     const merge = sheet().covered.get(refName(anchor.row, anchor.col));
-    const cellBox = merge ? rect(merge.r1, merge.c1, merge.r2, merge.c2) : rect(anchor.row, anchor.col, anchor.row, anchor.col);
+    const cellBox = merge ? onScreen(merge.r1, merge.c1, merge.r2, merge.c2) : onScreen(anchor.row, anchor.col, anchor.row, anchor.col);
     activeBox.style.cssText = `left:${cellBox.left - 1}px;top:${cellBox.top - 1}px;width:${cellBox.width + 1}px;height:${cellBox.height + 1}px`;
     const whole = range.r2 >= LAST_ROW || range.c2 >= LAST_COL;
     fillHandle.hidden = !canWrite() || !!editing || whole;
@@ -1854,10 +1959,17 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     layout();
     const box = rect(row, col, row, col);
     const viewW = scroll.clientWidth, viewH = scroll.clientHeight;
-    if (box.left - HEAD_W < scroll.scrollLeft) scroll.scrollLeft = box.left - HEAD_W;
-    else if (box.left + box.width > scroll.scrollLeft + viewW) scroll.scrollLeft = box.left + box.width - viewW;
-    if (box.top - HEAD_H < scroll.scrollTop) scroll.scrollTop = box.top - HEAD_H;
-    else if (box.top + box.height > scroll.scrollTop + viewH) scroll.scrollTop = box.top + box.height - viewH;
+    // Frozen rows and columns are always in view, and cover the start of the rest.
+    const f = frozen();
+    const frozenW = geo.colX[f.cols + 1] - HEAD_W, frozenH = geo.rowY[f.rows + 1] - HEAD_H;
+    if (col > f.cols) {
+      if (box.left - HEAD_W - frozenW < scroll.scrollLeft) scroll.scrollLeft = box.left - HEAD_W - frozenW;
+      else if (box.left + box.width > scroll.scrollLeft + viewW) scroll.scrollLeft = box.left + box.width - viewW;
+    }
+    if (row > f.rows) {
+      if (box.top - HEAD_H - frozenH < scroll.scrollTop) scroll.scrollTop = box.top - HEAD_H - frozenH;
+      else if (box.top + box.height > scroll.scrollTop + viewH) scroll.scrollTop = box.top + box.height - viewH;
+    }
   }
   function select(row, col, extend = false) {
     row = Math.max(1, Math.min(LAST_ROW, row));
@@ -2124,6 +2236,14 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       return Object.keys(sides).length ? { borders: sides } : null;
     });
   }
+  function freeze(rows, cols) {
+    if (rows >= LAST_ROW || cols >= LAST_COL) return;
+    if (structural(s => freezePanes(s, rows, cols))) {
+      scroll.scrollTop = 0;
+      scroll.scrollLeft = 0;
+      schedule();
+    }
+  }
   /** Merges the selection and centres it, or unmerges merged cells in it. */
   function toggleMerge() {
     const range = selectedRange();
@@ -2159,7 +2279,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   function startEdit(initial = null) {
     if (!canWrite() || editing) return;
     const merge = sheet().covered.get(refName(anchor.row, anchor.col));
-    const box = merge ? rect(merge.r1, merge.c1, merge.r2, merge.c2) : rect(anchor.row, anchor.col, anchor.row, anchor.col);
+    const box = merge ? onScreen(merge.r1, merge.c1, merge.r2, merge.c2) : onScreen(anchor.row, anchor.col, anchor.row, anchor.col);
     const original = editText(anchor.row, anchor.col);
     editing = { row: anchor.row, col: anchor.col, original, typed: initial != null, sheet: active };
     const style = activeStyle();
@@ -2344,7 +2464,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const point = editing && editing.sheet === active ? activePoint() : null;
     if (!point || !geo) { pointBox.hidden = true; return; }
     const { r1, c1, r2, c2 } = point.range;
-    const box = rect(Math.min(r1, geo.rows), Math.min(c1, geo.cols), Math.min(r2, geo.rows), Math.min(c2, geo.cols));
+    const box = onScreen(Math.min(r1, geo.rows), Math.min(c1, geo.cols), Math.min(r2, geo.rows), Math.min(c2, geo.cols));
     pointBox.style.cssText = `left:${box.left - 1}px;top:${box.top - 1}px;width:${box.width + 1}px;height:${box.height + 1}px`;
     pointBox.hidden = false;
   }
@@ -2556,10 +2676,14 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const box = canvas.getBoundingClientRect();
     const x = event.clientX - box.left, y = event.clientY - box.top;
     const head = { col: x - scroll.scrollLeft < HEAD_W, row: y - scroll.scrollTop < HEAD_H };
+    // Over frozen rows or columns, the place is as if not scrolled.
+    const f = frozen();
+    const inRows = f.rows && y - scroll.scrollTop < geo.rowY[f.rows + 1], inCols = f.cols && x - scroll.scrollLeft < geo.colX[f.cols + 1];
+    const px = inCols ? x - scroll.scrollLeft : x, py = inRows ? y - scroll.scrollTop : y;
     return {
-      x, y, head,
-      row: find(geo.rowY, geo.rows, Math.max(HEAD_H, y)),
-      col: find(geo.colX, geo.cols, Math.max(HEAD_W, x)),
+      x: px, y: py, head,
+      row: find(geo.rowY, geo.rows, Math.max(HEAD_H, py)),
+      col: find(geo.colX, geo.cols, Math.max(HEAD_W, px)),
     };
   }
   canvas.addEventListener('pointerdown', event => {
@@ -2629,7 +2753,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     if (dragging.kind === 'fill') {
       dragging.target = fillTarget(dragging.source, p);
       const area = dragging.target || dragging.source;
-      const box = rect(area.r1, area.c1, area.r2, area.c2);
+      const box = onScreen(area.r1, area.c1, area.r2, area.c2);
       fillBox.style.cssText = `left:${box.left - 1}px;top:${box.top - 1}px;width:${box.width + 1}px;height:${box.height + 1}px`;
       fillBox.hidden = !dragging.target;
       return;
