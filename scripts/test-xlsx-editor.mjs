@@ -12,7 +12,7 @@ Object.defineProperty(dom.window.HTMLElement.prototype, 'clientHeight', { get() 
 Object.defineProperty(dom.window.HTMLElement.prototype, 'clientWidth', { get() { return 800; } });
 dom.window.HTMLCanvasElement.prototype.getContext = () => null;
 const { zipSync, unzipSync, strToU8, strFromU8 } = await import('../web/vendor/three/addons/libs/fflate.module.js');
-const { fillSeries, mountXlsxEditor, openXlsx, parseInput, restructure } = await import('../web/xlsx-editor.js');
+const { conditionalFormats, fillSeries, mountXlsxEditor, openXlsx, parseInput, restructure } = await import('../web/xlsx-editor.js');
 
 const NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
 const sheet = `<worksheet xmlns="${NS}"><dimension ref="A1:B3"/><sheetData>
@@ -639,6 +639,36 @@ editor.destroy();
   assert.deepEqual([...container.querySelectorAll('.xlsx-tab:not(.xlsx-tab-add)')].map(item => item.textContent), ['Sheet2', 'My Data', 'My Data (2)']);
   again.destroy();
   editor9.destroy();
+}
+
+// Conditional formatting is shown: rules, colour scales, data bars.
+{
+  const rules = `<conditionalFormatting sqref="A1:A3"><cfRule type="cellIs" dxfId="0" priority="2" operator="greaterThan"><formula>15</formula></cfRule></conditionalFormatting>`
+    + `<conditionalFormatting sqref="B1:B2"><cfRule type="expression" dxfId="1" priority="1"><formula>$A1&gt;$B1</formula></cfRule></conditionalFormatting>`
+    + `<conditionalFormatting sqref="C1:C3"><cfRule type="colorScale" priority="3"><colorScale><cfvo type="min"/><cfvo type="max"/><color rgb="FFFFFFFF"/><color rgb="FF000000"/></colorScale></cfRule></conditionalFormatting>`
+    + `<conditionalFormatting sqref="D1:D2"><cfRule type="dataBar" priority="4"><dataBar><cfvo type="min"/><cfvo type="max"/><color rgb="FF638EC6"/></dataBar></cfRule></conditionalFormatting>`
+    + `<conditionalFormatting sqref="E1:E3"><cfRule type="duplicateValues" dxfId="0" priority="5"/></conditionalFormatting>`;
+  const data = `<worksheet xmlns="${NS}"><sheetData>
+<row r="1"><c r="A1"><v>10</v></c><c r="B1"><v>1</v></c><c r="C1"><v>0</v></c><c r="D1"><v>5</v></c><c r="E1" t="inlineStr"><is><t>x</t></is></c></row>
+<row r="2"><c r="A2"><v>20</v></c><c r="B2"><v>50</v></c><c r="C2"><v>5</v></c><c r="D2"><v>10</v></c><c r="E2" t="inlineStr"><is><t>X</t></is></c></row>
+<row r="3"><c r="A3"><f>SUM(A1:A2)</f><v>30</v></c><c r="C3"><v>10</v></c><c r="E3" t="inlineStr"><is><t>y</t></is></c></row>
+</sheetData>${rules}</worksheet>`;
+  const styles = `<styleSheet xmlns="${NS}"><fonts count="1"><font><sz val="11"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border/></borders><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellXfs><dxfs count="2"><dxf><font><b/><color rgb="FF9C0006"/></font><fill><patternFill><bgColor rgb="FFFFC7CE"/></patternFill></fill></dxf><dxf><fill><patternFill><bgColor rgb="FFC6EFCE"/></patternFill></fill></dxf></dxfs></styleSheet>`;
+  const book = openXlsx(zipSync(Object.fromEntries(Object.entries({ ...files, 'xl/worksheets/sheet1.xml': data, 'xl/styles.xml': styles }).map(([name, text]) => [name, strToU8(text)]))));
+  const shown = conditionalFormats(book, 0);
+  assert.equal(shown.get('A1'), undefined, '10 is not over 15');
+  assert.deepEqual(shown.get('A2'), { bold: true, color: '#9C0006', fill: '#FFC7CE' }, 'cell rules apply their format');
+  assert.equal(shown.get('A3').fill, '#FFC7CE', 'formulas count with their results');
+  assert.equal(shown.get('B1').fill, '#C6EFCE', 'formula rules move with each cell: $A1>$B1');
+  assert.equal(shown.get('B2'), undefined, '20 > 50 is false');
+  assert.deepEqual(['C1', 'C2', 'C3'].map(ref => shown.get(ref).fill), ['#ffffff', '#808080', '#000000'], 'colour scales blend');
+  assert.deepEqual(['D1', 'D2'].map(ref => shown.get(ref).bar.share), [0, 1], 'data bars');
+  assert.ok(shown.get('E1') && shown.get('E2') && !shown.get('E3'), 'duplicates, ignoring case');
+  const viewer = mountXlsxEditor(container, zipSync(Object.fromEntries(Object.entries({ ...files, 'xl/worksheets/sheet1.xml': data, 'xl/styles.xml': styles }).map(([name, text]) => [name, strToU8(text)]))), {});
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const cellA2 = [...container.querySelectorAll('.xlsx-cell')].find(cell => cell.textContent === '20');
+  assert.match(cellA2.style.cssText, /background: (rgb\(255, 199, 206\)|#ffc7ce)/i, 'and drawn');
+  viewer.destroy();
 }
 
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });

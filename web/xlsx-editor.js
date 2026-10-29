@@ -745,6 +745,196 @@ function recalc(model, { onlyMissing = false } = {}) {
     model.computed = outcome.results;
     model.failed = outcome.failed;
   } else for (const key of outcome.failed) model.failed.add(key);
+  model.conditional = new Map(model.sheets.map((sheet, index) => [index, conditionalFormats(model, index)]));
+}
+
+// --- Conditional formatting ---------------------------------------------------------------------
+
+/** The formatting a conditional rule applies (a "dxf"): only what it sets. */
+function dxfStyle(model, id) {
+  const styles = model.styles;
+  if (!styles || id == null) return {};
+  styles.dxfCache ||= new Map();
+  if (styles.dxfCache.has(id)) return styles.dxfCache.get(id);
+  const dxf = kids(direct(styles.root, 'dxfs'), 'dxf')[Number(id)];
+  const out = {};
+  const font = direct(dxf, 'font');
+  if (font) {
+    const on = name => { const node = direct(font, name); return node ? !['0', 'false'].includes(node.getAttribute('val')) : undefined; };
+    for (const [key, name] of [['bold', 'b'], ['italic', 'i'], ['strike', 'strike']]) { const value = on(name); if (value !== undefined) out[key] = value; }
+    const u = direct(font, 'u');
+    if (u) out.underline = u.getAttribute('val') !== 'none';
+    const color = colorOf(direct(font, 'color'), styles.theme);
+    if (color) out.color = color;
+  }
+  const pattern = direct(direct(dxf, 'fill'), 'patternFill');
+  if (pattern) {
+    const fill = colorOf(direct(pattern, 'bgColor'), styles.theme) || colorOf(direct(pattern, 'fgColor'), styles.theme);
+    if (fill) out.fill = fill;
+  }
+  styles.dxfCache.set(id, out);
+  return out;
+}
+
+/** A range in a list like "A1:B5 D:D 3:3". */
+function parseArea(text) {
+  const [a, b = a] = text.split(':');
+  const part = item => /^\$?([A-Z]{0,3})\$?(\d*)$/i.exec(item);
+  const x = part(a), y = part(b);
+  if (!x || !y || (!x[1] && !x[2])) return null;
+  const col = (match, fallback) => (match[1] ? parseRef(`${match[1]}1`)?.col : fallback);
+  const row = (match, fallback) => (match[2] ? Number(match[2]) : fallback);
+  return { r1: row(x, 1), c1: col(x, 1), r2: row(y, LAST_ROW), c2: col(y, LAST_COL) };
+}
+
+function mixColor(a, b, share) {
+  const parse = hex => [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16));
+  const [x, y] = [parse(a), parse(b)];
+  return `#${x.map((value, i) => Math.round(value + (y[i] - value) * share).toString(16).padStart(2, '0')).join('')}`;
+}
+
+/** What conditional formatting does to a sheet's cells, by reference: style changes (fill, color,
+ * bold, italic, underline, strike) and data bars ({ share, color }). Null when it has none. The
+ * rules go in priority order, the first to set something winning; rules this editor cannot
+ * work out are left out. */
+export function conditionalFormats(model, index) {
+  const sheet = model.sheets[index];
+  const blocks = kids(sheet.root, 'conditionalFormatting');
+  if (!blocks.length) return null;
+  try {
+    const byName = new Map(model.sheets.map((other, i) => [other.name.toLowerCase(), i]));
+    const value = (r, c) => valueAt(model, index, r, c);
+    const rules = [];
+    for (const block of blocks) {
+      const ranges = (block.getAttribute('sqref') || '').split(/\s+/).filter(Boolean).map(parseArea).filter(Boolean);
+      if (!ranges.length) continue;
+      for (const rule of kids(block, 'cfRule')) rules.push({ rule, ranges, priority: Number(rule.getAttribute('priority')) || 0 });
+    }
+    rules.sort((a, b) => a.priority - b.priority);
+    const places = [...sheet.cells.keys()].map(ref => ({ ref, ...parseRef(ref) }));
+    const out = new Map(), stopped = new Set();
+    const set = (ref, changes) => {
+      const now = out.get(ref) || {};
+      for (const [key, change] of Object.entries(changes)) if (!(key in now)) now[key] = change;
+      out.set(ref, now);
+    };
+    for (const { rule, ranges } of rules) {
+      const cells = places.filter(({ ref, row, col }) => !stopped.has(ref) && ranges.some(a => row >= a.r1 && row <= a.r2 && col >= a.c1 && col <= a.c2));
+      if (!cells.length) continue;
+      const top = ranges[0];
+      const formulas = kids(rule, 'formula').map(node => node.textContent);
+      // Formulas are written for the range's top-left cell, and move with each cell.
+      const at = (formula, row, col) => {
+        const text = shiftFormula(formula, row - top.r1, col - top.c1);
+        let tree = model.trees.get(text);
+        if (!tree) { tree = parseFormula(text); model.trees.set(text, tree); }
+        return evaluate(tree, {
+          row, col, date1904: model.date1904,
+          size: name => { const target = name == null ? index : byName.get(name.toLowerCase()); return target === undefined ? null : { rows: model.sheets[target].maxRow, cols: model.sheets[target].maxCol }; },
+          cell: (name, r, c) => { const target = name == null ? index : byName.get(name.toLowerCase()); if (target === undefined) throw new Unsupported('Unknown sheet'); return valueAt(model, target, r, c); },
+        });
+      };
+      const numbers = () => cells.map(({ row, col }) => value(row, col)).filter(v => typeof v === 'number');
+      const type = rule.getAttribute('type');
+      const text = (rule.getAttribute('text') || '').toLowerCase();
+      const plain = v => (v == null ? '' : v instanceof CellError ? v.code : String(v)).toLowerCase();
+      let test = null;
+      if (type === 'cellIs') {
+        const op = rule.getAttribute('operator') || 'equal';
+        const order = (a, b) => {
+          if (a == null || a === '') a = typeof b === 'string' ? '' : 0;
+          if (typeof a === 'number' && typeof b === 'number') return a - b;
+          if (typeof a !== typeof b) return typeof a === 'number' ? -1 : 1;
+          return plain(a) < plain(b) ? -1 : plain(a) > plain(b) ? 1 : 0;
+        };
+        test = (row, col, v) => {
+          if (v instanceof CellError) return false;
+          const a = at(formulas[0], row, col), b = formulas[1] != null ? at(formulas[1], row, col) : undefined;
+          const lo = b === undefined || order(a, b) <= 0 ? a : b, hi = b === undefined || order(a, b) <= 0 ? b : a;
+          return {
+            equal: () => order(v, a) === 0, notEqual: () => order(v, a) !== 0, greaterThan: () => order(v, a) > 0, lessThan: () => order(v, a) < 0,
+            greaterThanOrEqual: () => order(v, a) >= 0, lessThanOrEqual: () => order(v, a) <= 0,
+            between: () => order(v, lo) >= 0 && order(v, hi) <= 0, notBetween: () => order(v, lo) < 0 || order(v, hi) > 0,
+          }[op]?.() ?? false;
+        };
+      } else if (type === 'expression') {
+        test = (row, col) => { const result = at(formulas[0], row, col); return result === true || (typeof result === 'number' && result !== 0); };
+      } else if (type === 'containsText') test = (r, c, v) => plain(v).includes(text);
+      else if (type === 'notContainsText') test = (r, c, v) => !plain(v).includes(text);
+      else if (type === 'beginsWith') test = (r, c, v) => plain(v).startsWith(text);
+      else if (type === 'endsWith') test = (r, c, v) => plain(v).endsWith(text);
+      else if (type === 'containsBlanks') test = (r, c, v) => plain(v).trim() === '';
+      else if (type === 'notContainsBlanks') test = (r, c, v) => plain(v).trim() !== '';
+      else if (type === 'containsErrors') test = (r, c, v) => v instanceof CellError;
+      else if (type === 'notContainsErrors') test = (r, c, v) => !(v instanceof CellError);
+      else if (type === 'top10') {
+        const list = numbers().sort((a, b) => b - a);
+        const bottom = flag(rule.getAttribute('bottom'));
+        if (bottom) list.reverse();
+        const rank = Number(rule.getAttribute('rank')) || 10;
+        const count = flag(rule.getAttribute('percent')) ? Math.max(1, Math.floor(list.length * rank / 100)) : rank;
+        const edge = list[Math.min(count, list.length) - 1];
+        test = (r, c, v) => typeof v === 'number' && edge !== undefined && (bottom ? v <= edge : v >= edge);
+      } else if (type === 'aboveAverage') {
+        const list = numbers();
+        const mean = list.reduce((a, b) => a + b, 0) / (list.length || 1);
+        const above = rule.getAttribute('aboveAverage') !== '0', equal = flag(rule.getAttribute('equalAverage'));
+        test = (r, c, v) => typeof v === 'number' && (above ? v > mean || (equal && v === mean) : v < mean || (equal && v === mean));
+      } else if (type === 'duplicateValues' || type === 'uniqueValues') {
+        const counts = new Map();
+        for (const { row, col } of cells) { const key = plain(value(row, col)); if (key) counts.set(key, (counts.get(key) || 0) + 1); }
+        test = (r, c, v) => { const key = plain(v); return !!key && (counts.get(key) > 1) === (type === 'duplicateValues'); };
+      } else if (type === 'colorScale' || type === 'dataBar') {
+        const scale = direct(rule, type);
+        const points = kids(scale, 'cfvo');
+        const colors = kids(scale, 'color').map(node => colorOf(node, model.styles?.theme || []));
+        const list = numbers().sort((a, b) => a - b);
+        if (!list.length || colors.some(color => !color)) continue;
+        const threshold = point => {
+          const kind = point.getAttribute('type'), raw = point.getAttribute('val');
+          const share = Number(raw) / 100;
+          if (kind === 'min') return list[0];
+          if (kind === 'max') return list[list.length - 1];
+          if (kind === 'num') return Number(raw);
+          if (kind === 'percent') return list[0] + (list[list.length - 1] - list[0]) * share;
+          if (kind === 'percentile') return list[Math.min(list.length - 1, Math.max(0, Math.round(share * (list.length - 1))))];
+          if (kind === 'formula') { const result = at(raw, top.r1, top.c1); return typeof result === 'number' ? result : NaN; }
+          return NaN;
+        };
+        const edges = points.map(threshold);
+        if (edges.some(Number.isNaN)) continue;
+        for (const { ref, row, col } of cells) {
+          const v = value(row, col);
+          if (typeof v !== 'number') continue;
+          if (type === 'dataBar') {
+            const [lo, hi] = [edges[0], edges[edges.length - 1]];
+            set(ref, { bar: { share: hi === lo ? 1 : Math.max(0, Math.min(1, (v - lo) / (hi - lo))), color: colors[0] } });
+            continue;
+          }
+          let i = 0;
+          while (i < edges.length - 2 && v > edges[i + 1]) i++;
+          const span = edges[i + 1] - edges[i];
+          const share = span ? Math.max(0, Math.min(1, (v - edges[i]) / span)) : 0;
+          set(ref, { fill: mixColor(colors[i], colors[i + 1], share) });
+        }
+        continue;
+      }
+      if (!test) continue;
+      const style = dxfStyle(model, rule.getAttribute('dxfId'));
+      const stop = flag(rule.getAttribute('stopIfTrue'));
+      for (const { ref, row, col } of cells) {
+        let hit = false;
+        try { hit = test(row, col, value(row, col)); } catch (error) { if (!(error instanceof Unsupported)) throw error; break; }
+        if (!hit) continue;
+        set(ref, style);
+        if (stop) stopped.add(ref);
+      }
+    }
+    return out;
+  } catch (error) {
+    if (error instanceof Unsupported) return null;
+    throw error;
+  }
 }
 
 // --- Cell edits ---------------------------------------------------------------------------------
@@ -2093,7 +2283,9 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const spilled = spillAt(model, active, row, col);
     if (!cell && spilled === undefined) return null;
     const value = valueAt(model, active, row, col);
-    const style = cellStyle(model, cell?.getAttribute('s'));
+    let style = cellStyle(model, cell?.getAttribute('s'));
+    const conditional = model.conditional?.get(active)?.get(refName(row, col));
+    if (conditional) style = { ...style, ...conditional };
     const formatted = formatValue(value, style.numFmt, formatOptions);
     let align = style.align;
     if (!align || align === 'general') align = typeof value === 'number' ? 'right' : typeof value === 'boolean' || value instanceof CellError ? 'center' : 'left';
@@ -2172,6 +2364,8 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       el.textContent = text;
       const css = [`left:${box.left}px`, `top:${box.top}px`, `width:${width}px`, `height:${box.height}px`, `justify-content:${info.align === 'right' ? 'flex-end' : info.align === 'center' ? 'center' : 'flex-start'}`, `text-align:${info.align}`];
       if (style.fill) css.push(`background:${style.fill}`);
+      // A data bar, as long as the value is far between the rule's least and most.
+      if (style.bar) css.push(`background-image:linear-gradient(90deg, ${style.bar.color}cc 0, ${style.bar.color}66 ${Math.round(style.bar.share * 100)}%, transparent ${Math.round(style.bar.share * 100)}%)`);
       if (info.color || style.color) css.push(`color:${info.color || style.color}`);
       const lines = [style.underline && 'underline', style.strike && 'line-through'].filter(Boolean);
       if (lines.length) css.push(`text-decoration:${lines.join(' ')}`);
