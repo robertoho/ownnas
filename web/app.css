@@ -2435,7 +2435,7 @@ input, select, textarea {
 .xlsx-filter-button { z-index: 2; box-sizing: border-box; display: grid; place-items: center; border: 1px solid #b9bdb4; border-radius: 3px; background: #f7f8f5; color: #4a4f45; font: 10px/1 system-ui, sans-serif; cursor: pointer; }
 .xlsx-filter-button:hover { background: #e8ebe3; }
 .xlsx-filter-button.is-active { background: #2478dc; border-color: #2478dc; color: #fff; }
-.xlsx-filter-panel { z-index: 60; width: 15rem; max-height: min(26rem, calc(100vh - 16px)); grid-template-rows: auto auto auto auto auto minmax(0, 1fr) auto; }
+.xlsx-filter-panel { z-index: 60; width: 17rem; max-height: min(26rem, calc(100vh - 16px)); grid-template-rows: auto auto auto auto auto minmax(0, 1fr) auto; }
 .xlsx-filter-search { margin: 0.25rem 0.3rem; }
 .xlsx-filter-list { min-height: 4rem; overflow: auto; padding: 0.15rem 0.3rem; border: 1px solid var(--line); border-radius: 8px; margin: 0 0.3rem; }
 .xlsx-filter-item { display: flex; align-items: center; gap: 0.45rem; padding: 0.2rem 0.25rem; font-size: 0.82rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
@@ -2443,7 +2443,8 @@ input, select, textarea {
 .xlsx-filter-all { font-weight: 600; }
 .xlsx-filter-more { margin: 0.3rem; color: var(--muted); font-size: 0.75rem; }
 .xlsx-filter-actions { display: flex; gap: 0.35rem; justify-content: flex-end; padding: 0.45rem 0.3rem 0.1rem; }
-.xlsx-filter-actions button { width: auto; justify-content: center; }
+.xlsx-filter-panel > button { min-height: 0; padding: 0.35rem 0.6rem; font-size: 0.85rem; }
+.xlsx-filter-actions button { width: auto; min-height: 0; padding: 0.35rem 0.65rem; justify-content: center; font-size: 0.82rem; white-space: nowrap; }
 .xlsx-filter-actions .xlsx-filter-ok { background: var(--accent); color: var(--accent-ink, #000); }
 .xlsx-find { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem; padding: 0.35rem 0.45rem; border: 1px solid var(--line); border-radius: 8px; background: var(--input-bg); }
 .xlsx-find input[type="text"] { flex: 1 1 9rem; min-width: 7rem; height: 30px; }
