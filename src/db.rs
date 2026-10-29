@@ -150,9 +150,13 @@ fn wal_of(path: &std::path::Path) -> std::path::PathBuf {
 /// now (they are then copied as far as they can be, and tried again next time).
 pub fn checkpoint(path: &std::path::Path) -> Option<u64> {
     let [_, (_, wal), _, (_, index_wal)] = file_sizes(path);
-    let conn = Connection::open(path).ok()?;
     // Waits for readers, holding up writers meanwhile: briefly, unless a log has grown large.
-    let wait = if wal.max(index_wal) > WAL_LIMIT as u64 * 4 { 3000 } else { 500 };
+    checkpoint_waiting(path, if wal.max(index_wal) > WAL_LIMIT as u64 * 4 { 3000 } else { 500 })
+}
+
+fn checkpoint_waiting(path: &std::path::Path, wait: u64) -> Option<u64> {
+    let [_, (_, wal), _, (_, index_wal)] = file_sizes(path);
+    let conn = Connection::open(path).ok()?;
     conn.busy_timeout(std::time::Duration::from_millis(wait)).ok()?;
     attach_index(&conn, &index_path(path).to_string_lossy()).ok()?;
     let mut emptied = true;
@@ -170,6 +174,9 @@ pub fn checkpoint(path: &std::path::Path) -> Option<u64> {
                     "could not empty the write-ahead log of {name} ({} MB, {copied} of {pages} pages copied); open now:",
                     size / (1024 * 1024)
                 );
+                if let Some(marks) = read_marks(&file) {
+                    text.push_str(&format!(" [{marks}]"));
+                }
                 let open = crate::db_watch::held(std::time::Duration::from_secs(1));
                 if open.is_empty() {
                     text.push_str(
@@ -188,10 +195,33 @@ pub fn checkpoint(path: &std::path::Path) -> Option<u64> {
     emptied.then_some(wal + index_wal)
 }
 
+/// What SQLite's shared memory file says of a log: its length, how far it was copied, and the
+/// frame each reader slot holds the copy back to (a slot in use at that mark is the read that
+/// stops it).
+fn read_marks(file: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let mut head = [0u8; 132];
+    std::fs::File::open(format!("{}-shm", file.display())).ok()?.read_exact(&mut head).ok()?;
+    let word = |at: usize| u32::from_le_bytes([head[at], head[at + 1], head[at + 2], head[at + 3]]);
+    let marks: Vec<String> = (0..5)
+        .map(|slot| match word(100 + slot * 4) {
+            u32::MAX => "-".to_string(),
+            mark => mark.to_string(),
+        })
+        .collect();
+    Some(format!(
+        "log frames {}, copied {}, reader slots {}",
+        word(16),
+        word(96),
+        marks.join(" ")
+    ))
+}
+
 /// Empties the write-ahead logs every few minutes, so they cannot grow while a long read holds
 /// back SQLite's own checkpoints. And now and then brings the statistics SQLite plans queries
 /// with up to date, as the indexes grow (each table sampled, so it stays quick).
 pub fn start_checkpoints(path: std::path::PathBuf) {
+    const PAUSE_EVERY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
     let _ = std::thread::Builder::new().name("db-checkpoint".into()).spawn(move || {
         let optimize = || {
             if let Ok(conn) = connect(&path) {
@@ -201,12 +231,21 @@ pub fn start_checkpoints(path: std::path::PathBuf) {
         optimize();
         // Each minute: a read held too long goes in the log, and a log grown large is emptied.
         // Every five minutes the logs are emptied anyway, and the statistics every hour.
+        let mut paused_at: Option<std::time::Instant> = None;
         for round in (1..=60).cycle() {
             std::thread::sleep(std::time::Duration::from_secs(60));
             crate::db_watch::report_held();
             let [_, (_, wal), _, (_, index_wal)] = file_sizes(&path);
-            if round % 5 == 0 || wal.max(index_wal) > WAL_LIMIT as u64 * 4 {
-                checkpoint(&path);
+            let large = wal.max(index_wal) > WAL_LIMIT as u64 * 4;
+            if (round % 5 == 0 || large) && checkpoint(&path).is_none() && large && paused_at.is_none_or(|at| at.elapsed() >= PAUSE_EVERY) {
+                // The indexers read one after another all day; with them waiting, nothing of
+                // OwnNAS's should hold the log back. Not more often than PAUSE_EVERY, in case
+                // what does is another program.
+                paused_at = Some(std::time::Instant::now());
+                let emptied = crate::db_watch::with_indexing_paused(std::time::Duration::from_secs(60), || checkpoint_waiting(&path, 10_000));
+                if let Some(size) = emptied {
+                    crate::db_watch::log(&format!("emptied the write-ahead logs ({} MB) with indexing paused", size / (1024 * 1024)));
+                }
             }
             if round == 60 {
                 optimize();
@@ -1797,6 +1836,23 @@ mod tests {
         ));
         let conn = open(&path).unwrap();
         (path, conn)
+    }
+
+    #[test]
+    fn read_marks_name_the_frame_a_read_holds() {
+        let (path, conn) = scratch_db();
+        add_tag(&conn, "a.jpg", "one").unwrap();
+        let reader = connect(&path).unwrap();
+        reader.execute_batch("BEGIN; SELECT count(*) FROM file_tags;").unwrap();
+        let frames = |marks: &str| marks.split(", ").next().unwrap().trim_start_matches("log frames ").to_string();
+        let held = frames(&read_marks(&path).unwrap());
+        for n in 0..20 {
+            add_tag(&conn, &format!("{n}.jpg"), "two").unwrap();
+        }
+        let marks = read_marks(&path).unwrap();
+        assert_ne!(frames(&marks), held, "{marks}");
+        assert!(marks.ends_with(&format!(" {held}")) || marks.contains(&format!(" {held} ")), "{marks}");
+        reader.execute_batch("COMMIT").unwrap();
     }
 
     #[test]

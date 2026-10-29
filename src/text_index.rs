@@ -20,7 +20,8 @@ use crate::media_index::Speed;
 const MAX_TEXT: usize = 1024 * 1024;
 /// Text files larger than this are read only this far.
 const MAX_TEXT_FILE: u64 = 2 * 1024 * 1024;
-const BATCH: usize = 50;
+/// Files picked at a time. Finding them reads the whole name index, so not too few.
+const BATCH: usize = 2000;
 
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -131,6 +132,7 @@ impl TextIndex {
                     let started = Instant::now();
                     self.status.lock().unwrap_or_else(|err| err.into_inner()).current = Some(file.path.clone());
                     let text = read_text(&root.join(&file.path), &file.path, &file.kind, cache_dir, ocr).unwrap_or_default();
+                    crate::db_watch::pause_point();
                     store(&conn, &file, &text)?;
                     {
                         let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());

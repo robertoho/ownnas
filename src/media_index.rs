@@ -148,6 +148,7 @@ impl Indexer {
         if !rest.is_zero() {
             std::thread::sleep(rest);
         }
+        crate::db_watch::pause_point();
     }
 
     pub fn status(&self) -> Status {
@@ -299,7 +300,7 @@ impl Indexer {
         let (total, mut described, mut scanned) = crate::smart::progress(&conn).unwrap_or_default();
         if enabled(crate::ml::Feature::Search) {
             loop {
-                let Ok(batch) = crate::smart::pending_descriptions(&conn, 32) else { break };
+                let Ok(batch) = crate::smart::pending_descriptions(&conn, 1000) else { break };
                 if batch.is_empty() {
                     break;
                 }
@@ -325,7 +326,7 @@ impl Indexer {
         if enabled(crate::ml::Feature::Faces) {
             let Ok(mut people) = crate::smart::PeopleIndex::load(&conn) else { return };
             loop {
-                let Ok(batch) = crate::smart::pending_faces(&conn, 16) else { break };
+                let Ok(batch) = crate::smart::pending_faces(&conn, 1000) else { break };
                 if batch.is_empty() {
                     break;
                 }

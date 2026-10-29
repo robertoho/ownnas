@@ -10,6 +10,7 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -39,6 +40,36 @@ struct Running {
 
 static RUNNING: LazyLock<Mutex<Running>> = LazyLock::new(Mutex::default);
 static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
+/// Set while the write-ahead logs are being emptied with the indexers waiting.
+static PAUSED: AtomicBool = AtomicBool::new(false);
+
+/// The background indexers call this before each piece of database work: while the logs are
+/// being emptied, they wait here, with no read open.
+pub fn pause_point() {
+    while PAUSED.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Runs `work` with the background indexers held at their `pause_point`, once the reads and
+/// transactions they have open finish (waiting up to `wait` for them).
+pub fn with_indexing_paused<T>(wait: Duration, work: impl FnOnce() -> T) -> T {
+    PAUSED.store(true, Ordering::Relaxed);
+    let until = Instant::now() + wait;
+    while Instant::now() < until && indexer_busy() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let done = work();
+    PAUSED.store(false, Ordering::Relaxed);
+    done
+}
+
+/// Whether an indexer thread (`ownnas-…-index`) has a statement running or a transaction open.
+fn indexer_busy() -> bool {
+    let running = running();
+    let indexer = |open: &Open| open.thread.starts_with("ownnas-") && open.thread.ends_with("-index");
+    running.statements.values().any(indexer) || running.transactions.values().any(indexer)
+}
 
 /// Writes the log to `database.log` in `data_dir` as well as the console.
 pub fn log_to(data_dir: &std::path::Path) {

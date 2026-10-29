@@ -365,6 +365,7 @@ fn scan(
             progress(folders, read);
         }
         pace(worked);
+        crate::db_watch::pause_point();
         tx = conn.unchecked_transaction().map_err(sql)?;
     }
     tx.commit().map_err(sql)?;
