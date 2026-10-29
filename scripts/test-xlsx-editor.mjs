@@ -12,7 +12,7 @@ Object.defineProperty(dom.window.HTMLElement.prototype, 'clientHeight', { get() 
 Object.defineProperty(dom.window.HTMLElement.prototype, 'clientWidth', { get() { return 800; } });
 dom.window.HTMLCanvasElement.prototype.getContext = () => null;
 const { zipSync, unzipSync, strToU8, strFromU8 } = await import('../web/vendor/three/addons/libs/fflate.module.js');
-const { conditionalFormats, fillSeries, mountXlsxEditor, openXlsx, parseInput, restructure } = await import('../web/xlsx-editor.js');
+const { conditionalFormats, fillSeries, mountXlsxEditor, openXlsx, parseInput, readHtmlTable, restructure } = await import('../web/xlsx-editor.js');
 
 const NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
 const sheet = `<worksheet xmlns="${NS}"><dimension ref="A1:B3"/><sheetData>
@@ -783,6 +783,75 @@ editor.destroy();
   assert.equal(picture.style.width, `${64 * 2}px`);
   assert.match(container.querySelector('.xlsx-chart').textContent, /Sales/, 'charts show where they are, with their title');
   view.destroy();
+}
+
+// The clipboard: tables from other apps with their look, copying as HTML, paste special.
+{
+  globalThis.DOMParser = window.DOMParser;
+  const excel = `<html><head><style>.xl65 {background:#FFFF00; font-weight:700}</style></head><body><table>
+<tr><td class="xl65" x:num="1250.5">1,250.50 €</td><td style="color:#FF0000;font-style:italic">Hi<br>there</td></tr>
+<tr><td colspan="2">Wide</td><td data-sheets-value='{"1":3,"3":0.25}'>25%</td></tr></table><script>window.hacked = true</script></body></html>`;
+  const rows = readHtmlTable(excel);
+  assert.deepEqual(rows[0][0], { input: '1250.5', change: { fill: '#FFFF00', bold: true } }, "Excel's numbers and class styles");
+  assert.deepEqual(rows[0][1], { input: 'Hi\nthere', change: { color: '#FF0000', italic: true } });
+  assert.deepEqual(rows[1].map(item => item.input), ['Wide', '', '0.25'], 'spans leave room; Google Sheets numbers');
+  assert.equal(window.hacked, undefined, 'nothing in it runs');
+
+  const editor10 = mountXlsxEditor(container, bytes, { onSave: async data => { saved = data; } });
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const grid = container.querySelector('.xlsx-scroll');
+  const bar = container.querySelector('.xlsx-formula');
+  const menu = container.querySelector('.xlsx-menu');
+  const canvas = container.querySelector('.xlsx-canvas');
+  const key = (target, name, extra = {}) => target.dispatchEvent(new KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true, ...extra }));
+  const go = (col, row) => { key(grid, 'Home', { ctrlKey: true }); for (let i = 1; i < row; i++) key(grid, 'ArrowDown'); for (let i = 1; i < col; i++) key(grid, 'ArrowRight'); };
+  const clip = (type, data = {}) => {
+    const event = new window.Event(type, { bubbles: true, cancelable: true });
+    const written = {};
+    event.clipboardData = { getData: kind => data[kind] || '', setData: (kind, value) => { written[kind] = value; } };
+    document.dispatchEvent(event);
+    return written;
+  };
+  const special = (label, col, row) => {
+    canvas.dispatchEvent(new window.MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 46 + 64 * (col - 1) + 10, clientY: 24 + 20 * (row - 1) + 8 }));
+    [...menu.querySelectorAll('button')].find(item => item.textContent === label).click();
+  };
+  grid.focus();
+  // Paste Excel's table at G1.
+  go(7, 1);
+  clip('paste', { 'text/plain': '1,250.50 €\tHi there\nWide\t\t25%', 'text/html': excel });
+  go(7, 1);
+  assert.equal(bar.value, '1250.5', 'the number, not its text');
+  go(8, 1);
+  assert.equal(container.querySelector('.xlsx-live').textContent, 'H1, Hi\nthere', 'line breaks kept');
+  // Copy A3 (=SUM(A1:A2), shown as 30.00 €): HTML for other apps.
+  go(1, 3);
+  const copied = clip('copy');
+  assert.equal(copied['text/plain'], '30.00 €');
+  assert.match(copied['text/html'], /<td x:num="30" style="text-align:right[^"]*">30\.00 €<\/td>/);
+  // Paste special at G1: values only, then formats only.
+  go(7, 1);
+  special('Paste values only', 7, 1);
+  go(7, 1);
+  assert.equal(bar.value, '30', 'the value, not the formula');
+  go(1, 3);
+  clip('copy');
+  go(7, 1);
+  special('Paste formats only', 7, 1);
+  go(7, 1);
+  assert.equal(container.querySelector('.xlsx-live').textContent, 'G1, 30.00 €', "the copied cell's number format");
+  // Transposed: A1:A2 across G2:H2.
+  canvas.dispatchEvent(new window.MouseEvent('pointerdown', { button: 0, bubbles: true, cancelable: true, clientX: 46 + 10, clientY: 24 + 8 }));
+  canvas.dispatchEvent(new window.MouseEvent('pointermove', { button: 0, bubbles: true, cancelable: true, clientX: 46 + 10, clientY: 24 + 20 + 8 }));
+  canvas.dispatchEvent(new window.MouseEvent('pointerup', { button: 0, bubbles: true, cancelable: true, clientX: 46 + 10, clientY: 24 + 20 + 8 }));
+  clip('copy');
+  go(7, 2);
+  special('Paste transposed', 7, 2);
+  go(7, 2);
+  assert.equal(bar.value, '10');
+  go(8, 2);
+  assert.equal(bar.value, '20', 'rows become columns');
+  editor10.destroy();
 }
 
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });

@@ -1504,6 +1504,80 @@ export function safeLink(url) {
   }
 }
 
+// --- Clipboard HTML -----------------------------------------------------------------------------
+
+const CSS_COLOR = /^#([0-9a-f]{3}|[0-9a-f]{6})$|^rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)$/i;
+function cssColor(value) {
+  const match = CSS_COLOR.exec(String(value || '').trim());
+  if (!match) return null;
+  if (match[1]) return `#${(match[1].length === 3 ? [...match[1]].map(c => c + c).join('') : match[1]).toUpperCase()}`;
+  return `#${match.slice(2, 5).map(n => Math.min(255, Number(n)).toString(16).padStart(2, '0')).join('').toUpperCase()}`;
+}
+
+/** The cells of a table copied from a spreadsheet app as HTML (Excel, Google Sheets, LibreOffice):
+ * rows of { input, change } (the text to put in, and the style it had), or null when the HTML has
+ * no table. Scripts in it never run: it is only parsed. */
+export function readHtmlTable(html) {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const table = doc.querySelector('table');
+  if (!table) return null;
+  // Excel styles cells with classes in a <style> block.
+  const classes = new Map();
+  for (const style of doc.querySelectorAll('style')) {
+    for (const match of (style.textContent || '').matchAll(/\.([\w-]+)\s*\{([^}]*)\}/g)) classes.set(match[1], (classes.get(match[1]) || '') + ';' + match[2]);
+  }
+  const declarations = text => {
+    const out = {};
+    for (const part of String(text || '').split(';')) {
+      const at = part.indexOf(':');
+      if (at > 0) out[part.slice(0, at).trim().toLowerCase()] = part.slice(at + 1).trim().replace(/^["']|["']$/g, '');
+    }
+    return out;
+  };
+  const rows = [];
+  const taken = new Set();
+  [...table.rows].forEach((tr, r) => {
+    const row = rows[r] || (rows[r] = []);
+    let c = 0;
+    for (const td of tr.cells) {
+      while (taken.has(`${r}:${c}`)) c++;
+      const css = { ...declarations(td.closest('tr')?.getAttribute('style')), ...Object.assign({}, ...[...td.classList].map(name => declarations(classes.get(name)))), ...declarations(td.getAttribute('style')) };
+      // Text with line breaks kept; Excel and Sheets give the plain number too.
+      for (const br of td.querySelectorAll('br')) br.replaceWith('\n');
+      let input = (td.textContent || '').replace(/\u00a0/g, ' ').replace(/^\n+|\n+$/g, '');
+      const excelNumber = td.getAttribute('x:num');
+      if (excelNumber != null && excelNumber !== '' && Number.isFinite(Number(excelNumber))) input = String(Number(excelNumber));
+      try {
+        const typed = JSON.parse(td.getAttribute('data-sheets-value') || 'null');
+        if (typed && typed[1] === 3 && Number.isFinite(typed[3])) input = String(typed[3]);
+      } catch { /* not Google Sheets' */ }
+      const change = {};
+      const fill = cssColor(css['background-color'] || css.background);
+      if (fill && fill !== '#FFFFFF') change.fill = fill;
+      const color = cssColor(css.color);
+      if (color && color !== '#000000') change.color = color;
+      if (/^(bold|[6-9]00)$/.test(css['font-weight'] || '')) change.bold = true;
+      if (css['font-style'] === 'italic') change.italic = true;
+      const decoration = css['text-decoration'] || css['text-decoration-line'] || '';
+      if (decoration.includes('underline') || td.querySelector('u')) change.underline = true;
+      if (decoration.includes('line-through') || td.querySelector('s, strike')) change.strike = true;
+      if (td.querySelector('b, strong')) change.bold = true;
+      if (td.querySelector('i, em')) change.italic = true;
+      if (['left', 'center', 'right'].includes(css['text-align'])) change.align = css['text-align'];
+      const size = /^([\d.]+)(pt|px)$/.exec(css['font-size'] || '');
+      if (size) { const points = size[2] === 'px' ? Number(size[1]) * 0.75 : Number(size[1]); if (points >= 6 && points <= 72 && Math.round(points) !== 11) change.size = Math.round(points); }
+      const family = (css['font-family'] || '').split(',')[0].trim().replace(/^["']|["']$/g, '');
+      if (family && !/^(calibri|arial|sans-serif|docs-calibri)$/i.test(family)) change.font = family;
+      if (css['white-space'] === 'normal' && input.includes('\n')) change.wrap = true;
+      row[c] = { input, change };
+      const spanRows = Math.max(1, Number(td.rowSpan) || 1), spanCols = Math.max(1, Number(td.colSpan) || 1);
+      for (let dr = 0; dr < spanRows; dr++) for (let dc = 0; dc < spanCols; dc++) if (dr || dc) taken.add(`${r + dr}:${c + dc}`);
+      c += spanCols;
+    }
+  });
+  return rows.map(row => Array.from({ length: row.length }, (_, i) => row[i] || { input: '' }));
+}
+
 // --- Sheets -------------------------------------------------------------------------------------
 
 const WORKSHEET_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet';
@@ -4392,6 +4466,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     if (!wholeRows && !wholeCols) {
       if (rows > 1) items.push([`Fill down${IS_MAC ? ' (⌘D)' : ' (Ctrl+D)'}`, fillDown]);
       items.push(['Clear contents', clearSelection]);
+      items.push('-', ['Paste values only', () => pasteSpecial('values')], ['Paste formats only', () => pasteSpecial('formats')], ['Paste transposed', () => pasteSpecial('all', true)]);
       items.push('-', ['Sort A to Z', () => sortRange(sortTarget(), anchor.col, false)], ['Sort Z to A', () => sortRange(sortTarget(), anchor.col, true)]);
       items.push([autoFilterOf(sheet()) ? 'Remove filter' : 'Filter', toggleFilter]);
     }
@@ -4546,6 +4621,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     // Escape still closes the preview, and the page's ⌘⇧ shortcuts run before this.
     if (key !== 'Escape') event.stopPropagation();
     const arrows = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1] };
+    if (mod && event.shiftKey && key.toLowerCase() === 'v') pasteValuesNext = true;
     if (event.altKey && key === 'ArrowDown') { event.preventDefault(); openChoices(); }
     else if (arrows[key]) {
       event.preventDefault();
@@ -4608,7 +4684,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
         const text = shown(r, c)?.text ?? '';
         line.push(/[\t\n"]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text);
         const cell = s.cells.get(refName(r, c));
-        cellRow.push({ input: editText(r, c), style: cell?.getAttribute('s') || null, formula: formulaOf(s, cell) });
+        cellRow.push({ input: editText(r, c), style: cell?.getAttribute('s') || null, formula: formulaOf(s, cell), value: valueAt(model, active, r, c), text });
       }
       lines.push(line.join('\t'));
       cells.push(cellRow);
@@ -4616,6 +4692,27 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const text = lines.join('\n');
     clipboard = { text, cells, row: range.r1, col: range.c1 };
     return text;
+  }
+  /** The copied cells as an HTML table, so other apps keep their look. */
+  function copyHtml() {
+    const escape = value => value.replace(/[&<>"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[char]);
+    const rows = clipboard.cells.map((row, r) => `<tr>${row.map((item, c) => {
+      const info = shown(clipboard.row + r, clipboard.col + c);
+      const style = info?.style || {};
+      const css = [];
+      if (style.fill) css.push(`background-color:${style.fill}`);
+      if (info?.color || style.color) css.push(`color:${info?.color || style.color}`);
+      if (style.bold) css.push('font-weight:bold');
+      if (style.italic) css.push('font-style:italic');
+      const lines = [style.underline && 'underline', style.strike && 'line-through'].filter(Boolean);
+      if (lines.length) css.push(`text-decoration:${lines.join(' ')}`);
+      if (info?.align) css.push(`text-align:${info.align}`);
+      if (style.size) css.push(`font-size:${style.size}pt`);
+      if (style.font) css.push(`font-family:${style.font.replace(/[;"]/g, '')}`);
+      const number = typeof item.value === 'number' ? ` x:num="${item.value}"` : '';
+      return `<td${number}${css.length ? ` style="${escape(css.join(';'))}"` : ''}>${escape(item.text || '').replace(/\n/g, '<br>')}</td>`;
+    }).join('')}</tr>`);
+    return `<table>${rows.join('')}</table>`;
   }
   function parseClipboard(text) {
     const rows = [];
@@ -4643,42 +4740,86 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     if (!gridFocused()) return;
     event.preventDefault();
     event.clipboardData.setData('text/plain', copyText());
+    event.clipboardData.setData('text/html', copyHtml());
   }
   function onCut(event) {
     if (!gridFocused()) return;
     onCopy(event);
     clearSelection();
   }
+  /** Ctrl+Shift+V asks for values only; the paste event that follows does not say. */
+  let pasteValuesNext = false;
   function onPaste(event) {
     if (!gridFocused() || !canWrite()) return;
     event.preventDefault();
     const text = event.clipboardData.getData('text/plain');
+    const html = event.clipboardData.getData('text/html');
+    const mode = pasteValuesNext ? 'values' : 'all';
+    pasteValuesNext = false;
+    const internal = clipboard && clipboard.text === text.replace(/\r\n/g, '\n').replace(/\n$/, '') ? clipboard : null;
+    if (internal) { pasteGrid(internal.cells, { internal, mode }); return; }
+    // From another app: its table with formatting when it gave one, else its text.
+    const table = html && mode === 'all' ? readHtmlTable(html) : null;
+    pasteGrid(table || parseClipboard(text.replace(/\r\n$|\n$/, '')).map(row => row.map(input => ({ input }))), { mode });
+  }
+  /** Paste special, from what was last copied here (or the system clipboard's text). */
+  async function pasteSpecial(mode, transpose = false) {
+    if (!canWrite()) return;
+    if (clipboard) { pasteGrid(clipboard.cells, { internal: clipboard, mode, transpose }); return; }
+    if (mode === 'formats') { notice('Copy cells here first to paste their formats.'); return; }
+    try {
+      const text = await navigator.clipboard.readText();
+      pasteGrid(parseClipboard(text.replace(/\r\n$|\n$/, '')).map(row => row.map(input => ({ input }))), { mode, transpose });
+    } catch {
+      notice('The browser did not let this page read the clipboard: copy the cells here first, or paste with Ctrl+V.');
+    }
+  }
+  /** Puts copied cells at the selection. `mode`: "all", "values" (what cells show, as values, in
+   * the cells' own format), or "formats" (only the look); `transpose` swaps rows and columns. */
+  function pasteGrid(source, { internal = null, mode = 'all', transpose = false } = {}) {
     const s = sheet();
     const range = selectedRange();
-    const internal = clipboard && clipboard.text === text.replace(/\r\n/g, '\n').replace(/\n$/, '') ? clipboard : null;
-    const grid = internal ? internal.cells : parseClipboard(text.replace(/\r\n$|\n$/, '')).map(row => row.map(input => ({ input })));
+    let grid = source;
+    if (transpose) grid = Array.from({ length: Math.max(...source.map(row => row.length)) }, (_, c) => source.map(row => row[c]));
     if (!grid.length) return;
     const height = grid.length, width = Math.max(...grid.map(row => row.length));
     // One copied cell fills the whole selection.
     const fill = height === 1 && width === 1 && (range.r1 !== range.r2 || range.c1 !== range.c2);
     const rows = fill ? Math.min(range.r2, Math.max(s.maxRow, range.r1)) - range.r1 + 1 : height;
     const cols = fill ? Math.min(range.c2, Math.max(s.maxCol, range.c1)) - range.c1 + 1 : width;
-    if (rows * cols > MAX_FORMAT_CELLS) return;
+    if (rows * cols > MAX_FORMAT_CELLS) { notice('That is too many cells to paste at once.'); return; }
     transaction(touch => {
       for (let r = 0; r < rows; r++) {
         for (let c = 0; c < cols; c++) {
           const item = fill ? grid[0][0] : grid[r][c];
           if (!item) continue;
           const row = range.r1 + r, col = range.c1 + c;
+          const style = internal ? Number(item.style || 0) : item.change && Object.keys(item.change).length ? restyle(model, s.cells.get(refName(row, col))?.getAttribute('s'), item.change) : null;
+          if (mode === 'formats') {
+            touch(refName(row, col));
+            const cell = cellElement(s, row, col);
+            if (style) cell.setAttribute('s', String(style)); else cell.removeAttribute('s');
+            continue;
+          }
+          if (mode === 'values' && internal) {
+            const value = item.value;
+            const parsed = value == null || value === '' ? { kind: 'empty' } : typeof value === 'number' ? { kind: 'number', value }
+              : typeof value === 'boolean' ? { kind: 'bool', value } : { kind: 'text', value: value instanceof CellError ? value.code : String(value) };
+            writeParsed(s, row, col, parsed, touch);
+            continue;
+          }
           let input = item.input ?? '';
-          if (internal && item.formula != null) {
-            const source = { row: internal.row + (fill ? 0 : r), col: internal.col + (fill ? 0 : c) };
+          if (internal && item.formula != null && mode === 'all') {
+            // Where the copied cell was, so its formula's references move by the same step.
+            const at = transpose ? { r: fill ? 0 : c, c: fill ? 0 : r } : { r: fill ? 0 : r, c: fill ? 0 : c };
+            const source = { row: internal.row + at.r, col: internal.col + at.c };
             input = `=${shiftFormula(item.formula, row - source.row, col - source.col)}`;
           }
-          writeInput(s, row, col, input, touch, internal ? Number(item.style || 0) : null);
+          writeInput(s, row, col, input, touch, mode === 'all' ? style : null);
         }
       }
     });
+    anchor = { row: range.r1, col: range.c1 };
     focus = { row: range.r1 + rows - 1, col: range.c1 + cols - 1 };
     selectionChanged();
   }
