@@ -2933,6 +2933,22 @@ fn sync_current(full: &Path, rel: &str) -> Option<SyncEntry> {
     })
 }
 
+/// What is at `rel` after a change there, for the change feed: `Some(Some(entry))` when it is
+/// there, `Some(None)` when it is gone, and `None` when the path is OwnNAS's own (its Trash and
+/// Archive, uploads in progress) or a link, which sync leaves out.
+pub fn sync_change(root: &Path, rel: &str) -> Option<Option<SyncEntry>> {
+    let parts: Vec<String> = rel.split('/').filter(|part| !part.is_empty()).map(str::to_string).collect();
+    if parts.is_empty() || sync_reserved(root, &parts) || is_under_trash(rel) {
+        return None;
+    }
+    let full = parts.iter().fold(root.to_path_buf(), |path, part| path.join(part));
+    match fs::symlink_metadata(&full) {
+        Ok(meta) if meta.file_type().is_symlink() => None,
+        Ok(_) => Some(sync_current(&full, rel)),
+        Err(_) => Some(None),
+    }
+}
+
 fn sync_matches(current: &Option<SyncEntry>, base: SyncBase) -> bool {
     match (base, current) {
         (SyncBase::Any, _) => true,

@@ -5,6 +5,7 @@ mod albums;
 mod workspaces;
 mod auth;
 mod books;
+mod changes;
 mod content_index;
 mod data_tables;
 mod db;

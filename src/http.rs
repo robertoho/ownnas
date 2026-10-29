@@ -102,6 +102,8 @@ pub struct AppState {
     /// Served over native HTTPS (`--tls-cert`).
     pub https: bool,
     pub terminals: crate::terminal::Terminals,
+    /// What changed in the shared folder, for sync clients (`/api/sync/changes`).
+    pub changes: std::sync::Arc<crate::changes::Changes>,
     /// Loopback URL that agent hooks inside terminals report to.
     pub agent_url: std::sync::OnceLock<String>,
     /// The Gallery's photo index, kept up to date in the background once started.
@@ -191,6 +193,8 @@ pub fn new_state(
     // Pasted files belong to terminals, which do not survive a restart.
     let terminal_uploads = data_dir.join("terminal-uploads");
     let _ = std::fs::remove_dir_all(&terminal_uploads);
+    let changes = crate::changes::Changes::new();
+    changes.watch(&root);
     Ok(AppState {
         db: Mutex::new(conn),
         root,
@@ -210,6 +214,7 @@ pub fn new_state(
         sessions: Mutex::default(),
         https: false,
         terminals: crate::terminal::Terminals::default(),
+        changes,
         agent_url: std::sync::OnceLock::new(),
         media: std::sync::Arc::default(),
         file_index: std::sync::Arc::default(),
@@ -471,6 +476,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         )
         .route("/api/sync/mkdir", post(sync_mkdir))
         .route("/api/sync/delete", post(sync_delete))
+        .route("/api/sync/changes", get(sync_changes))
         .layer(axum::middleware::from_fn_with_state(state.clone(), note_changes))
         .with_state(state)
 }
@@ -4891,6 +4897,56 @@ async fn sync_tree(
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not list the folder"))?
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "readonly": state.readonly, "entries": entries })))
+}
+
+#[derive(Deserialize)]
+struct ChangesQuery {
+    /// Where the client got to; none to start from now.
+    #[serde(default)]
+    cursor: String,
+    /// Seconds to wait for a change when there is none yet.
+    #[serde(default)]
+    wait: u64,
+    /// Only changes under this folder.
+    #[serde(default)]
+    path: String,
+}
+
+/// What changed in the shared folder since the client's cursor: each path with what is there
+/// now (or `deleted`), and the cursor to ask from next. `expired` means the client must list
+/// everything again (the server restarted, or changes were missed).
+async fn sync_changes(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ChangesQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let cursor = (!query.cursor.is_empty()).then_some(query.cursor.as_str());
+    let since = state.changes.wait(cursor, Duration::from_secs(query.wait.min(55))).await;
+    let watching = state.changes.watching();
+    let (cursor, paths) = match since {
+        crate::changes::Since::Expired { cursor } => {
+            return Ok(Json(json!({ "cursor": cursor, "expired": true, "watching": watching, "changes": [] })));
+        }
+        crate::changes::Since::Changed { cursor, paths } => (cursor, paths),
+    };
+    let root = state.root.clone();
+    let folder = query.path.trim_matches('/').to_string();
+    let changes = tokio::task::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .filter(|path| folder.is_empty() || *path == folder || path.starts_with(&format!("{folder}/")))
+            .filter_map(|path| {
+                files::sync_change(&root, &path).map(|now| match now {
+                    Some(entry) => json!({ "path": entry.path, "dir": entry.dir, "size": entry.size, "mtime": entry.mtime }),
+                    None => json!({ "path": path, "deleted": true }),
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the changes"))?;
+    Ok(Json(json!({ "cursor": cursor, "expired": false, "watching": watching, "changes": changes })))
 }
 
 async fn sync_download(

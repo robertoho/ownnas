@@ -11,6 +11,7 @@ pub mod albums;
 pub mod workspaces;
 pub mod auth;
 pub mod books;
+pub mod changes;
 pub mod content_index;
 pub mod data_tables;
 pub mod db;

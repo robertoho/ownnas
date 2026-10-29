@@ -129,6 +129,14 @@ The client uses the `/api/sync/*` endpoints, which native apps can use as well.
 Authenticate with `POST /api/login` and `{"token": true}`, then send
 `Authorization: Bearer <token>`. Tokens stay valid while in use.
 
+`GET /api/sync/changes?cursor=…&wait=25` is the change feed clients follow instead of listing
+everything again: the paths that changed since the cursor (each with what is there now, or
+`"deleted": true`) and the cursor to ask from next, waiting up to `wait` seconds for a change.
+Ask without a cursor to start from now. `"expired": true` means list everything again (the
+server restarted, or changes were missed). A watcher on the shared folder feeds it, so changes
+made on the server's disk directly show up too; `"watching": false` means it could not be
+started (on Linux, raise `fs.inotify.max_user_watches` for very large folders).
+
 ## Terminals in the browser
 
 Administrators can open a shell in any folder from the right-click menu (**Open terminal

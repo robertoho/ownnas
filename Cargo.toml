@@ -18,6 +18,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 kamadak-exif = "0.6"
+# Watches the shared folder, for the change feed sync clients follow.
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 flate2 = "1"
 fs4 = { version = "1", default-features = false, features = ["sync"] }
 futures-util = { version = "0.3", default-features = false }
