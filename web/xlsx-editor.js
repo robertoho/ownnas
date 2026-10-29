@@ -7,7 +7,8 @@
 import { unzipSync, zipSync, strFromU8, strToU8 } from './vendor/three/addons/libs/fflate.module.js';
 import {
   BUILTIN_FORMATS, CellError, FUNCTION_HELP, Unsupported, callAt, canPointAt, columnName, dateSerial, evaluate,
-  formatGeneral, formatValue, formulaWordAt, localeSeparators, parseFormula, parseRef, refName, serialParts, shiftFormula,
+  formatGeneral, formatValue, formulaWordAt, localeSeparators, moveFormula, moveSpan, moveSqref, parseFormula, parseRef,
+  refName, serialParts, shiftFormula,
 } from './sheet-formula.js';
 
 const MAIN = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
@@ -15,6 +16,7 @@ const DOC_REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relations
 const PKG_REL = 'http://schemas.openxmlformats.org/package/2006/relationships';
 const CONTENT_TYPES = 'http://schemas.openxmlformats.org/package/2006/content-types';
 const DRAWING = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+const SHEET_DRAWING = 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing';
 const XML = 'http://www.w3.org/XML/1998/namespace';
 const MAX_COMPRESSED = 25 * 1024 * 1024;
 const MAX_EXPANDED = 100 * 1024 * 1024;
@@ -27,6 +29,7 @@ const HEAD_W = 46;
 const MAX_FORMAT_CELLS = 50000;
 // Excel sizes columns for Calibri; other fonts run wider, so text is drawn a little smaller.
 const FONT_SCALE = 0.92;
+const IS_MAC = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || '');
 let measurer = null;
 function textWidth(text, font) {
   measurer ||= document.createElement('canvas').getContext('2d');
@@ -285,6 +288,65 @@ function restyle(model, base, change) {
 
 // --- Workbook model -----------------------------------------------------------------------------
 
+/** The model of one worksheet from its XML: cells, rows, column widths and merged cells. */
+function readSheet(name, path, xml, hidden, counter = { cells: 0 }) {
+  const root = xml.documentElement;
+  const sheetData = direct(root, 'sheetData');
+  if (!sheetData) throw new Error('Worksheet data is missing.');
+  const sheet = {
+    name, path, xml, root, sheetData, cells: new Map(), rows: new Map(), shared: new Map(),
+    maxRow: 0, maxCol: 0, rowHeights: new Map(), hiddenRows: new Set(), cols: [], merges: [], covered: new Map(),
+    hidden,
+    protected: flag(direct(root, 'sheetProtection')?.getAttribute('sheet')),
+  };
+  let lastRow = 0;
+  for (const row of kids(sheetData, 'row')) {
+    const r = Number(row.getAttribute('r')) || lastRow + 1;
+    if (!row.hasAttribute('r')) row.setAttribute('r', String(r));
+    lastRow = r;
+    sheet.rows.set(r, row);
+    if (row.hasAttribute('ht')) sheet.rowHeights.set(r, Number(row.getAttribute('ht')));
+    if (flag(row.getAttribute('hidden'))) sheet.hiddenRows.add(r);
+    let lastCol = 0;
+    for (const cell of kids(row, 'c')) {
+      if (++counter.cells > MAX_CELLS) throw new Error('This workbook contains too many cells to edit in the browser.');
+      let position = parseRef(cell.getAttribute('r'));
+      if (!position) {
+        position = { row: r, col: lastCol + 1 };
+        cell.setAttribute('r', refName(position.row, position.col));
+      }
+      lastCol = position.col;
+      const ref = refName(position.row, position.col);
+      sheet.cells.set(ref, cell);
+      sheet.maxRow = Math.max(sheet.maxRow, position.row);
+      sheet.maxCol = Math.max(sheet.maxCol, position.col);
+      const f = direct(cell, 'f');
+      if (f?.getAttribute('t') === 'shared' && f.getAttribute('ref') && f.textContent) {
+        sheet.shared.set(f.getAttribute('si'), { formula: f.textContent, row: position.row, col: position.col });
+      }
+    }
+  }
+  const format = direct(root, 'sheetFormatPr');
+  sheet.defaultColPx = Math.round((Number(format?.getAttribute('defaultColWidth')) || (Number(format?.getAttribute('baseColWidth')) || 8) + 1.14) * 7);
+  sheet.defaultRowPx = Math.round((Number(format?.getAttribute('defaultRowHeight')) || 15) * 4 / 3);
+  for (const col of kids(direct(root, 'cols'), 'col')) {
+    sheet.cols.push({
+      min: Number(col.getAttribute('min')), max: Number(col.getAttribute('max')),
+      px: col.hasAttribute('width') ? Math.round(Number(col.getAttribute('width')) * 7) : null,
+      hidden: flag(col.getAttribute('hidden')),
+    });
+  }
+  for (const merge of kids(direct(root, 'mergeCells'), 'mergeCell')) {
+    const [a, b] = (merge.getAttribute('ref') || '').split(':').map(parseRef);
+    if (!a || !b) continue;
+    const range = { r1: Math.min(a.row, b.row), c1: Math.min(a.col, b.col), r2: Math.max(a.row, b.row), c2: Math.max(a.col, b.col) };
+    if ((range.r2 - range.r1 + 1) * (range.c2 - range.c1 + 1) > 100000) continue;
+    sheet.merges.push(range);
+    for (let r = range.r1; r <= range.r2; r++) for (let c = range.c1; c <= range.c2; c++) sheet.covered.set(refName(r, c), range);
+  }
+  return sheet;
+}
+
 export function openXlsx(bytes) {
   if (!(bytes instanceof Uint8Array) || bytes.length === 0 || bytes.length > MAX_COMPRESSED) {
     throw new Error('Spreadsheets must be between 1 byte and 25 MB.');
@@ -314,7 +376,7 @@ export function openXlsx(bytes) {
   const sheetNodes = workbookXml.getElementsByTagNameNS(MAIN, 'sheet');
   if (!sheetNodes.length) throw new Error('This workbook has no worksheets.');
   const sheets = [];
-  let cellCount = 0;
+  const counter = { cells: 0 };
   for (const sheetNode of sheetNodes) {
     const relId = sheetNode.getAttributeNS(DOC_REL, 'id') || sheetNode.getAttribute('r:id');
     const relationship = relationships.get(relId);
@@ -323,60 +385,7 @@ export function openXlsx(bytes) {
     if (!parts[path]) continue;
     const name = sheetNode.getAttribute('name') || `Sheet ${sheets.length + 1}`;
     const xml = parseXml(strFromU8(parts[path]), `Worksheet ${name}`);
-    const root = xml.documentElement;
-    const sheetData = direct(root, 'sheetData');
-    if (!sheetData) throw new Error('Worksheet data is missing.');
-    const sheet = {
-      name, path, xml, root, sheetData, cells: new Map(), rows: new Map(), shared: new Map(),
-      maxRow: 0, maxCol: 0, rowHeights: new Map(), hiddenRows: new Set(), cols: [], merges: [], covered: new Map(),
-      hidden: ['hidden', 'veryHidden'].includes(sheetNode.getAttribute('state')),
-      protected: flag(direct(root, 'sheetProtection')?.getAttribute('sheet')),
-    };
-    let lastRow = 0;
-    for (const row of kids(sheetData, 'row')) {
-      const r = Number(row.getAttribute('r')) || lastRow + 1;
-      if (!row.hasAttribute('r')) row.setAttribute('r', String(r));
-      lastRow = r;
-      sheet.rows.set(r, row);
-      if (row.hasAttribute('ht')) sheet.rowHeights.set(r, Number(row.getAttribute('ht')));
-      if (flag(row.getAttribute('hidden'))) sheet.hiddenRows.add(r);
-      let lastCol = 0;
-      for (const cell of kids(row, 'c')) {
-        if (++cellCount > MAX_CELLS) throw new Error('This workbook contains too many cells to edit in the browser.');
-        let position = parseRef(cell.getAttribute('r'));
-        if (!position) {
-          position = { row: r, col: lastCol + 1 };
-          cell.setAttribute('r', refName(position.row, position.col));
-        }
-        lastCol = position.col;
-        const ref = refName(position.row, position.col);
-        sheet.cells.set(ref, cell);
-        sheet.maxRow = Math.max(sheet.maxRow, position.row);
-        sheet.maxCol = Math.max(sheet.maxCol, position.col);
-        const f = direct(cell, 'f');
-        if (f?.getAttribute('t') === 'shared' && f.getAttribute('ref') && f.textContent) {
-          sheet.shared.set(f.getAttribute('si'), { formula: f.textContent, row: position.row, col: position.col });
-        }
-      }
-    }
-    const format = direct(root, 'sheetFormatPr');
-    sheet.defaultColPx = Math.round((Number(format?.getAttribute('defaultColWidth')) || (Number(format?.getAttribute('baseColWidth')) || 8) + 1.14) * 7);
-    sheet.defaultRowPx = Math.round((Number(format?.getAttribute('defaultRowHeight')) || 15) * 4 / 3);
-    for (const col of kids(direct(root, 'cols'), 'col')) {
-      sheet.cols.push({
-        min: Number(col.getAttribute('min')), max: Number(col.getAttribute('max')),
-        px: col.hasAttribute('width') ? Math.round(Number(col.getAttribute('width')) * 7) : null,
-        hidden: flag(col.getAttribute('hidden')),
-      });
-    }
-    for (const merge of kids(direct(root, 'mergeCells'), 'mergeCell')) {
-      const [a, b] = (merge.getAttribute('ref') || '').split(':').map(parseRef);
-      if (!a || !b) continue;
-      const range = { r1: Math.min(a.row, b.row), c1: Math.min(a.col, b.col), r2: Math.max(a.row, b.row), c2: Math.max(a.col, b.col) };
-      if ((range.r2 - range.r1 + 1) * (range.c2 - range.c1 + 1) > 100000) continue;
-      sheet.merges.push(range);
-      for (let r = range.r1; r <= range.r2; r++) for (let c = range.c1; c <= range.c2; c++) sheet.covered.set(refName(r, c), range);
-    }
+    const sheet = readSheet(name, path, xml, ['hidden', 'veryHidden'].includes(sheetNode.getAttribute('state')), counter);
     sheets.push(sheet);
   }
   if (!sheets.length) throw new Error('No readable worksheets were found.');
@@ -431,6 +440,7 @@ function exportWorkbook(model) {
       parts['xl/workbook.xml'] = strToU8(serialize(model.workbookXml));
     }
   }
+  if (model.workbookTouched) parts['xl/workbook.xml'] = strToU8(serialize(model.workbookXml));
   for (const sheet of model.touched) parts[sheet.path] = strToU8(serialize(sheet.xml));
   if (model.stylesTouched && model.styles) parts['xl/styles.xml'] = strToU8(serialize(model.styles.xml));
   return zipSync(parts, { level: 6 });
@@ -621,6 +631,261 @@ function updateDimension(sheet) {
   dimension.setAttribute('ref', end === 'A1' ? 'A1' : `A1:${end}`);
 }
 
+// --- Rows and columns ---------------------------------------------------------------------------
+
+/** The parts a worksheet links to, as { type, path }, the type being the relationship's last word. */
+function sheetLinks(model, sheet) {
+  const rels = model.parts[sheet.path.replace(/([^/]+)$/, '_rels/$1.rels')];
+  if (!rels) return [];
+  const xml = parseXml(strFromU8(rels), 'Worksheet relationships');
+  const folder = sheet.path.replace(/\/[^/]+$/, '');
+  return [...xml.getElementsByTagNameNS(PKG_REL, 'Relationship')]
+    .filter(rel => rel.getAttribute('TargetMode') !== 'External')
+    .map(rel => {
+      try { return { type: (rel.getAttribute('Type') || '').split('/').pop(), path: normalizePart(rel.getAttribute('Target') || '', folder) }; } catch { return null; }
+    })
+    .filter(Boolean);
+}
+
+/** Why rows or columns cannot be inserted into or deleted from a sheet, or null when they can. */
+export function structureBlocked(model, sheet) {
+  const types = new Set(sheetLinks(model, sheet).map(link => link.type));
+  if (types.has('table')) return 'This sheet has tables; rows and columns cannot be inserted or deleted in it here yet.';
+  if (types.has('pivotTable')) return 'This sheet has pivot tables; rows and columns cannot be inserted or deleted in it here yet.';
+  if (types.has('comments') || types.has('threadedComment')) return 'This sheet has comments; rows and columns cannot be inserted or deleted in it here yet.';
+  return null;
+}
+
+/** Turns every shared formula in the workbook into plain ones, so each can move on its own. */
+function unshareAll(model) {
+  for (const sheet of model.sheets) {
+    const plain = [];
+    for (const cell of sheet.cells.values()) {
+      const f = direct(cell, 'f');
+      if (f?.getAttribute('t') !== 'shared') continue;
+      const formula = formulaOf(sheet, cell);
+      if (formula != null) plain.push([f, formula]);
+    }
+    for (const [f, formula] of plain) {
+      f.textContent = formula;
+      for (const name of ['t', 'si', 'ref']) f.removeAttribute(name);
+    }
+    if (plain.length) { sheet.shared.clear(); model.touched.add(sheet); }
+  }
+}
+
+/** Inserts `count` rows or columns (`axis` "row" or "col") before `at` in sheet `index`, or deletes
+ * -count of them from `at` on, moving the cells after them and everything that refers to cells:
+ * formulas in every sheet, defined names, merged cells, ranges of formatting and validation,
+ * column widths, and pictures and charts. */
+export function restructure(model, index, axis, at, count) {
+  const sheet = model.sheets[index];
+  const blocked = structureBlocked(model, sheet);
+  if (blocked) throw new Error(blocked);
+  const last = axis === 'row' ? LAST_ROW : LAST_COL;
+  if (count > 0 && (axis === 'row' ? sheet.maxRow : sheet.maxCol) + count > last) {
+    throw new Error(`There is no room to insert ${axis === 'row' ? 'rows' : 'columns'}: cells would be pushed off the end of the sheet.`);
+  }
+  unshareAll(model);
+  const { root } = sheet;
+  for (const row of kids(sheet.sheetData, 'row')) {
+    if (axis === 'row') {
+      const r = Number(row.getAttribute('r'));
+      const span = moveSpan(r, r, at, count);
+      if (!span) { row.remove(); continue; }
+      if (span[0] === r) continue;
+      row.setAttribute('r', String(span[0]));
+      for (const cell of kids(row, 'c')) cell.setAttribute('r', refName(span[0], parseRef(cell.getAttribute('r')).col));
+    } else {
+      // Which columns a row uses is only a hint, and no longer right.
+      row.removeAttribute('spans');
+      for (const cell of kids(row, 'c')) {
+        const { row: r, col } = parseRef(cell.getAttribute('r'));
+        const span = moveSpan(col, col, at, count);
+        if (!span) cell.remove();
+        else if (span[0] !== col) cell.setAttribute('r', refName(r, span[0]));
+      }
+    }
+  }
+  if (axis === 'col') {
+    const cols = direct(root, 'cols');
+    for (const col of kids(cols, 'col')) {
+      const span = moveSpan(Number(col.getAttribute('min')), Number(col.getAttribute('max')), at, count);
+      if (!span || span[0] > LAST_COL) { col.remove(); continue; }
+      col.setAttribute('min', String(span[0]));
+      col.setAttribute('max', String(Math.min(LAST_COL, span[1])));
+    }
+    if (cols && !kids(cols, 'col').length) cols.remove();
+  }
+  // Formulas, in every sheet (conditional formatting and validation have them too).
+  model.sheets.forEach((other, i) => {
+    const change = { sheet: sheet.name, here: i === index, axis, at, count };
+    let moved = false;
+    for (const name of ['f', 'formula', 'formula1', 'formula2']) {
+      for (const node of other.root.getElementsByTagNameNS(MAIN, name)) {
+        if (!node.textContent) continue;
+        const next = moveFormula(node.textContent, change);
+        if (next !== node.textContent) { node.textContent = next; moved = true; }
+      }
+    }
+    if (moved) model.touched.add(other);
+  });
+  for (const node of model.workbookXml.getElementsByTagNameNS(MAIN, 'definedName')) {
+    const next = moveFormula(node.textContent, { sheet: sheet.name, here: false, axis, at, count });
+    if (next !== node.textContent) { node.textContent = next; model.workbookTouched = true; }
+  }
+  // Ranges in the sheet: merged cells, formatting, validation, links, filters, the selection.
+  const single = ref => !ref.includes(':') || ref.split(':')[0] === ref.split(':')[1];
+  for (const node of [...root.getElementsByTagNameNS(MAIN, '*')]) {
+    if (node.localName === 'dimension' || sheet.sheetData.contains(node)) continue;
+    for (const attr of ['sqref', 'ref', 'activeCell', 'topLeftCell']) {
+      if (!node.hasAttribute(attr) || !node.isConnected) continue;
+      const next = moveSqref(node.getAttribute(attr), axis, at, count);
+      if (next && !(node.localName === 'mergeCell' && single(next))) node.setAttribute(attr, next);
+      else if (node.localName === 'selection' || node.localName === 'pane') node.setAttribute(attr, 'A1');
+      else node.remove();
+    }
+  }
+  for (const [listName, itemName] of [['mergeCells', 'mergeCell'], ['dataValidations', 'dataValidation'], ['hyperlinks', 'hyperlink']]) {
+    const list = direct(root, listName);
+    if (!list) continue;
+    const left = kids(list, itemName).length;
+    if (!left) list.remove();
+    else if (list.hasAttribute('count')) list.setAttribute('count', String(left));
+  }
+  for (const node of kids(root, 'conditionalFormatting')) if (!kids(node, 'cfRule').length) node.remove();
+  // Arrays formulas in the cells: their range moves too.
+  for (const f of sheet.sheetData.getElementsByTagNameNS(MAIN, 'f')) {
+    if (f.getAttribute('t') !== 'array' || !f.hasAttribute('ref')) continue;
+    const next = moveSqref(f.getAttribute('ref'), axis, at, count);
+    if (next) f.setAttribute('ref', next); else f.removeAttribute('ref');
+  }
+  // Pictures and charts are anchored to cells (counted from 0).
+  for (const link of sheetLinks(model, sheet)) {
+    if (link.type !== 'drawing' || !model.parts[link.path]) continue;
+    const drawing = parseXml(strFromU8(model.parts[link.path]), 'Drawing');
+    for (const marker of [...drawing.getElementsByTagNameNS(SHEET_DRAWING, 'from'), ...drawing.getElementsByTagNameNS(SHEET_DRAWING, 'to')]) {
+      const node = kids(marker, axis, SHEET_DRAWING)[0];
+      if (!node) continue;
+      const position = Number(node.textContent) + 1;
+      const span = moveSpan(position, position, at, count);
+      node.textContent = String((span ? span[0] : at) - 1);
+    }
+    model.parts[link.path] = strToU8(serialize(drawing));
+  }
+  rereadSheet(sheet);
+  updateDimension(sheet);
+  model.touched.add(sheet);
+}
+
+/** Reads a sheet's model again from its XML, after its structure changed. */
+function rereadSheet(sheet) {
+  Object.assign(sheet, readSheet(sheet.name, sheet.path, sheet.xml, sheet.hidden));
+}
+
+/** Changes the <col> ranges of columns c1…c2 with `change(col)`, splitting ranges that reach
+ * outside them and adding ranges for columns that had none. */
+export function setColumns(sheet, c1, c2, change, { existingOnly = false, reread = true } = {}) {
+  const { root, xml } = sheet;
+  let cols = direct(root, 'cols');
+  if (!cols) {
+    // <cols> comes right before <sheetData>.
+    cols = xml.createElementNS(MAIN, 'cols');
+    root.insertBefore(cols, sheet.sheetData);
+  }
+  const make = (min, max, from) => {
+    const col = from ? from.cloneNode(true) : xml.createElementNS(MAIN, 'col');
+    col.setAttribute('min', String(min));
+    col.setAttribute('max', String(max));
+    return col;
+  };
+  const pieces = [], inside = [];
+  for (const col of kids(cols, 'col')) {
+    const min = Number(col.getAttribute('min')), max = Number(col.getAttribute('max'));
+    if (max < c1 || min > c2) { pieces.push(col); continue; }
+    if (min < c1) pieces.push(make(min, c1 - 1, col));
+    const middle = make(Math.max(min, c1), Math.min(max, c2), col);
+    inside.push(middle);
+    if (max > c2) pieces.push(make(c2 + 1, max, col));
+  }
+  inside.sort((a, b) => Number(a.getAttribute('min')) - Number(b.getAttribute('min')));
+  let next = c1;
+  for (const col of existingOnly ? [] : [...inside]) {
+    const min = Number(col.getAttribute('min'));
+    if (min > next) inside.push(make(next, min - 1, null));
+    next = Number(col.getAttribute('max')) + 1;
+  }
+  if (!existingOnly && next <= c2) inside.push(make(next, c2, null));
+  for (const col of inside) {
+    if (!col.hasAttribute('width')) col.setAttribute('width', String(Math.round(sheet.defaultColPx / 7 * 100) / 100));
+    change(col);
+  }
+  pieces.push(...inside);
+  pieces.sort((a, b) => Number(a.getAttribute('min')) - Number(b.getAttribute('min')));
+  cols.replaceChildren(...pieces);
+  if (!pieces.length) cols.remove();
+  if (reread) rereadSheet(sheet);
+}
+
+/** Changes the <row> elements of rows r1…r2 with `change(row)`, adding ones that are missing. */
+export function setRows(sheet, r1, r2, change, { existingOnly = false } = {}) {
+  if (existingOnly) {
+    for (const [r, row] of sheet.rows) if (r >= r1 && r <= r2) change(row);
+  } else {
+    for (let r = r1; r <= r2; r++) change(rowElement(sheet, r));
+  }
+  rereadSheet(sheet);
+}
+
+// --- Filling ------------------------------------------------------------------------------------
+
+const FILL_LISTS = [
+  ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+  ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'],
+  ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'],
+  ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'],
+];
+
+/** How dragging the fill handle continues a run of cells: given what they hold, in order, as
+ * { kind: "number" | "text" | …, value, date }, returns k => the entry k steps from the first
+ * (k may be negative, for filling up or left), or null when the cells are to be copied. */
+export function fillSeries(entries) {
+  const n = entries.length;
+  if (!n) return null;
+  const round = value => Number(value.toPrecision(15));
+  if (entries.every(entry => entry.kind === 'number')) {
+    const first = entries[0].value;
+    // One number is copied, except a date, which goes on a day at a time.
+    if (n === 1) return entries[0].date ? k => ({ kind: 'number', value: first + k }) : null;
+    const step = (entries[n - 1].value - first) / (n - 1);
+    return k => ({ kind: 'number', value: round(first + step * k) });
+  }
+  if (!entries.every(entry => entry.kind === 'text')) return null;
+  const texts = entries.map(entry => entry.value);
+  for (const list of FILL_LISTS) {
+    const positions = texts.map(text => list.findIndex(item => item.toLowerCase() === text.toLowerCase()));
+    if (positions.some(position => position < 0)) continue;
+    const step = n === 1 ? 1 : positions[1] - positions[0];
+    if (positions.some((position, i) => ((position - positions[0] - step * i) % list.length + list.length) % list.length)) return null;
+    const sample = texts[0];
+    const cased = item => (sample === sample.toUpperCase() ? item.toUpperCase() : sample === sample.toLowerCase() ? item.toLowerCase() : item);
+    return k => ({ kind: 'text', value: cased(list[(((positions[0] + step * k) % list.length) + list.length) % list.length]) });
+  }
+  // Text ending in a number ("Item 1", "Q1") counts on.
+  const numbered = texts.map(text => /^(.*?)(\d+)$/.exec(text));
+  if (numbered.every(match => match && match[1] === numbered[0][1])) {
+    const numbers = numbered.map(match => Number(match[2]));
+    const step = n === 1 ? 1 : (numbers[n - 1] - numbers[0]) / (n - 1);
+    if (!Number.isInteger(step) || numbers.some((number, i) => number !== numbers[0] + step * i)) return null;
+    const width = numbered[0][2].startsWith('0') ? numbered[0][2].length : 0;
+    return k => {
+      const number = numbers[0] + step * k;
+      return number < 0 ? null : { kind: 'text', value: numbered[0][1] + String(number).padStart(width, '0') };
+    };
+  }
+  return null;
+}
+
 function isDateFormat(code) {
   const body = String(code || '').replace(/"[^"]*"|\\.|\[[^\]]*\]/g, '');
   return /[dy]|h|s/i.test(body) && !/^general$/i.test(body.trim()) && !/[0#?]/.test(body.replace(/s+\.0+/gi, ''));
@@ -693,6 +958,12 @@ function* generalFits(value) {
 
 const SHEET_FONT = 'Calibri, Carlito, "Segoe UI", Arial, sans-serif';
 
+/** The CSS font a cell's text is drawn in. */
+function cellFont(style) {
+  const px = (style.size || 11) * 4 / 3 * FONT_SCALE;
+  return `${style.italic ? 'italic ' : ''}${style.bold ? '700 ' : ''}${px.toFixed(1)}px ${style.font ? `"${style.font.replace(/["\\]/g, '')}", ` : ''}${SHEET_FONT}`;
+}
+
 const FORMATS = [
   ['General', 'General'], ['0.00', 'Number'], ['#,##0.00', 'Thousands'], ['0%', 'Percent'], ['0.00%', 'Percent 0.00'],
   ['#,##0.00 "€"', 'Euro'], ['"$"#,##0.00', 'Dollar'], ['yyyy-mm-dd', 'Date'], ['yyyy-mm-dd hh:mm', 'Date and time'], ['hh:mm', 'Time'], ['@', 'Text'],
@@ -710,7 +981,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   let anchor = { row: 1, col: 1 }, focus = { row: 1, col: 1 };
   let editing = null, dragging = null, saving = false, destroyed = false, frame = 0, geo = null;
   const history = [];
-  let historyAt = 0, savedAt = 0, clipboard = null;
+  let historyAt = 0, savedAt = 0, clipboard = null, message = '';
 
   const root = document.createElement('section');
   root.className = 'xlsx-editor';
@@ -755,7 +1026,18 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   const pointBox = document.createElement('div');
   pointBox.className = 'xlsx-point';
   pointBox.hidden = true;
-  canvas.append(layer, selectionBox, activeBox, pointBox, cellEditor);
+  // The fill handle at the selection's corner, the cells a drag of it fills, and the line a
+  // column or row edge being dragged goes to.
+  const fillHandle = document.createElement('div');
+  fillHandle.className = 'xlsx-fill-handle';
+  fillHandle.title = 'Drag to fill; double-click to fill down';
+  const fillBox = document.createElement('div');
+  fillBox.className = 'xlsx-fill';
+  fillBox.hidden = true;
+  const sizeGuide = document.createElement('div');
+  sizeGuide.className = 'xlsx-size-guide';
+  sizeGuide.hidden = true;
+  canvas.append(layer, selectionBox, activeBox, pointBox, fillBox, fillHandle, sizeGuide, cellEditor);
   scroll.append(canvas);
   const footer = document.createElement('div');
   footer.className = 'xlsx-footer';
@@ -775,7 +1057,11 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   const assist = document.createElement('div');
   assist.className = 'xlsx-assist';
   assist.hidden = true;
-  root.append(toolbar, formulaRow, scroll, footer, note, live, assist);
+  const menu = document.createElement('div');
+  menu.className = 'menu xlsx-menu';
+  menu.setAttribute('role', 'menu');
+  menu.hidden = true;
+  root.append(toolbar, formulaRow, scroll, footer, note, live, assist, menu);
   container.replaceChildren(root);
 
   const sheet = () => model.sheets[active];
@@ -891,6 +1177,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     if (readonly) notes.push('Read only.');
     else if (sheet().protected) notes.push('This sheet is protected, so it is read only here.');
     const failed = [...model.failed].filter(key => key.startsWith(`${active}!`)).length;
+    if (message) notes.push(message);
     if (failed) notes.push(`${failed} formula${failed === 1 ? ' uses' : 's use'} functions this editor can't calculate; ${failed === 1 ? 'it keeps its' : 'they keep their'} saved value${failed === 1 ? '' : 's'} until the file is opened in a spreadsheet app.`);
     note.textContent = notes.join(' ');
     note.hidden = !notes.length;
@@ -1018,7 +1305,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       el.className = 'xlsx-cell';
       let width = box.width;
       const px = (style.size || 11) * 4 / 3 * FONT_SCALE;
-      const font = `${style.italic ? 'italic ' : ''}${style.bold ? '700 ' : ''}${px.toFixed(1)}px ${style.font ? `"${style.font.replace(/["\\]/g, '')}", ` : ''}${SHEET_FONT}`;
+      const font = cellFont(style);
       const needed = info.text && !style.wrap ? textWidth(info.text, font) + 8 : 0;
       // Text spills into empty neighbours on the right, as in spreadsheet apps.
       if (!merge && !style.wrap && info.align === 'left' && typeof info.value === 'string' && info.text) {
@@ -1139,6 +1426,10 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const merge = sheet().covered.get(refName(anchor.row, anchor.col));
     const cellBox = merge ? rect(merge.r1, merge.c1, merge.r2, merge.c2) : rect(anchor.row, anchor.col, anchor.row, anchor.col);
     activeBox.style.cssText = `left:${cellBox.left - 1}px;top:${cellBox.top - 1}px;width:${cellBox.width + 1}px;height:${cellBox.height + 1}px`;
+    const whole = range.r2 >= LAST_ROW || range.c2 >= LAST_COL;
+    fillHandle.hidden = !canWrite() || !!editing || whole;
+    const corner = range.r1 === range.r2 && range.c1 === range.c2 ? cellBox : box;
+    fillHandle.style.cssText = `left:${corner.left + corner.width - 4}px;top:${corner.top + corner.height - 4}px`;
   }
   function editText(row, col) {
     const s = sheet();
@@ -1260,14 +1551,71 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const items = [...before].map(([ref, copy]) => ({ ref, before: copy, after: s.cells.get(ref)?.cloneNode(true) || null }))
       .filter(item => (item.before ? serialize(item.before) : '') !== (item.after ? serialize(item.after) : ''));
     if (!items.length) return;
-    if (savedAt > historyAt) savedAt = -1;
-    history.splice(historyAt);
-    history.push({ sheet: active, items });
-    historyAt = history.length;
-    if (history.length > 200) { history.shift(); historyAt--; savedAt--; }
+    record({ sheet: active, items });
     changed();
   }
+  function record(entry) {
+    if (savedAt > historyAt) savedAt = -1;
+    history.splice(historyAt);
+    history.push(entry);
+    historyAt = history.length;
+    if (history.length > 200) { history.shift(); historyAt--; savedAt--; }
+  }
+  /** A change to rows, columns, or their sizes, with undo: the XML it changes is kept as it was
+   * before and after (`transaction` keeps cells alone). False when it could not be made. */
+  function structural(work) {
+    if (!canWrite()) return false;
+    commitEdit();
+    const drawings = sheetLinks(model, sheet()).filter(link => link.type === 'drawing').map(link => link.path);
+    const capture = () => ({
+      sheets: model.sheets.map(s => serialize(s.xml)),
+      workbook: serialize(model.workbookXml),
+      parts: Object.fromEntries(drawings.map(path => [path, model.parts[path]])),
+    });
+    const before = capture();
+    try {
+      work(sheet());
+    } catch (error) {
+      restore(before);
+      geo = null;
+      notice(error.message);
+      selectionChanged();
+      return false;
+    }
+    const after = capture();
+    const only = (mine, other) => ({
+      sheets: mine.sheets.map((text, i) => (text === other.sheets[i] ? null : text)),
+      workbook: mine.workbook === other.workbook ? null : mine.workbook,
+      parts: Object.fromEntries(Object.entries(mine.parts).filter(([path, bytes]) => bytes !== other.parts[path])),
+    });
+    const change = { before: only(before, after), after: only(after, before) };
+    if (change.after.sheets.every(text => text == null) && change.after.workbook == null && !Object.keys(change.after.parts).length) return true;
+    record({ sheet: active, snapshot: change });
+    changed();
+    return true;
+  }
+  /** Puts back sheets, the workbook, and drawings as `structural` kept them. */
+  function restore(state) {
+    state.sheets.forEach((text, index) => {
+      if (text == null) return;
+      const s = model.sheets[index];
+      s.xml = parseXml(text, `Worksheet ${s.name}`);
+      rereadSheet(s);
+      model.touched.add(s);
+    });
+    if (state.workbook != null) {
+      model.workbookXml = parseXml(state.workbook, 'Workbook XML');
+      model.workbookTouched = true;
+    }
+    Object.assign(model.parts, state.parts);
+  }
+  function notice(text) {
+    message = text;
+    live.textContent = text;
+    updateNote();
+  }
   function changed() {
+    message = '';
     model.edited = true;
     model.touched.add(sheet());
     geo = null;
@@ -1281,6 +1629,12 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const entry = direction < 0 ? history[historyAt - 1] : history[historyAt];
     if (!entry) return;
     if (entry.sheet !== active) showSheet(entry.sheet);
+    if (entry.snapshot) {
+      restore(direction < 0 ? entry.snapshot.before : entry.snapshot.after);
+      historyAt += direction;
+      changed();
+      return;
+    }
     const s = sheet();
     for (const item of entry.items) placeCell(s, item.ref, direction < 0 ? item.before : item.after);
     historyAt += direction;
@@ -1306,9 +1660,12 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     s.shared.delete(si);
   }
   function writeInput(s, row, col, text, touch, styleIndex = null) {
+    writeParsed(s, row, col, parseInput(text, { ...separators, date1904: model.date1904 }), touch, styleIndex);
+  }
+  /** Writes an entry as `parseInput` reads one ({ kind, value, format }) into a cell. */
+  function writeParsed(s, row, col, parsed, touch, styleIndex = null) {
     const ref = refName(row, col);
     const existing = s.cells.get(ref);
-    const parsed = parseInput(text, { ...separators, date1904: model.date1904 });
     if (parsed.kind === 'empty' && !existing && styleIndex == null) return;
     touch(ref);
     if (existing) unshare(s, existing, touch);
@@ -1666,6 +2023,24 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       return;
     }
     if (editing) commitEdit();
+    if (event.target === fillHandle) {
+      dragging = { kind: 'fill', source: expandForMerges(selectedRange()), target: null };
+      canvas.setPointerCapture?.(event.pointerId);
+      event.preventDefault();
+      return;
+    }
+    // The edge of a column or row header: drag to resize.
+    const edge = !canWrite() || (p.head.row && p.head.col) ? 0 : p.head.row ? colEdge(p.x) : p.head.col ? rowEdge(p.y) : 0;
+    if (edge) {
+      const axis = p.head.row ? 'col' : 'row';
+      const edges = axis === 'col' ? geo.colX : geo.rowY;
+      dragging = { kind: 'size', axis, index: edge, start: axis === 'col' ? p.x : p.y, px: edges[edge + 1] - edges[edge] };
+      placeGuide(dragging, dragging.start);
+      canvas.setPointerCapture?.(event.pointerId);
+      event.preventDefault();
+      scroll.focus({ preventScroll: true });
+      return;
+    }
     if (p.head.col && p.head.row) {
       anchor = { row: 1, col: 1 }; focus = { row: LAST_ROW, col: LAST_COL };
       dragging = null;
@@ -1687,8 +2062,26 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     selectionChanged();
   });
   canvas.addEventListener('pointermove', event => {
-    if (!dragging) return;
+    if (!geo) return;
     const p = pointAt(event);
+    if (!dragging) {
+      // Over a header's edge, show that it can be dragged.
+      const cursor = !canWrite() || (p.head.row && p.head.col) ? '' : p.head.row && colEdge(p.x) ? 'col-resize' : p.head.col && rowEdge(p.y) ? 'row-resize' : '';
+      if (canvas.style.cursor !== cursor) canvas.style.cursor = cursor;
+      return;
+    }
+    if (dragging.kind === 'size') {
+      placeGuide(dragging, Math.max(dragging.start - dragging.px, dragging.axis === 'col' ? p.x : p.y));
+      return;
+    }
+    if (dragging.kind === 'fill') {
+      dragging.target = fillTarget(dragging.source, p);
+      const area = dragging.target || dragging.source;
+      const box = rect(area.r1, area.c1, area.r2, area.c2);
+      fillBox.style.cssText = `left:${box.left - 1}px;top:${box.top - 1}px;width:${box.width + 1}px;height:${box.height + 1}px`;
+      fillBox.hidden = !dragging.target;
+      return;
+    }
     if (dragging === 'point') {
       const point = activePoint();
       if (point && (point.cell.row !== p.row || point.cell.col !== p.col)) pointTo(p.row, p.col, true);
@@ -1699,16 +2092,343 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     else focus = { row: p.row, col: LAST_COL };
     selectionChanged();
   });
-  const stopDrag = () => { dragging = null; };
   // Pointing keeps the keyboard in the formula.
   canvas.addEventListener('mousedown', event => { if (dragging === 'point') event.preventDefault(); });
-  canvas.addEventListener('pointerup', stopDrag);
-  canvas.addEventListener('pointercancel', stopDrag);
+  canvas.addEventListener('pointerup', event => {
+    const drag = dragging;
+    dragging = null;
+    sizeGuide.hidden = true;
+    fillBox.hidden = true;
+    if (drag?.kind === 'size') {
+      const p = pointAt(event);
+      const px = Math.max(0, Math.round(drag.px + (drag.axis === 'col' ? p.x : p.y) - drag.start));
+      if (px !== drag.px) setSize(drag.axis, drag.index, px);
+    } else if (drag?.kind === 'fill' && drag.target) {
+      fill(drag.source, drag.target);
+    }
+  });
+  canvas.addEventListener('pointercancel', () => {
+    dragging = null;
+    sizeGuide.hidden = true;
+    fillBox.hidden = true;
+  });
   canvas.addEventListener('dblclick', event => {
     if (event.target === cellEditor) return;
+    if (event.target === fillHandle) { fillToNeighbour(); return; }
     const p = pointAt(event);
-    if (!p.head.row && !p.head.col) startEdit();
+    if (p.head.row && p.head.col) return;
+    if (p.head.row) { const col = colEdge(p.x); if (col) fitColumns(...spanOf('col', col)); return; }
+    if (p.head.col) { const row = rowEdge(p.y); if (row) fitRows(...spanOf('row', row)); return; }
+    startEdit();
   });
+  canvas.addEventListener('contextmenu', event => {
+    if (event.target === cellEditor) return;
+    event.preventDefault();
+    if (editing) commitEdit();
+    layout();
+    const p = pointAt(event);
+    const range = selectedRange();
+    const wholeRows = range.c1 === 1 && range.c2 >= LAST_COL, wholeCols = range.r1 === 1 && range.r2 >= LAST_ROW;
+    const inRows = p.row >= range.r1 && p.row <= range.r2, inCols = p.col >= range.c1 && p.col <= range.c2;
+    // Right-clicking outside the selection selects what was clicked first.
+    if (p.head.row && p.head.col) {
+      anchor = { row: 1, col: 1 }; focus = { row: LAST_ROW, col: LAST_COL };
+    } else if (p.head.row) {
+      if (!(wholeCols && inCols)) { anchor = { row: 1, col: p.col }; focus = { row: LAST_ROW, col: p.col }; }
+    } else if (p.head.col) {
+      if (!(wholeRows && inRows)) { anchor = { row: p.row, col: 1 }; focus = { row: p.row, col: LAST_COL }; }
+    } else if (!(inRows && inCols)) {
+      select(p.row, p.col);
+    }
+    scroll.focus({ preventScroll: true });
+    selectionChanged();
+    openMenu(event.clientX, event.clientY);
+  });
+
+  // Rows and columns: sizes, inserting, deleting, hiding
+  /** The column whose right edge is at x (within a few pixels), or 0. */
+  function colEdge(x) {
+    const col = find(geo.colX, geo.cols, x);
+    if (geo.colX[col + 1] - x <= 4) return col;
+    if (x - geo.colX[col] <= 4 && col > 1) return col - 1;
+    return 0;
+  }
+  function rowEdge(y) {
+    const row = find(geo.rowY, geo.rows, y);
+    if (geo.rowY[row + 1] - y <= 3) return row;
+    if (y - geo.rowY[row] <= 3 && row > 1) return row - 1;
+    return 0;
+  }
+  function placeGuide(drag, at) {
+    const edges = drag.axis === 'col' ? geo.colX : geo.rowY;
+    const position = edges[drag.index] + Math.max(0, drag.px + at - drag.start);
+    sizeGuide.style.cssText = drag.axis === 'col'
+      ? `left:${position - 1}px;top:${scroll.scrollTop}px;width:2px;height:${scroll.clientHeight}px`
+      : `top:${position - 1}px;left:${scroll.scrollLeft}px;height:2px;width:${scroll.clientWidth}px`;
+    sizeGuide.hidden = false;
+  }
+  /** The columns (or rows) a header action applies to: all those selected whole, when `index` is
+   * one of them, or just `index`. */
+  function spanOf(axis, index) {
+    const range = selectedRange();
+    if (axis === 'col' && range.r1 === 1 && range.r2 >= LAST_ROW && index >= range.c1 && index <= range.c2) return [range.c1, Math.min(range.c2, Math.max(sheet().maxCol, range.c1))];
+    if (axis === 'row' && range.c1 === 1 && range.c2 >= LAST_COL && index >= range.r1 && index <= range.r2) return [range.r1, Math.min(range.r2, Math.max(sheet().maxRow, range.r1))];
+    return [index, index];
+  }
+  const MAX_ROW_CHANGES = 10000;
+  /** Sets the size of a column or row (and the others selected with it); 0 hides them. */
+  function setSize(axis, index, px) {
+    const [lo, hi] = spanOf(axis, index);
+    structural(s => {
+      if (axis === 'col') {
+        setColumns(s, lo, hi, col => {
+          if (!px) { col.setAttribute('hidden', '1'); return; }
+          col.setAttribute('width', String(Math.round(px / 7 * 100) / 100));
+          col.setAttribute('customWidth', '1');
+          col.removeAttribute('hidden');
+        });
+      } else {
+        if (hi - lo >= MAX_ROW_CHANGES) throw new Error(`Rows can be resized at most ${MAX_ROW_CHANGES} at a time.`);
+        setRows(s, lo, hi, row => {
+          if (!px) { row.setAttribute('hidden', '1'); return; }
+          row.setAttribute('ht', String(Math.round(px * 0.75 * 100) / 100));
+          row.setAttribute('customHeight', '1');
+          row.removeAttribute('hidden');
+        });
+      }
+    });
+  }
+  /** Columns as wide as their widest text (wrapped and merged cells aside). */
+  function fitColumns(lo, hi) {
+    const s = sheet();
+    const widths = new Map();
+    for (const ref of s.cells.keys()) {
+      const { row, col } = parseRef(ref);
+      if (col < lo || col > hi || s.covered.has(ref) || s.hiddenRows.has(row)) continue;
+      const info = shown(row, col);
+      if (!info?.text || info.style.wrap) continue;
+      widths.set(col, Math.max(widths.get(col) || 0, Math.ceil(textWidth(info.text, cellFont(info.style)) / FONT_SCALE) + 10));
+    }
+    structural(s => {
+      for (let col = lo; col <= hi; col++) {
+        const px = Math.min(1800, widths.get(col) || s.defaultColPx);
+        setColumns(s, col, col, node => {
+          node.setAttribute('width', String(Math.round(px / 7 * 100) / 100));
+          node.setAttribute('customWidth', '1');
+          node.removeAttribute('hidden');
+        }, { reread: false });
+      }
+      rereadSheet(s);
+    });
+  }
+  /** Rows back to the height of their text (the sheet's default height). */
+  function fitRows(lo, hi) {
+    structural(s => setRows(s, lo, hi, row => { row.removeAttribute('ht'); row.removeAttribute('customHeight'); }, { existingOnly: true }));
+  }
+  function hideOrShow(axis, hide) {
+    const range = selectedRange();
+    if (axis === 'col') {
+      structural(s => setColumns(s, range.c1, range.c2, col => {
+        if (hide) { col.setAttribute('hidden', '1'); return; }
+        col.removeAttribute('hidden');
+        if (!Number(col.getAttribute('width'))) col.setAttribute('width', String(Math.round(s.defaultColPx / 7 * 100) / 100));
+      }, { existingOnly: !hide }));
+    } else {
+      const hi = range.r2;
+      structural(s => {
+        if (hide && hi - range.r1 >= MAX_ROW_CHANGES) throw new Error(`Rows can be hidden at most ${MAX_ROW_CHANGES} at a time.`);
+        setRows(s, range.r1, hi, row => {
+          if (hide) { row.setAttribute('hidden', '1'); return; }
+          row.removeAttribute('hidden');
+          if (row.getAttribute('ht') === '0') { row.removeAttribute('ht'); row.removeAttribute('customHeight'); }
+        }, { existingOnly: !hide });
+      });
+    }
+  }
+  function insertOrDelete(axis, at, count) {
+    structural(() => restructure(model, active, axis, at, count));
+  }
+  function anyHidden(axis) {
+    const range = selectedRange();
+    const s = sheet();
+    if (axis === 'col') return s.cols.some(col => (col.hidden || col.px === 0) && col.max >= range.c1 && col.min <= range.c2);
+    return [...s.hiddenRows].some(row => row >= range.r1 && row <= range.r2) || [...s.rowHeights].some(([row, pt]) => !pt && row >= range.r1 && row <= range.r2);
+  }
+
+  // The right-click menu
+  function menuItems() {
+    const range = selectedRange();
+    const rows = range.r2 - range.r1 + 1, cols = range.c2 - range.c1 + 1;
+    const wholeRows = range.c1 === 1 && range.c2 >= LAST_COL, wholeCols = range.r1 === 1 && range.r2 >= LAST_ROW;
+    const count = (n, word) => (n === 1 ? `${word}` : `${n} ${word}s`);
+    const items = [];
+    if (!wholeCols) {
+      items.push([`Insert ${count(rows, 'row')} above`, () => insertOrDelete('row', range.r1, rows)]);
+      items.push([`Insert ${count(rows, 'row')} below`, () => insertOrDelete('row', range.r2 + 1, rows)]);
+    }
+    if (!wholeRows) {
+      items.push([`Insert ${count(cols, 'column')} left`, () => insertOrDelete('col', range.c1, cols)]);
+      items.push([`Insert ${count(cols, 'column')} right`, () => insertOrDelete('col', range.c2 + 1, cols)]);
+    }
+    items.push('-');
+    if (!wholeCols) items.push([`Delete ${count(rows, 'row')}`, () => insertOrDelete('row', range.r1, -rows)]);
+    if (!wholeRows) items.push([`Delete ${count(cols, 'column')}`, () => insertOrDelete('col', range.c1, -cols)]);
+    items.push('-');
+    if (wholeCols) {
+      if (!wholeRows) items.push([`Hide ${count(cols, 'column')}`, () => hideOrShow('col', true)]);
+      if (anyHidden('col')) items.push(['Unhide columns', () => hideOrShow('col', false)]);
+      items.push([cols === 1 ? 'Fit width to contents' : 'Fit widths to contents', () => fitColumns(...spanOf('col', range.c1))]);
+    }
+    if (wholeRows) {
+      if (!wholeCols) items.push([`Hide ${count(rows, 'row')}`, () => hideOrShow('row', true)]);
+      if (anyHidden('row')) items.push(['Unhide rows', () => hideOrShow('row', false)]);
+      items.push([rows === 1 ? 'Reset height' : 'Reset heights', () => fitRows(...spanOf('row', range.r1))]);
+    }
+    if (!wholeRows && !wholeCols) {
+      if (rows > 1) items.push([`Fill down${IS_MAC ? ' (⌘D)' : ' (Ctrl+D)'}`, fillDown]);
+      items.push(['Clear contents', clearSelection]);
+    }
+    return items;
+  }
+  function openMenu(x, y) {
+    const items = menuItems().filter((item, i, all) => item !== '-' || (i > 0 && all[i - 1] !== '-' && i < all.length - 1));
+    menu.replaceChildren(...items.map(item => {
+      if (item === '-') {
+        const line = document.createElement('div');
+        line.className = 'menu-separator';
+        return line;
+      }
+      const [label, action] = item;
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.setAttribute('role', 'menuitem');
+      button.textContent = label;
+      button.disabled = !canWrite();
+      button.addEventListener('click', () => {
+        closeMenu();
+        action();
+        scroll.focus({ preventScroll: true });
+      });
+      return button;
+    }));
+    menu.hidden = false;
+    menu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - menu.offsetWidth - 8))}px`;
+    menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - menu.offsetHeight - 8))}px`;
+    menu.querySelector('button:not(:disabled)')?.focus({ preventScroll: true });
+  }
+  function closeMenu() {
+    menu.hidden = true;
+  }
+  menu.addEventListener('keydown', event => {
+    const buttons = [...menu.querySelectorAll('button:not(:disabled)')];
+    const at = buttons.indexOf(document.activeElement);
+    if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeMenu(); scroll.focus({ preventScroll: true }); }
+    else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      buttons[(at + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length]?.focus();
+    }
+    event.stopPropagation();
+  });
+  const outsideMenu = event => { if (!menu.hidden && !menu.contains(event.target)) closeMenu(); };
+  document.addEventListener('pointerdown', outsideMenu, true);
+  scroll.addEventListener('scroll', closeMenu);
+
+  // Filling
+  /** The range a drag of the fill handle from `source` to point `p` fills, or null. */
+  function fillTarget(source, p) {
+    const below = p.row - source.r2, above = source.r1 - p.row, right = p.col - source.c2, left = source.c1 - p.col;
+    const down = Math.max(below, above, 0), across = Math.max(right, left, 0);
+    if (!down && !across) return null;
+    if (down >= across) return below > 0 ? { ...source, r2: p.row } : { ...source, r1: p.row };
+    return right > 0 ? { ...source, c2: p.col } : { ...source, c1: p.col };
+  }
+  /** What a cell holds, for `fillSeries`. */
+  function entryOf(cell) {
+    if (!cell) return { kind: 'empty' };
+    if (direct(cell, 'f')) return { kind: 'formula' };
+    const value = cachedValue(model, cell);
+    if (typeof value === 'number') return { kind: 'number', value, date: isDateFormat(cellStyle(model, cell.getAttribute('s')).numFmt) };
+    if (typeof value === 'string') return { kind: 'text', value };
+    return { kind: 'other' };
+  }
+  /** Copies a cell to row, col, its formula's relative references moved by dRow and dCol. */
+  function copyCell(s, source, row, col, dRow, dCol) {
+    const ref = refName(row, col);
+    if (!source) {
+      s.cells.get(ref)?.remove();
+      s.cells.delete(ref);
+      return;
+    }
+    const copy = source.cloneNode(true);
+    copy.setAttribute('r', ref);
+    const f = direct(copy, 'f');
+    if (f) {
+      const formula = formulaOf(s, source) ?? f.textContent;
+      for (const name of ['t', 'si', 'ref']) f.removeAttribute(name);
+      f.textContent = shiftFormula(formula, dRow, dCol);
+      for (const node of [...copy.children]) if (node.localName === 'v') node.remove();
+    }
+    placeCell(s, ref, copy);
+    s.maxRow = Math.max(s.maxRow, row);
+    s.maxCol = Math.max(s.maxCol, col);
+    updateDimension(s);
+  }
+  /** Fills `target` (the source range grown one way) from `source`: series go on (numbers, dates,
+   * "Item 1", weekdays, months), and anything else is copied, formulas moving as they go.
+   * `copy` copies always, as Ctrl+D does. */
+  function fill(source, target, { copy = false } = {}) {
+    if (!canWrite()) return;
+    commitEdit();
+    const s = sheet();
+    const down = target.r1 !== source.r1 || target.r2 !== source.r2;
+    const forward = down ? target.r2 > source.r2 : target.c2 > source.c2;
+    const length = down ? source.r2 - source.r1 + 1 : source.c2 - source.c1 + 1;
+    const extra = down ? target.r2 - target.r1 + 1 - length : target.c2 - target.c1 + 1 - length;
+    const lines = down ? source.c2 - source.c1 + 1 : source.r2 - source.r1 + 1;
+    if (extra <= 0) return;
+    if (extra * lines > MAX_FORMAT_CELLS) { notice('That is too many cells to fill at once.'); return; }
+    if (s.merges.some(m => !(m.r2 < target.r1 || m.r1 > target.r2 || m.c2 < target.c1 || m.c1 > target.c2))) {
+      notice('Cells cannot be filled across merged cells.');
+      return;
+    }
+    transaction(touch => {
+      for (let line = 0; line < lines; line++) {
+        const at = i => (down ? { row: source.r1 + i, col: source.c1 + line } : { row: source.r1 + line, col: source.c1 + i });
+        const cells = Array.from({ length }, (_, i) => { const { row, col } = at(i); return s.cells.get(refName(row, col)) || null; });
+        const series = copy ? null : fillSeries(cells.map(entryOf));
+        for (let step = 0; step < extra; step++) {
+          const k = forward ? length + step : -1 - step;
+          const { row, col } = at(k);
+          const from = ((k % length) + length) % length;
+          const ref = refName(row, col);
+          touch(ref);
+          const existing = s.cells.get(ref);
+          if (existing) unshare(s, existing, touch);
+          const value = series?.(k);
+          if (value) writeParsed(s, row, col, value, touch, Number(cells[from]?.getAttribute('s') || 0));
+          else copyCell(s, cells[from], row, col, down ? k - from : 0, down ? 0 : k - from);
+        }
+      }
+    });
+    anchor = { row: target.r1, col: target.c1 };
+    focus = { row: target.r2, col: target.c2 };
+    selectionChanged();
+  }
+  /** Double-clicking the fill handle: down as far as the column beside has data. */
+  function fillToNeighbour() {
+    const source = expandForMerges(selectedRange());
+    const side = source.c1 > 1 && filled(source.r2 + 1, source.c1 - 1) ? source.c1 - 1 : filled(source.r2 + 1, source.c2 + 1) ? source.c2 + 1 : 0;
+    if (!side) return;
+    let end = source.r2 + 1;
+    while (end < LAST_ROW && filled(end + 1, side)) end++;
+    fill(source, { ...source, r2: end });
+  }
+  /** Ctrl+D: the first row of the selection copied down through it. */
+  function fillDown() {
+    const range = expandForMerges(selectedRange());
+    if (range.r2 >= LAST_ROW || range.c2 >= LAST_COL || range.r1 === range.r2) return;
+    fill({ ...range, r2: range.r1 }, range, { copy: true });
+  }
 
   // Keyboard
   scroll.addEventListener('keydown', event => {
@@ -1734,6 +2454,13 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     } else if (key === 'F2') { event.preventDefault(); startEdit(); }
     else if (key === 'Delete' || key === 'Backspace') { event.preventDefault(); clearSelection(); }
     else if (mod && key.toLowerCase() === 'a') { event.preventDefault(); anchor = { row: 1, col: 1 }; focus = { row: LAST_ROW, col: LAST_COL }; selectionChanged(); }
+    else if (mod && key.toLowerCase() === 'd') { event.preventDefault(); fillDown(); }
+    else if (key === 'ContextMenu' || (key === 'F10' && event.shiftKey)) {
+      event.preventDefault();
+      const box = rect(anchor.row, anchor.col, anchor.row, anchor.col);
+      const at = canvas.getBoundingClientRect();
+      openMenu(at.left + box.left + box.width / 2, at.top + box.top + box.height / 2);
+    }
     else if (mod && key.toLowerCase() === 'b') { event.preventDefault(); formatSelection({ bold: !activeStyle().bold }); }
     else if (mod && key.toLowerCase() === 'i') { event.preventDefault(); formatSelection({ italic: !activeStyle().italic }); }
     else if (!mod && !event.altKey && key.length === 1) {
@@ -1883,6 +2610,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       document.removeEventListener('copy', onCopy);
       document.removeEventListener('cut', onCut);
       document.removeEventListener('paste', onPaste);
+      document.removeEventListener('pointerdown', outsideMenu, true);
       if (frame) cancelAnimationFrame(frame);
       root.remove();
     },

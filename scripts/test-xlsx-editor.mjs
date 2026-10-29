@@ -12,7 +12,7 @@ Object.defineProperty(dom.window.HTMLElement.prototype, 'clientHeight', { get() 
 Object.defineProperty(dom.window.HTMLElement.prototype, 'clientWidth', { get() { return 800; } });
 dom.window.HTMLCanvasElement.prototype.getContext = () => null;
 const { zipSync, unzipSync, strToU8, strFromU8 } = await import('../web/vendor/three/addons/libs/fflate.module.js');
-const { mountXlsxEditor, parseInput } = await import('../web/xlsx-editor.js');
+const { fillSeries, mountXlsxEditor, openXlsx, parseInput, restructure } = await import('../web/xlsx-editor.js');
 
 const NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
 const sheet = `<worksheet xmlns="${NS}"><dimension ref="A1:B3"/><sheetData>
@@ -149,6 +149,134 @@ editor.destroy();
   key(input, 'ArrowUp');
   assert.equal(input.value, '=A1:B1+1', 'where no reference can go, arrows move in the text as before');
   typing.destroy();
+}
+
+// Filling: series go on, other things are copied.
+{
+  const run = (entries, ks) => { const series = fillSeries(entries); return series && ks.map(k => series(k)?.value); };
+  const num = value => ({ kind: 'number', value }), text = value => ({ kind: 'text', value });
+  assert.deepEqual(run([num(1), num(2)], [2, 3, -1]), [3, 4, 0], 'numbers count on, and back');
+  assert.deepEqual(run([num(0.1), num(0.2)], [2]), [0.3], 'without floating-point dust');
+  assert.equal(fillSeries([num(5)]), null, 'one number is copied');
+  assert.deepEqual(run([{ kind: 'number', value: 46000, date: true }], [1, 2]), [46001, 46002], 'one date goes on a day at a time');
+  assert.deepEqual(run([text('Item 1')], [1, 2]), ['Item 2', 'Item 3']);
+  assert.deepEqual(run([text('Q01'), text('Q03')], [2]), ['Q05'], 'zeros in front are kept');
+  assert.deepEqual(run([text('Mon')], [1, 6, 7]), ['Tue', 'Sun', 'Mon'], 'weekdays wrap');
+  assert.deepEqual(run([text('JANUARY'), text('MARCH')], [2]), ['MAY'], 'months step, in the same case');
+  assert.equal(fillSeries([text('a'), num(1)]), null, 'a mix is copied');
+  assert.equal(fillSeries([text('x'), text('y')]), null);
+}
+
+// Inserting and deleting rows and columns moves cells, formulas everywhere, and merged cells.
+{
+  const two = { ...files,
+    'xl/workbook.xml': `<workbook xmlns="${NS}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/><sheet name="Other" sheetId="2" r:id="rId3"/></sheets><definedNames><definedName name="Total">Data!$A$3</definedName></definedNames></workbook>`,
+    'xl/_rels/workbook.xml.rels': `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>`,
+    'xl/worksheets/sheet1.xml': sheet.replace('</sheetData>', '<row r="5"><c r="A5"><v>1</v></c></row></sheetData><mergeCells count="1"><mergeCell ref="A5:B6"/></mergeCells><conditionalFormatting sqref="A1:A3"><cfRule type="expression" priority="1"><formula>A1&gt;15</formula></cfRule></conditionalFormatting>'),
+    'xl/worksheets/sheet2.xml': `<worksheet xmlns="${NS}"><sheetData><row r="1"><c r="A1"><f>Data!A3+Data!B2</f><v>70</v></c></row></sheetData></worksheet>`,
+  };
+  const book = openXlsx(zipSync(Object.fromEntries(Object.entries(two).map(([name, text]) => [name, strToU8(text)]))));
+  restructure(book, 0, 'row', 2, 2);
+  const data = book.sheets[0];
+  const formula = ref => data.cells.get(ref)?.getElementsByTagNameNS(NS, 'f')[0]?.textContent;
+  assert.equal(formula('A5'), 'SUM(A1:A4)', 'a range across the new rows grows');
+  assert.equal(formula('B4'), 'A4*2', 'shared formulas become plain and move');
+  assert.equal(formula('B1'), 'A1*2');
+  assert.ok(!data.cells.has('A3') && data.cells.get('A4'), 'cells after move down');
+  assert.equal(book.sheets[1].cells.get('A1').getElementsByTagNameNS(NS, 'f')[0].textContent, 'Data!A5+Data!B4', 'other sheets follow');
+  assert.equal(book.workbookXml.getElementsByTagNameNS(NS, 'definedName')[0].textContent, 'Data!$A$5', 'and names');
+  assert.deepEqual(data.merges, [{ r1: 7, c1: 1, r2: 8, c2: 2 }], 'merged cells move');
+  assert.equal(data.root.getElementsByTagNameNS(NS, 'conditionalFormatting')[0].getAttribute('sqref'), 'A1:A5');
+  restructure(book, 0, 'row', 2, -3);
+  assert.equal(formula('B1'), 'A1*2');
+  assert.equal(formula('A2'), 'SUM(A1:A1)', 'deleting rows in a range shrinks it');
+  assert.equal(formula('B1'), 'A1*2');
+  assert.equal(book.sheets[1].cells.get('A1').getElementsByTagNameNS(NS, 'f')[0].textContent, 'Data!A2+Data!#REF!', 'a deleted cell is #REF!');
+  restructure(book, 0, 'col', 1, -1);
+  assert.equal(formula('A1'), '#REF!*2', 'deleting a column');
+  assert.deepEqual(data.merges, [{ r1: 4, c1: 1, r2: 5, c2: 1 }]);
+}
+
+// The editor: the right-click menu, the fill handle, column widths, undo.
+{
+  const editor2 = mountXlsxEditor(container, bytes, { onSave: async data => { saved = data; } });
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const grid = container.querySelector('.xlsx-scroll');
+  const canvas = container.querySelector('.xlsx-canvas');
+  const menu = container.querySelector('.xlsx-menu');
+  const bar = container.querySelector('.xlsx-formula');
+  const key = (target, name, extra = {}) => target.dispatchEvent(new KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true, ...extra }));
+  const mouse = (target, type, x, y, extra = {}) => target.dispatchEvent(new window.MouseEvent(type, { button: 0, bubbles: true, cancelable: true, clientX: x, clientY: y, ...extra }));
+  const cellAt = (col, row) => [46 + 64 * (col - 1) + 10, 24 + 20 * (row - 1) + 8];
+  const show = (col, row) => { mouse(canvas, 'pointerdown', ...cellAt(col, row)); mouse(canvas, 'pointerup', ...cellAt(col, row)); return bar.value; };
+  const choose = label => {
+    const button = [...menu.querySelectorAll('button')].find(item => item.textContent === label);
+    assert.ok(button, `menu has "${label}": ${[...menu.querySelectorAll('button')].map(item => item.textContent).join(' | ')}`);
+    button.click();
+  };
+  grid.focus();
+  // Row header 2, right-click: insert a row above.
+  mouse(canvas, 'contextmenu', 20, 24 + 20 + 8);
+  assert.equal(menu.hidden, false);
+  choose('Insert row above');
+  assert.equal(menu.hidden, true);
+  assert.equal(show(1, 4), '=SUM(A1:A3)', 'the total moved down and grew');
+  assert.equal(show(1, 2), '', 'the new row is empty');
+  key(grid, 'z', { ctrlKey: true });
+  assert.equal(show(1, 3), '=SUM(A1:A2)', 'undo puts it back');
+  key(grid, 'y', { ctrlKey: true });
+  assert.equal(show(1, 4), '=SUM(A1:A3)', 'redo again');
+  key(grid, 'z', { ctrlKey: true });
+  // Cells: delete a column through the menu.
+  mouse(canvas, 'contextmenu', ...cellAt(1, 1));
+  choose('Delete column');
+  assert.equal(show(1, 1), '=#REF!*2', 'formulas pointing at it break, as in Excel');
+  key(grid, 'z', { ctrlKey: true });
+  assert.equal(show(2, 1), '=A1*2');
+
+  // Type 1 and 2 in D1:D2 and drag the fill handle to D5.
+  show(4, 1); key(grid, '1'); key(container.querySelector('.xlsx-cell-editor'), 'Enter');
+  key(grid, '2'); key(container.querySelector('.xlsx-cell-editor'), 'Enter');
+  mouse(canvas, 'pointerdown', ...cellAt(4, 1));
+  mouse(canvas, 'pointermove', ...cellAt(4, 2));
+  mouse(canvas, 'pointerup', ...cellAt(4, 2));
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const handle = container.querySelector('.xlsx-fill-handle');
+  assert.equal(handle.hidden, false, 'the fill handle shows');
+  mouse(handle, 'pointerdown', ...cellAt(4, 2));
+  mouse(canvas, 'pointermove', ...cellAt(4, 5));
+  assert.equal(container.querySelector('.xlsx-fill').hidden, false, 'the cells to fill are marked');
+  mouse(canvas, 'pointerup', ...cellAt(4, 5));
+  assert.deepEqual([3, 4, 5].map(row => show(4, row)), ['3', '4', '5'], 'the series goes on');
+  // A formula filled down moves its references.
+  show(2, 2);
+  mouse(handle, 'pointerdown', ...cellAt(2, 2));
+  mouse(canvas, 'pointermove', ...cellAt(2, 4));
+  mouse(canvas, 'pointerup', ...cellAt(2, 4));
+  assert.deepEqual([3, 4].map(row => show(2, row)), ['=A3*2', '=A4*2']);
+  key(grid, 'z', { ctrlKey: true });
+  assert.equal(show(2, 3), 'Note', 'undo puts back what was there');
+
+  // Drag column A's right edge 36 px wider.
+  const edge = 46 + 64;
+  mouse(canvas, 'pointermove', edge, 12);
+  assert.equal(canvas.style.cursor, 'col-resize', 'the edge shows it can be dragged');
+  mouse(canvas, 'pointerdown', edge, 12);
+  mouse(canvas, 'pointermove', edge + 36, 12);
+  mouse(canvas, 'pointerup', edge + 36, 12);
+  await editor2.save();
+  const widths = new DOMParser().parseFromString(strFromU8(unzipSync(saved)['xl/worksheets/sheet1.xml']), 'application/xml');
+  const col = widths.getElementsByTagNameNS(NS, 'col')[0];
+  assert.deepEqual([col.getAttribute('min'), col.getAttribute('max'), col.getAttribute('width'), col.getAttribute('customWidth')], ['1', '1', '14.29', '1']);
+  // Hide column B from its header's menu, then show it again.
+  mouse(canvas, 'contextmenu', 46 + 100 + 30, 12);
+  choose('Hide column');
+  mouse(canvas, 'contextmenu', 46 + 100 + 30, 12);
+  assert.ok(![...menu.querySelectorAll('button')].some(item => item.textContent === 'Unhide columns'), 'column C has nothing hidden');
+  key(menu, 'Escape');
+  assert.equal(menu.hidden, true);
+  key(grid, 'z', { ctrlKey: true });
+  editor2.destroy();
 }
 
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });

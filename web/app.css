@@ -2426,6 +2426,10 @@ input, select, textarea {
 .xlsx-assist-call { padding: 0.3rem 0.55rem; font: 0.78rem var(--mono); }
 .xlsx-assist-call b { color: var(--accent); }
 .xlsx-assist-call p { margin: 0.2rem 0 0; color: var(--muted); font: 0.76rem/1.3 system-ui, sans-serif; }
+.xlsx-fill-handle { position: absolute; z-index: 2; box-sizing: border-box; width: 8px; height: 8px; background: #2478dc; border: 1px solid #fff; cursor: crosshair; touch-action: none; }
+.xlsx-fill { position: absolute; z-index: 2; box-sizing: border-box; pointer-events: none; border: 1px dashed #2478dc; }
+.xlsx-size-guide { position: absolute; z-index: 6; pointer-events: none; background: #2478dc; }
+.xlsx-menu { z-index: 60; min-width: 13rem; }
 .xlsx-footer { display: flex; align-items: center; gap: 0.5rem; min-height: 30px; }
 .xlsx-tabs { display: flex; gap: 2px; flex: 1 1 auto; min-width: 0; overflow-x: auto; scrollbar-width: thin; }
 .xlsx-tab { flex: none; height: 28px; padding: 0 0.85rem; border-radius: 0 0 8px 8px; border: 1px solid var(--line); border-top-width: 0; background: transparent; color: var(--muted); font-size: 0.8rem; }

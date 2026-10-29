@@ -128,6 +128,59 @@ export function shiftFormula(formula, dRow, dCol) {
   return out + formula.slice(at);
 }
 
+/** Where the span lo…hi of rows or columns goes when `count` are inserted before `at` (count > 0)
+ * or deleted from `at` on (count < 0): [lo, hi], or null when all of it is deleted. */
+export function moveSpan(lo, hi, at, count) {
+  if (count > 0) return [lo >= at ? lo + count : lo, hi >= at ? hi + count : hi];
+  const end = at - count - 1;
+  if (lo >= at && hi <= end) return null;
+  const left = lo < at ? lo : lo > end ? lo + count : at;
+  const right = hi < at ? hi : hi > end ? hi + count : at - 1;
+  return right < left ? null : [left, right];
+}
+
+/** A reference's two ends moved for rows (`axis` "row") or columns inserted or deleted, or null. */
+function moveParts(a, b, axis, at, count) {
+  const end = b || a;
+  if (a[axis] == null || end[axis] == null) return { a, b };
+  const lo = Math.min(a[axis], end[axis]), hi = Math.max(a[axis], end[axis]);
+  const span = moveSpan(lo, hi, at, count);
+  if (!span) return null;
+  const flip = a[axis] > end[axis];
+  const first = { ...a, [axis]: flip ? span[1] : span[0] };
+  if (!b) return { a: first, b: null };
+  return { a: first, b: { ...b, [axis]: flip ? span[0] : span[1] } };
+}
+
+/** A formula's references to `sheet` (or, with `here`, to its own sheet) moved for rows or
+ * columns inserted or deleted there; references to deleted cells become #REF!. */
+export function moveFormula(formula, { sheet, here, axis, at, count }) {
+  let tokens;
+  try { tokens = tokenize(formula); } catch { return formula; }
+  let out = '', from = 0;
+  for (const token of tokens) {
+    if (token.t !== 'ref') continue;
+    if (token.sheet == null ? !here : token.sheet.toLowerCase() !== sheet.toLowerCase()) continue;
+    const moved = moveParts(token.a, token.b, axis, at, count);
+    const bang = token.text.lastIndexOf('!');
+    const prefix = bang > 0 ? token.text.slice(0, bang + 1) : '';
+    out += formula.slice(from, token.start) + (moved ? prefix + partText(moved.a) + (moved.b ? `:${partText(moved.b)}` : '') : `${prefix}#REF!`);
+    from = token.start + token.text.length;
+  }
+  return out + formula.slice(from);
+}
+
+/** A space-separated list of cells and ranges ("A1 B2:C4"), moved the same way; deleted ones are
+ * left out, so the result can be empty. */
+export function moveSqref(sqref, axis, at, count) {
+  return String(sqref || '').split(/\s+/).filter(Boolean).map(item => {
+    const [a, b] = item.split(':').map(refPart);
+    if (!a) return item;
+    const moved = moveParts(a, b, axis, at, count);
+    return moved ? partText(moved.a) + (moved.b ? `:${partText(moved.b)}` : '') : '';
+  }).filter(Boolean).join(' ');
+}
+
 // --- Parser -------------------------------------------------------------------------------------
 
 const BINARY = { '=': 1, '<>': 1, '<': 1, '>': 1, '<=': 1, '>=': 1, '&': 2, '+': 3, '-': 3, '*': 4, '/': 4, '^': 5 };
