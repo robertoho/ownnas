@@ -233,9 +233,12 @@ After=network.target
 
 [Service]
 Type=simple
+# The account that owns the files and can replace the binary on updates (leave out in a user unit).
+User=youruser
 ExecStart=/absolute/path/to/ownnas serve --root /absolute/path/to/library --data /absolute/path/to/ownnas-data --addr 0.0.0.0:8787 --restart-by-supervisor
 WorkingDirectory=/absolute/path/to/ownnas-data/..
-Restart=on-failure
+# Always: after installing an update, OwnNAS exits normally for systemd to start the new binary.
+Restart=always
 RestartSec=3
 
 [Install]
