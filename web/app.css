@@ -2456,7 +2456,11 @@ input, select, textarea {
 .xlsx-fill-handle { position: absolute; z-index: 2; box-sizing: border-box; width: 8px; height: 8px; background: #2478dc; border: 1px solid #fff; cursor: crosshair; touch-action: none; }
 .xlsx-fill { position: absolute; z-index: 2; box-sizing: border-box; pointer-events: none; border: 1px dashed #2478dc; }
 .xlsx-size-guide { position: absolute; z-index: 6; pointer-events: none; background: #2478dc; }
-.xlsx-menu { z-index: 60; min-width: 13rem; }
+.xlsx-menu { z-index: 60; min-width: 13rem; max-height: min(24rem, calc(100vh - 16px)); overflow: auto; }
+.xlsx-valid-button { position: absolute; z-index: 3; box-sizing: border-box; width: 18px; display: grid; place-items: center; border: 1px solid #b9bdb4; background: #f7f8f5; color: #4a4f45; font: 11px/1 system-ui, sans-serif; cursor: pointer; }
+.xlsx-valid-button:hover { background: #e8ebe3; }
+.xlsx-prompt { position: absolute; z-index: 4; max-width: 16rem; padding: 0.35rem 0.5rem; border: 1px solid #c9ccc2; border-radius: 4px; background: #fffef0; color: #2b2b2b; font: 12px/1.35 system-ui, sans-serif; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18); pointer-events: none; white-space: pre-wrap; }
+.xlsx-prompt strong { display: block; }
 .xlsx-functions { position: absolute; z-index: 40; left: 0; bottom: 0; width: min(36rem, 100%); box-sizing: border-box; display: flex; flex-direction: column; background: var(--bg-2); color: var(--text); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); overflow: hidden; }
 .xlsx-functions-head { display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem 0.75rem 0.45rem; }
 .xlsx-functions-head strong { flex: 1 1 auto; }

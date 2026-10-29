@@ -748,6 +748,111 @@ function recalc(model, { onlyMissing = false } = {}) {
   model.conditional = new Map(model.sheets.map((sheet, index) => [index, conditionalFormats(model, index)]));
 }
 
+/** Evaluates a formula written for one cell (`from`) at another (row, col): its relative references
+ * move by the difference, as conditional formatting and validation rules do. */
+function evaluateAt(model, index, formula, from, row, col, options, override = null) {
+  const text = shiftFormula(formula, row - from.row, col - from.col);
+  let tree = model.trees.get(text);
+  if (!tree) { tree = parseFormula(text); model.trees.set(text, tree); }
+  const target = name => (name == null ? index : model.sheets.findIndex(sheet => sheet.name.toLowerCase() === name.toLowerCase()));
+  return evaluate(tree, {
+    row, col, date1904: model.date1904,
+    size: name => { const i = target(name); return i < 0 ? null : { rows: model.sheets[i].maxRow, cols: model.sheets[i].maxCol }; },
+    cell: (name, r, c) => {
+      const i = target(name);
+      if (i < 0) throw new Unsupported('Unknown sheet');
+      return override && i === index && r === override.row && c === override.col ? override.value : valueAt(model, i, r, c);
+    },
+  }, options);
+}
+
+// --- Data validation ----------------------------------------------------------------------------
+
+const X14 = 'http://schemas.microsoft.com/office/spreadsheetml/2009/9/main';
+const XM = 'http://schemas.microsoft.com/office/excel/2006/main';
+
+/** The validation rules of a sheet: those in <dataValidations>, and the newer ones Excel keeps in
+ * an extension (lists from other sheets). */
+function validations(sheet) {
+  const read = (node, formula, sqref) => ({
+    type: node.getAttribute('type') || 'any', operator: node.getAttribute('operator') || 'between',
+    allowBlank: flag(node.getAttribute('allowBlank')), showError: node.getAttribute('showErrorMessage') !== '0',
+    errorStyle: node.getAttribute('errorStyle') || 'stop', error: node.getAttribute('error') || '', errorTitle: node.getAttribute('errorTitle') || '',
+    prompt: node.getAttribute('prompt') || '', promptTitle: node.getAttribute('promptTitle') || '',
+    showPrompt: flag(node.getAttribute('showInputMessage')), noDropdown: flag(node.getAttribute('showDropDown')),
+    f1: formula(1), f2: formula(2), ranges: sqref.split(/\s+/).filter(Boolean).map(parseArea).filter(Boolean),
+  });
+  const list = kids(direct(sheet.root, 'dataValidations'), 'dataValidation')
+    .map(node => read(node, n => direct(node, `formula${n}`)?.textContent ?? null, node.getAttribute('sqref') || ''));
+  for (const node of sheet.root.getElementsByTagNameNS(X14, 'dataValidation')) {
+    const sqref = node.getElementsByTagNameNS(XM, 'sqref')[0]?.textContent || '';
+    list.push(read(node, n => node.getElementsByTagNameNS(X14, `formula${n}`)[0]?.getElementsByTagNameNS(XM, 'f')[0]?.textContent ?? null, sqref));
+  }
+  return list;
+}
+
+/** The validation rule of a cell, or null. */
+export function validationAt(sheet, row, col) {
+  return validations(sheet).find(rule => rule.ranges.some(a => row >= a.r1 && row <= a.r2 && col >= a.c1 && col <= a.c2)) || null;
+}
+
+/** The choices of a list rule, as shown text. */
+export function validationChoices(model, index, rule, row, col) {
+  if (rule.type !== 'list' || rule.f1 == null) return [];
+  const formula = rule.f1.trim();
+  // "a,b,c" in quotes is the list itself.
+  if (formula.startsWith('"')) return formula.slice(1, -1).replace(/""/g, '"').split(',').map(item => item.trim()).filter(Boolean);
+  try {
+    const result = evaluateAt(model, index, formula, { row: rule.ranges[0].r1, col: rule.ranges[0].c1 }, row, col, { array: true });
+    const values = result?.rows ? result.rows.flat() : [result];
+    return values.filter(value => value != null && value !== '' && !(value instanceof CellError)).map(value => (typeof value === 'boolean' ? (value ? 'TRUE' : 'FALSE') : String(value)));
+  } catch (error) {
+    if (error instanceof Unsupported) return [];
+    throw error;
+  }
+}
+
+/** Whether a value typed in a cell keeps to its rule: null when it does, or the rule broken. */
+export function validationProblem(model, index, row, col, parsed) {
+  const rule = validationAt(model.sheets[index], row, col);
+  if (!rule || rule.type === 'any' || !rule.showError) return null;
+  if (parsed.kind === 'empty') return rule.allowBlank ? null : rule;
+  if (parsed.kind === 'formula') return null;
+  const from = { row: rule.ranges[0].r1, col: rule.ranges[0].c1 };
+  const bound = formula => {
+    if (formula == null) return undefined;
+    try { return evaluateAt(model, index, formula, from, row, col); } catch (error) { if (error instanceof Unsupported) return undefined; throw error; }
+  };
+  const within = number => {
+    const a = bound(rule.f1), b = bound(rule.f2);
+    if (typeof a !== 'number' && rule.f1 != null) return true;
+    return {
+      between: () => number >= Math.min(a, b) && number <= Math.max(a, b), notBetween: () => number < Math.min(a, b) || number > Math.max(a, b),
+      equal: () => number === a, notEqual: () => number !== a, greaterThan: () => number > a, lessThan: () => number < a,
+      greaterThanOrEqual: () => number >= a, lessThanOrEqual: () => number <= a,
+    }[rule.operator]?.() ?? true;
+  };
+  const value = parsed.value;
+  let ok = true;
+  if (rule.type === 'list') {
+    const choices = validationChoices(model, index, rule, row, col).map(choice => choice.toLowerCase());
+    const typed = typeof value === 'number' ? formatGeneral(value) : String(value);
+    ok = !choices.length || choices.includes(typed.toLowerCase());
+  } else if (rule.type === 'whole') ok = typeof value === 'number' && Number.isInteger(value) && within(value);
+  else if (['decimal', 'date', 'time'].includes(rule.type)) ok = typeof value === 'number' && within(value);
+  else if (rule.type === 'textLength') ok = within(String(value).length);
+  else if (rule.type === 'custom' && rule.f1 != null) {
+    // Custom rules read the cell as it would be: their formula usually uses it.
+    try {
+      const result = evaluateAt(model, index, rule.f1, from, row, col, undefined, { row, col, value });
+      ok = result === true || (typeof result === 'number' && result !== 0);
+    } catch (error) {
+      if (!(error instanceof Unsupported)) throw error;
+    }
+  }
+  return ok ? null : rule;
+}
+
 // --- Conditional formatting ---------------------------------------------------------------------
 
 /** The formatting a conditional rule applies (a "dxf"): only what it sets. */
@@ -1839,7 +1944,16 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   const sizeGuide = document.createElement('div');
   sizeGuide.className = 'xlsx-size-guide';
   sizeGuide.hidden = true;
-  canvas.append(layer, selectionBox, activeBox, pointBox, fillBox, fillHandle, sizeGuide, cellEditor);
+  // A cell with a list of choices gets a dropdown beside it, and a rule's hint shows under it.
+  const validButton = document.createElement('div');
+  validButton.className = 'xlsx-valid-button';
+  validButton.textContent = '▾';
+  validButton.title = 'Choose from the list (Alt+↓)';
+  validButton.hidden = true;
+  const promptTip = document.createElement('div');
+  promptTip.className = 'xlsx-prompt';
+  promptTip.hidden = true;
+  canvas.append(layer, selectionBox, activeBox, pointBox, fillBox, fillHandle, sizeGuide, validButton, promptTip, cellEditor);
   scroll.append(canvas);
   const footer = document.createElement('div');
   footer.className = 'xlsx-footer';
@@ -2528,6 +2642,28 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     fillHandle.hidden = !canWrite() || !!editing || whole;
     const corner = range.r1 === range.r2 && range.c1 === range.c2 ? cellBox : box;
     fillHandle.style.cssText = `left:${corner.left + corner.width - 4}px;top:${corner.top + corner.height - 4}px`;
+    const rule = validationAt(sheet(), anchor.row, anchor.col);
+    // showDropDown="1" means the dropdown is hidden (Excel's naming).
+    validButton.hidden = !rule || rule.type !== 'list' || rule.noDropdown || !canWrite() || !!editing;
+    if (!validButton.hidden) validButton.style.cssText = `left:${cellBox.left + cellBox.width + 1}px;top:${cellBox.top + cellBox.height - Math.min(18, cellBox.height)}px;height:${Math.min(18, cellBox.height)}px`;
+    promptTip.hidden = !rule?.showPrompt || !rule.prompt || !!editing;
+    if (!promptTip.hidden) {
+      promptTip.replaceChildren();
+      if (rule.promptTitle) { const title = document.createElement('strong'); title.textContent = rule.promptTitle; promptTip.append(title); }
+      promptTip.append(rule.prompt);
+      promptTip.style.cssText = `left:${cellBox.left + 8}px;top:${cellBox.top + cellBox.height + 6}px`;
+    }
+  }
+  /** The list of choices for the selected cell, to pick one. */
+  function openChoices() {
+    const rule = validationAt(sheet(), anchor.row, anchor.col);
+    if (!rule || rule.type !== 'list' || !canWrite()) return;
+    const choices = validationChoices(model, active, rule, anchor.row, anchor.col);
+    if (!choices.length) { notice('The list for this cell is empty, or comes from something this editor cannot read.'); return; }
+    const box = validButton.getBoundingClientRect();
+    const { row, col } = anchor;
+    const s = sheet();
+    openMenu(box.right, box.bottom + 2, choices.map(choice => [choice, () => transaction(touch => writeInput(s, row, col, choice, touch))]));
   }
   function editText(row, col, s = sheet()) {
     const cell = s.cells.get(refName(row, col));
@@ -3342,6 +3478,15 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const source = editing.bar ? formulaInput : cellEditor;
     const { row, col, original, sheet: index } = editing;
     const value = source.value;
+    // A value the cell's rule does not allow: "stop" keeps the edit open, the others warn.
+    const broken = value !== original ? validationProblem(model, index, row, col, parseInput(value, { ...separators, date1904: model.date1904 })) : null;
+    const warning = broken && `${broken.errorTitle ? `${broken.errorTitle}: ` : ''}${broken.error || 'This value does not match the rules set for this cell.'}`;
+    if (broken && broken.errorStyle === 'stop') {
+      notice(warning);
+      source.focus({ preventScroll: true });
+      source.select?.();
+      return;
+    }
     editing = null;
     cellEditor.hidden = true;
     hideAssist();
@@ -3352,6 +3497,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       transaction(touch => writeInput(s, row, col, value, touch));
     }
     if (dr || dc) move(dr, dc); else selectionChanged();
+    if (warning) notice(warning);
     scroll.focus({ preventScroll: true });
   }
   function cancelEdit() {
@@ -3770,6 +3916,11 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       return;
     }
     if (editing?.away) { event.preventDefault(); commitEdit(); return; }
+    if (event.target === validButton) {
+      event.preventDefault();
+      openChoices();
+      return;
+    }
     if (editing) commitEdit();
     if (event.target === fillHandle) {
       dragging = { kind: 'fill', source: expandForMerges(selectedRange()), target: null };
@@ -4189,7 +4340,8 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     // Escape still closes the preview, and the page's ⌘⇧ shortcuts run before this.
     if (key !== 'Escape') event.stopPropagation();
     const arrows = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1] };
-    if (arrows[key]) {
+    if (event.altKey && key === 'ArrowDown') { event.preventDefault(); openChoices(); }
+    else if (arrows[key]) {
       event.preventDefault();
       const [dr, dc] = arrows[key];
       if (mod) jump(dr, dc, event.shiftKey); else move(dr, dc, event.shiftKey);

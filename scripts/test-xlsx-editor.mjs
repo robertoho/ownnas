@@ -671,6 +671,65 @@ editor.destroy();
   viewer.destroy();
 }
 
+// Data validation: dropdown lists, hints, and values a rule does not allow.
+{
+  const data = `<worksheet xmlns="${NS}"><sheetData>
+<row r="1"><c r="A1" t="inlineStr"><is><t>Red</t></is></c></row>
+<row r="2"><c r="A2" t="inlineStr"><is><t>Blue</t></is></c></row>
+</sheetData><dataValidations count="4">
+<dataValidation type="list" allowBlank="1" showInputMessage="1" showErrorMessage="1" promptTitle="Answer" prompt="Pick yes or no" sqref="C1:C5"><formula1>"Yes,No"</formula1></dataValidation>
+<dataValidation type="whole" allowBlank="1" showErrorMessage="1" error="From 1 to 10" sqref="D1:D5"><formula1>1</formula1><formula2>10</formula2></dataValidation>
+<dataValidation type="list" sqref="E1"><formula1>$A$1:$A$2</formula1></dataValidation>
+<dataValidation type="custom" errorStyle="warning" showErrorMessage="1" error="Short words only" sqref="F1"><formula1>LEN(F1)&lt;4</formula1></dataValidation>
+</dataValidations></worksheet>`;
+  const valid = mountXlsxEditor(container, zipSync(Object.fromEntries(Object.entries({ ...files, 'xl/worksheets/sheet1.xml': data }).map(([name, text]) => [name, strToU8(text)]))), { onSave: async out => { saved = out; } });
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const grid = container.querySelector('.xlsx-scroll');
+  const input = container.querySelector('.xlsx-cell-editor');
+  const bar = container.querySelector('.xlsx-formula');
+  const menu = container.querySelector('.xlsx-menu');
+  const button = container.querySelector('.xlsx-valid-button');
+  const tip = container.querySelector('.xlsx-prompt');
+  const note = container.querySelector('.xlsx-note');
+  const key = (target, name, extra = {}) => target.dispatchEvent(new KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true, ...extra }));
+  const go = (col, row) => { key(grid, 'Home', { ctrlKey: true }); for (let i = 1; i < row; i++) key(grid, 'ArrowDown'); for (let i = 1; i < col; i++) key(grid, 'ArrowRight'); };
+  const typeIn = text => { key(grid, text[0]); input.value = text; input.dispatchEvent(new Event('input')); key(input, 'Enter'); };
+  grid.focus();
+  go(3, 1);
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  assert.equal(button.hidden, false, 'a list cell has a dropdown');
+  assert.equal(tip.hidden, false);
+  assert.equal(tip.textContent, 'AnswerPick yes or no', 'and its hint');
+  button.dispatchEvent(new window.MouseEvent('pointerdown', { button: 0, bubbles: true, cancelable: true }));
+  assert.deepEqual([...menu.querySelectorAll('button')].map(item => item.textContent), ['Yes', 'No']);
+  [...menu.querySelectorAll('button')][1].click();
+  assert.equal(bar.value, 'No', 'picking one fills the cell');
+  go(3, 2);
+  typeIn('Maybe');
+  assert.equal(input.hidden, false, 'a value not in the list keeps the edit open');
+  assert.match(note.textContent, /does not match the rules/);
+  key(input, 'Escape');
+  go(5, 1);
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  key(grid, 'ArrowDown', { altKey: true });
+  assert.deepEqual([...menu.querySelectorAll('button')].map(item => item.textContent), ['Red', 'Blue'], 'lists from cells, with Alt+Down');
+  key(menu, 'Escape');
+  go(4, 1);
+  typeIn('50');
+  assert.equal(input.hidden, false);
+  assert.match(note.textContent, /From 1 to 10/, 'its own message');
+  input.value = '7';
+  key(input, 'Enter');
+  assert.equal(input.hidden, true, 'an allowed value is taken');
+  go(6, 1);
+  typeIn('lengthy');
+  assert.equal(input.hidden, true, 'a warning lets it through');
+  assert.match(note.textContent, /Short words only/);
+  go(6, 1);
+  assert.equal(bar.value, 'lengthy');
+  valid.destroy();
+}
+
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });
 assert.equal(container.querySelector('.office-save'), null);
 readonly.destroy();
