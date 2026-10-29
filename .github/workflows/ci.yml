@@ -17,7 +17,14 @@ jobs:
       matrix:
         include:
           - os: windows-2025
+            keep: ownnas-windows-x86_64
+            binary: target/release/ownnas.exe
           - os: ubuntu-24.04
+            keep: ownnas-linux-x86_64
+            binary: target/release/ownnas
+          - os: ubuntu-24.04-arm
+            keep: ownnas-linux-aarch64
+            binary: target/release/ownnas
           - os: macos-15
     runs-on: ${{ matrix.os }}
     steps:
@@ -33,9 +40,9 @@ jobs:
       - name: Test
         run: cargo test --locked -p ownnas
 
-      - name: Keep the Windows build
-        if: runner.os == 'Windows'
+      - name: Keep the Windows and Linux builds
+        if: matrix.keep
         uses: actions/upload-artifact@v4
         with:
-          name: ownnas-windows-x86_64
-          path: target/release/ownnas.exe
+          name: ${{ matrix.keep }}
+          path: ${{ matrix.binary }}
