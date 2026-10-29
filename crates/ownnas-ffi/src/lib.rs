@@ -92,6 +92,33 @@ pub struct Folder {
     pub truncated: bool,
 }
 
+/// A path that changed on the server, and what is there now.
+#[derive(uniffi::Record, serde::Deserialize)]
+pub struct Change {
+    pub path: String,
+    #[serde(default)]
+    pub deleted: bool,
+    #[serde(default)]
+    pub dir: bool,
+    #[serde(default)]
+    pub size: u64,
+    /// Milliseconds since the Unix epoch.
+    #[serde(default, rename = "mtime")]
+    pub modified: i64,
+}
+
+/// What changed since a cursor (see `Server::changes`).
+#[derive(uniffi::Record, serde::Deserialize)]
+pub struct Changes {
+    /// Where to ask from next.
+    pub cursor: String,
+    /// The cursor no longer counts (the server restarted, or changes were missed): list again.
+    pub expired: bool,
+    /// False when the server cannot watch its folder: changes made on its disk are not seen.
+    pub watching: bool,
+    pub changes: Vec<Change>,
+}
+
 /// A file or folder that matches a search.
 #[derive(uniffi::Record, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -250,6 +277,13 @@ impl Server {
                 })
                 .collect(),
         })
+    }
+
+    /// What changed on the server since `cursor` ("" starts from now), waiting up to
+    /// `wait_seconds` for a change when there is none yet.
+    pub fn changes(&self, cursor: String, wait_seconds: u32) -> Result<Changes, ClientError> {
+        let wait = wait_seconds.min(55).to_string();
+        Ok(self.api.get_json("/api/sync/changes", &[("cursor", &cursor), ("wait", &wait)])?)
     }
 
     /// PNG bytes of a file's thumbnail.

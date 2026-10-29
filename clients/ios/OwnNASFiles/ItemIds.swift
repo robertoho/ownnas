@@ -32,6 +32,14 @@ final class ItemIds: @unchecked Sendable {
         return NSFileProviderItemIdentifier(made)
     }
 
+    /// The identifier a path already has, without making one (for changes to items never seen).
+    func known(_ path: String) -> NSFileProviderItemIdentifier? {
+        if path.isEmpty { return .rootContainer }
+        lock.lock()
+        defer { lock.unlock() }
+        return byPath[path].map { NSFileProviderItemIdentifier($0) }
+    }
+
     /// Where an item is on the server, or nil for an unknown item or a place the server lacks.
     func path(_ identifier: NSFileProviderItemIdentifier) -> String? {
         switch identifier {

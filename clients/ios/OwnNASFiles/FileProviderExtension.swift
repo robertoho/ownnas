@@ -177,7 +177,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
     // MARK: Folders
 
     func enumerator(for containerItemIdentifier: NSFileProviderItemIdentifier, request: NSFileProviderRequest) throws -> NSFileProviderEnumerator {
-        if containerItemIdentifier == .workingSet { return WorkingSet() }
+        if containerItemIdentifier == .workingSet { return WorkingSet(provider: self) }
         guard let path = ids.path(containerItemIdentifier) else { throw NSFileProviderError(.noSuchItem) }
         return FolderEnumerator(path: path, provider: self)
     }
@@ -289,6 +289,10 @@ final class FileItem: NSObject, NSFileProviderItem {
 
     var capabilities: NSFileProviderItemCapabilities {
         var can: NSFileProviderItemCapabilities = isFolder ? [.allowsReading, .allowsContentEnumerating] : [.allowsReading]
+        #if os(macOS)
+        // "Remove Download" in Finder: the file stays on the server, and comes back when opened.
+        can.insert(.allowsEvicting)
+        #endif
         if writable {
             can.formUnion(isFolder ? [.allowsAddingSubItems] : [.allowsWriting])
             if !path.isEmpty { can.formUnion([.allowsRenaming, .allowsReparenting, .allowsDeleting]) }
@@ -332,20 +336,24 @@ final class FolderEnumerator: NSObject, NSFileProviderEnumerator {
         }
     }
 
-    /// The server does not keep a list of changes, so Files lists the folder again instead.
+    /// What changed in this folder since the anchor, from the server's change feed.
     func enumerateChanges(for observer: NSFileProviderChangeObserver, from anchor: NSFileProviderSyncAnchor) {
-        observer.finishEnumeratingWithError(NSFileProviderError(.syncAnchorExpired))
+        ChangeFeed.report(provider, from: anchor, to: observer, folder: path)
     }
 
     func currentSyncAnchor(completionHandler: @escaping (NSFileProviderSyncAnchor?) -> Void) {
-        completionHandler(NSFileProviderSyncAnchor(Data("\(Date().timeIntervalSince1970)".utf8)))
+        ChangeFeed.anchor(provider, completionHandler)
     }
 }
 
-/// What the system watches for changes everywhere: nothing here, since folders are listed
-/// afresh when they are opened.
+/// What the system watches for changes everywhere: everything it has seen, kept up to date from
+/// the server's change feed (the app tells the system when there is something new).
 final class WorkingSet: NSObject, NSFileProviderEnumerator {
-    private static let anchor = NSFileProviderSyncAnchor(Data("ownnas".utf8))
+    weak var provider: FileProviderExtension?
+
+    init(provider: FileProviderExtension) {
+        self.provider = provider
+    }
 
     func invalidate() {}
 
@@ -354,11 +362,66 @@ final class WorkingSet: NSObject, NSFileProviderEnumerator {
     }
 
     func enumerateChanges(for observer: NSFileProviderChangeObserver, from anchor: NSFileProviderSyncAnchor) {
-        observer.finishEnumeratingChanges(upTo: Self.anchor, moreComing: false)
+        ChangeFeed.report(provider, from: anchor, to: observer, folder: nil)
     }
 
     func currentSyncAnchor(completionHandler: @escaping (NSFileProviderSyncAnchor?) -> Void) {
-        completionHandler(Self.anchor)
+        ChangeFeed.anchor(provider, completionHandler)
+    }
+}
+
+/// The server's change feed (`/api/sync/changes`): an anchor is the server's cursor, and the
+/// changes after it are told to the system as items updated or deleted.
+enum ChangeFeed {
+    static func anchor(_ provider: FileProviderExtension?, _ completion: @escaping (NSFileProviderSyncAnchor?) -> Void) {
+        Task.detached {
+            let cursor = provider.flatMap { provider in try? provider.call { try provider.server().changes(cursor: "", waitSeconds: 0) }.cursor }
+            completion(NSFileProviderSyncAnchor(Data((cursor ?? "\(Date().timeIntervalSince1970)").utf8)))
+        }
+    }
+
+    /// Changes after `anchor`: everywhere, or (with `folder`) just in that folder.
+    static func report(_ provider: FileProviderExtension?, from anchor: NSFileProviderSyncAnchor, to observer: NSFileProviderChangeObserver, folder: String?) {
+        Task.detached {
+            guard let provider else {
+                observer.finishEnumeratingWithError(NSFileProviderError(.serverUnreachable))
+                return
+            }
+            do {
+                let cursor = String(data: anchor.rawValue, encoding: .utf8) ?? ""
+                let feed = try provider.call { try provider.server().changes(cursor: cursor, waitSeconds: 0) }
+                if !feed.watching {
+                    // The server cannot watch its folder: folders are listed again when opened.
+                    if folder != nil { observer.finishEnumeratingWithError(NSFileProviderError(.syncAnchorExpired)) }
+                    else { observer.finishEnumeratingChanges(upTo: anchor, moreComing: false) }
+                    return
+                }
+                if feed.expired {
+                    observer.finishEnumeratingWithError(NSFileProviderError(.syncAnchorExpired))
+                    return
+                }
+                let writable = provider.writable()
+                var updated: [NSFileProviderItem] = []
+                var deleted: [NSFileProviderItemIdentifier] = []
+                for change in feed.changes {
+                    if let folder, (change.path as NSString).deletingLastPathComponent != folder { continue }
+                    if change.deleted {
+                        // Only items the system knows; what was inside a folder goes with it.
+                        if let id = provider.ids.known(change.path) {
+                            deleted.append(id)
+                            provider.ids.removed(change.path)
+                        }
+                    } else {
+                        updated.append(FileItem(path: change.path, name: (change.path as NSString).lastPathComponent, isFolder: change.dir, size: change.size, modified: change.modified, writable: writable, ids: provider.ids))
+                    }
+                }
+                if !deleted.isEmpty { observer.didDeleteItems(withIdentifiers: deleted) }
+                if !updated.isEmpty { observer.didUpdate(updated) }
+                observer.finishEnumeratingChanges(upTo: NSFileProviderSyncAnchor(Data(feed.cursor.utf8)), moreComing: false)
+            } catch {
+                observer.finishEnumeratingWithError(FileProviderExtension.fileError(error))
+            }
+        }
     }
 }
 

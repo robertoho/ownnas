@@ -74,7 +74,14 @@ final class ServerStore {
     }
 
     private func keychainQuery(_ id: String) -> [String: Any] {
-        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "app.ownnas.token", kSecAttrAccount as String: id]
+        var query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "app.ownnas.token", kSecAttrAccount as String: id]
+        #if os(macOS)
+        // On the Mac the app and its Finder extension share the tokens through the App Group,
+        // in the data protection Keychain (as on iOS), which needs no provisioning profile.
+        query[kSecUseDataProtectionKeychain as String] = true
+        if let group = ServerStore.appGroup { query[kSecAttrAccessGroup as String] = group }
+        #endif
+        return query
     }
 
     /// The Gallery workspace last shown for a server (`nil`: every photo).
