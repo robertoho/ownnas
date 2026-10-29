@@ -730,7 +730,8 @@ function recalc(model, { onlyMissing = false } = {}) {
     model.sheets.forEach((sheet, index) => {
       for (const [ref, cell] of sheet.cells) {
         if (!direct(cell, 'f')) continue;
-        if (onlyMissing && direct(cell, 'v') && !spills(cell, formulaOf(sheet, cell) || '')) continue;
+        // A formula saved with a value keeps it on opening; an empty <v/> (openpyxl writes them) is none.
+        if (onlyMissing && direct(cell, 'v')?.textContent && !spills(cell, formulaOf(sheet, cell) || '')) continue;
         const { row, col } = parseRef(ref);
         const value = cellValue(index, row, col);
         if (onlyMissing) model.computed.set(`${index}!${ref}`, value);
@@ -2677,8 +2678,8 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const look = table && !style.fill ? tableLook(model, table, row) : null;
     if (look) style = { ...look, ...style, fill: look.fill ?? style.fill, color: style.color || look.color, bold: style.bold || look.bold };
     const link = sheetExtras(model, s).links.get(refName(row, col));
-    // Links look like links, unless the file styles them otherwise.
-    if (link && !style.color) style = { ...style, color: '#0563C1', underline: true };
+    // Links look like links, unless the file colours them otherwise than its usual text.
+    if (link && (!style.color || style.color === cellStyle(model, 0).color)) style = { ...style, color: '#0563C1', underline: true };
     const formatted = formatValue(value, style.numFmt, formatOptions);
     let align = style.align;
     if (!align || align === 'general') align = typeof value === 'number' ? 'right' : typeof value === 'boolean' || value instanceof CellError ? 'center' : 'left';

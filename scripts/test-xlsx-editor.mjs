@@ -891,6 +891,13 @@ editor.destroy();
   editor11.destroy();
 }
 
+// Formulas saved with an empty value (as openpyxl writes them) are calculated on opening.
+{
+  const data = `<worksheet xmlns="${NS}"><sheetData><row r="1"><c r="A1"><v>2</v></c><c r="B1"><f>A1*21</f><v/></c></row></sheetData></worksheet>`;
+  const book = openXlsx(zipSync(Object.fromEntries(Object.entries({ ...files, 'xl/worksheets/sheet1.xml': data }).map(([name, text]) => [name, strToU8(text)]))));
+  assert.equal(book.computed.get('0!B1'), 42);
+}
+
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });
 assert.equal(container.querySelector('.office-save'), null);
 readonly.destroy();
