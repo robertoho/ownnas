@@ -1,0 +1,36 @@
+name: Windows client
+
+# Started by hand (Actions > Windows client > Run workflow, or `gh workflow run windows-client.yml`):
+# pushes are built and tested on Linux only. Builds ownnas-cloud (clients/windows), tests it
+# against a server on the runner, and keeps the programs to download.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --locked --release -p ownnas-cloud -p ownnas
+
+      - name: Test
+        run: cargo test --locked -p ownnas-cloud
+
+      - name: Explorer round trip
+        shell: pwsh
+        run: ./scripts/test-windows-cloud.ps1
+
+      - name: Keep the programs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ownnas-cloud-windows-x86_64
+          path: |
+            target/release/ownnas-cloud.exe
+            target/release/ownnas-cloud-agent.exe

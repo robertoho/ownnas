@@ -1,0 +1,28 @@
+[package]
+name = "ownnas-cloud"
+version = "0.1.0"
+edition = "2021"
+description = "OwnNAS servers in Windows Explorer, with online-only files (Cloud Files API)"
+
+# Signs in, adds the place in Explorer, shows status (a console program).
+[[bin]]
+name = "ownnas-cloud"
+path = "src/main.rs"
+
+# Keeps it in sync in the background, started at sign-in (no console window).
+[[bin]]
+name = "ownnas-cloud-agent"
+path = "src/agent.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+ownnas-core = { path = "../../crates/ownnas-core" }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+cloud-filter = "0.0.6"
+notify = { version = "8", default-features = false }
+nt-time = "0.8"
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
