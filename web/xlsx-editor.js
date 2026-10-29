@@ -369,7 +369,10 @@ function readSheet(name, path, xml, hidden, counter = { cells: 0 }) {
       }
     }
   }
-  const pane = direct(direct(direct(root, 'sheetViews'), 'sheetView'), 'pane');
+  const view = direct(direct(root, 'sheetViews'), 'sheetView');
+  // The zoom the sheet was last seen at.
+  sheet.zoom = Math.max(10, Math.min(400, Number(view?.getAttribute('zoomScale')) || 100)) / 100;
+  const pane = direct(view, 'pane');
   const frozen = ['frozen', 'frozenSplit'].includes(pane?.getAttribute('state'));
   sheet.frozen = {
     rows: frozen ? Math.max(0, Math.round(Number(pane.getAttribute('ySplit')) || 0)) : 0,
@@ -2265,7 +2268,18 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   tabs.setAttribute('aria-label', 'Sheets');
   const summary = document.createElement('span');
   summary.className = 'xlsx-summary';
-  footer.append(tabs, summary);
+  const zoomSelect = document.createElement('select');
+  zoomSelect.className = 'office-select xlsx-zoom';
+  zoomSelect.title = 'Zoom';
+  zoomSelect.setAttribute('aria-label', 'Zoom');
+  for (const percent of [50, 75, 90, 100, 110, 125, 150, 200]) {
+    const option = document.createElement('option');
+    option.value = String(percent);
+    option.textContent = `${percent}%`;
+    zoomSelect.append(option);
+  }
+  zoomSelect.value = '100';
+  footer.append(tabs, summary, zoomSelect);
   const note = document.createElement('p');
   note.className = 'xlsx-note';
   const live = document.createElement('span');
@@ -2646,6 +2660,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     if (!force && model.sheets[active]) selections.set(model.sheets[active], { anchor, focus, top: scroll.scrollTop, left: scroll.scrollLeft });
     active = index;
     extra = [];
+    setZoom(model.sheets[index].zoomNow ?? model.sheets[index].zoom ?? 1);
     const saved = selections.get(model.sheets[index]) || { anchor: { row: 1, col: 1 }, focus: { row: 1, col: 1 }, top: 0, left: 0 };
     anchor = saved.anchor; focus = saved.focus;
     geo = null;
@@ -2698,6 +2713,30 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       width: geo.colX[Math.min(c2, geo.cols) + 1] - geo.colX[c1], height: geo.rowY[Math.min(r2, geo.rows) + 1] - geo.rowY[r1],
     };
   };
+  // Zoom: the canvas is drawn scaled; scroll positions and sizes are read on its own scale.
+  let zoom = 1;
+  const sx = () => scroll.scrollLeft / zoom, sy = () => scroll.scrollTop / zoom;
+  const viewW = () => scroll.clientWidth / zoom, viewH = () => scroll.clientHeight / zoom;
+  function setZoom(next) {
+    const value = Math.max(0.25, Math.min(4, next));
+    if (value === zoom) return;
+    // Keep the top-left cell in view.
+    const keep = { left: sx(), top: sy() };
+    zoom = value;
+    if (model.sheets[active]) model.sheets[active].zoomNow = zoom;
+    canvas.style.zoom = String(zoom);
+    const percent = String(Math.round(zoom * 100));
+    if (![...zoomSelect.options].some(option => option.value === percent)) {
+      const option = document.createElement('option');
+      option.value = percent;
+      option.textContent = `${percent}%`;
+      zoomSelect.append(option);
+    }
+    zoomSelect.value = percent;
+    scroll.scrollLeft = keep.left * zoom;
+    scroll.scrollTop = keep.top * zoom;
+    schedule();
+  }
   const frozen = () => {
     const f = sheet().frozen || { rows: 0, cols: 0 };
     return { rows: Math.min(f.rows, geo ? geo.rows - 1 : f.rows), cols: Math.min(f.cols, geo ? geo.cols - 1 : f.cols) };
@@ -2706,8 +2745,8 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   function onScreen(r1, c1, r2, c2) {
     const box = rect(r1, c1, r2, c2);
     const f = frozen();
-    if (f.rows && r2 <= f.rows) box.top += scroll.scrollTop;
-    if (f.cols && c2 <= f.cols) box.left += scroll.scrollLeft;
+    if (f.rows && r2 <= f.rows) box.top += sy();
+    if (f.cols && c2 <= f.cols) box.left += sx();
     return box;
   }
 
@@ -2745,8 +2784,8 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     if (destroyed) return;
     layout();
     const s = sheet();
-    const top = scroll.scrollTop, left = scroll.scrollLeft;
-    const height = scroll.clientHeight || 600, width = scroll.clientWidth || 800;
+    const top = sy(), left = sx();
+    const height = viewH() || 600, width = viewW() || 800;
     // Frozen rows and columns stay in place: drawn over the rest, shifted by the scroll.
     const { rows: fr, cols: fc } = frozen();
     const frozenH = geo.rowY[fr + 1] - HEAD_H, frozenW = geo.colX[fc + 1] - HEAD_W;
@@ -3144,17 +3183,17 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   function scrollIntoView(row, col) {
     layout();
     const box = rect(row, col, row, col);
-    const viewW = scroll.clientWidth, viewH = scroll.clientHeight;
+    const width = viewW(), height = viewH();
     // Frozen rows and columns are always in view, and cover the start of the rest.
     const f = frozen();
     const frozenW = geo.colX[f.cols + 1] - HEAD_W, frozenH = geo.rowY[f.rows + 1] - HEAD_H;
     if (col > f.cols) {
-      if (box.left - HEAD_W - frozenW < scroll.scrollLeft) scroll.scrollLeft = box.left - HEAD_W - frozenW;
-      else if (box.left + box.width > scroll.scrollLeft + viewW) scroll.scrollLeft = box.left + box.width - viewW;
+      if (box.left - HEAD_W - frozenW < sx()) scroll.scrollLeft = (box.left - HEAD_W - frozenW) * zoom;
+      else if (box.left + box.width > sx() + width) scroll.scrollLeft = (box.left + box.width - width) * zoom;
     }
     if (row > f.rows) {
-      if (box.top - HEAD_H - frozenH < scroll.scrollTop) scroll.scrollTop = box.top - HEAD_H - frozenH;
-      else if (box.top + box.height > scroll.scrollTop + viewH) scroll.scrollTop = box.top + box.height - viewH;
+      if (box.top - HEAD_H - frozenH < sy()) scroll.scrollTop = (box.top - HEAD_H - frozenH) * zoom;
+      else if (box.top + box.height > sy() + height) scroll.scrollTop = (box.top + box.height - height) * zoom;
     }
   }
   function select(row, col, extend = false) {
@@ -4465,12 +4504,13 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   // Pointer
   function pointAt(event) {
     const box = canvas.getBoundingClientRect();
-    const x = event.clientX - box.left, y = event.clientY - box.top;
-    const head = { col: x - scroll.scrollLeft < HEAD_W, row: y - scroll.scrollTop < HEAD_H };
+    // On the canvas's own scale: zoom scales what is on screen.
+    const x = (event.clientX - box.left) / zoom, y = (event.clientY - box.top) / zoom;
+    const head = { col: x - sx() < HEAD_W, row: y - sy() < HEAD_H };
     // Over frozen rows or columns, the place is as if not scrolled.
     const f = frozen();
-    const inRows = f.rows && y - scroll.scrollTop < geo.rowY[f.rows + 1], inCols = f.cols && x - scroll.scrollLeft < geo.colX[f.cols + 1];
-    const px = inCols ? x - scroll.scrollLeft : x, py = inRows ? y - scroll.scrollTop : y;
+    const inRows = f.rows && y - sy() < geo.rowY[f.rows + 1], inCols = f.cols && x - sx() < geo.colX[f.cols + 1];
+    const px = inCols ? x - sx() : x, py = inRows ? y - sy() : y;
     return {
       x: px, y: py, head,
       row: find(geo.rowY, geo.rows, Math.max(HEAD_H, py)),
@@ -4664,8 +4704,8 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const edges = drag.axis === 'col' ? geo.colX : geo.rowY;
     const position = edges[drag.index] + Math.max(0, drag.px + at - drag.start);
     sizeGuide.style.cssText = drag.axis === 'col'
-      ? `left:${position - 1}px;top:${scroll.scrollTop}px;width:2px;height:${scroll.clientHeight}px`
-      : `top:${position - 1}px;left:${scroll.scrollLeft}px;height:2px;width:${scroll.clientWidth}px`;
+      ? `left:${position - 1}px;top:${sy()}px;width:2px;height:${viewH()}px`
+      : `top:${position - 1}px;left:${sx()}px;height:2px;width:${viewW()}px`;
     sizeGuide.hidden = false;
   }
   /** The columns (or rows) a header action applies to: all those selected whole, when `index` is
@@ -4958,7 +4998,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     else if (key === 'End' && mod) { event.preventDefault(); select(Math.max(1, sheet().maxRow), Math.max(1, sheet().maxCol)); }
     else if (key === 'PageDown' || key === 'PageUp') {
       event.preventDefault();
-      const rows = Math.max(1, Math.floor(scroll.clientHeight / (sheet().defaultRowPx || 20)) - 1);
+      const rows = Math.max(1, Math.floor(viewH() / (sheet().defaultRowPx || 20)) - 1);
       move(key === 'PageDown' ? rows : -rows, 0, event.shiftKey);
     } else if (key === 'F2') { event.preventDefault(); startEdit(); }
     else if (key === 'Delete' || key === 'Backspace') { event.preventDefault(); clearSelection(); }
@@ -4971,7 +5011,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       event.preventDefault();
       const box = rect(anchor.row, anchor.col, anchor.row, anchor.col);
       const at = canvas.getBoundingClientRect();
-      openMenu(at.left + box.left + box.width / 2, at.top + box.top + box.height / 2);
+      openMenu(at.left + (box.left + box.width / 2) * zoom, at.top + (box.top + box.height / 2) * zoom);
     }
     else if (mod && key.toLowerCase() === 'b') { event.preventDefault(); formatSelection({ bold: !activeStyle().bold }); }
     else if (mod && key.toLowerCase() === 'i') { event.preventDefault(); formatSelection({ italic: !activeStyle().italic }); }
@@ -5175,6 +5215,14 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   }
 
   scroll.addEventListener('scroll', schedule, { passive: true });
+  zoomSelect.addEventListener('change', () => { setZoom(Number(zoomSelect.value) / 100); scroll.focus({ preventScroll: true }); });
+  // Ctrl+wheel and pinching zoom the sheet, not the page.
+  scroll.addEventListener('wheel', event => {
+    if (!event.ctrlKey) return;
+    event.preventDefault();
+    setZoom(Math.round(zoom * (event.deltaY < 0 ? 1.1 : 1 / 1.1) * 100) / 100);
+  }, { passive: false });
+  setZoom(sheet().zoom || 1);
   const resize = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(schedule) : null;
   resize?.observe(scroll);
   drawTabs();

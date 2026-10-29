@@ -1009,6 +1009,25 @@ editor.destroy();
   editor15.destroy();
 }
 
+// Zoom: the grid scales, and clicks still land on the cell under the pointer.
+{
+  const editor16 = mountXlsxEditor(container, bytes, {});
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const canvas = container.querySelector('.xlsx-canvas');
+  const zoom = container.querySelector('.xlsx-zoom');
+  zoom.value = '200';
+  zoom.dispatchEvent(new Event('change'));
+  assert.equal(canvas.style.zoom, '2');
+  const at = (col, row) => ({ clientX: (46 + 64 * (col - 1) + 10) * 2, clientY: (24 + 20 * (row - 1) + 8) * 2 });
+  canvas.dispatchEvent(new window.MouseEvent('pointerdown', { button: 0, bubbles: true, cancelable: true, ...at(2, 3) }));
+  canvas.dispatchEvent(new window.MouseEvent('pointerup', { button: 0, bubbles: true, cancelable: true, ...at(2, 3) }));
+  assert.equal(container.querySelector('.xlsx-address').textContent, 'B3');
+  container.querySelector('.xlsx-scroll').dispatchEvent(new window.WheelEvent('wheel', { deltaY: 100, ctrlKey: true, bubbles: true, cancelable: true }));
+  assert.equal(zoom.value, '182', 'Ctrl+wheel zooms, the menu showing it');
+  assert.equal(canvas.style.zoom, '1.82');
+  editor16.destroy();
+}
+
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });
 assert.equal(container.querySelector('.office-save'), null);
 readonly.destroy();
