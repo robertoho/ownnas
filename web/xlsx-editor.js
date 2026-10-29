@@ -8,7 +8,7 @@ import { unzipSync, zipSync, strFromU8, strToU8 } from './vendor/three/addons/li
 import {
   BUILTIN_FORMATS, CellError, FUNCTION_HELP, changeDecimals, Unsupported, callAt, canPointAt, columnName, dateSerial, evaluate,
   formatGeneral, formatValue, formulaWordAt, fromFileFormula, quoteSheet, renameSheet, toFileFormula, localeSeparators, moveFormula, moveSpan, moveSqref, parseFormula, parseRef,
-  refName, serialParts, shiftFormula,
+  refName, serialParts, shiftFormula, tokenize,
 } from './sheet-formula.js';
 
 const MAIN = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
@@ -2065,6 +2065,18 @@ const CUSTOM_EXAMPLES = [
   ['dd/mm/yyyy', 'Day/month/year'], ['d mmm yyyy', '1 Jan 2026'], ['dddd', 'Weekday'], ['hh:mm:ss', 'Time'], ['[h]:mm', 'Hours over 24'],
   ['#,##0.00;[Red]-#,##0.00', 'Negative in red'], ['0;-0;"–"', 'Dash for zero'], ['@', 'Text'],
 ];
+/** What each error value means, for the people who meet them. */
+const ERROR_HELP = {
+  '#DIV/0!': 'Divides by zero, or by an empty cell.',
+  '#VALUE!': 'Uses the wrong kind of value: text where a number is needed, or a range where one cell is.',
+  '#REF!': 'Refers to cells that are gone: deleted, or off the edge of the sheet.',
+  '#NAME?': 'Uses a name or function that does not exist; check the spelling.',
+  '#N/A': 'A value was not found (by VLOOKUP, MATCH or XLOOKUP, say), or is marked as not available.',
+  '#NUM!': 'A number is out of range or impossible, like the square root of a negative number.',
+  '#NULL!': 'Two ranges that do not meet.',
+  '#SPILL!': 'The results need empty cells below and to the right, and something is in the way.',
+  '#CALC!': 'The calculation gives nothing, like FILTER finding no rows; give it a value for that case.',
+};
 const FONTS = ['Calibri', 'Aptos', 'Arial', 'Cambria', 'Consolas', 'Courier New', 'Georgia', 'Segoe UI', 'Tahoma', 'Times New Roman', 'Trebuchet MS', 'Verdana'];
 const SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48, 72];
 
@@ -2239,7 +2251,11 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   const promptTip = document.createElement('div');
   promptTip.className = 'xlsx-prompt';
   promptTip.hidden = true;
-  canvas.append(layer, selectionBox, activeBox, pointBox, fillBox, fillHandle, sizeGuide, validButton, promptTip, cellEditor);
+  // What an error in the selected cell means, and where it comes from.
+  const errorTip = document.createElement('div');
+  errorTip.className = 'xlsx-prompt xlsx-error-tip';
+  errorTip.hidden = true;
+  canvas.append(layer, selectionBox, activeBox, pointBox, fillBox, fillHandle, sizeGuide, validButton, promptTip, errorTip, cellEditor);
   scroll.append(canvas);
   const footer = document.createElement('div');
   footer.className = 'xlsx-footer';
@@ -2793,6 +2809,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       }
       el.textContent = text;
       if (info.link) el.title = `${info.link.tip || info.link.url || info.link.location}\n${IS_MAC ? '⌘' : 'Ctrl'}+click to open`;
+      else if (info.value instanceof CellError) el.title = ERROR_HELP[info.value.code] || '';
       const css = [`left:${box.left}px`, `top:${box.top}px`, `width:${width}px`, `height:${box.height}px`, `justify-content:${info.align === 'right' ? 'flex-end' : info.align === 'center' ? 'center' : 'flex-start'}`, `text-align:${info.align}`];
       if (style.fill) css.push(`background:${style.fill}`);
       // A data bar, as long as the value is far between the rule's least and most.
@@ -3012,6 +3029,48 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       promptTip.append(rule.prompt);
       promptTip.style.cssText = `left:${cellBox.left + 8}px;top:${cellBox.top + cellBox.height + 6}px`;
     }
+    const explained = editing ? null : explainCell(anchor.row, anchor.col);
+    errorTip.hidden = !explained || !promptTip.hidden;
+    if (!errorTip.hidden) {
+      errorTip.textContent = explained;
+      errorTip.style.cssText = `left:${cellBox.left + 8}px;top:${cellBox.top + cellBox.height + 6}px`;
+    }
+  }
+  /** Why a cell shows an error (or the value saved in the file), or null when it shows neither. */
+  function explainCell(row, col) {
+    const key = `${active}!${refName(row, col)}`;
+    if (model.failed.has(key)) return 'This formula uses something this editor cannot calculate, so it shows the value saved in the file.';
+    const value = valueAt(model, active, row, col);
+    if (!(value instanceof CellError)) return null;
+    let text = `${value.code} ${ERROR_HELP[value.code] || 'An error.'}`;
+    const source = errorSource(row, col, value.code);
+    if (source) text += ` It comes from ${source}.`;
+    return text;
+  }
+  /** The first cell a formula reads that has the same error, if any: where to look. */
+  function errorSource(row, col, code) {
+    const s = sheet();
+    const formula = formulaOf(s, s.cells.get(refName(row, col)));
+    if (formula == null) return null;
+    let tokens;
+    try { tokens = tokenize(formula); } catch { return null; }
+    let looked = 0;
+    for (const token of tokens) {
+      if (token.t !== 'ref' || !token.a) continue;
+      const index = token.sheet == null ? active : model.sheets.findIndex(item => item.name.toLowerCase() === token.sheet.toLowerCase());
+      if (index < 0) continue;
+      const target = model.sheets[index];
+      const b = token.b || token.a;
+      const r1 = token.a.row ?? 1, c1 = token.a.col ?? 1, r2 = Math.min(b.row ?? target.maxRow, target.maxRow), c2 = Math.min(b.col ?? target.maxCol, target.maxCol);
+      for (let r = Math.min(r1, r2); r <= Math.max(r1, r2); r++) {
+        for (let c = Math.min(c1, c2); c <= Math.max(c1, c2); c++) {
+          if (++looked > 20000) return null;
+          const found = valueAt(model, index, r, c);
+          if (found instanceof CellError && found.code === code) return `${index === active ? '' : `${quoteSheet(target.name)}!`}${refName(r, c)}`;
+        }
+      }
+    }
+    return null;
   }
   /** The list of choices for the selected cell, to pick one. */
   function openChoices() {

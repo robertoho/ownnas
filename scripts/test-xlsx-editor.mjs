@@ -963,6 +963,29 @@ editor.destroy();
   editor13.destroy();
 }
 
+// Errors are explained, with the cell they come from.
+{
+  const editor14 = mountXlsxEditor(container, bytes, {});
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const grid = container.querySelector('.xlsx-scroll');
+  const input = container.querySelector('.xlsx-cell-editor');
+  const tip = container.querySelector('.xlsx-error-tip');
+  const key = (target, name, extra = {}) => target.dispatchEvent(new KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true, ...extra }));
+  const go = (col, row) => { key(grid, 'Home', { ctrlKey: true }); for (let i = 1; i < row; i++) key(grid, 'ArrowDown'); for (let i = 1; i < col; i++) key(grid, 'ArrowRight'); };
+  const enter = text => { key(grid, text[0]); input.value = text; input.dispatchEvent(new Event('input')); key(input, 'Enter'); };
+  grid.focus();
+  go(4, 1); enter('=1/0');
+  go(4, 2); enter('=D1*2');
+  go(4, 2);
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  assert.equal(tip.hidden, false);
+  assert.equal(tip.textContent, '#DIV/0! Divides by zero, or by an empty cell. It comes from D1.');
+  go(1, 1);
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  assert.equal(tip.hidden, true, 'only errors are explained');
+  editor14.destroy();
+}
+
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });
 assert.equal(container.querySelector('.office-save'), null);
 readonly.destroy();
