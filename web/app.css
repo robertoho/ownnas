@@ -747,6 +747,8 @@ input, select, textarea {
   text-overflow: ellipsis;
   white-space: nowrap;
   flex: 0 0 auto;
+  /* A block, so a long name ends in "…" (a flex button would cut it off at both ends). */
+  display: block;
 }
 .top-actions {
   display: flex;
@@ -3124,7 +3126,7 @@ dialog { color: var(--text); }
 
 .files.columns { display:flex; align-items:stretch; gap:0; overflow:auto; min-height:100%; padding:0; columns:auto; }
 .finder-column { flex:0 0 260px; width:260px; border-right:1px solid var(--line); padding:8px; }
-.finder-column-title { padding:8px; font-weight:700; position:sticky; top:0; background:var(--panel); }
+.finder-column-title { padding:8px; font-weight:700; position:sticky; top:0; background:var(--panel); min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
 .column-entry { display:flex; align-items:center; gap:8px; width:100%; border:0; border-radius:6px; text-align:left; padding:8px; background:transparent; }
 .column-entry>span:nth-child(2) { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .column-glyph { width:22px; height:22px; flex-shrink:0; }

@@ -230,7 +230,7 @@ async function renderColumns() {
     columnEntries = new Map();
     $("files").innerHTML = paths.map((p, index) => {
       const entries = index === paths.length - 1 ? sortedEntries() : listings[index].entries;
-      return `<section class="finder-column" data-column-path="${esc(p)}" aria-label="${esc(p || state.me.rootName || 'Library')}"><div class="finder-column-title">${esc(p.split('/').pop() || state.me.rootName || 'Library')}</div>${entries.map(entry => {
+      return `<section class="finder-column" data-column-path="${esc(p)}" aria-label="${esc(p || state.me.rootName || 'Library')}"><div class="finder-column-title" title="${esc(p.split('/').pop() || state.me.rootName || 'Library')}">${esc(p.split('/').pop() || state.me.rootName || 'Library')}</div>${entries.map(entry => {
         columnEntries.set(entry.path, entry);
         return `<button type="button" class="column-entry ${paths[index+1] === entry.path ? 'active' : ''}" draggable="${!state.me.readonly}" data-column-entry="${esc(entry.path)}" data-dir="${entry.dir ? 1 : 0}"><span class="column-glyph">${entryIcon(entry)}</span><span>${esc(entry.name)}</span>${entry.dir ? '<span>›</span>' : ''}</button>`;
       }).join('')}</section>`;
@@ -631,7 +631,7 @@ function renderCrumbs() {
   parts.forEach((part, index) => {
     walked = walked ? `${walked}/${part}` : part;
     const current = index === parts.length - 1 ? ' aria-current="page"' : "";
-    html += `<span class="muted">/</span><button type="button" data-go="${esc(walked)}"${current}>${esc(specialFolderLabel(part))}</button>`;
+    html += `<span class="muted">/</span><button type="button" data-go="${esc(walked)}" title="${esc(specialFolderLabel(part))}"${current}>${esc(specialFolderLabel(part))}</button>`;
   });
   nav.innerHTML = html;
 }
