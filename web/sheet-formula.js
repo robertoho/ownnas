@@ -181,6 +181,27 @@ export function moveSqref(sqref, axis, at, count) {
   }).filter(Boolean).join(' ');
 }
 
+/** A sheet name as formulas write it: quoted unless plain letters, digits and underscores. */
+export function quoteSheet(name) {
+  return /^[A-Za-z_][A-Za-z0-9_.]*$/.test(name) && !/^[A-Za-z]{1,3}\d+$/.test(name) && !/^(?:TRUE|FALSE)$/i.test(name)
+    ? name : `'${name.replace(/'/g, "''")}'`;
+}
+
+/** A formula's references to sheet `from` pointed at `to` instead, or with `to` null (the sheet
+ * deleted) made #REF!. */
+export function renameSheet(formula, from, to) {
+  let tokens;
+  try { tokens = tokenize(formula); } catch { return formula; }
+  let out = '', at = 0;
+  for (const token of tokens) {
+    if (token.t !== 'ref' || token.sheet == null || token.sheet.toLowerCase() !== from.toLowerCase()) continue;
+    const bang = token.text.lastIndexOf('!');
+    out += formula.slice(at, token.start) + (to == null ? '#REF!' : `${quoteSheet(to)}${token.text.slice(bang)}`);
+    at = token.start + token.text.length;
+  }
+  return out + formula.slice(at);
+}
+
 /** Functions newer than Excel 2007, which files name with a prefix (Excel shows #NAME? without it). */
 const FILE_PREFIX = {
   CONCAT: '_xlfn.', TEXTJOIN: '_xlfn.', IFNA: '_xlfn.', XOR: '_xlfn.', XLOOKUP: '_xlfn.', 'STDEV.S': '_xlfn.', 'STDEV.P': '_xlfn.',

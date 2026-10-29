@@ -7,7 +7,7 @@
 import { unzipSync, zipSync, strFromU8, strToU8 } from './vendor/three/addons/libs/fflate.module.js';
 import {
   BUILTIN_FORMATS, CellError, FUNCTION_HELP, Unsupported, callAt, canPointAt, columnName, dateSerial, evaluate,
-  formatGeneral, formatValue, formulaWordAt, fromFileFormula, toFileFormula, localeSeparators, moveFormula, moveSpan, moveSqref, parseFormula, parseRef,
+  formatGeneral, formatValue, formulaWordAt, fromFileFormula, quoteSheet, renameSheet, toFileFormula, localeSeparators, moveFormula, moveSpan, moveSqref, parseFormula, parseRef,
   refName, serialParts, shiftFormula,
 } from './sheet-formula.js';
 
@@ -1104,6 +1104,172 @@ function relinkSheets(model) {
   }
 }
 
+// --- Sheets -------------------------------------------------------------------------------------
+
+const WORKSHEET_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet';
+const WORKSHEET_CONTENT = 'application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml';
+const EMPTY_SHEET = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="${MAIN}" xmlns:r="${DOC_REL}"><dimension ref="A1"/><sheetViews><sheetView workbookViewId="0"/></sheetViews><sheetFormatPr defaultRowHeight="15"/><sheetData/><pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/></worksheet>`;
+
+/** Why a sheet cannot have a name, or null when it can. */
+export function sheetNameProblem(model, name, except = null) {
+  if (!name.trim()) return 'A sheet needs a name.';
+  if (name.length > 31) return 'Sheet names can be at most 31 characters long.';
+  if (/[:\\/?*[\]]/.test(name)) return 'Sheet names cannot contain : \\ / ? * [ or ].';
+  if (/^'|'$/.test(name)) return "Sheet names cannot start or end with an apostrophe.";
+  if (name.toLowerCase() === 'history') return '"History" is a name Excel keeps for itself.';
+  const taken = [...model.workbookXml.getElementsByTagNameNS(MAIN, 'sheet')].some(node => node !== except?.node && (node.getAttribute('name') || '').toLowerCase() === name.toLowerCase());
+  return taken ? `There is already a sheet called "${name}".` : null;
+}
+
+/** Every formula and defined name in the workbook passed through `change`. */
+function eachFormula(model, change) {
+  for (const sheet of model.sheets) {
+    let changedHere = false;
+    for (const name of ['f', 'formula', 'formula1', 'formula2']) {
+      for (const node of sheet.root.getElementsByTagNameNS(MAIN, name)) {
+        if (!node.textContent) continue;
+        const next = change(node.textContent);
+        if (next !== node.textContent) { node.textContent = next; changedHere = true; }
+      }
+    }
+    if (changedHere) model.touched.add(sheet);
+  }
+  for (const node of model.workbookXml.getElementsByTagNameNS(MAIN, 'definedName')) {
+    const next = change(node.textContent);
+    if (next !== node.textContent) { node.textContent = next; model.workbookTouched = true; }
+  }
+}
+
+/** Runs `work`, which moves, adds or removes <sheet> elements, keeping names local to a sheet with
+ * their sheet (they count sheets by position) and dropping those of a sheet removed. */
+function keepLocalNames(model, work) {
+  const nodes = () => [...model.workbookXml.getElementsByTagNameNS(MAIN, 'sheet')];
+  const before = nodes();
+  const locals = [...model.workbookXml.getElementsByTagNameNS(MAIN, 'definedName')]
+    .filter(node => node.hasAttribute('localSheetId'))
+    .map(node => [node, before[Number(node.getAttribute('localSheetId'))]]);
+  const result = work();
+  const after = nodes();
+  for (const [node, sheetNode] of locals) {
+    const position = after.indexOf(sheetNode);
+    if (position < 0) node.remove(); else node.setAttribute('localSheetId', String(position));
+  }
+  const names = direct(model.workbookXml.documentElement, 'definedNames');
+  if (names && !kids(names, 'definedName').length) names.remove();
+  // The tab shown on opening must still be a sheet.
+  const view = direct(direct(model.workbookXml.documentElement, 'bookViews'), 'workbookView');
+  if (view && Number(view.getAttribute('activeTab') || 0) >= after.length) view.setAttribute('activeTab', '0');
+  if (view && Number(view.getAttribute('firstSheet') || 0) >= after.length) view.removeAttribute('firstSheet');
+  model.workbookTouched = true;
+  return result;
+}
+
+function editContentTypes(model, change) {
+  const types = parseXml(strFromU8(model.parts['[Content_Types].xml']), 'Content types');
+  change(types);
+  model.parts['[Content_Types].xml'] = strToU8(serialize(types));
+}
+
+/** Renames a sheet, and the references to it in formulas and names. */
+export function renameSheetTo(model, sheet, name) {
+  if (name === sheet.name) return;
+  const problem = sheetNameProblem(model, name, sheet);
+  if (problem) throw new Error(problem);
+  eachFormula(model, formula => renameSheet(formula, sheet.name, name));
+  sheet.name = name;
+  sheet.node.setAttribute('name', name);
+  model.workbookTouched = true;
+}
+
+/** Adds a worksheet after the sheet at `after` (its XML `text`, or an empty sheet). Returns its index. */
+export function addSheet(model, name, after, text = EMPTY_SHEET) {
+  const problem = sheetNameProblem(model, name);
+  if (problem) throw new Error(problem);
+  let n = 1;
+  while (model.parts[`xl/worksheets/sheet${n}.xml`] || model.sheets.some(sheet => sheet.path === `xl/worksheets/sheet${n}.xml`)) n++;
+  const path = `xl/worksheets/sheet${n}.xml`;
+  model.parts[path] = strToU8(text);
+  const ids = new Set([...model.relsXml.getElementsByTagNameNS(PKG_REL, 'Relationship')].map(rel => rel.getAttribute('Id')));
+  let id = 1;
+  while (ids.has(`rId${id}`)) id++;
+  const rel = model.relsXml.createElementNS(PKG_REL, 'Relationship');
+  rel.setAttribute('Id', `rId${id}`);
+  rel.setAttribute('Type', WORKSHEET_TYPE);
+  rel.setAttribute('Target', `worksheets/sheet${n}.xml`);
+  model.relsXml.documentElement.append(rel);
+  model.parts['xl/_rels/workbook.xml.rels'] = strToU8(serialize(model.relsXml));
+  editContentTypes(model, types => {
+    if ([...types.getElementsByTagNameNS(CONTENT_TYPES, 'Override')].some(item => item.getAttribute('PartName') === `/${path}`)) return;
+    const override = types.createElementNS(CONTENT_TYPES, 'Override');
+    override.setAttribute('PartName', `/${path}`);
+    override.setAttribute('ContentType', WORKSHEET_CONTENT);
+    types.documentElement.append(override);
+  });
+  const list = direct(model.workbookXml.documentElement, 'sheets');
+  const node = model.workbookXml.createElementNS(MAIN, 'sheet');
+  node.setAttribute('name', name);
+  node.setAttribute('sheetId', String(Math.max(0, ...kids(list, 'sheet').map(item => Number(item.getAttribute('sheetId')) || 0)) + 1));
+  node.setAttributeNS(DOC_REL, 'r:id', `rId${id}`);
+  const sheet = readSheet(name, path, parseXml(text, `Worksheet ${name}`), false);
+  sheet.node = node;
+  sheet.relId = `rId${id}`;
+  keepLocalNames(model, () => list.insertBefore(node, model.sheets[after]?.node.nextSibling || null));
+  model.sheets.splice(after + 1, 0, sheet);
+  model.touched.add(sheet);
+  return after + 1;
+}
+
+/** A copy of a sheet after it. Parts it links to (pictures, charts, comments, tables) are left
+ * out of the copy, which says so by returning true. */
+export function duplicateSheet(model, index) {
+  const source = model.sheets[index];
+  const copy = parseXml(serialize(source.xml), 'Worksheet');
+  let dropped = false;
+  for (const node of [...copy.getElementsByTagName('*')]) {
+    if (!node.isConnected || ![...node.attributes].some(attr => attr.namespaceURI === DOC_REL)) continue;
+    node.remove();
+    dropped = true;
+  }
+  for (const name of ['hyperlinks', 'tableParts']) {
+    const list = direct(copy.documentElement, name);
+    if (list && !list.children.length) list.remove();
+  }
+  // Only one sheet is the one selected.
+  for (const view of copy.getElementsByTagNameNS(MAIN, 'sheetView')) view.removeAttribute('tabSelected');
+  let n = 2, name;
+  do { name = `${source.name.slice(0, 26)} (${n++})`; } while (sheetNameProblem(model, name));
+  return { index: addSheet(model, name, index, serialize(copy)), dropped };
+}
+
+/** Deletes a sheet: references to it become #REF!. */
+export function deleteSheet(model, index) {
+  const sheet = model.sheets[index];
+  if (!sheet.hidden && model.sheets.filter(item => !item.hidden).length <= 1) throw new Error('A workbook needs at least one visible sheet.');
+  keepLocalNames(model, () => sheet.node.remove());
+  model.sheets.splice(index, 1);
+  model.touched.delete(sheet);
+  eachFormula(model, formula => renameSheet(formula, sheet.name, null));
+  for (const rel of [...model.relsXml.getElementsByTagNameNS(PKG_REL, 'Relationship')]) if (rel.getAttribute('Id') === sheet.relId) rel.remove();
+  model.parts['xl/_rels/workbook.xml.rels'] = strToU8(serialize(model.relsXml));
+  editContentTypes(model, types => {
+    for (const item of [...types.getElementsByTagNameNS(CONTENT_TYPES, 'Override')]) if (item.getAttribute('PartName') === `/${sheet.path}`) item.remove();
+  });
+  delete model.parts[sheet.path];
+  delete model.parts[sheet.path.replace(/([^/]+)$/, '_rels/$1.rels')];
+}
+
+/** Moves a sheet one place left (-1) or right (1) among the tabs. */
+export function moveSheet(model, index, step) {
+  const to = index + step;
+  if (to < 0 || to >= model.sheets.length) return index;
+  const [sheet] = model.sheets.splice(index, 1);
+  model.sheets.splice(to, 0, sheet);
+  const other = model.sheets[step < 0 ? to + 1 : to - 1];
+  keepLocalNames(model, () => sheet.node.parentNode.insertBefore(sheet.node, step < 0 ? other.node : other.node.nextSibling));
+  return to;
+}
+
 // --- Sorting and filtering ----------------------------------------------------------------------
 
 /** A sheet's filter: its range (header row first) and element, or null. */
@@ -1365,8 +1531,8 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   const locale = typeof navigator !== 'undefined' ? navigator.language : 'en-US';
   const separators = localeSeparators(locale);
   const formatOptions = { ...separators, date1904: model.date1904 };
-  const visibleSheets = model.sheets.map((sheet, index) => index).filter(index => !model.sheets[index].hidden);
-  let active = model.sheets[model.activeSheet]?.hidden ? visibleSheets[0] ?? 0 : model.activeSheet;
+  const visibleSheets = () => model.sheets.map((sheet, index) => index).filter(index => !model.sheets[index].hidden);
+  let active = model.sheets[model.activeSheet]?.hidden ? visibleSheets()[0] ?? 0 : model.activeSheet;
   const selections = new Map();
   let anchor = { row: 1, col: 1 }, focus = { row: 1, col: 1 };
   let editing = null, dragging = null, saving = false, destroyed = false, frame = 0, geo = null;
@@ -1764,23 +1930,94 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   // Sheet tabs
   function drawTabs() {
     tabs.replaceChildren();
-    for (const index of visibleSheets) {
+    for (const index of visibleSheets()) {
       const tab = document.createElement('button');
       tab.type = 'button';
       tab.className = 'xlsx-tab';
       tab.textContent = model.sheets[index].name;
       tab.setAttribute('role', 'tab');
       tab.setAttribute('aria-selected', String(index === active));
-      tab.addEventListener('click', () => showSheet(index));
+      if (!readonly) tab.title = 'Double-click to rename; right-click for more';
+      // Typing a formula, the keyboard stays in it: another sheet's cells can go into it.
+      tab.addEventListener('mousedown', event => { if (editing) event.preventDefault(); });
+      tab.addEventListener('click', () => {
+        if (editing && index !== active && formulaPointable()) pointAcross(index);
+        else showSheet(index, { keepEdit: !!editing?.away });
+      });
+      tab.addEventListener('dblclick', () => renameTab(index, tab));
+      tab.addEventListener('contextmenu', event => {
+        event.preventDefault();
+        if (index !== active) showSheet(index);
+        openMenu(event.clientX, event.clientY, tabMenu(index));
+      });
       tabs.append(tab);
     }
+    if (!readonly && !model.protected) {
+      const add = document.createElement('button');
+      add.type = 'button';
+      add.className = 'xlsx-tab xlsx-tab-add';
+      add.textContent = '+';
+      add.title = 'Add a sheet';
+      add.setAttribute('aria-label', 'Add a sheet');
+      add.addEventListener('click', () => {
+        let n = model.sheets.length + 1;
+        while (sheetNameProblem(model, `Sheet${n}`)) n++;
+        bookChange(() => addSheet(model, `Sheet${n}`, active));
+      });
+      tabs.append(add);
+    }
   }
-  function showSheet(index) {
-    if (index === active) return;
-    commitEdit();
-    selections.set(active, { anchor, focus, top: scroll.scrollTop, left: scroll.scrollLeft });
+  function tabMenu(index) {
+    const sheetNow = model.sheets[index];
+    const items = [
+      ['Rename…', () => renameTab(index, [...tabs.children].find(tab => tab.textContent === sheetNow.name))],
+      ['Duplicate', () => {
+        let dropped = false;
+        if (bookChange(() => { const copy = duplicateSheet(model, index); dropped = copy.dropped; return copy.index; }) && dropped) {
+          notice('Copied without its pictures, charts, comments, links and tables.');
+        }
+      }],
+    ];
+    if (index > 0) items.push(['Move left', () => bookChange(() => moveSheet(model, index, -1))]);
+    if (index < model.sheets.length - 1) items.push(['Move right', () => bookChange(() => moveSheet(model, index, 1))]);
+    items.push('-', [`Delete "${sheetNow.name}"`, () => {
+      if (bookChange(() => { deleteSheet(model, index); return Math.min(index, model.sheets.length - 1); })) notice(`Deleted the sheet "${sheetNow.name}". Undo brings it back.`);
+    }]);
+    return items;
+  }
+  /** Renames a sheet in place: its tab becomes a text box. */
+  function renameTab(index, tab) {
+    if (readonly || model.protected || !tab) return;
+    const input = document.createElement('input');
+    input.className = 'xlsx-tab-input';
+    input.value = model.sheets[index].name;
+    input.maxLength = 31;
+    input.setAttribute('aria-label', 'Sheet name');
+    tab.replaceWith(input);
+    input.focus();
+    input.select();
+    let done = false;
+    const finish = save => {
+      if (done) return;
+      done = true;
+      const name = input.value.trim();
+      if (save && name && name !== model.sheets[index].name) bookChange(() => { renameSheetTo(model, model.sheets[index], name); return index; });
+      drawTabs();
+      scroll.focus({ preventScroll: true });
+    };
+    input.addEventListener('keydown', event => {
+      event.stopPropagation();
+      if (event.key === 'Enter') { event.preventDefault(); finish(true); }
+      else if (event.key === 'Escape') { event.preventDefault(); finish(false); }
+    });
+    input.addEventListener('blur', () => finish(true));
+  }
+  function showSheet(index, { keepEdit = false, force = false } = {}) {
+    if (index === active && !force) return;
+    if (!keepEdit) commitEdit();
+    if (!force && model.sheets[active]) selections.set(model.sheets[active], { anchor, focus, top: scroll.scrollTop, left: scroll.scrollLeft });
     active = index;
-    const saved = selections.get(index) || { anchor: { row: 1, col: 1 }, focus: { row: 1, col: 1 }, top: 0, left: 0 };
+    const saved = selections.get(model.sheets[index]) || { anchor: { row: 1, col: 1 }, focus: { row: 1, col: 1 }, top: 0, left: 0 };
     anchor = saved.anchor; focus = saved.focus;
     geo = null;
     drawTabs();
@@ -1825,10 +2062,13 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     }
     return lo;
   }
-  const rect = (r1, c1, r2, c2) => ({
-    left: geo.colX[c1], top: geo.rowY[r1],
-    width: geo.colX[Math.min(c2, geo.cols) + 1] - geo.colX[c1], height: geo.rowY[Math.min(r2, geo.rows) + 1] - geo.rowY[r1],
-  });
+  const rect = (r1, c1, r2, c2) => {
+    if (!geo) layout();
+    return {
+      left: geo.colX[c1], top: geo.rowY[r1],
+      width: geo.colX[Math.min(c2, geo.cols) + 1] - geo.colX[c1], height: geo.rowY[Math.min(r2, geo.rows) + 1] - geo.rowY[r1],
+    };
+  };
   const frozen = () => {
     const f = sheet().frozen || { rows: 0, cols: 0 };
     return { rows: Math.min(f.rows, geo ? geo.rows - 1 : f.rows), cols: Math.min(f.cols, geo ? geo.cols - 1 : f.cols) };
@@ -2280,6 +2520,56 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     }
     Object.assign(model.parts, state.parts);
   }
+  /** A change to the workbook's sheets (adding, renaming, deleting, moving), with undo: it keeps
+   * the list of sheets and every part of the workbook as they were before and after. `work`
+   * returns the index of the sheet to show after, or nothing to stay. */
+  const structureLocked = () => flag(direct(model.workbookXml.documentElement, 'workbookProtection')?.getAttribute('lockStructure'));
+  function bookChange(work) {
+    if (readonly || saving) return false;
+    if (structureLocked()) { notice("This workbook's sheets are protected: they cannot be added, renamed, moved or deleted here."); return false; }
+    commitEdit();
+    selections.set(model.sheets[active], { anchor, focus, top: scroll.scrollTop, left: scroll.scrollLeft });
+    const capture = () => ({
+      list: model.sheets.slice(),
+      names: model.sheets.map(s => s.name),
+      texts: model.sheets.map(s => serialize(s.xml)),
+      workbook: serialize(model.workbookXml),
+      rels: serialize(model.relsXml),
+      parts: { ...model.parts },
+    });
+    const before = { ...capture(), active };
+    let shown;
+    try {
+      shown = work();
+    } catch (error) {
+      restoreBook(before);
+      showSheet(Math.min(before.active, model.sheets.length - 1), { force: true });
+      notice(error.message);
+      return false;
+    }
+    const target = typeof shown === 'number' ? shown : Math.min(active, model.sheets.length - 1);
+    record({ book: { before, after: { ...capture(), active: target } } });
+    showSheet(target, { force: true });
+    drawTabs();
+    changed();
+    return true;
+  }
+  function restoreBook(state) {
+    for (const path of Object.keys(model.parts)) if (!(path in state.parts)) delete model.parts[path];
+    Object.assign(model.parts, state.parts);
+    model.sheets = state.list.slice();
+    model.workbookXml = parseXml(state.workbook, 'Workbook XML');
+    model.relsXml = parseXml(state.rels, 'Workbook relationships');
+    model.workbookTouched = true;
+    state.list.forEach((s, i) => {
+      s.name = state.names[i];
+      s.xml = parseXml(state.texts[i], `Worksheet ${s.name}`);
+      rereadSheet(s);
+      model.touched.add(s);
+    });
+    relinkSheets(model);
+    for (const s of [...model.touched]) if (!model.sheets.includes(s)) model.touched.delete(s);
+  }
   function notice(text) {
     message = text;
     live.textContent = text;
@@ -2299,6 +2589,16 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     if (saving || editing) return;
     const entry = direction < 0 ? history[historyAt - 1] : history[historyAt];
     if (!entry) return;
+    if (entry.book) {
+      selections.set(model.sheets[active], { anchor, focus, top: scroll.scrollTop, left: scroll.scrollLeft });
+      const state = direction < 0 ? entry.book.before : entry.book.after;
+      restoreBook(state);
+      historyAt += direction;
+      showSheet(Math.min(state.active, model.sheets.length - 1), { force: true });
+      drawTabs();
+      changed();
+      return;
+    }
     if (entry.sheet !== active) showSheet(entry.sheet);
     if (entry.snapshot) {
       restore(direction < 0 ? entry.snapshot.before : entry.snapshot.after);
@@ -2852,6 +3152,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     cellEditor.hidden = true;
     hideAssist();
     placePoint();
+    if (index !== active && model.sheets[index]) showSheet(index);
     if (value !== original && index === active) {
       const s = sheet();
       transaction(touch => writeInput(s, row, col, value, touch));
@@ -2861,7 +3162,9 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   }
   function cancelEdit() {
     if (!editing) return;
+    const index = editing.sheet;
     editing = null;
+    if (index !== active && model.sheets[index]) showSheet(index);
     cellEditor.hidden = true;
     hideAssist();
     placePoint();
@@ -2986,7 +3289,23 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const input = editorInput();
     return input.selectionStart === point.end && input.selectionEnd === point.end && input.value.slice(point.start, point.end) === point.text ? point : null;
   }
-  const canPoint = () => editing && editing.sheet === active && (activePoint() || canPointAt(editorInput().value, editorInput().selectionStart));
+  const formulaPointable = () => !!editing && (activePoint() || canPointAt(editorInput().value, editorInput().selectionStart));
+  const canPoint = () => editing && (editing.sheet === active || editing.away) && formulaPointable();
+  /** Typing a formula, a click on another sheet's tab shows that sheet to point at its cells; the
+   * formula bar keeps the typing, and finishing goes back to the cell. */
+  function pointAcross(index) {
+    const input = editorInput();
+    const start = input.selectionStart, end = input.selectionEnd;
+    formulaInput.value = input.value;
+    editing.bar = true;
+    editing.away = true;
+    cellEditor.hidden = true;
+    showSheet(index, { keepEdit: true });
+    formulaInput.focus({ preventScroll: true });
+    formulaInput.setSelectionRange(start, end);
+    placePoint();
+    updateAssist();
+  }
   /** Puts the reference of a cell (or, extending, of the range from where pointing started) at
    * the caret, in place of the one pointed at before. */
   function pointTo(row, col, extend = false) {
@@ -2996,12 +3315,14 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     col = Math.max(1, Math.min(LAST_COL, col));
     const merge = !extend && sheet().covered.get(refName(row, col));
     if (merge) { row = merge.r1; col = merge.c1; }
-    const from = extend && before ? before.from : { row, col };
+    const from = extend && before && before.sheet === active ? before.from : { row, col };
     const range = { r1: Math.min(from.row, row), c1: Math.min(from.col, col), r2: Math.max(from.row, row), c2: Math.max(from.col, col) };
-    const text = range.r1 === range.r2 && range.c1 === range.c2 ? refName(row, col) : `${refName(range.r1, range.c1)}:${refName(range.r2, range.c2)}`;
+    // On another sheet than the formula's, the reference names it.
+    const prefix = active === editing.sheet ? '' : `${quoteSheet(sheet().name)}!`;
+    const text = prefix + (range.r1 === range.r2 && range.c1 === range.c2 ? refName(row, col) : `${refName(range.r1, range.c1)}:${refName(range.r2, range.c2)}`);
     const start = before ? before.start : input.selectionStart;
     input.setRangeText(text, start, before ? before.end : input.selectionEnd, 'end');
-    editing.point = { start, end: start + text.length, text, from, cell: { row, col }, range };
+    editing.point = { start, end: start + text.length, text, from, cell: { row, col }, range, sheet: active };
     syncEditors(input);
     input.focus({ preventScroll: true });
     placePoint();
@@ -3009,7 +3330,8 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     updateAssist();
   }
   function placePoint() {
-    const point = editing && editing.sheet === active ? activePoint() : null;
+    const point = editing ? activePoint() : null;
+    if (point && point.sheet !== active) { pointBox.hidden = true; return; }
     if (!point || !geo) { pointBox.hidden = true; return; }
     const { r1, c1, r2, c2 } = point.range;
     const box = onScreen(Math.min(r1, geo.rows), Math.min(c1, geo.cols), Math.min(r2, geo.rows), Math.min(c2, geo.cols));
@@ -3253,6 +3575,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       canvas.setPointerCapture?.(event.pointerId);
       return;
     }
+    if (editing?.away) { event.preventDefault(); commitEdit(); return; }
     if (editing) commitEdit();
     if (event.target === fillHandle) {
       dragging = { kind: 'fill', source: expandForMerges(selectedRange()), target: null };

@@ -568,6 +568,79 @@ editor.destroy();
   editor8.destroy();
 }
 
+// Sheets: add, point at another sheet's cells, rename, duplicate, move, delete, undo.
+{
+  const editor9 = mountXlsxEditor(container, bytes, { onSave: async data => { saved = data; } });
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const grid = container.querySelector('.xlsx-scroll');
+  const canvas = container.querySelector('.xlsx-canvas');
+  const menu = container.querySelector('.xlsx-menu');
+  const bar = container.querySelector('.xlsx-formula');
+  const input = container.querySelector('.xlsx-cell-editor');
+  const tabNames = () => [...container.querySelectorAll('.xlsx-tab:not(.xlsx-tab-add)')].map(tab => tab.textContent);
+  const tab = name => [...container.querySelectorAll('.xlsx-tab')].find(item => item.textContent === name);
+  const key = (target, name, extra = {}) => target.dispatchEvent(new KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true, ...extra }));
+  const mouse = (type, col, row) => canvas.dispatchEvent(new window.MouseEvent(type, { button: 0, bubbles: true, cancelable: true, clientX: 46 + 64 * (col - 1) + 10, clientY: 24 + 20 * (row - 1) + 8 }));
+  const tabMenu = (name, label) => {
+    tab(name).dispatchEvent(new window.MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 10, clientY: 10 }));
+    const button = [...menu.querySelectorAll('button')].find(item => item.textContent === label);
+    assert.ok(button, `"${label}" in ${[...menu.querySelectorAll('button')].map(item => item.textContent)}`);
+    button.click();
+  };
+  grid.focus();
+  tab('+').click();
+  assert.deepEqual(tabNames(), ['Data', 'Sheet2'], 'a sheet is added and shown');
+  assert.equal(container.querySelector('.xlsx-tab[aria-selected="true"]').textContent, 'Sheet2');
+  // In Sheet2!A1, start a formula and point at Data!A3.
+  key(grid, '=');
+  tab('Data').dispatchEvent(new window.MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+  tab('Data').click();
+  assert.equal(container.querySelector('.xlsx-tab[aria-selected="true"]').textContent, 'Data', 'the other sheet shows');
+  assert.equal(document.activeElement, bar, 'and the formula bar keeps the typing');
+  mouse('pointerdown', 1, 3);
+  mouse('pointerup', 1, 3);
+  assert.equal(bar.value, '=Data!A3', 'its cells go in named by their sheet');
+  key(bar, 'Enter');
+  assert.equal(container.querySelector('.xlsx-tab[aria-selected="true"]').textContent, 'Sheet2', 'Enter goes back to the cell');
+  key(grid, 'ArrowUp');
+  assert.equal(bar.value, '=Data!A3');
+  assert.equal(container.querySelector('.xlsx-live').textContent, 'A1, 30');
+  // Rename Data: the formula follows.
+  tab('Data').dispatchEvent(new window.MouseEvent('dblclick', { bubbles: true }));
+  const rename = container.querySelector('.xlsx-tab-input');
+  rename.value = 'My Data';
+  key(rename, 'Enter');
+  assert.deepEqual(tabNames(), ['My Data', 'Sheet2']);
+  key(grid, 'Home', { ctrlKey: true });
+  tab('Sheet2').click();
+  assert.equal(bar.value, "='My Data'!A3", 'formulas follow a renamed sheet');
+  tabMenu('Sheet2', 'Move left');
+  assert.deepEqual(tabNames(), ['Sheet2', 'My Data']);
+  tabMenu('My Data', 'Duplicate');
+  assert.deepEqual(tabNames(), ['Sheet2', 'My Data', 'My Data (2)']);
+  tabMenu('My Data', 'Delete "My Data"');
+  assert.deepEqual(tabNames(), ['Sheet2', 'My Data (2)']);
+  tab('Sheet2').click();
+  assert.equal(bar.value, '=#REF!', 'references to a deleted sheet break, as in Excel');
+  key(grid, 'z', { ctrlKey: true });
+  assert.deepEqual(tabNames(), ['Sheet2', 'My Data', 'My Data (2)'], 'undo brings the sheet back');
+  tab('Sheet2').click();
+  assert.equal(bar.value, "='My Data'!A3", 'with what pointed at it');
+  await editor9.save();
+  const out = unzipSync(saved);
+  const book = strFromU8(out['xl/workbook.xml']);
+  assert.match(book, /<sheet name="Sheet2" sheetId="2" r:id="rId\d+"\/><sheet name="My Data" sheetId="1" r:id="rId1"\/><sheet name="My Data \(2\)" sheetId="3" r:id="rId\d+"\/>/, book.match(/<sheets>.*<\/sheets>/)?.[0]);
+  const rels = strFromU8(out['xl/_rels/workbook.xml.rels']);
+  assert.equal((rels.match(/\/worksheet"/g) || []).length, 3);
+  assert.equal((strFromU8(out['[Content_Types].xml']).match(/worksheet\+xml/g) || []).length, 2, 'the two new sheets are declared (the first relies on its default)');
+  assert.ok(out['xl/worksheets/sheet2.xml'] && out['xl/worksheets/sheet3.xml']);
+  // And it opens again.
+  const again = mountXlsxEditor(container, saved, {});
+  assert.deepEqual([...container.querySelectorAll('.xlsx-tab:not(.xlsx-tab-add)')].map(item => item.textContent), ['Sheet2', 'My Data', 'My Data (2)']);
+  again.destroy();
+  editor9.destroy();
+}
+
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });
 assert.equal(container.querySelector('.office-save'), null);
 readonly.destroy();
