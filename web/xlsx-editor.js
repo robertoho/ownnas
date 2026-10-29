@@ -4218,7 +4218,39 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     scrollIntoView(row, col);
     updateAssist();
   }
+  // The cells a formula being typed refers to, each reference in its own colour, as spreadsheet
+  // apps show them.
+  const REF_COLORS = ['#2f6fdf', '#d6336c', '#2b9a66', '#9c36b5', '#e67700', '#0c8599', '#c92a2a'];
+  const refBoxes = [];
+  function placeRefs() {
+    for (const box of refBoxes.splice(0)) box.remove();
+    if (!editing || !geo) return;
+    const text = editorInput().value;
+    if (!text.startsWith('=')) return;
+    let tokens;
+    try { tokens = tokenize(text.slice(1)); } catch { return; }
+    const colors = new Map();
+    for (const token of tokens) {
+      if (token.t !== 'ref' || !token.a) continue;
+      const here = token.sheet == null ? editing.sheet === active : token.sheet.toLowerCase() === sheet().name.toLowerCase();
+      if (!here) continue;
+      const b = token.b || token.a;
+      const r1 = Math.min(token.a.row ?? 1, b.row ?? 1), r2 = Math.min(geo.rows, Math.max(token.a.row ?? geo.rows, b.row ?? geo.rows));
+      const c1 = Math.min(token.a.col ?? 1, b.col ?? 1), c2 = Math.min(geo.cols, Math.max(token.a.col ?? geo.cols, b.col ?? geo.cols));
+      if (r1 > geo.rows || c1 > geo.cols) continue;
+      const key = token.text.replace(/\$/g, '').toUpperCase();
+      if (!colors.has(key)) colors.set(key, REF_COLORS[colors.size % REF_COLORS.length]);
+      const color = colors.get(key);
+      const box = onScreen(r1, c1, r2, c2);
+      const node = document.createElement('div');
+      node.className = 'xlsx-ref-box';
+      node.style.cssText = `left:${box.left - 1}px;top:${box.top - 1}px;width:${box.width + 1}px;height:${box.height + 1}px;border-color:${color};background:${color}1a`;
+      canvas.insertBefore(node, cellEditor);
+      refBoxes.push(node);
+    }
+  }
   function placePoint() {
+    placeRefs();
     const point = editing ? activePoint() : null;
     if (point && point.sheet !== active) { pointBox.hidden = true; return; }
     if (!point || !geo) { pointBox.hidden = true; return; }

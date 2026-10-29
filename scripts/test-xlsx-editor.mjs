@@ -986,6 +986,29 @@ editor.destroy();
   editor14.destroy();
 }
 
+// While typing a formula, the cells it refers to are marked, each reference in its colour.
+{
+  const editor15 = mountXlsxEditor(container, bytes, {});
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const grid = container.querySelector('.xlsx-scroll');
+  const input = container.querySelector('.xlsx-cell-editor');
+  grid.focus();
+  grid.dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', ctrlKey: true, bubbles: true }));
+  grid.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+  grid.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+  grid.dispatchEvent(new KeyboardEvent('keydown', { key: '=', bubbles: true }));
+  input.value = '=SUM(A1:A2)+B1+a1:a2';
+  input.dispatchEvent(new Event('input'));
+  const boxes = [...container.querySelectorAll('.xlsx-ref-box')];
+  assert.equal(boxes.length, 3);
+  assert.equal(boxes[0].style.borderColor, boxes[2].style.borderColor, 'the same reference, the same colour');
+  assert.notEqual(boxes[0].style.borderColor, boxes[1].style.borderColor);
+  assert.equal(boxes[0].style.height, `${20 * 2 + 1}px`, 'over the cells it covers');
+  input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  assert.equal(container.querySelectorAll('.xlsx-ref-box').length, 0, 'gone when the edit ends');
+  editor15.destroy();
+}
+
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });
 assert.equal(container.querySelector('.office-save'), null);
 readonly.destroy();
