@@ -171,6 +171,11 @@ final class MacHub: ObservableObject {
                 } catch ClientError.Unauthorized {
                     self?.status[saved.id] = "Signed out by the server: sign in again"
                     return
+                } catch ClientError.NotFound {
+                    // A server from before the change feed: Finder still works, and lists
+                    // folders again when they are opened.
+                    self?.status[saved.id] = "Connected. Update the server for its changes to show in Finder at once"
+                    return
                 } catch {
                     server = nil
                     self?.status[saved.id] = "Cannot reach the server: \(userMessage(error))"

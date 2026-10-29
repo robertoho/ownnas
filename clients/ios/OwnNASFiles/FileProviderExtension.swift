@@ -438,7 +438,15 @@ enum ChangeFeed {
             }
             do {
                 let cursor = String(data: anchor.rawValue, encoding: .utf8) ?? ""
-                let feed = try provider.call { try provider.server().changes(cursor: cursor, waitSeconds: 0) }
+                let feed: Changes
+                do {
+                    feed = try provider.call { try provider.server().changes(cursor: cursor, waitSeconds: 0) }
+                } catch ClientError.NotFound {
+                    // A server from before the change feed: folders are listed again when opened.
+                    if folder != nil { observer.finishEnumeratingWithError(NSFileProviderError(.syncAnchorExpired)) }
+                    else { observer.finishEnumeratingChanges(upTo: anchor, moreComing: false) }
+                    return
+                }
                 if !feed.watching {
                     // The server cannot watch its folder: folders are listed again when opened.
                     if folder != nil { observer.finishEnumeratingWithError(NSFileProviderError(.syncAnchorExpired)) }
