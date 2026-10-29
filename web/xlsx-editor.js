@@ -996,9 +996,14 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   formulaRow.className = 'xlsx-formula-row';
   const address = document.createElement('span');
   address.className = 'xlsx-address';
-  const fx = document.createElement('span');
+  const fx = document.createElement('button');
+  fx.type = 'button';
   fx.className = 'xlsx-fx';
   fx.textContent = 'fx';
+  fx.title = 'Functions';
+  fx.setAttribute('aria-label', 'Functions');
+  fx.setAttribute('aria-haspopup', 'dialog');
+  fx.setAttribute('aria-expanded', 'false');
   const formulaInput = document.createElement('input');
   formulaInput.className = 'xlsx-formula';
   formulaInput.setAttribute('aria-label', 'Cell contents');
@@ -1061,7 +1066,61 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   menu.className = 'menu xlsx-menu';
   menu.setAttribute('role', 'menu');
   menu.hidden = true;
-  root.append(toolbar, formulaRow, scroll, footer, note, live, assist, menu);
+  // Every function, with how to use it and a quick filter; picking one puts it in the formula.
+  const functionsPanel = document.createElement('div');
+  functionsPanel.className = 'xlsx-functions';
+  functionsPanel.setAttribute('role', 'dialog');
+  functionsPanel.setAttribute('aria-label', 'Functions');
+  functionsPanel.hidden = true;
+  const functionsHead = document.createElement('div');
+  functionsHead.className = 'xlsx-functions-head';
+  const functionsTitle = document.createElement('strong');
+  functionsTitle.textContent = 'Functions';
+  const functionsClose = document.createElement('button');
+  functionsClose.type = 'button';
+  functionsClose.className = 'xlsx-functions-close';
+  functionsClose.textContent = '✕';
+  functionsClose.setAttribute('aria-label', 'Close');
+  functionsHead.append(functionsTitle, functionsClose);
+  const functionsFilter = document.createElement('input');
+  functionsFilter.type = 'search';
+  functionsFilter.className = 'xlsx-functions-filter';
+  functionsFilter.placeholder = 'Filter: name or what it does';
+  functionsFilter.setAttribute('aria-label', 'Filter functions');
+  functionsFilter.autocomplete = 'off';
+  functionsFilter.spellcheck = false;
+  const functionsHelp = document.createElement('details');
+  functionsHelp.className = 'xlsx-functions-help';
+  const helpSummary = document.createElement('summary');
+  helpSummary.textContent = 'How formulas work';
+  const helpList = document.createElement('ul');
+  for (const parts of [
+    ['A formula starts with ', ['=A1+B1'], '. Operators: ', ['+ - * /'], ', ', ['^'], ' for powers, ', ['&'], ' to join text, and ', ['= <> < > <= >='], ' to compare.'],
+    ['A function takes its arguments in brackets, separated by commas: ', ['=ROUND(A1, 2)'], '. Arguments in [square brackets] can be left out; … means more can follow.'],
+    ['A range is two corners with a colon: ', ['A1:B10'], '. A whole column is ', ['A:A'], ', another sheet ', ['Data!A1'], '.'],
+    ['$ keeps a reference from moving when the formula is copied or filled: ', ['$A$1'], ' keeps both, ', ['A$1'], ' just the row.'],
+    ['Text goes in double quotes: ', ['"Paid"'], '. So do conditions: ', ['=COUNTIF(B2:B20, ">100")'], '.'],
+    ['While typing, click a cell to put it in (drag for a range), and Tab picks the function suggested.'],
+  ]) {
+    const item = document.createElement('li');
+    for (const part of parts) {
+      if (typeof part === 'string') { item.append(part); continue; }
+      const code = document.createElement('code');
+      code.textContent = part[0];
+      item.append(code);
+    }
+    helpList.append(item);
+  }
+  functionsHelp.append(helpSummary, helpList);
+  const functionsCount = document.createElement('p');
+  functionsCount.className = 'xlsx-functions-count';
+  functionsCount.setAttribute('aria-live', 'polite');
+  const functionsList = document.createElement('div');
+  functionsList.className = 'xlsx-functions-list';
+  functionsList.setAttribute('role', 'listbox');
+  functionsList.setAttribute('aria-label', 'Functions');
+  functionsPanel.append(functionsHead, functionsFilter, functionsHelp, functionsCount, functionsList);
+  root.append(toolbar, formulaRow, scroll, footer, note, live, assist, menu, functionsPanel);
   container.replaceChildren(root);
 
   const sheet = () => model.sheets[active];
@@ -1977,7 +2036,9 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       commitEdit(dr, dc);
     }
   });
-  cellEditor.addEventListener('blur', () => { if (editing && !destroyed) setTimeout(() => { if (editing && document.activeElement !== cellEditor && document.activeElement !== formulaInput) commitEdit(); }, 0); });
+  // Focus going to the list of functions keeps the edit open: a function picked there goes into it.
+  const keepsEdit = () => [cellEditor, formulaInput].includes(document.activeElement) || functionsPanel.contains(document.activeElement);
+  cellEditor.addEventListener('blur', () => { if (editing && !destroyed) setTimeout(() => { if (editing && !keepsEdit()) commitEdit(); }, 0); });
 
   formulaInput.addEventListener('focus', () => {
     if (!canWrite() || editing) return;
@@ -1996,8 +2057,154 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     else if (event.key === 'Escape') { event.preventDefault(); cancelEdit(); }
   });
   formulaInput.addEventListener('blur', () => {
-    setTimeout(() => { if (editing?.bar && document.activeElement !== formulaInput) commitEdit(); }, 0);
+    setTimeout(() => { if (editing?.bar && !keepsEdit()) commitEdit(); }, 0);
   });
+
+  // The list of functions
+  const CATEGORIES = ['Math', 'Statistics', 'Logic', 'Text', 'Date and time', 'Lookup', 'Information'];
+  let functionsBack = null, functionsShown = [], functionsActive = 0;
+  function openFunctions() {
+    closeMenu();
+    hideAssist();
+    // Where the edit was, to put the function there.
+    const input = editing ? editorInput() : null;
+    functionsBack = input ? { input, start: input.selectionStart, end: input.selectionEnd } : null;
+    functionsPanel.style.top = `${formulaRow.offsetTop + formulaRow.offsetHeight + 4}px`;
+    functionsPanel.hidden = false;
+    fx.setAttribute('aria-expanded', 'true');
+    functionsFilter.value = '';
+    renderFunctions();
+    functionsFilter.focus({ preventScroll: true });
+  }
+  function closeFunctions(refocus = true) {
+    if (functionsPanel.hidden) return;
+    functionsPanel.hidden = true;
+    fx.setAttribute('aria-expanded', 'false');
+    if (!refocus) return;
+    if (editing && functionsBack) {
+      functionsBack.input.focus({ preventScroll: true });
+      functionsBack.input.setSelectionRange(functionsBack.start, functionsBack.end);
+    } else {
+      scroll.focus({ preventScroll: true });
+    }
+  }
+  /** The functions matching the filter: by name first, then by what they do. */
+  function matchingFunctions(query) {
+    const all = Object.keys(FUNCTION_HELP);
+    const q = query.trim().toLowerCase();
+    if (!q) return all.sort((a, b) => CATEGORIES.indexOf(FUNCTION_HELP[a][2]) - CATEGORIES.indexOf(FUNCTION_HELP[b][2]) || a.localeCompare(b));
+    const score = name => {
+      const [, about, category] = FUNCTION_HELP[name];
+      const lower = name.toLowerCase();
+      if (lower.startsWith(q)) return 0;
+      if (lower.includes(q)) return 1;
+      return `${about} ${category}`.toLowerCase().includes(q) ? 2 : -1;
+    };
+    return all.map(name => [name, score(name)]).filter(([, s]) => s >= 0)
+      .sort((a, b) => a[1] - b[1] || a[0].length - b[0].length || a[0].localeCompare(b[0])).map(([name]) => name);
+  }
+  function renderFunctions() {
+    const query = functionsFilter.value;
+    functionsShown = matchingFunctions(query);
+    functionsActive = 0;
+    const total = Object.keys(FUNCTION_HELP).length;
+    functionsCount.textContent = !query.trim() ? `${total} functions${canWrite() ? '. Pick one to put it in the cell.' : ''}`
+      : functionsShown.length ? `${functionsShown.length} of ${total}` : 'No function matches.';
+    const items = [];
+    let group = null;
+    functionsShown.forEach((name, index) => {
+      const [args, about, category, example] = FUNCTION_HELP[name];
+      if (!query.trim() && category !== group) {
+        group = category;
+        const heading = document.createElement('div');
+        heading.className = 'xlsx-functions-group';
+        heading.textContent = category;
+        items.push(heading);
+      }
+      const item = document.createElement('div');
+      item.className = 'xlsx-function';
+      item.id = `xlsx-function-${name.replace(/\W/g, '-')}`;
+      item.setAttribute('role', 'option');
+      item.setAttribute('aria-selected', String(index === functionsActive));
+      const signature = document.createElement('code');
+      signature.className = 'xlsx-function-sig';
+      signature.textContent = `${name}(${args})`;
+      item.append(signature);
+      if (query.trim()) {
+        const tag = document.createElement('span');
+        tag.className = 'xlsx-function-tag';
+        tag.textContent = category;
+        item.append(tag);
+      }
+      const text = document.createElement('p');
+      text.textContent = about;
+      const sample = document.createElement('p');
+      sample.className = 'xlsx-function-example';
+      const code = document.createElement('code');
+      code.textContent = example;
+      sample.append('Example: ', code);
+      item.append(text, sample);
+      // The filter keeps the keyboard.
+      item.addEventListener('pointerdown', event => event.preventDefault());
+      item.addEventListener('click', () => insertFunction(name));
+      items.push(item);
+    });
+    functionsList.replaceChildren(...items);
+    functionsList.scrollTop = 0;
+    markActiveFunction();
+  }
+  function markActiveFunction() {
+    const name = functionsShown[functionsActive];
+    for (const item of functionsList.querySelectorAll('.xlsx-function')) {
+      const on = name != null && item.id === `xlsx-function-${name.replace(/\W/g, '-')}`;
+      item.setAttribute('aria-selected', String(on));
+      if (on) { item.scrollIntoView?.({ block: 'nearest' }); functionsFilter.setAttribute('aria-activedescendant', item.id); }
+    }
+  }
+  /** Puts `NAME(` into the formula being typed (in place of a name begun), or starts one. */
+  function insertFunction(name) {
+    if (!canWrite()) return;
+    const back = functionsBack;
+    closeFunctions(false);
+    if (editing && back) {
+      const { input } = back;
+      input.focus({ preventScroll: true });
+      if (!input.value.startsWith('=')) {
+        input.value = `=${name}(`;
+        input.setSelectionRange(input.value.length, input.value.length);
+      } else {
+        const typed = back.start === back.end ? formulaWordAt(input.value, back.start) : null;
+        input.setRangeText(`${name}(`, typed ? typed.start : back.start, back.end, 'end');
+      }
+      syncEditors(input);
+    } else {
+      if (editing) commitEdit();
+      startEdit(`=${name}(`);
+    }
+    placePoint();
+    updateAssist();
+  }
+  fx.addEventListener('pointerdown', event => event.preventDefault());
+  fx.addEventListener('click', () => (functionsPanel.hidden ? openFunctions() : closeFunctions()));
+  functionsClose.addEventListener('click', () => closeFunctions());
+  functionsFilter.addEventListener('input', renderFunctions);
+  functionsPanel.addEventListener('keydown', event => {
+    // The page's own keys (Escape closes the preview) stay out.
+    event.stopPropagation();
+    if (event.key === 'Escape') { event.preventDefault(); closeFunctions(); }
+    else if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && functionsShown.length) {
+      event.preventDefault();
+      functionsActive = (functionsActive + (event.key === 'ArrowDown' ? 1 : -1) + functionsShown.length) % functionsShown.length;
+      markActiveFunction();
+    } else if (event.key === 'Enter' && event.target === functionsFilter && functionsShown.length) {
+      event.preventDefault();
+      insertFunction(functionsShown[functionsActive]);
+    }
+  });
+  const outsideFunctions = event => {
+    if (!functionsPanel.hidden && !functionsPanel.contains(event.target) && event.target !== fx) closeFunctions();
+  };
+  document.addEventListener('pointerdown', outsideFunctions, true);
 
   // Pointer
   function pointAt(event) {
@@ -2611,6 +2818,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       document.removeEventListener('cut', onCut);
       document.removeEventListener('paste', onPaste);
       document.removeEventListener('pointerdown', outsideMenu, true);
+      document.removeEventListener('pointerdown', outsideFunctions, true);
       if (frame) cancelAnimationFrame(frame);
       root.remove();
     },

@@ -2395,11 +2395,12 @@ input, select, textarea {
 .archive-empty { justify-content: flex-start; padding: 0.5rem 0; }
 .archive-footnote { margin: 0.65rem 0 0; font-size: 0.82rem; }
 /* The sheet is drawn on light paper, like a printed page, whatever the app theme. */
-.xlsx-editor { --sheet-font: Calibri, Carlito, "Segoe UI", Arial, sans-serif; display: flex; flex-direction: column; gap: 6px; flex: 1 1 auto; min-height: 24rem; width: 100%; }
+.xlsx-editor { --sheet-font: Calibri, Carlito, "Segoe UI", Arial, sans-serif; position: relative; display: flex; flex-direction: column; gap: 6px; flex: 1 1 auto; min-height: 24rem; width: 100%; }
 .xlsx-editor > :not(.xlsx-scroll) { flex: none; }
 .xlsx-formula-row { display: flex; align-items: stretch; gap: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--input-bg); }
 .xlsx-address { display: grid; place-items: center; min-width: 5.5rem; padding: 0 0.5rem; border-right: 1px solid var(--line); color: var(--muted); font: 0.78rem var(--mono); white-space: nowrap; }
-.xlsx-fx { display: grid; place-items: center; padding: 0 0.55rem; border-right: 1px solid var(--line); color: var(--muted); font: italic 600 0.8rem Georgia, serif; }
+.xlsx-fx { display: grid; place-items: center; min-height: 0; margin: 0; padding: 0 0.55rem; border: 0; border-right: 1px solid var(--line); border-radius: 0; background: transparent; box-shadow: none; color: var(--muted); font: italic 600 0.8rem Georgia, serif; cursor: pointer; }
+.xlsx-fx:hover, .xlsx-fx[aria-expanded="true"] { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
 .xlsx-formula { flex: 1 1 auto; min-width: 0; height: 30px; border: 0; border-radius: 0; background: transparent; font: 0.84rem var(--mono); padding: 0 0.6rem; }
 .xlsx-formula:focus { outline: none; box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent); }
 .xlsx-scroll { position: relative; flex: 1 1 auto; min-height: 16rem; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: #fff; outline: none; overscroll-behavior: contain; }
@@ -2430,6 +2431,24 @@ input, select, textarea {
 .xlsx-fill { position: absolute; z-index: 2; box-sizing: border-box; pointer-events: none; border: 1px dashed #2478dc; }
 .xlsx-size-guide { position: absolute; z-index: 6; pointer-events: none; background: #2478dc; }
 .xlsx-menu { z-index: 60; min-width: 13rem; }
+.xlsx-functions { position: absolute; z-index: 40; left: 0; bottom: 0; width: min(36rem, 100%); box-sizing: border-box; display: flex; flex-direction: column; background: var(--bg-2); color: var(--text); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); overflow: hidden; }
+.xlsx-functions-head { display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem 0.75rem 0.45rem; }
+.xlsx-functions-head strong { flex: 1 1 auto; }
+.xlsx-functions-close { min-height: 0; padding: 0.15rem 0.45rem; border: 0; background: transparent; color: var(--muted); font-size: 0.85rem; }
+.xlsx-functions-filter { margin: 0 0.75rem 0.45rem; }
+.xlsx-functions-help { margin: 0 0.75rem 0.35rem; color: var(--muted); font-size: 0.8rem; }
+.xlsx-functions-help summary { cursor: pointer; color: var(--text); }
+.xlsx-functions-help ul { margin: 0.35rem 0 0.2rem; padding-left: 1.1rem; display: grid; gap: 0.25rem; }
+.xlsx-functions-help code, .xlsx-function code { font: 0.76rem var(--mono); color: var(--text); }
+.xlsx-functions-count { margin: 0; padding: 0 0.75rem 0.3rem; color: var(--muted); font-size: 0.75rem; }
+.xlsx-functions-list { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 0 0.4rem 0.5rem; }
+.xlsx-functions-group { padding: 0.6rem 0.55rem 0.2rem; color: var(--muted); font-size: 0.7rem; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; }
+.xlsx-function { padding: 0.45rem 0.55rem; border-radius: 8px; cursor: pointer; }
+.xlsx-function:hover, .xlsx-function[aria-selected="true"] { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.xlsx-function .xlsx-function-sig { font: 600 0.8rem var(--mono); }
+.xlsx-function-tag { float: right; color: var(--muted); font-size: 0.7rem; }
+.xlsx-function p { margin: 0.15rem 0 0; font-size: 0.8rem; }
+.xlsx-function .xlsx-function-example { color: var(--muted); }
 .xlsx-footer { display: flex; align-items: center; gap: 0.5rem; min-height: 30px; }
 .xlsx-tabs { display: flex; gap: 2px; flex: 1 1 auto; min-width: 0; overflow-x: auto; scrollbar-width: thin; }
 .xlsx-tab { flex: none; height: 28px; padding: 0 0.85rem; border-radius: 0 0 8px 8px; border: 1px solid var(--line); border-top-width: 0; background: transparent; color: var(--muted); font-size: 0.8rem; }

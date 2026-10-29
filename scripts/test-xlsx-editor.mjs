@@ -279,6 +279,57 @@ editor.destroy();
   editor2.destroy();
 }
 
+// The fx button lists the functions, with a filter; picking one puts it in the formula.
+{
+  const editor3 = mountXlsxEditor(container, bytes, {});
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const grid = container.querySelector('.xlsx-scroll');
+  const fx = container.querySelector('.xlsx-fx');
+  const panel = container.querySelector('.xlsx-functions');
+  const filter = panel.querySelector('.xlsx-functions-filter');
+  const input = container.querySelector('.xlsx-cell-editor');
+  const key = (target, name, extra = {}) => target.dispatchEvent(new KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true, ...extra }));
+  const names = () => [...panel.querySelectorAll('.xlsx-function-sig')].map(item => item.textContent.split('(')[0]);
+  grid.focus();
+  key(grid, 'Home', { ctrlKey: true });
+  key(grid, 'ArrowRight'); key(grid, 'ArrowRight'); key(grid, 'ArrowRight');
+  fx.click();
+  assert.equal(panel.hidden, false, 'fx opens the list');
+  assert.equal(document.activeElement, filter, 'with the filter ready to type in');
+  assert.equal(names().length, 80);
+  assert.deepEqual([...panel.querySelectorAll('.xlsx-functions-group')].map(item => item.textContent).slice(0, 2), ['Math', 'Statistics'], 'grouped');
+  assert.match(panel.textContent, /Example: =VLOOKUP\(A2, D2:F50, 3, FALSE\)/, 'each has an example');
+  filter.value = 'look';
+  filter.dispatchEvent(new Event('input', { bubbles: true }));
+  assert.deepEqual(names().slice(0, 3), ['HLOOKUP', 'VLOOKUP', 'XLOOKUP'], 'the filter matches names first, then categories');
+  filter.value = 'average';
+  filter.dispatchEvent(new Event('input', { bubbles: true }));
+  assert.deepEqual(names().slice(0, 3), ['AVERAGE', 'AVERAGEA', 'AVERAGEIF'], 'names first');
+  assert.ok(names().includes('MEDIAN') === false && names().length >= 3);
+  filter.value = 'remainder';
+  filter.dispatchEvent(new Event('input', { bubbles: true }));
+  assert.deepEqual(names(), ['MOD'], 'and what they do');
+  key(filter, 'Enter');
+  assert.equal(panel.hidden, true, 'picking one closes the list');
+  assert.equal(input.hidden, false);
+  assert.equal(input.value, '=MOD(', 'and starts a formula with it');
+  input.setRangeText('A1, 2)+', input.selectionStart, input.selectionEnd, 'end');
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  fx.dispatchEvent(new window.MouseEvent('pointerdown', { bubbles: true, cancelable: true }));
+  fx.click();
+  filter.value = 'abs';
+  filter.dispatchEvent(new Event('input', { bubbles: true }));
+  key(filter, 'Enter');
+  assert.equal(input.value, '=MOD(A1, 2)+ABS(', 'while typing, it goes in at the caret');
+  fx.click();
+  key(filter, 'Escape');
+  assert.equal(panel.hidden, true);
+  assert.equal(document.activeElement, input, 'Escape goes back to the formula');
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(input.hidden, false, 'still being typed');
+  editor3.destroy();
+}
+
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });
 assert.equal(container.querySelector('.office-save'), null);
 readonly.destroy();
