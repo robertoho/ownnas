@@ -898,6 +898,33 @@ editor.destroy();
   assert.equal(book.computed.get('0!B1'), 42);
 }
 
+// Several ranges: Ctrl+click adds one; formatting, clearing and the totals take them all.
+{
+  const editor12 = mountXlsxEditor(container, bytes, { onSave: async data => { saved = data; } });
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const canvas = container.querySelector('.xlsx-canvas');
+  const grid = container.querySelector('.xlsx-scroll');
+  const mouse = (type, col, row, extra = {}) => canvas.dispatchEvent(new window.MouseEvent(type, { button: 0, bubbles: true, cancelable: true, clientX: 46 + 64 * (col - 1) + 10, clientY: 24 + 20 * (row - 1) + 8, ...extra }));
+  const click = (col, row, extra) => { mouse('pointerdown', col, row, extra); mouse('pointerup', col, row, extra); };
+  grid.focus();
+  click(1, 1);
+  click(1, 2, { ctrlKey: true });
+  click(2, 1, { metaKey: true });
+  assert.equal(container.querySelector('.xlsx-address').textContent, '3 ranges');
+  assert.equal(container.querySelector('.xlsx-address').title, 'A1, A2, B1');
+  assert.match(container.querySelector('.xlsx-summary').textContent, /Count: 3 {3}Min: 10 {3}Max: 20 {3}Sum: 50/, 'totals take every range, with min and max');
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  assert.equal(container.querySelectorAll('.xlsx-selection').length, 3, 'each range is drawn');
+  [...container.querySelectorAll('.xlsx-toolbar button')].find(button => button.title.startsWith('Bold')).click();
+  click(3, 3);
+  assert.equal(container.querySelector('.xlsx-address').textContent, 'C3', 'a plain click starts over');
+  await editor12.save();
+  const xml = strFromU8(unzipSync(saved)['xl/worksheets/sheet1.xml']);
+  const styleOf = ref => new RegExp(`<c r="${ref}" s="(\\d+)"`).exec(xml)?.[1];
+  assert.ok(styleOf('A1') && styleOf('A1') === styleOf('A2') && styleOf('B1') && styleOf('B1') !== '0', 'bold went to all three');
+  editor12.destroy();
+}
+
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });
 assert.equal(container.querySelector('.office-save'), null);
 readonly.destroy();

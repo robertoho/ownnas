@@ -2103,6 +2103,9 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   let active = model.sheets[model.activeSheet]?.hidden ? visibleSheets()[0] ?? 0 : model.activeSheet;
   const selections = new Map();
   let anchor = { row: 1, col: 1 }, focus = { row: 1, col: 1 };
+  // Ranges selected before the current one with Ctrl/Cmd+click.
+  let extra = [];
+  const allRanges = () => [...extra, selectedRange()];
   let editing = null, dragging = null, saving = false, destroyed = false, frame = 0, geo = null;
   const history = [];
   let historyAt = 0, savedAt = 0, clipboard = null, message = '';
@@ -2195,6 +2198,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   const layer = document.createElement('div');
   const selectionBox = document.createElement('div');
   selectionBox.className = 'xlsx-selection';
+  const extraBoxes = [];
   const activeBox = document.createElement('div');
   activeBox.className = 'xlsx-active';
   const cellEditor = document.createElement('textarea');
@@ -2594,6 +2598,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     if (!keepEdit) commitEdit();
     if (!force && model.sheets[active]) selections.set(model.sheets[active], { anchor, focus, top: scroll.scrollTop, left: scroll.scrollLeft });
     active = index;
+    extra = [];
     const saved = selections.get(model.sheets[index]) || { anchor: { row: 1, col: 1 }, focus: { row: 1, col: 1 }, top: 0, left: 0 };
     anchor = saved.anchor; focus = saved.focus;
     geo = null;
@@ -2950,8 +2955,19 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const merge = sheet().covered.get(refName(anchor.row, anchor.col));
     const cellBox = merge ? onScreen(merge.r1, merge.c1, merge.r2, merge.c2) : onScreen(anchor.row, anchor.col, anchor.row, anchor.col);
     activeBox.style.cssText = `left:${cellBox.left - 1}px;top:${cellBox.top - 1}px;width:${cellBox.width + 1}px;height:${cellBox.height + 1}px`;
+    for (const box of extraBoxes.splice(0)) box.remove();
+    for (const item of extra) {
+      const area = expandForMerges(item);
+      const shape = onScreen(area.r1, area.c1, Math.min(area.r2, geo.rows), Math.min(area.c2, geo.cols));
+      const node = document.createElement('div');
+      node.className = 'xlsx-selection';
+      node.style.cssText = `left:${shape.left - 1}px;top:${shape.top - 1}px;width:${shape.width + 1}px;height:${shape.height + 1}px`;
+      canvas.insertBefore(node, activeBox);
+      extraBoxes.push(node);
+    }
+    if (extra.length) selectionBox.hidden = false;
     const whole = range.r2 >= LAST_ROW || range.c2 >= LAST_COL;
-    fillHandle.hidden = !canWrite() || !!editing || whole;
+    fillHandle.hidden = !canWrite() || !!editing || whole || extra.length > 0;
     const corner = range.r1 === range.r2 && range.c1 === range.c2 ? cellBox : box;
     fillHandle.style.cssText = `left:${corner.left + corner.width - 4}px;top:${corner.top + corner.height - 4}px`;
     const rule = validationAt(sheet(), anchor.row, anchor.col);
@@ -3006,7 +3022,9 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   function selectionChanged() {
     const ref = refName(anchor.row, anchor.col);
     const range = selectedRange();
-    address.textContent = range.r1 === range.r2 && range.c1 === range.c2 ? ref : `${refName(range.r1, range.c1)}:${refName(Math.min(range.r2, LAST_ROW), Math.min(range.c2, LAST_COL))}`;
+    const name = item => (item.r1 === item.r2 && item.c1 === item.c2 ? refName(item.r1, item.c1) : `${refName(item.r1, item.c1)}:${refName(Math.min(item.r2, LAST_ROW), Math.min(item.c2, LAST_COL))}`);
+    address.textContent = extra.length ? `${extra.length + 1} ranges` : range.r1 === range.r2 && range.c1 === range.c2 ? ref : name(range);
+    address.title = extra.length ? allRanges().map(name).join(', ') : '';
     if (!editing) formulaInput.value = editText(anchor.row, anchor.col);
     formulaInput.readOnly = !canWrite();
     const info = shown(anchor.row, anchor.col);
@@ -3016,20 +3034,22 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     schedule();
   }
   function updateSummary() {
-    const range = selectedRange();
-    if (range.r1 === range.r2 && range.c1 === range.c2) { summary.textContent = ''; return; }
-    let count = 0, numbers = 0, sum = 0;
+    const ranges = allRanges();
+    if (ranges.length === 1 && ranges[0].r1 === ranges[0].r2 && ranges[0].c1 === ranges[0].c2) { summary.textContent = ''; return; }
+    let count = 0, numbers = 0, sum = 0, min = Infinity, max = -Infinity;
     const s = sheet();
     for (const [ref] of s.cells) {
       const { row, col } = parseRef(ref);
-      if (row < range.r1 || row > range.r2 || col < range.c1 || col > range.c2) continue;
+      if (!ranges.some(range => row >= range.r1 && row <= range.r2 && col >= range.c1 && col <= range.c2)) continue;
       const value = valueAt(model, active, row, col);
       if (value == null || value === '') continue;
       count++;
-      if (typeof value === 'number') { numbers++; sum += value; }
+      if (typeof value === 'number') { numbers++; sum += value; min = Math.min(min, value); max = Math.max(max, value); }
     }
     const show = value => formatGeneral(Number(value.toPrecision(12)), separators);
-    summary.textContent = numbers ? `Average: ${show(sum / numbers)}   Count: ${count}   Sum: ${show(sum)}` : count ? `Count: ${count}` : '';
+    summary.textContent = numbers
+      ? `Average: ${show(sum / numbers)}   Count: ${count}   Min: ${show(min)}   Max: ${show(max)}   Sum: ${show(sum)}`
+      : count ? `Count: ${count}` : '';
   }
   function scrollIntoView(row, col) {
     layout();
@@ -3048,6 +3068,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     }
   }
   function select(row, col, extend = false) {
+    if (!extend) extra = [];
     row = Math.max(1, Math.min(LAST_ROW, row));
     col = Math.max(1, Math.min(LAST_COL, col));
     if (extend) focus = { row, col };
@@ -3322,20 +3343,23 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   /** The cells to change for the selection: whole rows or columns stop at the used area. */
   function selectionCells({ create }) {
     const s = sheet();
-    const range = expandForMerges(selectedRange());
-    const r2 = Math.min(range.r2, Math.max(s.maxRow, range.r1)), c2 = Math.min(range.c2, Math.max(s.maxCol, range.c1));
-    const list = [];
-    if (create && (r2 - range.r1 + 1) * (c2 - range.c1 + 1) <= MAX_FORMAT_CELLS) {
-      for (let r = range.r1; r <= r2; r++) for (let c = range.c1; c <= c2; c++) {
-        const merge = s.covered.get(refName(r, c));
-        if (merge && (merge.r1 !== r || merge.c1 !== c)) continue;
-        list.push({ row: r, col: c });
+    const list = [], seen = new Set();
+    const add = (row, col) => { const ref = refName(row, col); if (!seen.has(ref)) { seen.add(ref); list.push({ row, col }); } };
+    for (const selected of allRanges()) {
+      const range = expandForMerges(selected);
+      const r2 = Math.min(range.r2, Math.max(s.maxRow, range.r1)), c2 = Math.min(range.c2, Math.max(s.maxCol, range.c1));
+      if (create && (r2 - range.r1 + 1) * (c2 - range.c1 + 1) <= MAX_FORMAT_CELLS) {
+        for (let r = range.r1; r <= r2; r++) for (let c = range.c1; c <= c2; c++) {
+          const merge = s.covered.get(refName(r, c));
+          if (merge && (merge.r1 !== r || merge.c1 !== c)) continue;
+          add(r, c);
+        }
+        continue;
       }
-      return list;
-    }
-    for (const ref of s.cells.keys()) {
-      const { row, col } = parseRef(ref);
-      if (row >= range.r1 && row <= r2 && col >= range.c1 && col <= c2) list.push({ row, col });
+      for (const ref of s.cells.keys()) {
+        const { row, col } = parseRef(ref);
+        if (row >= range.r1 && row <= r2 && col >= range.c1 && col <= c2) add(row, col);
+      }
     }
     return list;
   }
@@ -3359,9 +3383,11 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   /** Borders on the selection: "all", "outside", "none", or one side. */
   function borderSelection(kind) {
     const s = sheet();
-    const range = expandForMerges(selectedRange());
-    const r2 = Math.min(range.r2, Math.max(s.maxRow, range.r1)), c2 = Math.min(range.c2, Math.max(s.maxCol, range.c1));
+    const ranges = allRanges().map(expandForMerges);
     formatSelection((row, col) => {
+      // The edges are those of the range the cell is in (the last, of overlapping ones).
+      const range = ranges.findLast(item => row >= item.r1 && row <= item.r2 && col >= item.c1 && col <= item.c2) || ranges[ranges.length - 1];
+      const r2 = Math.min(range.r2, Math.max(s.maxRow, range.r1)), c2 = Math.min(range.c2, Math.max(s.maxCol, range.c1));
       const merge = s.covered.get(refName(row, col));
       const bottom = merge ? merge.r2 : row, right = merge ? merge.c2 : col;
       if (kind === 'all') return { borders: { left: true, right: true, top: true, bottom: true } };
@@ -4312,6 +4338,13 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       scroll.focus({ preventScroll: true });
       return;
     }
+    // Ctrl/Cmd+click keeps what was selected and starts another range.
+    const adding = (event.ctrlKey || event.metaKey) && !event.shiftKey;
+    if (adding && !(p.head.row && p.head.col) && !(!p.head.row && !p.head.col && sheetExtras(model, sheet()).links.get(refName(p.row, p.col)))) {
+      extra.push(selectedRange());
+    } else if (!event.shiftKey) {
+      extra = [];
+    }
     if (p.head.col && p.head.row) {
       anchor = { row: 1, col: 1 }; focus = { row: LAST_ROW, col: LAST_COL };
       dragging = null;
@@ -4331,7 +4364,13 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
         openLink(link);
         return;
       }
-      select(p.row, p.col, event.shiftKey);
+      if (adding) {
+        const merge = sheet().covered.get(refName(p.row, p.col));
+        anchor = merge ? { row: merge.r1, col: merge.c1 } : { row: p.row, col: p.col };
+        focus = { ...anchor };
+      } else {
+        select(p.row, p.col, event.shiftKey);
+      }
       dragging = 'cell';
     }
     canvas.setPointerCapture?.(event.pointerId);
@@ -4841,11 +4880,13 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
   function onCopy(event) {
     if (!gridFocused()) return;
     event.preventDefault();
+    if (extra.length) { notice('Several ranges cannot be copied at once: select one.'); return; }
     event.clipboardData.setData('text/plain', copyText());
     event.clipboardData.setData('text/html', copyHtml());
   }
   function onCut(event) {
     if (!gridFocused()) return;
+    if (extra.length) { event.preventDefault(); notice('Several ranges cannot be cut at once: select one.'); return; }
     onCopy(event);
     clearSelection();
   }
