@@ -184,8 +184,10 @@ fn start_agent_at_sign_in() -> Result<(), String> {
 /// Starts the agent now (a second one finds the places connected already and stops).
 #[cfg(windows)]
 fn start_agent() {
+    use std::process::Stdio;
     if let Ok(agent) = agent_path() {
-        let _ = std::process::Command::new(agent).spawn();
+        // Without this window's handles: whatever reads its output would wait for the agent.
+        let _ = std::process::Command::new(agent).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
     }
 }
 
