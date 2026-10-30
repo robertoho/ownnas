@@ -671,6 +671,8 @@ impl Inner {
         }
         let mut st = self.st.lock().unwrap();
         st.fresh.remove(split(path).0);
+        // A folder changed: what is in it may have, when the feed tells only of the folder.
+        st.fresh.remove(path);
         if deleted {
             st.fresh.retain(|dir, _| !under(dir, path));
             // Unless changed here: that is sent again (as a new file).

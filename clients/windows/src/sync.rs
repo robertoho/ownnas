@@ -236,6 +236,11 @@ impl Engine {
     /// Brings a local folder (and the folders under it this computer has) in line with the
     /// server, after changes may have been missed. Local edits not yet sent are kept.
     pub fn reconcile(&self, folder: &Path) {
+        self.reconcile_folder(folder, true);
+    }
+
+    /// Like `reconcile`, and with `deep`, in the folders under it too.
+    fn reconcile_folder(&self, folder: &Path, deep: bool) {
         let Some(remote) = self.server(folder) else { return };
         let listing = match self.api.list(&remote) {
             Ok(listing) => listing,
@@ -243,7 +248,10 @@ impl Engine {
         };
         let names: HashSet<String> = listing.entries.iter().map(|entry| entry.name.clone()).collect();
         for entry in &listing.entries {
-            self.server_changed(entry);
+            // Folders here are looked in below (or, not deep, left as they are).
+            if !entry.dir || !local_path(&self.root, &entry.path).is_dir() {
+                self.server_changed(entry);
+            }
         }
         let Ok(children) = fs::read_dir(folder) else { return };
         for child in children.flatten() {
@@ -254,8 +262,8 @@ impl Engine {
             }
             if !names.contains(&name) {
                 self.server_removed(&path);
-            } else if path.is_dir() {
-                self.reconcile(&path);
+            } else if deep && path.is_dir() {
+                self.reconcile_folder(&path, true);
             }
         }
     }
@@ -272,7 +280,14 @@ impl Engine {
             self.trace(|| format!("{}: new here", entry.path));
             return self.create(parent, entry);
         }
-        // Being sent from here (the feed tells of it too), or not a file. (Not `hushed`: that
+        // A folder changed: what is in it may have, when the feed tells only of the folder.
+        if entry.dir {
+            if path.is_dir() {
+                self.reconcile_folder(&path, false);
+            }
+            return;
+        }
+        // Being sent from here (the feed tells of it too). (Not `hushed`: that
         // keeps the watcher from sending back what this engine did, and a change the server
         // makes meanwhile, such as right after the placeholder was made, is still to apply.)
         if entry.dir || self.sending.lock().unwrap_or_else(|err| err.into_inner()).contains(&path) {
