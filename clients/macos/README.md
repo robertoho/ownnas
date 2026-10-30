@@ -27,6 +27,24 @@ It is signed with the Developer ID of team K27HXR2Q62 (see `project.yml`). Its A
 with the team ID, so no provisioning profile is needed. To build under another team, change
 `DEVELOPMENT_TEAM` and `OWNNAS_APP_GROUP`.
 
+### A release
+
+`./release.sh` builds `build/dist/OwnNAS-<version>-mac.dmg`, a disk image for the releases page.
+It holds the app for Apple silicon and Intel, notarized and stapled, so it opens on any Mac
+without warnings. The version comes from `MARKETING_VERSION` in `project.yml`.
+
+Notarizing needs the team's Apple credentials in this Mac's keychain. Store them once:
+
+```bash
+xcrun notarytool store-credentials ownnas-notary --apple-id <Apple ID> --team-id K27HXR2Q62
+```
+
+This asks for an app-specific password, made at account.apple.com.
+
+The icon is drawn in `icon/AppIcon.svg`. `icon/AppIcon-small.svg` is the same with heavier
+lines, for the 16 and 32 pixel sizes. To change the icon, render the PNGs in
+`OwnNAS/Assets.xcassets/AppIcon.appiconset` from them, for example with `rsvg-convert -w 512`.
+
 ## The first time
 
 1. Open OwnNAS: its icon is in the menu bar, and a window asks for the server, username and

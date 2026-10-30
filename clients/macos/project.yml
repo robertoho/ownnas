@@ -25,6 +25,10 @@ settings:
     # The build script writes the Rust library and bindings next to the project.
     ENABLE_USER_SCRIPT_SANDBOXING: NO
     GENERATE_INFOPLIST_FILE: NO
+  configs:
+    # Notarizing refuses apps that let debuggers attach (get-task-allow), which Xcode adds.
+    Release:
+      CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
 targets:
   OwnNAS:
     type: application
@@ -62,6 +66,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.ownnas.mac
         PRODUCT_NAME: OwnNAS
+        # From icon/AppIcon.svg (and AppIcon-small.svg, with heavier lines, for 16 and 32 px).
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
   # The servers in Finder.
   OwnNASFiles:
     type: app-extension
