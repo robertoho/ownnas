@@ -147,11 +147,31 @@ impl Engine {
         }
     }
 
-    /// What a local path is: (is a placeholder, is in sync, the version it was made from).
+    /// What a local placeholder is: (in sync, the version it was made from); `None` when it is
+    /// not one. Read here rather than with cloud-filter, whose `blob()` starts at the end of the
+    /// structure instead of at its `FileIdentity` field, 4 bytes earlier, so versions never read.
     fn state(path: &Path) -> Option<(bool, Option<Stamp>)> {
-        let handle = Placeholder::open(path).ok()?;
-        let info = handle.info().ok()?;
-        info.map(|info| (info.is_in_sync(), blob_stamp(info.blob())))
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::CloudFilters::{
+            CfGetPlaceholderInfo, CF_IN_SYNC_STATE_IN_SYNC, CF_PLACEHOLDER_INFO_STANDARD, CF_PLACEHOLDER_STANDARD_INFO,
+        };
+        const FILE_READ_ATTRIBUTES: u32 = 0x80;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        let file = fs::OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES).share_mode(0x7).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path).ok()?;
+        // In u64s, aligned for the structure.
+        let mut buffer = vec![0u64; (std::mem::size_of::<CF_PLACEHOLDER_STANDARD_INFO>() + 4096) / 8];
+        let mut length = 0u32;
+        unsafe {
+            CfGetPlaceholderInfo(HANDLE(file.as_raw_handle()), CF_PLACEHOLDER_INFO_STANDARD, buffer.as_mut_ptr().cast(), (buffer.len() * 8) as u32, Some(&mut length))
+        }
+        .ok()?;
+        let info = unsafe { &*(buffer.as_ptr() as *const CF_PLACEHOLDER_STANDARD_INFO) };
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const u8, (length as usize).min(buffer.len() * 8)) };
+        let start = std::mem::offset_of!(CF_PLACEHOLDER_STANDARD_INFO, FileIdentity);
+        let blob = bytes.get(start..start + info.FileIdentityLength as usize)?;
+        Some((info.InSyncState == CF_IN_SYNC_STATE_IN_SYNC, blob_stamp(blob)))
     }
 
     // --- Changes on the server -----------------------------------------------------------------
@@ -219,6 +239,8 @@ impl Engine {
             self.note(&format!("{} changed on the server: the new version downloads when opened", entry.path));
         }
         if let Err(err) = updated {
+            // Not changed after all: what happens to it next is the person's doing.
+            self.quiet.lock().unwrap_or_else(|err| err.into_inner()).remove(&path);
             self.note(&format!("could not update {} from {base:?} to {now:?} (open in an app?): {err}", entry.path));
         }
     }
