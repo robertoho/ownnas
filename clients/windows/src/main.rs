@@ -185,8 +185,17 @@ fn start_agent_at_sign_in() -> Result<(), String> {
 #[cfg(windows)]
 fn start_agent() {
     use std::process::Stdio;
+    use windows::Win32::Foundation::{SetHandleInformation, HANDLE_FLAGS, HANDLE_FLAG_INHERIT};
+    use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    // Programs started here inherit every handle that may be inherited, whatever their own
+    // input and output are: the agent would keep this window's, and whatever reads this
+    // program's output would wait for the agent to end.
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        if let Ok(handle) = unsafe { GetStdHandle(which) } {
+            let _ = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) };
+        }
+    }
     if let Ok(agent) = agent_path() {
-        // Without this window's handles: whatever reads its output would wait for the agent.
         let _ = std::process::Command::new(agent).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
     }
 }
