@@ -627,9 +627,18 @@ impl Inner {
                             let _ = self.keeps.lock().unwrap().send(path);
                         }
                     } else {
-                        for change in feed.changes {
+                        for change in &feed.changes {
                             self.apply(&change.path, change.deleted);
                         }
+                        // The feed tells of a change as it starts: a file being written may
+                        // still list with its old version, so look again once it is done.
+                        let inner = self.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_secs(3));
+                            for change in feed.changes {
+                                inner.apply(&change.path, change.deleted);
+                            }
+                        });
                     }
                     cursor = feed.cursor;
                 }

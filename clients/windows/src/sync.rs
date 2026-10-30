@@ -223,6 +223,9 @@ impl Engine {
         };
         let now = Stamp { size: entry.size, mtime: Self::millis(entry) };
         if base == Some(now) {
+            if std::env::var_os("OWNNAS_TRACE").is_some() {
+                self.note(&format!("{} is the server's version already", entry.path));
+            }
             return;
         }
         // Local edits not yet sent win here; their upload finds the conflict.
@@ -292,12 +295,22 @@ impl Engine {
                         // Starting, or changes were missed: look at everything this computer has.
                         self.reconcile(&self.root);
                     } else {
-                        for change in feed.changes {
+                        for change in &feed.changes {
                             if std::env::var_os("OWNNAS_TRACE").is_some() {
                                 self.note(&format!("feed: {}{}", change.path, if change.deleted { " (deleted)" } else { "" }));
                             }
                             self.apply(&change.path, change.deleted);
                         }
+                        // The feed tells of a change as it starts: a file being written may
+                        // still list with its old version (NTFS sets the time later), so look
+                        // again once it is done.
+                        let engine = self.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_secs(3));
+                            for change in feed.changes {
+                                engine.apply(&change.path, change.deleted);
+                            }
+                        });
                     }
                     cursor = feed.cursor;
                 }
