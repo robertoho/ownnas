@@ -19,6 +19,8 @@ function Wait-Until($what, [scriptblock]$test, $seconds = 30) {
 }
 
 $env:OWNNAS_USER = 'admin'; $env:OWNNAS_PASSWORD = 'test passphrase 123'
+# The agent (started by setup) logs each change the server's feed tells of.
+$env:OWNNAS_TRACE = '1'
 & "$bin\ownnas.exe" user add --data $data | Out-Host
 $server = Start-Process -PassThru -NoNewWindow "$bin\ownnas.exe" -ArgumentList 'serve', '--root', $library, '--data', $data, '--addr', '127.0.0.1:8899'
 Wait-Until 'the server is up' { try { (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8899/api/health).StatusCode -eq 200 } catch { $false } }

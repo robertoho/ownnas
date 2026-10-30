@@ -215,6 +215,9 @@ impl Engine {
             // Emptied: the new version downloads when the file is next opened.
             handle.update(UpdateOptions::default().metadata(Self::metadata(entry)).blob(&blob).dehydrate().mark_in_sync(), None).map(|_| ())
         });
+        if updated.is_ok() {
+            self.note(&format!("{} changed on the server: the new version downloads when opened", entry.path));
+        }
         if let Err(err) = updated {
             self.note(&format!("could not update {} from {base:?} to {now:?} (open in an app?): {err}", entry.path));
         }
@@ -268,6 +271,9 @@ impl Engine {
                         self.reconcile(&self.root);
                     } else {
                         for change in feed.changes {
+                            if std::env::var_os("OWNNAS_TRACE").is_some() {
+                                self.note(&format!("feed: {}{}", change.path, if change.deleted { " (deleted)" } else { "" }));
+                            }
                             self.apply(&change.path, change.deleted);
                         }
                     }
@@ -307,11 +313,10 @@ impl Engine {
             return;
         }
         match self.api.list(parent) {
-            Ok(listing) => {
-                if let Some(entry) = listing.entries.iter().find(|entry| entry.path == remote) {
-                    self.server_changed(entry);
-                }
-            }
+            Ok(listing) => match listing.entries.iter().find(|entry| entry.path == remote) {
+                Some(entry) => self.server_changed(entry),
+                None => self.note(&format!("{remote} changed on the server, but its folder's listing does not have it")),
+            },
             Err(err) => self.note(&format!("could not list {parent}: {err}")),
         }
     }
