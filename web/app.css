@@ -663,6 +663,15 @@ input, select, textarea {
   .status-right:has(.update-pill:not([hidden])) .tile-size-control { display: none; }
 }
 .update-dot { flex: 0 0 auto; width: 0.45rem; height: 0.45rem; border-radius: 50%; background: var(--accent); }
+/* The Trash reminder: as quiet as the update note, one segment more. */
+#trash-pill-open { border-radius: 999px 0 0 999px; white-space: nowrap; }
+#trash-pill-empty { border-radius: 0; white-space: nowrap; }
+#trash-pill-short { display: none; }
+@media (max-width: 600px) {
+  #trash-pill-text, #trash-pill-empty { display: none; }
+  #trash-pill-short { display: inline; }
+  .status-right:has(.trash-pill:not([hidden])) .tile-size-control { display: none; }
+}
 .storage-bar { display: flex; width: 5.5rem; height: 0.45rem; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, var(--text) 14%, transparent); }
 .storage-bar > span { display: block; height: 100%; }
 .storage-bar-library, .storage-seg-library { background: var(--accent); }

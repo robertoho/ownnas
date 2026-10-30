@@ -621,6 +621,85 @@ pub fn empty_trash(root: &Path) -> Result<u32, FileError> {
     Ok(removed)
 }
 
+/// How much of the Trash has been there a while: what was deleted before a time.
+#[derive(Serialize, Default, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TrashSummary {
+    /// Everything in the Trash.
+    pub items: u32,
+    /// Deleted before the time asked about, and the space that takes.
+    pub old_items: u32,
+    pub old_bytes: u64,
+    /// When the longest-held item was deleted (seconds since 1970).
+    pub oldest: Option<i64>,
+}
+
+/// The items at the top of the Trash, with when each was deleted (items from before deletion
+/// times were kept count from when they last changed).
+fn trash_items(root: &Path) -> Result<Vec<(PathBuf, String, i64)>, FileError> {
+    let trash = ensure_trash_dir(root)?;
+    let mut items = Vec::new();
+    for item in fs::read_dir(&trash).map_err(map_io)? {
+        let item = item.map_err(map_io)?;
+        let name = item.file_name().to_string_lossy().to_string();
+        if name == TRASH_MARK || name == TRASH_META_DIR || name == TRASH_LOG {
+            continue;
+        }
+        let deleted_at = match read_trash_meta(root, &name) {
+            Ok(Some(meta)) => meta.deleted_at,
+            _ => item
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_secs() as i64),
+        };
+        items.push((item.path(), name, deleted_at));
+    }
+    Ok(items)
+}
+
+/// The space a file or folder takes (links are not followed).
+fn tree_bytes(path: &Path) -> u64 {
+    let Ok(meta) = fs::symlink_metadata(path) else { return 0 };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    fs::read_dir(path).map_or(0, |items| items.flatten().map(|item| tree_bytes(&item.path())).sum())
+}
+
+pub fn trash_summary(root: &Path, before: i64) -> Result<TrashSummary, FileError> {
+    let mut summary = TrashSummary::default();
+    for (path, _, deleted_at) in trash_items(root)? {
+        summary.items += 1;
+        summary.oldest = Some(summary.oldest.map_or(deleted_at, |oldest| oldest.min(deleted_at)));
+        if deleted_at < before {
+            summary.old_items += 1;
+            summary.old_bytes += tree_bytes(&path);
+        }
+    }
+    Ok(summary)
+}
+
+/// Permanently deletes what was moved to the Trash before `before` (seconds since 1970).
+/// Returns the paths deleted.
+pub fn empty_trash_before(root: &Path, before: i64) -> Result<Vec<String>, FileError> {
+    let mut removed = Vec::new();
+    for (path, name, deleted_at) in trash_items(root)? {
+        if deleted_at >= before {
+            continue;
+        }
+        if path.is_dir() {
+            fs::remove_dir_all(&path).map_err(map_io)?;
+        } else {
+            fs::remove_file(&path).map_err(map_io)?;
+        }
+        let _ = remove_trash_meta(root, &name);
+        removed.push(format!("{TRASH_DIR}/{name}"));
+    }
+    Ok(removed)
+}
+
 #[derive(Serialize, serde::Deserialize)]
 struct TrashMeta {
     original: String,
@@ -3442,6 +3521,37 @@ mod tests {
         assert!(lines[1].ends_with("  note.txt saved as note (2).txt"));
         assert!(lines[2].ends_with("  note.txt saved as note (3).txt"));
         assert_eq!(format_utc(1_577_836_800), "2020-01-01 00:00:00Z");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn what_has_been_in_the_trash_a_while() {
+        let root = scratch();
+        fs::write(root.join("sub").join("old.txt"), b"twelve bytes").unwrap();
+        fs::create_dir(root.join("sub").join("old folder")).unwrap();
+        fs::write(root.join("sub").join("old folder").join("a.bin"), vec![0u8; 100]).unwrap();
+        fs::write(root.join("sub").join("new.txt"), b"new").unwrap();
+        for rel in ["sub/old.txt", "sub/old folder", "sub/new.txt"] {
+            trash_entry(&root, rel).unwrap();
+        }
+        // Deleted 40 days ago.
+        let long_ago = now_unix() - 40 * 86400;
+        for name in ["old.txt", "old folder"] {
+            let path = trash_meta_path(&root, name).unwrap();
+            let mut meta: TrashMeta = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            meta.deleted_at = long_ago;
+            fs::write(&path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        }
+        let month_ago = now_unix() - 30 * 86400;
+        let summary = trash_summary(&root, month_ago).unwrap();
+        assert_eq!((summary.items, summary.old_items, summary.old_bytes, summary.oldest), (3, 2, 112, Some(long_ago)));
+
+        let mut removed = empty_trash_before(&root, month_ago).unwrap();
+        removed.sort();
+        assert_eq!(removed, [".ownnas-trash/old folder", ".ownnas-trash/old.txt"]);
+        let left = list_dir(&root, ".ownnas-trash", true, false).unwrap();
+        assert_eq!(left.entries.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(), ["new.txt"]);
+        assert_eq!(trash_summary(&root, month_ago).unwrap().old_items, 0);
         let _ = fs::remove_dir_all(&root);
     }
 

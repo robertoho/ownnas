@@ -288,7 +288,7 @@ async function api(url, options = {}) {
     throw error;
   }
   if (!undoBusy && state.me) {
-    if (method === "DELETE" && url.startsWith("/api/entry?") && data.action === "deleted" || url === "/api/trash/empty") { undoHistory.length = 0; syncUndo(); }
+    if (method === "DELETE" && url.startsWith("/api/entry?") && data.action === "deleted" || url.startsWith("/api/trash/empty")) { undoHistory.length = 0; syncUndo(); }
     const request = options.json || (["/api/rename", "/api/move"].includes(url) && typeof options.body === "string" ? JSON.parse(options.body) : {});
     let operation;
     if (["/api/rename", "/api/move"].includes(url) && method === "POST") operation = { path: data.path, dest: request.path, label: url.endsWith("rename") ? "rename" : "move" };
@@ -4253,6 +4253,7 @@ async function emptyTrash() {
   // The Trash's share of the disk changed: measure again.
   api("/api/storage/measure", { method: "POST" }).then(paintStorage).catch(() => {});
   toast(result.removed ? `Emptied ${result.removed} item(s)` : "Trash was already empty");
+  $("trash-pill").hidden = true;
   invalidateFolderSizes();
   await load(state.path);
 }
@@ -4876,6 +4877,9 @@ async function boot() {
   refreshSmartStatus().then(syncSimilarButton);
   pollHealthAlerts().catch(() => {});
   if (!healthTimer) healthTimer = setInterval(() => pollHealthAlerts().catch(() => {}), 10 * 60 * 1000);
+  pollTrashReminder();
+  // Things cross the month mark as days go by.
+  if (!trashTimer) trashTimer = setInterval(pollTrashReminder, 6 * 60 * 60 * 1000);
   try {
     await route();
   } catch (err) {
@@ -5076,6 +5080,58 @@ function showUpdatePill(update) {
 }
 
 $("update-pill-open").addEventListener("click", () => openSettings("updates"));
+
+// ---- A reminder when the Trash has held things a long time (they stay until it is emptied) ----
+
+const TRASH_SNOOZE_KEY = "ownnas-trash-snooze";
+const TRASH_SNOOZE_DAYS = 14;
+const TRASH_OLD_DAYS = 30;
+let trashTimer = null;
+
+async function pollTrashReminder() {
+  const pill = $("trash-pill");
+  let until = 0;
+  try { until = Number(localStorage.getItem(TRASH_SNOOZE_KEY) || 0); } catch {}
+  if (!state.me || state.me.readonly || Date.now() < until) {
+    pill.hidden = true;
+    return;
+  }
+  let summary;
+  try { summary = await api(`/api/trash/summary?days=${TRASH_OLD_DAYS}`); } catch { return; }
+  if (!summary.oldItems) {
+    pill.hidden = true;
+    return;
+  }
+  const items = summary.oldItems === 1 ? "1 item" : `${summary.oldItems} items`;
+  const size = formatSize(summary.oldBytes, false);
+  $("trash-pill-text").textContent = `Trash: ${items} from over a month ago · ${size}`;
+  $("trash-pill-short").textContent = `Trash ${size}`;
+  pill.dataset.items = items;
+  pill.dataset.size = size;
+  pill.hidden = false;
+}
+
+$("trash-pill-open").addEventListener("click", () => go(".ownnas-trash").catch((err) => toast(err.message, true)));
+$("trash-pill-empty").addEventListener("click", async () => {
+  const pill = $("trash-pill");
+  const question = `Permanently delete the ${pill.dataset.items} (${pill.dataset.size}) that have been in the Trash for over a month? The rest of the Trash stays.`;
+  if (!await askConfirm(question, "Delete Them")) return;
+  try {
+    const result = await api(`/api/trash/empty?olderThanDays=${TRASH_OLD_DAYS}`, { method: "POST" });
+    pill.hidden = true;
+    toast(result.removed === 1 ? "Deleted 1 item from the Trash" : `Deleted ${result.removed} items from the Trash`);
+    api("/api/storage/measure", { method: "POST" }).then(paintStorage).catch(() => {});
+    invalidateFolderSizes();
+    if (inTrashPath(state.path)) await load(state.path);
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+$("trash-pill-later").addEventListener("click", () => {
+  $("trash-pill").hidden = true;
+  try { localStorage.setItem(TRASH_SNOOZE_KEY, String(Date.now() + TRASH_SNOOZE_DAYS * 24 * 60 * 60 * 1000)); } catch {}
+  toast("We'll remind you again in two weeks.");
+});
 $("update-pill-later").addEventListener("click", () => {
   const pill = $("update-pill");
   pill.hidden = true;

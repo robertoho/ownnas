@@ -360,6 +360,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/entry", axum::routing::delete(delete_entry))
         .route("/api/restore", post(restore_item))
         .route("/api/trash/empty", post(empty_trash))
+        .route("/api/trash/summary", get(trash_summary))
         .route("/api/bookmarks", get(list_bookmarks).post(add_bookmark).delete(remove_bookmark))
         .route("/api/recent", get(list_recent).post(touch_recent))
         .route("/api/search", get(search))
@@ -4668,22 +4669,71 @@ async fn restore_item(
     Ok(Json(json!({ "path": path })))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrashQuery {
+    /// Only what was moved to the Trash more than this many days ago.
+    older_than_days: Option<u32>,
+    /// For the summary: what counts as there a while (30 days if left out).
+    days: Option<u32>,
+}
+
+fn days_ago(days: u32) -> i64 {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    now - i64::from(days) * 86_400
+}
+
 async fn empty_trash(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
+    Query(query): Query<TrashQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     check_csrf(&headers)?;
     let (user, _) = require_user(&state, &headers)?;
     require_write(&state)?;
     let root = state.root.clone();
-    let removed = tokio::task::spawn_blocking(move || files::empty_trash(&root))
-        .await
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not empty the Trash"))?
-        .map_err(ApiError::from)?;
-    delete_meta(&state, files::TRASH_DIR);
-    delete_meta(&state, "Trash");
-    record(&state, &user, "empty-trash", &format!("{removed} item(s)"));
+    let failed = |_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not empty the Trash");
+    let removed = match query.older_than_days {
+        Some(days) => {
+            let before = days_ago(days);
+            let paths = tokio::task::spawn_blocking(move || files::empty_trash_before(&root, before))
+                .await
+                .map_err(failed)?
+                .map_err(ApiError::from)?;
+            for path in &paths {
+                delete_meta(&state, path);
+            }
+            record(&state, &user, "empty-trash", &format!("{} item(s) deleted over {days} days ago", paths.len()));
+            paths.len() as u32
+        }
+        None => {
+            let removed = tokio::task::spawn_blocking(move || files::empty_trash(&root))
+                .await
+                .map_err(failed)?
+                .map_err(ApiError::from)?;
+            delete_meta(&state, files::TRASH_DIR);
+            delete_meta(&state, "Trash");
+            record(&state, &user, "empty-trash", &format!("{removed} item(s)"));
+            removed
+        }
+    };
     Ok(Json(json!({ "removed": removed })))
+}
+
+/// How much of the Trash has been there a while, for the reminder to empty it.
+async fn trash_summary(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<TrashQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let root = state.root.clone();
+    let before = days_ago(query.days.unwrap_or(30));
+    let summary = tokio::task::spawn_blocking(move || files::trash_summary(&root, before))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not look in the Trash"))?
+        .map_err(ApiError::from)?;
+    Ok(Json(summary))
 }
 
 fn upload_choice(query: &UploadQuery) -> Result<Option<files::UploadChoice>, ApiError> {
