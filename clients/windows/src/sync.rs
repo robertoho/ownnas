@@ -21,7 +21,7 @@ use std::time::{Duration, Instant, SystemTime};
 use cloud_filter::error::{CResult, CloudErrorKind};
 use cloud_filter::filter::{info, ticket, Request, SyncFilter};
 use cloud_filter::metadata::Metadata;
-use cloud_filter::placeholder::{ConvertOptions, Placeholder, UpdateOptions};
+use cloud_filter::placeholder::{ConvertOptions, Placeholder};
 use cloud_filter::placeholder_file::PlaceholderFile;
 use cloud_filter::root::{HydrationType, PopulationType, ProtectionMode, SecurityId, Session, SyncRootId, SyncRootIdBuilder, SyncRootInfo};
 use cloud_filter::utility::WriteAt;
@@ -73,18 +73,54 @@ pub fn unregister(account: &Account) -> Result<(), String> {
 /// one: the Cloud Files calls that change placeholders take no other (those `CfOpenFileWithOplock`
 /// gives are refused as invalid). `exclusive`: no one else may have it open (needed to empty it).
 fn writable(path: &Path, exclusive: bool) -> windows::core::Result<Placeholder> {
+    open_writable(path, exclusive).map(Placeholder::from)
+}
+
+fn open_writable(path: &Path, exclusive: bool) -> windows::core::Result<fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
-    let file = fs::OpenOptions::new()
+    fs::OpenOptions::new()
         .read(true)
         .write(true)
         .share_mode(if exclusive { 0 } else { SHARE_ALL })
         // Folders open only with this.
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
-        .map_err(|err| windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(err.raw_os_error().unwrap_or(0) as u32)))?;
-    Ok(Placeholder::from(file))
+        .map_err(|err| windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(err.raw_os_error().unwrap_or(0) as u32)))
+}
+
+/// Changes a placeholder's version (and with `server`, its size and times too, emptied so the
+/// new version downloads when opened), marking it in sync. Done here rather than with
+/// cloud-filter, whose `update` passes an empty list of ranges to empty when asked to empty
+/// the whole file, which Windows refuses ("The parameter is incorrect").
+fn update_placeholder(path: &Path, blob: &[u8], server: Option<&Entry>) -> windows::core::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::CloudFilters::{CfUpdatePlaceholder, CF_FS_METADATA, CF_UPDATE_FLAGS, CF_UPDATE_FLAG_DEHYDRATE, CF_UPDATE_FLAG_MARK_IN_SYNC};
+    use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO};
+    // Emptying needs it to be open nowhere else.
+    let file = open_writable(path, server.is_some())?;
+    let metadata = server.map(|entry| {
+        let time = file_time(Engine::millis(entry)) as i64;
+        CF_FS_METADATA {
+            BasicInfo: FILE_BASIC_INFO { CreationTime: time, LastAccessTime: time, LastWriteTime: time, ChangeTime: time, FileAttributes: FILE_ATTRIBUTE_NORMAL.0 },
+            FileSize: entry.size as i64,
+        }
+    });
+    let flags = CF_UPDATE_FLAG_MARK_IN_SYNC.0 | if server.is_some() { CF_UPDATE_FLAG_DEHYDRATE.0 } else { 0 };
+    unsafe {
+        CfUpdatePlaceholder(
+            HANDLE(file.as_raw_handle()),
+            metadata.as_ref().map(|metadata| metadata as *const _),
+            Some(blob.as_ptr().cast()),
+            blob.len() as u32,
+            None,
+            CF_UPDATE_FLAGS(flags),
+            None,
+            None,
+        )
+    }
 }
 
 /// The sync engine for one account.
@@ -245,10 +281,8 @@ impl Engine {
         self.hush(&path);
         let blob = stamp_blob(now.size, now.mtime);
         self.trace(|| format!("{}: updating from {base:?} to {now:?}", entry.path));
-        let updated = writable(&path, true).and_then(|mut handle| {
-            // Emptied: the new version downloads when the file is next opened.
-            handle.update(UpdateOptions::default().metadata(Self::metadata(entry)).blob(&blob).dehydrate().mark_in_sync(), None).map(|_| ())
-        });
+        // Emptied: the new version downloads when the file is next opened.
+        let updated = update_placeholder(&path, &blob, Some(entry));
         if updated.is_ok() {
             self.note(&format!("{} changed on the server: the new version downloads when opened", entry.path));
         }
@@ -483,7 +517,8 @@ impl Engine {
         let blob = stamp_blob(stamp.size, stamp.mtime);
         let marked = writable(path, false).and_then(|mut handle| {
             if was_placeholder {
-                handle.update(UpdateOptions::default().blob(&blob).mark_in_sync(), None).map(|_| ())
+                drop(handle);
+                update_placeholder(path, &blob, None)
             } else {
                 handle.convert_to_placeholder(ConvertOptions::default().mark_in_sync().blob(blob.clone()), None).map(|_| ())
             }

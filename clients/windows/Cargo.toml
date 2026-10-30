@@ -25,4 +25,4 @@ serde_json = "1"
 cloud-filter = "0.0.6"
 notify = { version = "8", default-features = false }
 nt-time = "0.8"
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_CloudFilters", "Win32_System_Console"] }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_CloudFilters", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO"] }
