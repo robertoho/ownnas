@@ -145,7 +145,17 @@ fn run(command: Command) -> Result<(), String> {
                 .position(|account| account.server == server.trim_end_matches('/') || account.name == server)
                 .ok_or_else(|| format!("No server {server}: see `ownnas-cloud status`."))?;
             let account = settings.accounts.remove(at);
-            sync::unregister(&account)?;
+            // Windows won't take out a place while the agent has it connected: stop it, and
+            // start it again for the places left.
+            stop_agent();
+            let unregistered = sync::unregister(&account);
+            if !settings.accounts.is_empty() {
+                start_agent();
+            }
+            if let Err(err) = unregistered {
+                settings.accounts.insert(at, account);
+                return Err(err);
+            }
             if let Ok(token) = secret::unprotect(&account.token) {
                 if let Ok(api) = api_for(&account.server, Some(token), account.ca_pem.as_deref(), &account.pinned) {
                     let _ = api.logout();
@@ -179,6 +189,14 @@ fn start_agent_at_sign_in() -> Result<(), String> {
         .output()
         .map_err(|err| err.to_string())?;
     if out.status.success() { Ok(()) } else { Err(format!("Could not set OwnNAS to start at sign-in: {}", String::from_utf8_lossy(&out.stderr))) }
+}
+
+/// Stops the agent (every place it serves goes offline until it starts again).
+#[cfg(windows)]
+fn stop_agent() {
+    let _ = std::process::Command::new("taskkill").args(["/F", "/IM", "ownnas-cloud-agent.exe"]).output();
+    // Windows lets go of the places a moment after the process ends.
+    std::thread::sleep(std::time::Duration::from_secs(1));
 }
 
 /// Starts the agent now (a second one finds the places connected already and stops).
