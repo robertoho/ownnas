@@ -15,6 +15,7 @@
 		8C4ECEAA4610156A7567F1DE /* MacHub.swift in Sources */ = {isa = PBXBuildFile; fileRef = ECF48F2E3B8E28C62EFC6034 /* MacHub.swift */; };
 		90CE6B143A81BC022C302486 /* ServerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F571EC2CEC1266E622DBDA6B /* ServerStore.swift */; };
 		97CB8FAE87ADAD790EFE9104 /* OwnNASCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 928AE3C0126BC1ABA1DEC5F2 /* OwnNASCore.xcframework */; };
+		98053B969B48DECB6A4BC650 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = E133809D16D6B176C6A59473 /* Assets.xcassets */; };
 		A70AEA8B47BA5631053744E4 /* OwnNASApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = BAEAF5CDE1B66B842C0689A0 /* OwnNASApp.swift */; };
 		B388B4C872C6C308DA22661A /* ItemIds.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A6FA63E8D7911CEE6FE1140 /* ItemIds.swift */; };
 		BF45262C6F8469F6846E63B3 /* ownnas_ffi.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04AA69F933C6090E0AE462DC /* ownnas_ffi.swift */; };
@@ -54,6 +55,7 @@
 		8610BB03CF3B539129516725 /* SignInView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignInView.swift; sourceTree = "<group>"; };
 		928AE3C0126BC1ABA1DEC5F2 /* OwnNASCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = OwnNASCore.xcframework; path = Generated/OwnNASCore.xcframework; sourceTree = "<group>"; };
 		BAEAF5CDE1B66B842C0689A0 /* OwnNASApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OwnNASApp.swift; sourceTree = "<group>"; };
+		E133809D16D6B176C6A59473 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		EB0BD4B1B50C206BAA75C117 /* OwnNASFiles.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = OwnNASFiles.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		ECF48F2E3B8E28C62EFC6034 /* MacHub.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacHub.swift; sourceTree = "<group>"; };
 		F5249859B6A73AF340C3C0E1 /* OwnNAS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = OwnNAS.entitlements; sourceTree = "<group>"; };
@@ -117,6 +119,7 @@
 		B13F28C431F3FA91232FAFD3 /* OwnNAS */ = {
 			isa = PBXGroup;
 			children = (
+				E133809D16D6B176C6A59473 /* Assets.xcassets */,
 				325060305FF2FCA1E785F8DA /* Info.plist */,
 				ECF48F2E3B8E28C62EFC6034 /* MacHub.swift */,
 				F5249859B6A73AF340C3C0E1 /* OwnNAS.entitlements */,
@@ -198,6 +201,7 @@
 			buildConfigurationList = 53AA3E2A47BEAECA878DB7A0 /* Build configuration list for PBXNativeTarget "OwnNAS" */;
 			buildPhases = (
 				2E28D623AFDB147DB1EFA5F0 /* Sources */,
+				9EA731B3919AA85115243972 /* Resources */,
 				04688FE8297DC24B72302BD0 /* Frameworks */,
 				E7D66068B245082E5B912916 /* Embed Foundation Extensions */,
 			);
@@ -251,6 +255,17 @@
 			);
 		};
 /* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		9EA731B3919AA85115243972 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				98053B969B48DECB6A4BC650 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
 		7863181E296B81EF7F099668 /* Build the Rust client library */ = {
@@ -386,6 +401,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_IDENTITY = "Developer ID Application";
+				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
 				CODE_SIGN_STYLE = Manual;
 				COPY_PHASE_STRIP = NO;
 				CURRENT_PROJECT_VERSION = 1;
