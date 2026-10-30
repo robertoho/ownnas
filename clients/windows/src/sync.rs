@@ -132,11 +132,13 @@ pub struct Engine {
     quiet: Mutex<HashMap<PathBuf, Instant>>,
     /// Files being sent: the change feed tells of them before they are marked as sent.
     sending: Mutex<HashSet<PathBuf>>,
+    /// Paths this engine is deleting here (Windows asks `Filter::delete` while it does).
+    removing: Mutex<HashSet<PathBuf>>,
 }
 
 impl Engine {
     pub fn new(account: &Account, api: Api) -> Arc<Self> {
-        Arc::new(Engine { api, root: account.folder.clone(), name: account.name.clone(), quiet: Mutex::new(HashMap::new()), sending: Mutex::new(HashSet::new()) })
+        Arc::new(Engine { api, root: account.folder.clone(), name: account.name.clone(), quiet: Mutex::new(HashMap::new()), sending: Mutex::new(HashSet::new()), removing: Mutex::new(HashSet::new()) })
     }
 
     /// A line in the log only with `OWNNAS_TRACE` set (for troubleshooting).
@@ -155,6 +157,18 @@ impl Engine {
     }
 
     /// Marks a local path as being changed here, for a few seconds.
+    /// Deletes a file or (empty) folder here, not on the server.
+    fn remove_here(&self, path: &Path) -> std::io::Result<()> {
+        self.removing.lock().unwrap_or_else(|err| err.into_inner()).insert(path.to_path_buf());
+        let removed = if path.is_dir() { fs::remove_dir(path) } else { fs::remove_file(path) };
+        self.removing.lock().unwrap_or_else(|err| err.into_inner()).remove(path);
+        removed
+    }
+
+    fn removing(&self, path: &Path) -> bool {
+        self.removing.lock().unwrap_or_else(|err| err.into_inner()).contains(path)
+    }
+
     fn hush(&self, path: &Path) {
         self.quiet.lock().unwrap_or_else(|err| err.into_inner()).insert(path.to_path_buf(), Instant::now());
     }
@@ -302,13 +316,13 @@ impl Engine {
                 }
             }
             self.hush(path);
-            let _ = fs::remove_dir(path);
+            let _ = self.remove_here(path);
             return;
         }
         match Self::state(path) {
             Some((true, _)) => {
                 self.hush(path);
-                if let Err(err) = fs::remove_file(path) {
+                if let Err(err) = self.remove_here(path) {
                     self.note(&format!("could not remove {}: {err}", path.display()));
                 }
             }
@@ -540,7 +554,7 @@ impl Engine {
         let parent_remote = remote.rsplit_once('/').map_or("", |(parent, _)| parent);
         let (Some(parent), Ok(listing)) = (path.parent(), self.api.list(parent_remote)) else { return };
         self.hush(path);
-        if fs::remove_file(path).is_ok() {
+        if self.remove_here(path).is_ok() {
             if let Some(entry) = listing.entries.iter().find(|entry| entry.path == remote) {
                 self.create(parent, entry);
             }
@@ -613,7 +627,7 @@ impl SyncFilter for Filter {
     /// Deleted in Explorer: to the server's Trash first.
     fn delete(&self, request: Request, ticket: ticket::Delete, info: info::Delete) -> CResult<()> {
         let path = request.path();
-        if info.is_undelete() || self.0.hushed(&path) {
+        if info.is_undelete() || self.0.removing(&path) {
             return ticket.pass().map_err(|_| CloudErrorKind::InvalidRequest);
         }
         let remote = self.0.server(&path).ok_or(CloudErrorKind::NotUnderSyncRoot)?;
@@ -632,7 +646,8 @@ impl SyncFilter for Filter {
     fn rename(&self, request: Request, ticket: ticket::Rename, info: info::Rename) -> CResult<()> {
         let source = request.path();
         let target = info.target_path();
-        if self.0.hushed(&source) || !info.source_in_scope() {
+        // (This engine never renames here: every rename is the person's.)
+        if !info.source_in_scope() {
             return ticket.pass().map_err(|_| CloudErrorKind::InvalidRequest);
         }
         let from = self.0.server(&source).ok_or(CloudErrorKind::NotUnderSyncRoot)?;
