@@ -94,11 +94,13 @@ pub struct Engine {
     name: String,
     /// Local paths this engine is changing itself, whose events are not the person's doing.
     quiet: Mutex<HashMap<PathBuf, Instant>>,
+    /// Files being sent: the change feed tells of them before they are marked as sent.
+    sending: Mutex<HashSet<PathBuf>>,
 }
 
 impl Engine {
     pub fn new(account: &Account, api: Api) -> Arc<Self> {
-        Arc::new(Engine { api, root: account.folder.clone(), name: account.name.clone(), quiet: Mutex::new(HashMap::new()) })
+        Arc::new(Engine { api, root: account.folder.clone(), name: account.name.clone(), quiet: Mutex::new(HashMap::new()), sending: Mutex::new(HashSet::new()) })
     }
 
     fn note(&self, line: &str) {
@@ -192,14 +194,20 @@ impl Engine {
         if !path.exists() {
             return self.create(parent, entry);
         }
-        if entry.dir {
+        // Being sent from here (the feed tells of it too), or not a file.
+        if entry.dir || self.hushed(&path) || self.sending.lock().unwrap_or_else(|err| err.into_inner()).contains(&path) {
             return;
         }
-        let Some((in_sync, base)) = Self::state(&path) else { return };
+        let Some((in_sync, base)) = Self::state(&path) else {
+            return self.note(&format!("{} changed on the server, but it is not a placeholder here", entry.path));
+        };
         let now = Stamp { size: entry.size, mtime: Self::millis(entry) };
-        // Local edits not yet sent win here; their upload finds the conflict.
-        if !in_sync || base == Some(now) {
+        if base == Some(now) {
             return;
+        }
+        // Local edits not yet sent win here; their upload finds the conflict.
+        if !in_sync {
+            return self.note(&format!("{} changed on the server and here: this computer's version goes up next", entry.path));
         }
         self.hush(&path);
         let blob = stamp_blob(now.size, now.mtime);
@@ -398,7 +406,8 @@ impl Engine {
             // Still open in the app writing it.
             Err(_) => return false,
         };
-        match self.api.upload(&remote, base, mtime, size, file) {
+        self.sending.lock().unwrap_or_else(|err| err.into_inner()).insert(path.to_path_buf());
+        let done = match self.api.upload(&remote, base, mtime, size, file) {
             Ok(stamp) => {
                 self.mark_sent(path, state.is_some(), stamp);
                 self.note(&format!("sent {remote}"));
@@ -412,7 +421,9 @@ impl Engine {
                 self.note(&format!("could not send {remote}: {err}"));
                 false
             }
-        }
+        };
+        self.sending.lock().unwrap_or_else(|err| err.into_inner()).remove(path);
+        done
     }
 
     fn mark_sent(&self, path: &Path, was_placeholder: bool, stamp: Stamp) {
