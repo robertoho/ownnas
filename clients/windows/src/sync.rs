@@ -208,7 +208,7 @@ impl Engine {
             handle.update(UpdateOptions::default().metadata(Self::metadata(entry)).blob(&blob).dehydrate().mark_in_sync(), None).map(|_| ())
         });
         if let Err(err) = updated {
-            self.note(&format!("could not update {} (open in an app?): {err}", entry.path));
+            self.note(&format!("could not update {} from {base:?} to {now:?} (open in an app?): {err}", entry.path));
         }
     }
 

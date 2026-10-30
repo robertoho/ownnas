@@ -44,6 +44,10 @@ try {
     Set-Content -NoNewline -Path (Join-Path $library 'Docs\from-server.txt') -Value 'made on the server'
     Wait-Until 'a file made on the server shows here' { Test-Path (Join-Path $place 'Docs\from-server.txt') }
 
+    # A downloaded file changed on the server: the new version shows here.
+    Set-Content -NoNewline -Path (Join-Path $library 'Docs\readme.txt') -Value 'changed on the server'
+    Wait-Until 'a change on the server reaches a downloaded file' { (Get-Content -Raw (Join-Path $place 'Docs\readme.txt')) -eq 'changed on the server' }
+
     Rename-Item (Join-Path $place 'Docs\from-windows.txt') 'renamed.txt'
     Wait-Until 'a rename here happens on the server' { Test-Path (Join-Path $library 'Docs\renamed.txt') }
 
