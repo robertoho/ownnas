@@ -103,6 +103,13 @@ impl Engine {
         Arc::new(Engine { api, root: account.folder.clone(), name: account.name.clone(), quiet: Mutex::new(HashMap::new()), sending: Mutex::new(HashSet::new()) })
     }
 
+    /// A line in the log only with `OWNNAS_TRACE` set (for troubleshooting).
+    fn trace(&self, line: impl FnOnce() -> String) {
+        if std::env::var_os("OWNNAS_TRACE").is_some() {
+            self.note(&line());
+        }
+    }
+
     fn note(&self, line: &str) {
         log(&format!("[{}] {line}", self.name));
     }
@@ -209,24 +216,25 @@ impl Engine {
         let Some(parent) = path.parent() else { return };
         // Folders not opened here yet are filled when they are.
         if !parent.is_dir() {
-            return;
+            return self.trace(|| format!("{}: its folder is not here", entry.path));
         }
         if !path.exists() {
+            self.trace(|| format!("{}: new here", entry.path));
             return self.create(parent, entry);
         }
         // Being sent from here (the feed tells of it too), or not a file.
         if entry.dir || self.hushed(&path) || self.sending.lock().unwrap_or_else(|err| err.into_inner()).contains(&path) {
-            return;
+            return self.trace(|| format!("{}: a folder, or being changed from here", entry.path));
         }
-        let Some((in_sync, base)) = Self::state(&path) else {
+        self.trace(|| format!("{}: reading its version here", entry.path));
+        let state = Self::state(&path);
+        self.trace(|| format!("{}: here {state:?}", entry.path));
+        let Some((in_sync, base)) = state else {
             return self.note(&format!("{} changed on the server, but it is not a placeholder here", entry.path));
         };
         let now = Stamp { size: entry.size, mtime: Self::millis(entry) };
         if base == Some(now) {
-            if std::env::var_os("OWNNAS_TRACE").is_some() {
-                self.note(&format!("{} is the server's version already", entry.path));
-            }
-            return;
+            return self.trace(|| format!("{} is the server's version already", entry.path));
         }
         // Local edits not yet sent win here; their upload finds the conflict.
         if !in_sync {
@@ -234,6 +242,7 @@ impl Engine {
         }
         self.hush(&path);
         let blob = stamp_blob(now.size, now.mtime);
+        self.trace(|| format!("{}: updating from {base:?} to {now:?}", entry.path));
         let updated = writable(&path, true).and_then(|mut handle| {
             // Emptied: the new version downloads when the file is next opened.
             handle.update(UpdateOptions::default().metadata(Self::metadata(entry)).blob(&blob).dehydrate().mark_in_sync(), None).map(|_| ())
@@ -347,6 +356,7 @@ impl Engine {
         if !local_path(&self.root, parent).is_dir() {
             return;
         }
+        self.trace(|| format!("{remote}: listing {parent}"));
         match self.api.list(parent) {
             Ok(listing) => match listing.entries.iter().find(|entry| entry.path == remote) {
                 Some(entry) => self.server_changed(entry),
