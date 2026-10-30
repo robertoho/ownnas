@@ -222,9 +222,11 @@ impl Engine {
             self.trace(|| format!("{}: new here", entry.path));
             return self.create(parent, entry);
         }
-        // Being sent from here (the feed tells of it too), or not a file.
-        if entry.dir || self.hushed(&path) || self.sending.lock().unwrap_or_else(|err| err.into_inner()).contains(&path) {
-            return self.trace(|| format!("{}: a folder, or being changed from here", entry.path));
+        // Being sent from here (the feed tells of it too), or not a file. (Not `hushed`: that
+        // keeps the watcher from sending back what this engine did, and a change the server
+        // makes meanwhile, such as right after the placeholder was made, is still to apply.)
+        if entry.dir || self.sending.lock().unwrap_or_else(|err| err.into_inner()).contains(&path) {
+            return self.trace(|| format!("{}: a folder, or being sent from here", entry.path));
         }
         self.trace(|| format!("{}: reading its version here", entry.path));
         let state = Self::state(&path);
