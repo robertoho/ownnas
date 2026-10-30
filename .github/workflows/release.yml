@@ -93,6 +93,15 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         shell: bash
 
+      - name: Build and package the desktop sync client
+        if: contains(matrix.target, 'linux') || contains(matrix.target, 'windows')
+        run: |
+          cargo build --locked --release --target ${{ matrix.target }} -p ${{ contains(matrix.target, 'linux') && 'ownnas-mount' || 'ownnas-cloud' }}
+          python scripts/package-clients.py "$RELEASE_TAG" "${{ matrix.target }}"
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        shell: bash
+
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ github.token }}

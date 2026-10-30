@@ -12,7 +12,7 @@ settings:
     # Shared by the app and its Files extension (the server list). Change it together with the
     # bundle identifiers if you build under your own.
     OWNNAS_APP_GROUP: group.app.ownnas.ios
-    MARKETING_VERSION: "0.7.0"
+    MARKETING_VERSION: "0.8.0"
     CURRENT_PROJECT_VERSION: "1"
 targets:
   OwnNAS:

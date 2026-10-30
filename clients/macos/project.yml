@@ -13,7 +13,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.7.0"
+    MARKETING_VERSION: "0.8.0"
     CURRENT_PROJECT_VERSION: "1"
     # Signed with a Developer ID, to give out outside the App Store (notarized for release).
     # The App Group starts with the team ID, which needs no provisioning profile on the Mac.
