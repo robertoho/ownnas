@@ -1,0 +1,7 @@
+[Nemo Action]
+Name=Free up space (OwnNAS)
+Comment=Remove these from this computer; they stay on the server and download again when opened
+Exec="@EXE@" free %F
+Icon-Name=edit-clear
+Selection=notnone
+Extensions=any;

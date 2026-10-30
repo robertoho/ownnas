@@ -105,6 +105,11 @@ day), and terminals. See [clients/ios/README.md](clients/ios/README.md) to build
 Dropbox does: files show without being downloaded, download when opened, and changes go both ways
 within seconds. See [clients/macos/README.md](clients/macos/README.md).
 
+`ownnas-mount` (in `clients/linux`) does the same on Linux: each server is a folder in your
+home folder (and in the file manager's sidebar) whose files download when opened, and
+"Always keep on this computer" and "Free up space" are in the menus of Dolphin, GNOME Files
+and Nemo. See [clients/linux/README.md](clients/linux/README.md).
+
 ## Sync a folder with your computer
 
 `ownnas-sync` is a separate command-line client (in `clients/desktop`) that keeps a local

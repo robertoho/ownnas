@@ -1,0 +1,7 @@
+[Nemo Action]
+Name=Always keep on this computer (OwnNAS)
+Comment=Download these and keep them on this computer
+Exec="@EXE@" keep %F
+Icon-Name=folder-download
+Selection=notnone
+Extensions=any;

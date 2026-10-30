@@ -30,13 +30,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --locked --release -p ownnas
+        run: cargo build --locked --release -p ownnas -p ownnas-mount
 
       - name: Test
-        run: cargo test --locked -p ownnas
+        run: cargo test --locked -p ownnas -p ownnas-mount
+
+      - name: Linux mount round trip
+        timeout-minutes: 10
+        run: |
+          sudo apt-get install -y -q fuse3 attr
+          BIN=target/release scripts/test-linux-mount.sh
 
       - name: Keep the build
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.keep }}
-          path: target/release/ownnas
+          path: |
+            target/release/ownnas
+            target/release/ownnas-mount

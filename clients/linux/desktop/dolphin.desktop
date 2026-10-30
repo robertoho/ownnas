@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Service
+MimeType=all/all;
+X-KDE-Submenu=OwnNAS
+X-KDE-Protocols=file
+Actions=keep;free;
+
+[Desktop Action keep]
+Name=Always keep on this computer
+Icon=folder-download
+Exec="@EXE@" keep %F
+
+[Desktop Action free]
+Name=Free up space
+Icon=edit-clear
+Exec="@EXE@" free %F
