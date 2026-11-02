@@ -889,8 +889,9 @@ editor.destroy();
   assert.match(container.querySelector('.xlsx-note').textContent, /header row of Stock/, 'but its header row stays');
   canvas.dispatchEvent(new window.MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 46 + 64 + 10, clientY: 12 }));
   [...menu.querySelectorAll('button')].find(item => item.textContent === 'Delete column').click();
-  assert.match(container.querySelector('.xlsx-note').textContent, /Columns inside Stock/);
-  container.querySelector('.xlsx-scroll').dispatchEvent(new KeyboardEvent('keydown', { key: 'z', ctrlKey: true, bubbles: true }));
+  await editor11.save();
+  assert.match(strFromU8(unzipSync(saved)['xl/tables/table1.xml']), /ref="A1:A4".*<tableColumns count="1"><tableColumn id="1" name="Name"\/><\/tableColumns>/s, 'a column deleted inside a table takes its table column');
+  for (let i = 0; i < 2; i++) container.querySelector('.xlsx-scroll').dispatchEvent(new KeyboardEvent('keydown', { key: 'z', ctrlKey: true, bubbles: true }));
   await editor11.save();
   assert.match(strFromU8(unzipSync(saved)['xl/tables/table1.xml']), /ref="A1:B3"/, 'undo puts the table back as it was');
   editor11.destroy();
@@ -1182,6 +1183,32 @@ editor.destroy();
   assert.match(serializeNode(book.styles.root), /<dxfs count="1"><dxf><font><b\/><\/font><fill><patternFill><bgColor rgb="FFFFC7CE"\/>/);
   removeConditional(s, { node: conditionalRules(s)[0].node });
   assert.doesNotMatch(serializeNode(s.root), /B1:B4/);
+}
+
+// Columns inserted inside a table become table columns, named in the header; deleted ones take
+// their table column, and formulas naming it, with them.
+{
+  const data = `<worksheet xmlns="${NS}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData>
+<row r="1"><c r="A1" t="inlineStr"><is><t>Item</t></is></c><c r="B1" t="inlineStr"><is><t>Qty</t></is></c><c r="C1" t="inlineStr"><is><t>Price</t></is></c></row>
+<row r="2"><c r="A2" t="inlineStr"><is><t>Pen</t></is></c><c r="B2"><v>2</v></c><c r="C2"><v>3</v></c><c r="E2"><f>SUM(Sales[Qty])</f></c><c r="F2"><f>SUM(Sales[Price])</f></c></row>
+</sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts></worksheet>`;
+  const table = `<table xmlns="${NS}" id="1" name="Sales" displayName="Sales" ref="A1:C2"><autoFilter ref="A1:C2"><filterColumn colId="2"><filters><filter val="3"/></filters></filterColumn></autoFilter><tableColumns count="3"><tableColumn id="1" name="Item"/><tableColumn id="2" name="Qty"/><tableColumn id="3" name="Price"/></tableColumns><tableStyleInfo name="TableStyleMedium2" showRowStripes="1"/></table>`;
+  const book = openXlsx(zipSync(Object.fromEntries(Object.entries({
+    ...files, 'xl/worksheets/sheet1.xml': data, 'xl/tables/table1.xml': table,
+    'xl/worksheets/_rels/sheet1.xml.rels': '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/></Relationships>',
+  }).map(([name, text]) => [name, strToU8(text)]))));
+  restructure(book, 0, 'col', 2, 2);
+  let tableXml = strFromU8(book.parts['xl/tables/table1.xml']);
+  assert.match(tableXml, /ref="A1:E2"/);
+  assert.match(tableXml, /<tableColumns count="5"><tableColumn id="1" name="Item"\/><tableColumn id="4" name="Column1"\/><tableColumn id="5" name="Column2"\/><tableColumn id="2" name="Qty"\/>/);
+  assert.match(tableXml, /<filterColumn colId="4">/, 'filters move with their columns');
+  const sheetXml = serializeNode(book.sheets[0].root);
+  assert.match(sheetXml, /<c r="B1" t="inlineStr"><is><t>Column1<\/t><\/is><\/c><c r="C1" t="inlineStr"><is><t>Column2<\/t>/, 'and are named in the header');
+  restructure(book, 0, 'col', 4, -1);
+  tableXml = strFromU8(book.parts['xl/tables/table1.xml']);
+  assert.match(tableXml, /ref="A1:D2".*<tableColumns count="4">.*name="Column2"\/><tableColumn id="3" name="Price"\/>/s, 'a deleted column takes its table column');
+  assert.match(serializeNode(book.sheets[0].root), /<f>SUM\(#REF!\)<\/f>.*<f>SUM\(Sales\[Price\]\)<\/f>/s, 'and formulas naming it');
+  assert.throws(() => restructure(book, 0, 'col', 1, -4), /every column of Sales/);
 }
 
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });

@@ -1509,19 +1509,33 @@ export function restructure(model, index, axis, at, count) {
   if (count > 0 && (axis === 'row' ? sheet.maxRow : sheet.maxCol) + count > last) {
     throw new Error(`There is no room to insert ${axis === 'row' ? 'rows' : 'columns'}: cells would be pushed off the end of the sheet.`);
   }
-  // Tables: rows may come and go (a table grows or shrinks), but not their headers, and columns
-  // only around them.
+  // Tables: rows may come and go (a table grows or shrinks), but not their headers; columns inside
+  // one become new table columns, or take theirs with them.
   const tables = sheetLinks(model, sheet).filter(link => link.type === 'table' && model.parts[link.path])
     .map(link => ({ path: link.path, xml: parseXml(strFromU8(model.parts[link.path]), 'Table') }));
+  const gone = [];
   for (const table of tables) {
     const area = parseArea(table.xml.documentElement.getAttribute('ref') || '');
     if (!area) continue;
     const name = table.xml.documentElement.getAttribute('displayName') || 'a table';
     const end = at - count - 1;
     if (axis === 'row' && count < 0 && at <= area.r1 && end >= area.r1) throw new Error(`That would delete the header row of ${name}.`);
-    if (axis === 'col' && (count > 0 ? at > area.c1 && at <= area.c2 : !(end < area.c1 || at > area.c2))) {
-      throw new Error(`Columns inside ${name} cannot be inserted or deleted here yet; rows can.`);
+    if (axis !== 'col') continue;
+    table.area = area;
+    const inside = (count > 0 && at > area.c1 && at <= area.c2) || (count < 0 && !(end < area.c1 || at > area.c2));
+    if (inside && table.xml.documentElement.getAttribute('tableType') === 'queryTable') throw new Error(`The columns of ${name} come from a query, so columns cannot be inserted or deleted inside it.`);
+    if (count > 0 && at > area.c1 && at <= area.c2) table.insert = { index: at - area.c1, count };
+    if (count < 0 && !(end < area.c1 || at > area.c2)) {
+      const first = Math.max(at, area.c1), last = Math.min(end, area.c2);
+      if (first === area.c1 && last === area.c2) throw new Error(`That would delete every column of ${name}: delete the table's columns with what is around them, or fewer.`);
+      table.remove = { index: first - area.c1, count: last - first + 1 };
     }
+  }
+  for (const table of tables) {
+    if (!table.remove) continue;
+    const columns = kids(direct(table.xml.documentElement, 'tableColumns'), 'tableColumn');
+    const name = table.xml.documentElement.getAttribute('displayName') || table.xml.documentElement.getAttribute('name');
+    for (const column of columns.slice(table.remove.index, table.remove.index + table.remove.count)) gone.push({ table: name, column: column.getAttribute('name') || '' });
   }
   unshareAll(model);
   const { root } = sheet;
@@ -1597,12 +1611,25 @@ export function restructure(model, index, axis, at, count) {
     const next = moveSqref(f.getAttribute('ref'), axis, at, count);
     if (next) f.setAttribute('ref', next); else f.removeAttribute('ref');
   }
+  const headers = [];
   for (const table of tables) {
-    for (const node of [table.xml.documentElement, ...table.xml.documentElement.getElementsByTagNameNS(MAIN, 'autoFilter')]) {
+    for (const node of [table.xml.documentElement, ...table.xml.documentElement.getElementsByTagNameNS(MAIN, 'autoFilter'), ...table.xml.documentElement.getElementsByTagNameNS(MAIN, 'sortState')]) {
       const next = moveSqref(node.getAttribute('ref') || '', axis, at, count);
       if (next) node.setAttribute('ref', next);
     }
+    if (table.insert || table.remove) headers.push(...changeTableColumns(table.xml, table.area, table.insert, table.remove));
     model.parts[table.path] = strToU8(serialize(table.xml));
+  }
+  // Formulas that named a table column deleted now refer to nothing.
+  if (gone.length) {
+    for (const other of model.sheets) {
+      for (const f of other.sheetData.getElementsByTagNameNS(MAIN, 'f')) {
+        const text = f.textContent;
+        if (!text || !text.includes('[')) continue;
+        const next = gone.reduce((formula, item) => dropTableColumn(formula, item.table, item.column), text);
+        if (next !== text) { f.textContent = next; model.touched.add(other); }
+      }
+    }
   }
   // Comments move with their cells (and go with them): in their list, and in the VML Excel draws
   // them with, which is edited as text (Excel's VML is not always well-formed XML).
@@ -1654,8 +1681,68 @@ export function restructure(model, index, axis, at, count) {
     model.parts[link.path] = strToU8(serialize(drawing));
   }
   rereadSheet(sheet);
+  // New table columns are named in their header cells, as the table names them.
+  for (const { row, col, name } of headers) {
+    const cell = cellElement(sheet, row, col);
+    for (const child of [...cell.children]) child.remove();
+    cell.setAttribute('t', 'inlineStr');
+    const is = sheet.xml.createElementNS(MAIN, 'is');
+    const t = sheet.xml.createElementNS(MAIN, 't');
+    t.textContent = name;
+    is.append(t);
+    cell.append(is);
+  }
   updateDimension(sheet);
   model.touched.add(sheet);
+}
+
+/** Adds table columns (named Column1, Column2… as Excel names them) where columns went into a
+ * table, or takes away those of columns deleted; filters on later columns move with them.
+ * Returns the header cells to write: { row, col, name }. */
+function changeTableColumns(xml, area, insert, remove) {
+  const root = xml.documentElement;
+  const list = direct(root, 'tableColumns');
+  if (!list) return [];
+  const columns = kids(list, 'tableColumn');
+  const headers = [];
+  if (remove) for (const column of columns.slice(remove.index, remove.index + remove.count)) column.remove();
+  if (insert) {
+    const names = new Set(columns.map(column => (column.getAttribute('name') || '').toLowerCase()));
+    let id = Math.max(0, ...columns.map(column => Number(column.getAttribute('id')) || 0));
+    let n = 1;
+    const before = columns[insert.index] || null;
+    for (let i = 0; i < insert.count; i++) {
+      while (names.has(`column${n}`)) n++;
+      const name = `Column${n}`;
+      names.add(name.toLowerCase());
+      const node = xml.createElementNS(MAIN, 'tableColumn');
+      node.setAttribute('id', String(++id));
+      node.setAttribute('name', name);
+      list.insertBefore(node, before);
+      if (root.getAttribute('headerRowCount') !== '0') headers.push({ row: area.r1, col: area.c1 + insert.index + i, name });
+    }
+  }
+  list.setAttribute('count', String(kids(list, 'tableColumn').length));
+  // Filters say which column by its place in the table.
+  for (const filter of root.getElementsByTagNameNS(MAIN, 'filterColumn')) {
+    const at = Number(filter.getAttribute('colId')) || 0;
+    if (remove && at >= remove.index && at < remove.index + remove.count) { filter.remove(); continue; }
+    let next = at;
+    if (remove && at >= remove.index + remove.count) next -= remove.count;
+    if (insert && at >= insert.index) next += insert.count;
+    filter.setAttribute('colId', String(next));
+  }
+  return headers;
+}
+
+/** A formula's references to column `column` of table `table` made #REF!: Table[Column],
+ * Table[@Column], Table[[#This Row],[Column]], and inside the table [@Column]. */
+function dropTableColumn(formula, table, column) {
+  const word = column.replace(/[\]\[#'@]/g, "'$&").replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const name = table.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return formula
+    .replace(new RegExp(`\\b${name}\\[(?:@|\\[#[^\\]]+\\]\\s*,\\s*)?\\[?${word}\\]?\\]`, 'gi'), '#REF!')
+    .replace(new RegExp(`(?<![\\w\\]])\\[@\\[?${word}\\]?\\]`, 'gi'), '#REF!');
 }
 
 /** Reads a sheet's model again from its XML, after its structure changed. */
