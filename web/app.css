@@ -2471,6 +2471,11 @@ input, select, textarea {
 .xlsx-chart { border-style: dashed; }
 .xlsx-number-tool { min-width: 1.9rem; padding: 0 0.35rem; font: 600 0.78rem var(--mono); }
 .xlsx-format-panel { width: 21rem; }
+.xlsx-panel-field { display: grid; gap: 0.2rem; margin: 0.25rem 0.3rem; color: var(--muted); font-size: 0.78rem; }
+.xlsx-panel-field input { color: var(--text); font-size: 0.85rem; }
+.xlsx-comment-input { box-sizing: border-box; width: calc(100% - 0.6rem); margin: 0.25rem 0.3rem; resize: vertical; font: inherit; font-size: 0.85rem; }
+.xlsx-panel-problem { margin: 0.2rem 0.3rem; color: var(--danger, #c62828); font-size: 0.78rem; }
+.xlsx-filter-actions .xlsx-panel-danger { margin-right: auto; color: var(--danger, #c62828); }
 .xlsx-format-code { margin: 0.25rem 0.3rem; font-family: var(--mono); }
 .xlsx-format-preview { margin: 0.15rem 0.45rem; font-size: 0.82rem; }
 .xlsx-format-help { margin: 0.25rem 0.45rem; color: var(--muted); font-size: 0.74rem; line-height: 1.35; }
@@ -2518,6 +2523,20 @@ input, select, textarea {
 .xlsx-summary { flex: none; color: var(--muted); font-size: 0.78rem; white-space: pre; font-variant-numeric: tabular-nums; }
 .xlsx-note { margin: 0; color: var(--muted); font-size: 0.78rem; }
 .xlsx-live { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+/* A sheet being printed: on its own, on white paper, without gridlines, as spreadsheet apps print. */
+.xlsx-print { display: none; }
+@media print {
+  @page { margin: 12mm; }
+  html:has(body.xlsx-printing), body.xlsx-printing { background: #fff !important; }
+  body.xlsx-printing > :not(.xlsx-print) { display: none !important; }
+  body.xlsx-printing > .xlsx-print { display: block; color: #000; }
+}
+.xlsx-print h1 { margin: 0 0 8px; color: #000; font: 600 11pt system-ui, sans-serif; }
+.xlsx-print-sheet { position: relative; width: max-content; }
+.xlsx-print table { border-collapse: collapse; table-layout: fixed; width: max-content; }
+.xlsx-print td { box-sizing: border-box; padding: 0 3px; overflow: hidden; color: #000; white-space: pre; line-height: 1.2; }
+.xlsx-print tr { break-inside: avoid; }
+.xlsx-print .xlsx-drawing { position: absolute; object-fit: contain; }
 .table-wrap { padding: 0.35rem; }
 table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
 td, th { border: 1px solid var(--line); padding: 0.3rem 0.45rem; text-align: left; }

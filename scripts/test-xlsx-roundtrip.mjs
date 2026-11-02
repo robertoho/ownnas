@@ -65,6 +65,17 @@ async function edit(bytes) {
   // Sort the table by quantity, largest first: the comment on Ink goes with it.
   go(2, 2);
   container.querySelector('.xlsx-toolbar button[title^="Sort Z to A"]').click();
+  // A second comment beside the one there, and a link to another sheet.
+  const panelButton = label => [...menu.querySelectorAll('button')].find(item => item.textContent === label).click();
+  go(2, 2);
+  key(grid, 'F2', { shiftKey: true });
+  menu.querySelector('textarea').value = 'Checked twice';
+  panelButton('Save');
+  go(8, 1);
+  key(grid, 'k', { ctrlKey: true });
+  menu.querySelectorAll('input')[0].value = "'Summary'!A1";
+  menu.querySelectorAll('input')[1].value = 'To the summary';
+  panelButton('Apply');
   // Summary: one more formula, then renamed.
   tab('Summary').click();
   type(1, 3, 'Check');
@@ -76,6 +87,15 @@ async function edit(bytes) {
   // A new sheet with its top row frozen.
   tab('+').click();
   type(1, 1, 'Hello');
+  // A comment and a link on a sheet that had neither.
+  go(1, 1);
+  key(grid, 'F2', { shiftKey: true });
+  menu.querySelector('textarea').value = 'First note';
+  panelButton('Save');
+  go(5, 1);
+  key(grid, 'k', { ctrlKey: true });
+  menu.querySelectorAll('input')[0].value = 'example.com/report';
+  panelButton('Apply');
   // A spilling formula, and a filter hiding a row.
   type(1, 2, 'c');
   type(1, 3, 'a');
@@ -116,6 +136,9 @@ print(json.dumps({
   "notesFreeze": book[book.sheetnames[-1]].freeze_panes,
   "notesFilter": book[book.sheetnames[-1]].auto_filter.ref,
   "notesHidden": [row for row, dim in book[book.sheetnames[-1]].row_dimensions.items() if dim.hidden],
+  "texts": {sheet.title + "!" + cell.coordinate: cell.comment.text for sheet in book for row in sheet.iter_rows() for cell in row if cell.comment},
+  "targets": {sheet.title + "!" + cell.coordinate: cell.hyperlink.target or "#" + cell.hyperlink.location for sheet in book for row in sheet.iter_rows() for cell in row if cell.hyperlink},
+  "linkText": [book["Sales"]["H1"].value, book[book.sheetnames[-1]]["E1"].value],
 }))`;
   return JSON.parse(execFileSync('python3', ['-c', script, file], { encoding: 'utf8' }));
 }
@@ -167,8 +190,20 @@ for (const [label, source] of [['openpyxl', path.join(work, 'rich.xlsx')], ['Lib
   assert.deepEqual(view.merged, ['F6:G7'], `${label}: merged cells moved down`);
   assert.deepEqual(view.conditional, ['A2:A6', 'B2:B6', 'C2:C6'], `${label}: conditional formatting grew`);
   assert.deepEqual(view.validation, ['E2:E6'], `${label}: validation grew`);
-  assert.deepEqual(view.comments, ['A3'], `${label}: the comment moved with its cell, and its row when sorted`);
-  assert.deepEqual(view.links, ['F4'], `${label}: the link moved`);
+  assert.deepEqual(view.comments, ['A3', 'B2'], `${label}: the comment moved with its cell, and its row when sorted; one was added`);
+  assert.deepEqual(view.links, ['F4', 'H1'], `${label}: the link moved, and one was added`);
+  assert.equal(view.texts['Sales!B2'], 'Checked twice', `${label}: the new comment`);
+  assert.equal(view.texts['Sheet3!A1'], 'First note', `${label}: a comment on a sheet without any`);
+  assert.equal(view.targets['Sales!H1'].replace(/'/g, ''), '#Summary!A1', `${label}: a link into the workbook`);
+  assert.equal(view.targets['Sheet3!E1'], 'https://example.com/report', `${label}: a web link`);
+  assert.deepEqual(view.linkText, ['To the summary', 'example.com/report'], `${label}: links put their text in empty cells`);
+  // LibreOffice reads them too: what it saves keeps them.
+  const again = path.join(work, `again-${label}`);
+  execFileSync(SOFFICE, ['--headless', '--convert-to', 'xlsx:Calc MS Excel 2007 XML', '--outdir', again, file], { stdio: 'ignore' });
+  const reread = openpyxlView(path.join(again, path.basename(file)));
+  assert.equal(reread.texts['Sales!B2'], 'Checked twice', `${label}: LibreOffice reads the new comment`);
+  assert.equal(reread.texts['Sheet3!A1'], 'First note', `${label}: and the one on the new sheet`);
+  assert.equal(reread.targets['Sheet3!E1'], 'https://example.com/report', `${label}: and the links`);
   assert.equal(view.images, 1, `${label}: the picture kept`);
   assert.equal(view.names.Grand.replace(/'/g, ''), 'Sales!$G$1', `${label}: names kept`);
   assert.equal(view.notesFreeze, 'A2', `${label}: the new sheet's frozen row`);

@@ -12,7 +12,7 @@ Object.defineProperty(dom.window.HTMLElement.prototype, 'clientHeight', { get() 
 Object.defineProperty(dom.window.HTMLElement.prototype, 'clientWidth', { get() { return 800; } });
 dom.window.HTMLCanvasElement.prototype.getContext = () => null;
 const { zipSync, unzipSync, strToU8, strFromU8 } = await import('../web/vendor/three/addons/libs/fflate.module.js');
-const { conditionalFormats, fillSeries, mountXlsxEditor, openXlsx, parseInput, readHtmlTable, restructure } = await import('../web/xlsx-editor.js');
+const { conditionalFormats, fillSeries, linkTarget, mountXlsxEditor, openXlsx, parseInput, readHtmlTable, restructure } = await import('../web/xlsx-editor.js');
 
 const NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
 const sheet = `<worksheet xmlns="${NS}"><dimension ref="A1:B3"/><sheetData>
@@ -1059,6 +1059,99 @@ editor.destroy();
   key(grid, 'z', { ctrlKey: true });
   assert.deepEqual([shown(4, 1), shown(2, 2)], ['21', '21'], 'and undoing it');
   chain.destroy();
+}
+
+// Exporting: the sheet as CSV, as it shows, and printing it as a table on its own.
+{
+  const data = `<worksheet xmlns="${NS}"><sheetData>
+<row r="1"><c r="A1" t="inlineStr"><is><t>Name, first</t></is></c><c r="B1" t="inlineStr"><is><t>Say "hi"</t></is></c></row>
+<row r="2"><c r="A2" s="1"><v>1234.5</v></c><c r="B2"><f>A2*2</f></c></row>
+<row r="3" hidden="1"><c r="A3"><v>3</v></c></row>
+<row r="4"><c r="A4"><v>4</v></c></row>
+</sheetData><mergeCells count="1"><mergeCell ref="A4:B4"/></mergeCells></worksheet>`;
+  const blobs = [];
+  const created = URL.createObjectURL, revoked = URL.revokeObjectURL;
+  URL.createObjectURL = blob => { blobs.push(blob); return 'blob:export'; };
+  URL.revokeObjectURL = () => {};
+  let downloaded = null;
+  const click = window.HTMLAnchorElement.prototype.click;
+  window.HTMLAnchorElement.prototype.click = function () { downloaded = this.download; };
+  let printed = null;
+  window.print = () => { printed = document.querySelector('body > .xlsx-print')?.cloneNode(true); };
+  const exporting = mountXlsxEditor(container, zipSync(Object.fromEntries(Object.entries({ ...files, 'xl/worksheets/sheet1.xml': data }).map(([name, text]) => [name, strToU8(text)]))), { readonly: true, name: 'Report.xlsx' });
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const exportButton = container.querySelector('button[aria-label="Download as CSV, or print"]');
+  assert.ok(exportButton && !exportButton.disabled, 'export works when read only too');
+  const pick = label => {
+    exportButton.click();
+    const item = [...container.querySelectorAll('.xlsx-menu button')].find(button => button.textContent.startsWith(label));
+    assert.ok(item, label);
+    item.click();
+  };
+  pick('Download this sheet as CSV');
+  assert.equal(downloaded, 'Report.csv');
+  const csv = await blobs.at(-1).text();
+  assert.equal(csv.replace(/^﻿/, ''), '"Name, first","Say ""hi"""\r\n"1,234.50 €",2469\r\n3,\r\n4,\r\n', 'CSV is the cells as they show, quoted where needed');
+  pick('Print');
+  assert.ok(printed, 'the page is printed');
+  assert.equal(printed.querySelector('h1').textContent, 'Report');
+  const rows = [...printed.querySelectorAll('tr')].map(row => [...row.cells].map(cell => cell.textContent));
+  assert.deepEqual(rows, [['Name, first', 'Say "hi"'], ['1,234.50 €', '2469'], ['4']], 'hidden rows are left out and merges span');
+  assert.equal(printed.querySelectorAll('tr')[2].cells[0].colSpan, 2);
+  window.dispatchEvent(new Event('afterprint'));
+  assert.equal(document.querySelector('body > .xlsx-print'), null, 'and taken away after');
+  assert.ok(!document.body.classList.contains('xlsx-printing'));
+  exporting.destroy();
+  URL.createObjectURL = created; URL.revokeObjectURL = revoked;
+  window.HTMLAnchorElement.prototype.click = click;
+}
+
+// Comments and links: added with their parts, taken away with them, and undone.
+{
+  assert.deepEqual(linkTarget('example.com'), { url: 'https://example.com' });
+  assert.deepEqual(linkTarget('me@example.com'), { url: 'mailto:me@example.com' });
+  assert.deepEqual(linkTarget("'My sheet'!B2"), { location: "'My sheet'!B2" });
+  assert.deepEqual(linkTarget('C3'), { location: 'C3' });
+  assert.deepEqual(linkTarget('#Data!A1'), { location: 'Data!A1' });
+  const noted = mountXlsxEditor(container, bytes, { author: 'ana', onSave: async data => { saved = data; } });
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  const grid = container.querySelector('.xlsx-scroll');
+  const menu = container.querySelector('.xlsx-menu');
+  const key = (target, name, extra = {}) => target.dispatchEvent(new KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true, ...extra }));
+  const press = label => [...menu.querySelectorAll('button')].find(item => item.textContent === label).click();
+  grid.focus();
+  key(grid, 'Home', { ctrlKey: true });
+  key(grid, 'F2', { shiftKey: true });
+  menu.querySelector('textarea').value = 'Hello';
+  press('Save');
+  await noted.save();
+  let parts = unzipSync(saved);
+  assert.match(strFromU8(parts['xl/comments1.xml']), /<author>ana<\/author>.*<comment ref="A1" authorId="0"><text><t xml:space="preserve">Hello<\/t>/s);
+  assert.match(strFromU8(parts['xl/drawings/vmlDrawing1.vml']), /<x:Row>0<\/x:Row><x:Column>0<\/x:Column>/);
+  assert.match(strFromU8(parts['xl/worksheets/_rels/sheet1.xml.rels']), /Target="\.\.\/comments1\.xml"/);
+  assert.match(strFromU8(parts['xl/worksheets/sheet1.xml']), /<legacyDrawing r:id="rId\d"\/><\/worksheet>|<sheetProtection[^>]*\/><legacyDrawing/);
+  assert.match(strFromU8(parts['[Content_Types].xml']), /Extension="vml"[\s\S]*PartName="\/xl\/comments1\.xml"/);
+  key(grid, 'k', { ctrlKey: true });
+  menu.querySelectorAll('input')[0].value = 'example.com';
+  press('Apply');
+  const linked = async () => { await noted.save(); return strFromU8(unzipSync(saved)['xl/worksheets/sheet1.xml']); };
+  assert.match(await linked(), /<hyperlinks><hyperlink ref="A1" r:id="rId\d"\/><\/hyperlinks>/, 'Ctrl+K links the cell');
+  assert.match(strFromU8(unzipSync(saved)['xl/worksheets/_rels/sheet1.xml.rels']), /Target="https:\/\/example.com" TargetMode="External"/);
+  key(grid, 'z', { ctrlKey: true });
+  assert.doesNotMatch(await linked(), /hyperlink/, 'undone');
+  key(grid, 'z', { ctrlKey: true });
+  await noted.save();
+  parts = unzipSync(saved);
+  assert.ok(!parts['xl/comments1.xml'] && !parts['xl/drawings/vmlDrawing1.vml'], 'undoing the comment takes its parts away');
+  assert.doesNotMatch(strFromU8(parts['xl/worksheets/sheet1.xml']), /legacyDrawing/);
+  key(grid, 'y', { ctrlKey: true });
+  key(grid, 'F2', { shiftKey: true });
+  press('Delete');
+  await noted.save();
+  parts = unzipSync(saved);
+  assert.ok(!parts['xl/comments1.xml'] && !parts['xl/drawings/vmlDrawing1.vml'], 'deleting the last comment takes its parts away');
+  assert.doesNotMatch(strFromU8(parts['[Content_Types].xml']), /comments1/);
+  noted.destroy();
 }
 
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });

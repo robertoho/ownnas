@@ -2536,6 +2536,8 @@ async function openEntry(entry) {
       const editor = { dirty: false, destroy: null };
       const mounted = module.mountXlsxEditor(body, bytes, {
         readonly: !write || inTrashPath(entry.path),
+        name: entry.name,
+        author: state.me?.username || '',
         onChange: dirty => { editor.dirty = dirty; },
         onSave: async data => {
           let binary = '';

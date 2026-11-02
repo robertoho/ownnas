@@ -1714,6 +1714,230 @@ function readDrawing(model, path) {
   return items;
 }
 
+// --- Adding parts: comments and links -----------------------------------------------------------
+
+const REL_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/';
+const COMMENTS_CONTENT = 'application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml';
+const VML_CONTENT = 'application/vnd.openxmlformats-officedocument.vmlDrawing';
+
+/** The relationships part of `part`, parsed (empty when it has none), and a way to save it. */
+function relsOf(model, part) {
+  const path = part.replace(/([^/]+)$/, '_rels/$1.rels');
+  const xml = parseXml(model.parts[path] ? strFromU8(model.parts[path]) : `<Relationships xmlns="${PKG_REL}"/>`, 'Relationships');
+  return { xml, list: () => [...xml.getElementsByTagNameNS(PKG_REL, 'Relationship')], save() { model.parts[path] = strToU8(serialize(xml)); } };
+}
+
+/** Adds a relationship from `part` to `target` (a part's path, or a URL when external); returns its id. */
+function addRel(model, part, type, target, external = false) {
+  const rels = relsOf(model, part);
+  const ids = new Set(rels.list().map(rel => rel.getAttribute('Id')));
+  let n = 1;
+  while (ids.has(`rId${n}`)) n++;
+  const rel = rels.xml.createElementNS(PKG_REL, 'Relationship');
+  rel.setAttribute('Id', `rId${n}`);
+  rel.setAttribute('Type', REL_TYPE + type);
+  rel.setAttribute('Target', external ? target : relativePath(part, target));
+  if (external) rel.setAttribute('TargetMode', 'External');
+  rels.xml.documentElement.append(rel);
+  rels.save();
+  return `rId${n}`;
+}
+
+function removeRel(model, part, id) {
+  const rels = relsOf(model, part);
+  for (const rel of rels.list()) if (rel.getAttribute('Id') === id) rel.remove();
+  rels.save();
+}
+
+/** The path to part `to` from the folder of part `from`, as relationships give it. */
+function relativePath(from, to) {
+  const folder = from.split('/').slice(0, -1), target = to.split('/');
+  let same = 0;
+  while (same < folder.length && same < target.length - 1 && folder[same] === target[same]) same++;
+  return [...folder.slice(same).map(() => '..'), ...target.slice(same)].join('/');
+}
+
+/** The first free path of the form `pattern(1)`, `pattern(2)`… */
+function freePart(model, pattern) {
+  let n = 1;
+  while (model.parts[pattern(n)]) n++;
+  return pattern(n);
+}
+
+/** Says what a part holds (or, with `type` null, stops saying so). */
+function setOverride(model, path, type) {
+  editContentTypes(model, types => {
+    for (const item of [...types.getElementsByTagNameNS(CONTENT_TYPES, 'Override')]) if (item.getAttribute('PartName') === `/${path}`) item.remove();
+    if (!type) return;
+    const override = types.createElementNS(CONTENT_TYPES, 'Override');
+    override.setAttribute('PartName', `/${path}`);
+    override.setAttribute('ContentType', type);
+    types.documentElement.append(override);
+  });
+}
+
+function setDefault(model, extension, type) {
+  editContentTypes(model, types => {
+    if ([...types.getElementsByTagNameNS(CONTENT_TYPES, 'Default')].some(item => item.getAttribute('Extension')?.toLowerCase() === extension)) return;
+    const node = types.createElementNS(CONTENT_TYPES, 'Default');
+    node.setAttribute('Extension', extension);
+    node.setAttribute('ContentType', type);
+    // Defaults come before overrides.
+    types.documentElement.insertBefore(node, types.getElementsByTagNameNS(CONTENT_TYPES, 'Override')[0] || null);
+  });
+}
+
+/** Points a worksheet element at a relationship (r:id), declaring the r prefix on the sheet so
+ * it is written as spreadsheet apps write it. */
+function setRelId(sheet, node, id) {
+  if (!sheet.root.hasAttribute('xmlns:r')) sheet.root.setAttributeNS('http://www.w3.org/2000/xmlns/', 'xmlns:r', DOC_REL);
+  node.setAttributeNS(DOC_REL, 'r:id', id);
+}
+
+/** A relationship of a sheet of a given type: { id, path }, or null. */
+function sheetRel(model, sheet, type) {
+  for (const [id, target] of relTargets(model, sheet.path)) if (target.type === type && target.path) return { id, path: target.path };
+  return null;
+}
+
+/** Why comments cannot be added or changed on a sheet here, or null when they can. */
+export function commentsBlocked(model, sheet) {
+  if (sheetRel(model, sheet, 'threadedComment')) return "This sheet's comments are threaded conversations, which can only be changed in Excel.";
+  return null;
+}
+
+/** The note shape Excel draws a comment in, hidden until the cell is pointed at. */
+function noteShape(id, row, col) {
+  const r = row - 1, c = col - 1;
+  return `<v:shape id="_x0000_s${id}" type="#_x0000_t202" style="position:absolute;margin-left:59.25pt;margin-top:1.5pt;width:108pt;height:59.25pt;z-index:1;visibility:hidden" fillcolor="#ffffe1" o:insetmode="auto">`
+    + '<v:fill color2="#ffffe1"/><v:shadow on="t" color="black" obscured="t"/><v:path o:connecttype="none"/>'
+    + '<v:textbox style="mso-direction-alt:auto"><div style="text-align:left"></div></v:textbox>'
+    + `<x:ClientData ObjectType="Note"><x:MoveWithCells/><x:SizeWithCells/><x:Anchor>${c + 1}, 15, ${Math.max(0, r - 1)}, 10, ${c + 3}, 15, ${r + 3}, 4</x:Anchor>`
+    + `<x:AutoFill>False</x:AutoFill><x:Row>${r}</x:Row><x:Column>${c}</x:Column></x:ClientData></v:shape>`;
+}
+const NOTE_TYPE = '<v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe"><v:stroke joinstyle="miter"/><v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype>';
+const noteAt = (row, col) => shape => /ObjectType="Note"/.test(shape)
+  && Number(/<(?:\w+:)?Row>(\d+)</.exec(shape)?.[1]) === row - 1 && Number(/<(?:\w+:)?Column>(\d+)</.exec(shape)?.[1]) === col - 1;
+const VML_SHAPE = /<((?:\w+:)?)shape\b[\s\S]*?<\/\1shape>/g;
+
+/** Sets the comment (an Excel note) on cell `ref`, or with `text` null removes it. Notes are kept
+ * in a comments part, and drawn by Excel from a shape in the sheet's legacy (VML) drawing. */
+export function setComment(model, sheet, ref, text, author = '') {
+  const problem = commentsBlocked(model, sheet);
+  if (problem) throw new Error(problem);
+  const { row, col } = parseRef(ref);
+  let comments = sheetRel(model, sheet, 'comments');
+  if (!comments && text == null) return;
+  if (!comments) {
+    const path = freePart(model, n => `xl/comments${n}.xml`);
+    model.parts[path] = strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<comments xmlns="${MAIN}"><authors/><commentList/></comments>`);
+    comments = { id: addRel(model, sheet.path, 'comments', path), path };
+    setOverride(model, path, COMMENTS_CONTENT);
+  }
+  const xml = parseXml(strFromU8(model.parts[comments.path]), 'Comments');
+  const root = xml.documentElement;
+  const authors = direct(root, 'authors') || root.insertBefore(xml.createElementNS(MAIN, 'authors'), root.firstChild);
+  const list = direct(root, 'commentList') || root.insertBefore(xml.createElementNS(MAIN, 'commentList'), authors.nextSibling);
+  const existing = kids(list, 'comment').find(node => node.getAttribute('ref') === ref);
+  if (text == null) existing?.remove();
+  else {
+    let authorId = kids(authors, 'author').findIndex(node => node.textContent === author);
+    if (authorId < 0) {
+      const node = xml.createElementNS(MAIN, 'author');
+      node.textContent = author;
+      authors.append(node);
+      authorId = kids(authors, 'author').length - 1;
+    }
+    const node = xml.createElementNS(MAIN, 'comment');
+    node.setAttribute('ref', ref);
+    node.setAttribute('authorId', String(authorId));
+    const body = xml.createElementNS(MAIN, 'text');
+    const t = xml.createElementNS(MAIN, 't');
+    t.setAttributeNS(XML, 'xml:space', 'preserve');
+    t.textContent = text;
+    body.append(t);
+    node.append(body);
+    if (existing) existing.replaceWith(node);
+    else list.insertBefore(node, kids(list, 'comment').find(item => {
+      const place = parseRef(item.getAttribute('ref'));
+      return place && (place.row > row || (place.row === row && place.col > col));
+    }) || null);
+  }
+  const empty = !kids(list, 'comment').length;
+  if (empty) {
+    delete model.parts[comments.path];
+    removeRel(model, sheet.path, comments.id);
+    setOverride(model, comments.path, null);
+  } else model.parts[comments.path] = strToU8(serialize(xml));
+
+  // The note's shape in the legacy drawing.
+  let vml = sheetRel(model, sheet, 'vmlDrawing');
+  if (!vml && text == null) return;
+  if (!vml) {
+    const path = freePart(model, n => `xl/drawings/vmlDrawing${n}.vml`);
+    const block = Number(/(\d+)\.vml$/.exec(path)[1]);
+    model.parts[path] = strToU8('<xml xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel">'
+      + `<o:shapelayout v:ext="edit"><o:idmap v:ext="edit" data="${block}"/></o:shapelayout>${NOTE_TYPE}</xml>`);
+    vml = { id: addRel(model, sheet.path, 'vmlDrawing', path), path };
+    setDefault(model, 'vml', VML_CONTENT);
+    const legacy = worksheetChild(sheet, 'legacyDrawing');
+    setRelId(sheet, legacy, vml.id);
+  }
+  let drawing = strFromU8(model.parts[vml.path]);
+  const here = noteAt(row, col);
+  if (text == null || !drawing.match(VML_SHAPE)?.some(here)) {
+    drawing = drawing.replace(VML_SHAPE, shape => (here(shape) ? '' : shape));
+    if (text != null) {
+      if (!/id="_x0000_t202"/.test(drawing)) drawing = drawing.replace(/<\/xml>\s*$/, `${NOTE_TYPE}</xml>`);
+      const block = Number(/<o:idmap\b[^>]*data="(\d+)/.exec(drawing)?.[1]) || 1;
+      const used = [...drawing.matchAll(/id="_x0000_s(\d+)"/g)].map(match => Number(match[1]));
+      drawing = drawing.replace(/<\/xml>\s*$/, `${noteShape(Math.max(block * 1024, ...used) + 1, row, col)}</xml>`);
+    }
+  }
+  if (!drawing.match(VML_SHAPE)?.length) {
+    // Nothing else is drawn from it: it goes.
+    delete model.parts[vml.path];
+    removeRel(model, sheet.path, vml.id);
+    direct(sheet.root, 'legacyDrawing')?.remove();
+  } else model.parts[vml.path] = strToU8(drawing);
+  sheet.extras = null;
+}
+
+/** What a link typed by someone goes to: { url } outside, { location } in the workbook, or null. */
+export function linkTarget(text) {
+  const value = String(text || '').trim();
+  if (!value) return null;
+  if (/^#/.test(value)) return { location: value.slice(1) };
+  if (/^(?:'(?:[^']|'')+'|[^\s!:/]+)!\$?[A-Z]{1,3}\$?\d+(?::\$?[A-Z]{1,3}\$?\d+)?$/i.test(value) || /^\$?[A-Z]{1,3}\$?\d+$/i.test(value)) return { location: value };
+  if (/^[^\s@/:]+@[^\s@/]+\.[^\s@/]+$/.test(value)) return { url: `mailto:${value}` };
+  if (/^[a-z][a-z0-9+.-]*:/i.test(value)) return { url: value };
+  return { url: `https://${value}` };
+}
+
+/** Sets the link on cell `ref` ({ url } or { location }, with an optional tip), or with `link`
+ * null removes it. */
+export function setLink(model, sheet, ref, link) {
+  const { row, col } = parseRef(ref);
+  const list = direct(sheet.root, 'hyperlinks');
+  for (const node of kids(list, 'hyperlink')) {
+    const area = parseArea(node.getAttribute('ref') || '');
+    if (!area || row < area.r1 || row > area.r2 || col < area.c1 || col > area.c2) continue;
+    const id = node.getAttributeNS(DOC_REL, 'id') || node.getAttribute('r:id');
+    node.remove();
+    if (id && !kids(list, 'hyperlink').some(other => (other.getAttributeNS(DOC_REL, 'id') || other.getAttribute('r:id')) === id)) removeRel(model, sheet.path, id);
+  }
+  if (link) {
+    const holder = worksheetChild(sheet, 'hyperlinks');
+    const node = sheet.xml.createElementNS(MAIN, 'hyperlink');
+    node.setAttribute('ref', ref);
+    if (link.url) setRelId(sheet, node, addRel(model, sheet.path, 'hyperlink', link.url, true));
+    else node.setAttribute('location', link.location);
+    if (link.tip) node.setAttribute('tooltip', link.tip);
+    holder.append(node);
+  } else if (list && !kids(list, 'hyperlink').length) list.remove();
+  sheet.extras = null;
+}
+
 /** Only links that are safe to open: web pages and e-mail. */
 export function safeLink(url) {
   try {
@@ -1991,6 +2215,17 @@ export function moveSheet(model, index, step) {
 // --- Sorting and filtering ----------------------------------------------------------------------
 
 /** A sheet's filter: its range (header row first) and element, or null. */
+/** The area of a sheet set to be printed, or null. */
+export function printArea(model, sheet) {
+  const index = [...model.workbookXml.getElementsByTagNameNS(MAIN, 'sheet')].indexOf(sheet.node);
+  for (const node of model.workbookXml.getElementsByTagNameNS(MAIN, 'definedName')) {
+    if (node.getAttribute('name') !== '_xlnm.Print_Area' || Number(node.getAttribute('localSheetId')) !== index) continue;
+    // Its first range, without the sheet's name: 'My sheet'!$A$1:$F$20
+    return parseArea((node.textContent || '').split(',')[0].replace(/^.*!/, ''));
+  }
+  return null;
+}
+
 export function autoFilterOf(sheet) {
   const node = direct(sheet.root, 'autoFilter');
   const [a, b] = (node?.getAttribute('ref') || '').split(':').map(parseRef);
@@ -2204,6 +2439,7 @@ const ICONS = {
   wrap: '<path d="M3 4h10M3 8h8a2 2 0 0 1 0 4H8"/><path d="M9.5 10.5 8 12l1.5 1.5M3 12h3"/>',
   merge: '<path d="M2.5 3.5h11v9h-11z"/><path d="M5 8h6M6.5 6.5 5 8l1.5 1.5M9.5 6.5 11 8l-1.5 1.5"/>',
   border: '<path d="M2.5 2.5h11v11h-11zM8 2.5v11M2.5 8h11" stroke-dasharray="1.5 1.5"/><path d="M2.5 13.5h11"/>',
+  export: '<path d="M8 2.5v7M5 6.5l3 3 3-3"/><path d="M3 10.5v3h10v-3"/>',
 };
 
 const CURRENCIES = [
@@ -2266,7 +2502,7 @@ const FORMATS = [
 ];
 
 /** Mount the editor; onSave receives the updated OOXML package as Uint8Array. */
-export function mountXlsxEditor(container, bytes, { readonly = false, onChange = () => {}, onSave } = {}) {
+export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Spreadsheet.xlsx', author = '', onChange = () => {}, onSave } = {}) {
   const model = openXlsx(bytes);
   const locale = typeof navigator !== 'undefined' ? navigator.language : 'en-US';
   const separators = localeSeparators(locale);
@@ -2665,6 +2901,18 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     textTool('fewer', '.0←', 'Fewer decimal places', () => stepDecimals(-1));
     textTool('more', '.00→', 'More decimal places', () => stepDecimals(1));
   }
+  tool('export', 'Download as CSV, or print', () => {
+    const box = buttons.export.getBoundingClientRect();
+    const range = selectedRange();
+    const several = range.r2 > range.r1 || range.c2 > range.c1;
+    openMenu(box.left, box.bottom + 4, [
+      ['Download this sheet as CSV', downloadCsv, true],
+      '-',
+      ['Print, or save as PDF…', () => printSheet(false), true],
+      ...(several ? [['Print the selection…', () => printSheet(true), true]] : []),
+    ]);
+  });
+  buttons.export.setAttribute('aria-haspopup', 'menu');
   const spacer = document.createElement('span');
   spacer.className = 'office-spacer';
   toolbar.append(spacer, status);
@@ -2683,7 +2931,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     if (readonly) { status.textContent = 'Read only'; return; }
     const style = activeStyle();
     const writable = canWrite();
-    for (const [name, b] of Object.entries(buttons)) b.disabled = !writable && name !== 'undo' && name !== 'redo';
+    for (const [name, b] of Object.entries(buttons)) b.disabled = !writable && !['undo', 'redo', 'export'].includes(name);
     formatSelect.disabled = !writable || !model.styles;
     buttons.undo.disabled = saving || historyAt === 0;
     buttons.redo.disabled = saving || historyAt === history.length;
@@ -3075,18 +3323,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     for (const item of extras.drawings) {
       const box = drawingBox(item);
       if (!box || box.left > left + width || box.left + box.width < left || box.top > top + height || box.top + box.height < top) continue;
-      let node;
-      if (item.kind === 'picture') {
-        node = document.createElement('img');
-        node.src = pictureUrl(item);
-        node.alt = item.name || 'Picture';
-        node.draggable = false;
-      } else {
-        node = document.createElement('div');
-        node.textContent = item.kind === 'chart' ? `📊 ${item.title || 'Chart'}` : item.text;
-        if (item.kind === 'chart') node.title = 'Charts are kept in the file, but not drawn here yet';
-      }
-      node.className = `xlsx-drawing xlsx-${item.kind}`;
+      const node = drawingNode(item);
       node.style.cssText = `left:${box.left}px;top:${box.top}px;width:${box.width}px;height:${box.height}px`;
       fragment.append(node);
     }
@@ -3461,6 +3698,8 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       model.workbookTouched = true;
       relinkSheets(model);
     }
+    // A snapshot of every part also takes away parts added since.
+    if (state.every) for (const path of Object.keys(model.parts)) if (!(path in state.parts)) delete model.parts[path];
     Object.assign(model.parts, state.parts);
   }
   /** A change to the workbook's sheets (adding, renaming, deleting, moving), with undo: it keeps
@@ -3750,6 +3989,22 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     if (!pictureUrls.has(item.path)) pictureUrls.set(item.path, URL.createObjectURL(new Blob([model.parts[item.path]], { type: item.type })));
     return pictureUrls.get(item.path);
   }
+  /** A picture, chart or shape, to be placed over the cells. */
+  function drawingNode(item) {
+    let node;
+    if (item.kind === 'picture') {
+      node = document.createElement('img');
+      node.src = pictureUrl(item);
+      node.alt = item.name || 'Picture';
+      node.draggable = false;
+    } else {
+      node = document.createElement('div');
+      node.textContent = item.kind === 'chart' ? `📊 ${item.title || 'Chart'}` : item.text;
+      if (item.kind === 'chart') node.title = 'Charts are kept in the file, but not drawn here yet';
+    }
+    node.className = `xlsx-drawing xlsx-${item.kind}`;
+    return node;
+  }
   /** Where a drawing sits on the canvas, from its anchor (offsets are in EMU). */
   function drawingBox(item) {
     const px = emu => emu / EMU_PER_PX;
@@ -3799,6 +4054,139 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     commentTip.hidden = false;
   }
   canvas.addEventListener('pointerleave', () => { commentTip.hidden = true; });
+
+  // Adding comments and links
+  /** A change to the active sheet and the parts it links to (comments, links, charts), with undo:
+   * the sheet and every part of the package as they were before and after. */
+  function partsChange(work) {
+    if (!canWrite()) return false;
+    commitEdit();
+    const s = sheet();
+    const capture = () => ({ sheets: model.sheets.map(item => (item === s ? serialize(s.xml) : null)), workbook: null, parts: { ...model.parts }, every: true });
+    const before = capture();
+    try {
+      work(s);
+    } catch (error) {
+      restore(before);
+      geo = null;
+      notice(error.message);
+      selectionChanged();
+      return false;
+    }
+    s.extras = null;
+    record({ sheet: active, snapshot: { before, after: capture() } });
+    changed();
+    return true;
+  }
+  /** The cell a comment or link of the active cell belongs to: the first of its merge. */
+  function anchorRef() {
+    const merge = sheet().covered.get(refName(anchor.row, anchor.col));
+    return merge ? refName(merge.r1, merge.c1) : refName(anchor.row, anchor.col);
+  }
+  /** A small panel under the active cell, in the menu's place, with buttons at its foot. */
+  function openCellPanel(label, fields, actions) {
+    closeMenu();
+    const make = (tag, className, text) => { const node = document.createElement(tag); if (className) node.className = className; if (text != null) node.textContent = text; return node; };
+    const close = () => { menu.hidden = true; menu.classList.remove('xlsx-format-panel'); scroll.focus({ preventScroll: true }); };
+    const foot = make('div', 'xlsx-filter-actions');
+    for (const [text, action, kind] of actions) {
+      const button = make('button', kind === 'ok' ? 'xlsx-filter-ok' : kind === 'danger' ? 'xlsx-panel-danger' : '', text);
+      button.type = 'button';
+      button.addEventListener('click', () => { if (action() !== false) close(); });
+      foot.append(button);
+    }
+    menu.replaceChildren(make('div', 'menu-label', label), ...fields, foot);
+    menu.classList.add('xlsx-format-panel');
+    menu.hidden = false;
+    const box = rect(anchor.row, anchor.col, anchor.row, anchor.col);
+    const at = canvas.getBoundingClientRect();
+    const x = at.left + box.left * zoom, y = at.top + (box.top + box.height) * zoom + 4;
+    menu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - menu.offsetWidth - 8))}px`;
+    menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - menu.offsetHeight - 8))}px`;
+    return foot.querySelector('.xlsx-filter-ok');
+  }
+  function labelled(text, field) {
+    const wrap = document.createElement('label');
+    wrap.className = 'xlsx-panel-field';
+    const caption = document.createElement('span');
+    caption.textContent = text;
+    wrap.append(caption, field);
+    return wrap;
+  }
+  function editComment() {
+    if (!canWrite()) return;
+    const problem = commentsBlocked(model, sheet());
+    if (problem) { notice(problem); return; }
+    const ref = anchorRef();
+    const current = sheetExtras(model, sheet()).comments.get(ref);
+    const area = document.createElement('textarea');
+    area.className = 'xlsx-comment-input';
+    area.rows = 4;
+    area.value = current?.text || '';
+    area.setAttribute('aria-label', 'Comment');
+    const save = () => {
+      const text = area.value.replace(/\s+$/, '');
+      if (!text && !current) return;
+      partsChange(s => setComment(model, s, ref, text || null, text ? author : ''));
+    };
+    const ok = openCellPanel(current ? `Comment on ${ref}` : `New comment on ${ref}`, [area], [
+      ...(current ? [['Delete', () => partsChange(s => setComment(model, s, ref, null)), 'danger']] : []),
+      ['Cancel', () => {}],
+      ['Save', save, 'ok'],
+    ]);
+    area.addEventListener('keydown', event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); ok.click(); } });
+    area.focus();
+    area.setSelectionRange(area.value.length, area.value.length);
+  }
+  function deleteComment() {
+    const problem = commentsBlocked(model, sheet());
+    if (problem) { notice(problem); return; }
+    const ref = anchorRef();
+    partsChange(s => setComment(model, s, ref, null));
+  }
+  function editLink() {
+    if (!canWrite()) return;
+    const ref = anchorRef();
+    const { row, col } = parseRef(ref);
+    const current = sheetExtras(model, sheet()).links.get(ref);
+    const cell = sheet().cells.get(ref);
+    // The text shown can be typed here when the cell holds text or nothing (not a number or a formula).
+    const value = valueAt(model, active, row, col);
+    const textual = !cell || (!direct(cell, 'f') && (value == null || value === '' || typeof value === 'string'));
+    const target = document.createElement('input');
+    target.type = 'text';
+    target.placeholder = 'https://…, name@example.com, or Sheet2!A1';
+    target.spellcheck = false;
+    target.value = current ? (current.url ? current.url.replace(/^mailto:/i, '') : current.location) : '';
+    const shownText = document.createElement('input');
+    shownText.type = 'text';
+    shownText.value = textual ? String(value ?? '') : '';
+    const problem = document.createElement('p');
+    problem.className = 'xlsx-panel-problem';
+    problem.hidden = true;
+    const apply = () => {
+      const link = linkTarget(target.value);
+      const fail = text => { problem.textContent = text; problem.hidden = false; target.focus(); return false; };
+      if (!link) return fail('Type where the link goes.');
+      if (link.url && !safeLink(link.url)) return fail('Only web and e-mail links can be added here.');
+      const text = textual ? shownText.value || (current || cell ? '' : target.value.trim()) : null;
+      return partsChange(s => {
+        setLink(model, s, ref, link);
+        if (text != null && text !== String(value ?? '')) writeParsed(s, row, col, text ? { kind: 'text', value: text } : { kind: 'empty' }, () => {});
+      }) || false;
+    };
+    const fields = [labelled('Link to', target)];
+    if (textual) fields.push(labelled('Text to show', shownText));
+    fields.push(problem);
+    const ok = openCellPanel(current ? `Link in ${ref}` : `Insert a link in ${ref}`, fields, [
+      ...(current ? [['Remove link', () => partsChange(s => setLink(model, s, ref, null)), 'danger']] : []),
+      ['Cancel', () => {}],
+      ['Apply', apply, 'ok'],
+    ]);
+    for (const input of [target, shownText]) input.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); ok.click(); } });
+    target.focus();
+    target.select();
+  }
 
   // Find and replace
   function openFind(replacing) {
@@ -4965,8 +5353,17 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const wholeRows = range.c1 === 1 && range.c2 >= LAST_COL, wholeCols = range.r1 === 1 && range.r2 >= LAST_ROW;
     const count = (n, word) => (n === 1 ? `${word}` : `${n} ${word}s`);
     const items = [];
-    const link = sheetExtras(model, sheet()).links.get(refName(anchor.row, anchor.col));
-    if (link) items.push([link.url ? 'Open link' : 'Go to link', () => openLink(link), true], '-');
+    const extras = sheetExtras(model, sheet());
+    const link = extras.links.get(anchorRef());
+    if (link) items.push([link.url ? 'Open link' : 'Go to link', () => openLink(link), true]);
+    if (!wholeRows && !wholeCols && rows === 1 && cols === 1 || sheet().covered.has(refName(anchor.row, anchor.col))) {
+      const mod = IS_MAC ? '⌘' : 'Ctrl+';
+      items.push(link ? ['Edit link…', editLink] : [`Insert link… (${mod}K)`, editLink]);
+      if (link) items.push(['Remove link', () => partsChange(s => setLink(model, s, anchorRef(), null))]);
+      if (extras.comments.has(anchorRef())) items.push(['Edit comment…', editComment], ['Delete comment', deleteComment]);
+      else items.push(['New comment… (Shift+F2)', editComment]);
+    }
+    items.push('-');
     if (!wholeCols) {
       items.push([`Insert ${count(rows, 'row')} above`, () => insertOrDelete('row', range.r1, rows)]);
       items.push([`Insert ${count(rows, 'row')} below`, () => insertOrDelete('row', range.r2 + 1, rows)]);
@@ -5032,7 +5429,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
     const buttons = [...menu.querySelectorAll('button:not(:disabled)')];
     const at = buttons.indexOf(document.activeElement);
     if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeMenu(); scroll.focus({ preventScroll: true }); }
-    else if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && event.target.tagName !== 'INPUT') {
+    else if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && !['INPUT', 'TEXTAREA'].includes(event.target.tagName)) {
       event.preventDefault();
       buttons[(at + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length]?.focus();
     }
@@ -5162,7 +5559,9 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       event.preventDefault();
       const rows = Math.max(1, Math.floor(viewH() / (sheet().defaultRowPx || 20)) - 1);
       move(key === 'PageDown' ? rows : -rows, 0, event.shiftKey);
-    } else if (key === 'F2') { event.preventDefault(); startEdit(); }
+    } else if (key === 'F2' && event.shiftKey) { event.preventDefault(); editComment(); }
+    else if (key === 'F2') { event.preventDefault(); startEdit(); }
+    else if (mod && key.toLowerCase() === 'k') { event.preventDefault(); editLink(); }
     else if (key === 'Delete' || key === 'Backspace') { event.preventDefault(); clearSelection(); }
     else if (mod && key.toLowerCase() === 'a') { event.preventDefault(); anchor = { row: 1, col: 1 }; focus = { row: LAST_ROW, col: LAST_COL }; selectionChanged(); }
     else if (mod && key.toLowerCase() === 'd') { event.preventDefault(); fillDown(); }
@@ -5197,6 +5596,146 @@ export function mountXlsxEditor(container, bytes, { readonly = false, onChange =
       step(key === 'y' || event.shiftKey ? 1 : -1);
     }
   }, true);
+
+  // Exporting and printing
+  const baseName = () => name.replace(/\.[^.]*$/, '') || 'Spreadsheet';
+  function download(blob, fileName) {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = fileName.replace(/[\\/:*?"<>|]/g, '_');
+    link.hidden = true;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+  /** The last row and column with something in them, counting what formulas spill. */
+  function usedSize() {
+    const s = sheet();
+    let rows = s.maxRow, cols = s.maxCol;
+    for (const spill of model.spills?.get(active) || []) { rows = Math.max(rows, spill.r2); cols = Math.max(cols, spill.c2); }
+    return { rows, cols };
+  }
+  /** The sheet as CSV, each cell as it shows. Where numbers have a decimal comma, fields are
+   * separated by semicolons, as spreadsheet apps there expect. */
+  function sheetCsv() {
+    const delimiter = separators.decimal === ',' ? ';' : ',';
+    const needsQuotes = new RegExp(`["\\r\\n${delimiter}]`);
+    const { rows, cols } = usedSize();
+    const lines = [];
+    for (let r = 1; r <= rows; r++) {
+      const line = [];
+      for (let c = 1; c <= cols; c++) {
+        const text = shown(r, c)?.text ?? '';
+        line.push(needsQuotes.test(text) ? `"${text.replace(/"/g, '""')}"` : text);
+      }
+      lines.push(line.join(delimiter));
+    }
+    return lines.length ? `${lines.join('\r\n')}\r\n` : '';
+  }
+  function downloadCsv() {
+    commitEdit();
+    const fileName = model.sheets.length > 1 ? `${baseName()} - ${sheet().name}.csv` : `${baseName()}.csv`;
+    // The byte order mark tells Excel the file is UTF-8.
+    download(new Blob(['﻿', sheetCsv()], { type: 'text/csv;charset=utf-8' }), fileName);
+  }
+  /** The sheet (its print area, or everything used) or the selection as a table on its own page,
+   * printed with the browser, which can also save it as a PDF. Like spreadsheet apps, gridlines
+   * are not printed; borders, fills, fonts, merges and pictures are. */
+  function printSheet(selectionOnly) {
+    commitEdit();
+    const s = sheet();
+    const used = usedSize();
+    const area = selectionOnly ? selectedRange() : printArea(model, s) || { r1: 1, c1: 1, r2: Math.max(1, used.rows), c2: Math.max(1, used.cols) };
+    area.r2 = Math.min(area.r2, Math.max(area.r1, used.rows));
+    area.c2 = Math.min(area.c2, Math.max(area.c1, used.cols));
+    const rows = [], cols = [];
+    for (let r = area.r1; r <= area.r2; r++) if (rowPx(s, r)) rows.push(r);
+    for (let c = area.c1; c <= area.c2; c++) if (colPx(s, c)) cols.push(c);
+    if (rows.length * cols.length > 200000) { notice('That is too much to print at once: select a part of the sheet, then print the selection.'); return; }
+    const page = document.createElement('div');
+    page.className = 'xlsx-print';
+    const title = document.createElement('h1');
+    title.textContent = model.sheets.length > 1 ? `${baseName()} – ${s.name}` : baseName();
+    const table = document.createElement('table');
+    const colgroup = document.createElement('colgroup');
+    for (const c of cols) {
+      const col = document.createElement('col');
+      col.style.width = `${colPx(s, c)}px`;
+      colgroup.append(col);
+    }
+    table.append(colgroup);
+    const visibleRows = new Set(rows), visibleCols = new Set(cols);
+    const body = document.createElement('tbody');
+    for (const r of rows) {
+      const tr = document.createElement('tr');
+      tr.style.height = `${rowPx(s, r)}px`;
+      for (const c of cols) {
+        const merge = s.covered.get(refName(r, c));
+        if (merge && (merge.r1 !== r || merge.c1 !== c)) {
+          // Covered by a merge that starts outside what is printed: the first cell shown stands in.
+          const firstRow = rows.find(row => row >= Math.max(merge.r1, area.r1)), firstCol = cols.find(col => col >= Math.max(merge.c1, area.c1));
+          if (firstRow !== r || firstCol !== c) continue;
+        }
+        const td = document.createElement('td');
+        if (merge) {
+          let rowSpan = 0, colSpan = 0;
+          for (let row = Math.max(r, merge.r1); row <= Math.min(merge.r2, area.r2); row++) if (visibleRows.has(row)) rowSpan++;
+          for (let col = Math.max(c, merge.c1); col <= Math.min(merge.c2, area.c2); col++) if (visibleCols.has(col)) colSpan++;
+          if (rowSpan > 1) td.rowSpan = rowSpan;
+          if (colSpan > 1) td.colSpan = colSpan;
+        }
+        const info = shown(merge ? merge.r1 : r, merge ? merge.c1 : c);
+        if (info) {
+          const { style } = info;
+          const css = td.style;
+          css.font = cellFont(style);
+          if (style.fill) css.backgroundColor = style.fill;
+          if (info.color || style.color) css.color = info.color || style.color;
+          css.textAlign = info.align;
+          css.verticalAlign = style.valign === 'center' ? 'middle' : style.valign === 'top' ? 'top' : 'bottom';
+          css.textDecoration = [style.underline && 'underline', style.strike && 'line-through'].filter(Boolean).join(' ') || 'none';
+          if (style.wrap) css.whiteSpace = 'pre-wrap';
+          if (style.indent) css.paddingLeft = `${3 + style.indent * 9}px`;
+          for (const [side, { kind, color }] of Object.entries(style.borders || {})) css.setProperty(`border-${side}`, `${BORDER_CSS[kind] || '1px solid'} ${color}`);
+          td.textContent = info.text;
+        }
+        tr.append(td);
+      }
+      body.append(tr);
+    }
+    table.append(body);
+    const sheetBox = document.createElement('div');
+    sheetBox.className = 'xlsx-print-sheet';
+    sheetBox.append(table);
+    page.append(title, sheetBox);
+    // Pictures, where they sit over the cells printed.
+    layout();
+    const origin = { x: geo.colX[area.c1], y: geo.rowY[area.r1] };
+    const end = { x: geo.colX[Math.min(area.c2 + 1, geo.cols + 1)], y: geo.rowY[Math.min(area.r2 + 1, geo.rows + 1)] };
+    for (const item of sheetExtras(model, s).drawings) {
+      const box = drawingBox(item);
+      if (!box || box.left >= end.x || box.top >= end.y || box.left + box.width <= origin.x || box.top + box.height <= origin.y) continue;
+      const node = drawingNode(item);
+      node.style.cssText = `left:${box.left - origin.x}px;top:${box.top - origin.y}px;width:${box.width}px;height:${box.height}px`;
+      sheetBox.append(node);
+    }
+    for (const old of document.querySelectorAll('body > .xlsx-print')) old.remove();
+    document.body.append(page);
+    document.body.classList.add('xlsx-printing');
+    const done = () => {
+      window.removeEventListener('afterprint', done);
+      document.body.classList.remove('xlsx-printing');
+      page.remove();
+    };
+    window.addEventListener('afterprint', done);
+    // Pictures load before the page is printed.
+    const images = [...page.querySelectorAll('img')].filter(image => !image.complete).map(image => new Promise(resolve => { image.onload = image.onerror = resolve; }));
+    const print = () => { try { window.print(); } catch { done(); } };
+    if (images.length) Promise.all(images).then(print);
+    else print();
+  }
 
   // Clipboard
   const gridFocused = () => document.activeElement === scroll;
