@@ -103,6 +103,25 @@ async function edit(bytes) {
   key(grid, 'k', { ctrlKey: true });
   menu.querySelectorAll('input')[0].value = 'example.com/report';
   panelButton('Apply');
+  // A list of choices in D2:D4, and text with an "a" in it marked in A2:A4.
+  go(4, 2);
+  key(grid, 'ArrowDown', { shiftKey: true });
+  key(grid, 'ArrowDown', { shiftKey: true });
+  key(grid, 'F10', { shiftKey: true });
+  choose('Data validation…');
+  menu.querySelector('input[type="text"]').value = 'Yes, No';
+  panelButton('Apply');
+  go(1, 2);
+  key(grid, 'ArrowDown', { shiftKey: true });
+  key(grid, 'ArrowDown', { shiftKey: true });
+  key(grid, 'F10', { shiftKey: true });
+  choose('Conditional formatting…');
+  const kind = menu.querySelector('select');
+  kind.value = 'containsText';
+  kind.dispatchEvent(new window.Event('change'));
+  menu.querySelector('input[placeholder="Text"]').value = 'a';
+  panelButton('Add rule');
+  panelButton('Close');
   // A spilling formula, and a filter hiding a row.
   type(1, 2, 'c');
   type(1, 3, 'a');
@@ -146,6 +165,8 @@ print(json.dumps({
   "texts": {sheet.title + "!" + cell.coordinate: cell.comment.text for sheet in book for row in sheet.iter_rows() for cell in row if cell.comment},
   "targets": {sheet.title + "!" + cell.coordinate: cell.hyperlink.target or "#" + cell.hyperlink.location for sheet in book for row in sheet.iter_rows() for cell in row if cell.hyperlink},
   "linkText": [book["Sales"]["H1"].value, book[book.sheetnames[-1]]["E1"].value],
+  "notesRules": [[str(item.sqref), item.formula1] for item in book[book.sheetnames[-1]].data_validations.dataValidation]
+    + [[str(block.sqref), rule.type, rule.text] for block in book[book.sheetnames[-1]].conditional_formatting for rule in block.rules],
 }))`;
   return JSON.parse(execFileSync('python3', ['-c', script, file], { encoding: 'utf8' }));
 }
@@ -204,6 +225,7 @@ for (const [label, source] of [['openpyxl', path.join(work, 'rich.xlsx')], ['Lib
   assert.equal(view.targets['Sales!H1'].replace(/'/g, ''), '#Summary!A1', `${label}: a link into the workbook`);
   assert.equal(view.targets['Sheet3!E1'], 'https://example.com/report', `${label}: a web link`);
   assert.deepEqual(view.linkText, ['To the summary', 'example.com/report'], `${label}: links put their text in empty cells`);
+  assert.deepEqual(view.notesRules, [['D2:D4', '"Yes,No"'], ['A2:A4', 'containsText', 'a']], `${label}: validation and conditional formatting added`);
   // LibreOffice reads them too: what it saves keeps them.
   const again = path.join(work, `again-${label}`);
   execFileSync(SOFFICE, ['--headless', '--convert-to', 'xlsx:Calc MS Excel 2007 XML', '--outdir', again, file], { stdio: 'ignore' });
@@ -211,6 +233,7 @@ for (const [label, source] of [['openpyxl', path.join(work, 'rich.xlsx')], ['Lib
   assert.equal(reread.texts['Sales!B2'], 'Checked twice', `${label}: LibreOffice reads the new comment`);
   assert.equal(reread.texts['Sheet3!A1'], 'First note', `${label}: and the one on the new sheet`);
   assert.equal(reread.targets['Sheet3!E1'], 'https://example.com/report', `${label}: and the links`);
+  assert.deepEqual(reread.notesRules, view.notesRules, `${label}: and the rules`);
   // Both charts: the one there, and the one added, reading the cells it was made from.
   const charts = Object.entries(unzipSync(fs.readFileSync(path.join(again, path.basename(file))))).filter(([name]) => /^xl\/charts\/chart\d+\.xml$/.test(name)).map(([, bytes]) => strFromU8(bytes));
   assert.equal(charts.length, 2, `${label}: LibreOffice reads the new chart beside the old`);

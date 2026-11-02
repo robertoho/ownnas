@@ -1161,6 +1161,232 @@ export function conditionalFormats(model, index) {
   }
 }
 
+// --- Changing validation and conditional formatting ---------------------------------------------
+
+/** What is left of `areas` once `hole` is taken out of them, as rectangles. */
+export function subtractArea(areas, hole) {
+  const out = [];
+  for (const a of areas) {
+    if (hole.r2 < a.r1 || hole.r1 > a.r2 || hole.c2 < a.c1 || hole.c1 > a.c2) { out.push(a); continue; }
+    if (a.r1 < hole.r1) out.push({ ...a, r2: hole.r1 - 1 });
+    if (a.r2 > hole.r2) out.push({ ...a, r1: hole.r2 + 1 });
+    const r1 = Math.max(a.r1, hole.r1), r2 = Math.min(a.r2, hole.r2);
+    if (a.c1 < hole.c1) out.push({ r1, r2, c1: a.c1, c2: hole.c1 - 1 });
+    if (a.c2 > hole.c2) out.push({ r1, r2, c1: hole.c2 + 1, c2: a.c2 });
+  }
+  return out;
+}
+
+export function sqrefText(areas) {
+  return areas.map(a => (a.r1 === a.r2 && a.c1 === a.c2 ? refName(a.r1, a.c1) : `${refName(a.r1, a.c1)}:${refName(a.r2, a.c2)}`)).join(' ');
+}
+
+const overlaps = (a, b) => !(b.r2 < a.r1 || b.r1 > a.r2 || b.c2 < a.c1 || b.c1 > a.c2);
+
+/** Takes `holes` out of a rule's cells. Its formulas are written for the top-left cell of its first
+ * range: when that cell changes they are moved with it. Returns false when no cells are left. */
+function shrinkRule(sqref, holes, formulas) {
+  const before = sqref.split(/\s+/).filter(Boolean).map(parseArea).filter(Boolean);
+  let after = before;
+  for (const hole of holes) after = subtractArea(after, hole);
+  if (!after.length) return null;
+  const dRow = after[0].r1 - before[0].r1, dCol = after[0].c1 - before[0].c1;
+  if (dRow || dCol) for (const node of formulas) node.textContent = shiftFormula(node.textContent, dRow, dCol);
+  return sqrefText(after);
+}
+
+/** A worksheet element put in its place among the others, after any of its own kind. */
+function insertWorksheetChild(sheet, node) {
+  const name = node.localName;
+  const after = WORKSHEET_ORDER.slice(WORKSHEET_ORDER.indexOf(name) + 1);
+  sheet.root.insertBefore(node, [...sheet.root.children].find(child => after.includes(child.localName)) || null);
+  return node;
+}
+
+/** Sets the validation rule of the cells in `areas` (taking them out of the rules they had), or
+ * with `rule` null only takes them out. A rule: { type, operator, f1, f2, allowBlank, dropdown,
+ * prompt, promptTitle, error, errorTitle, errorStyle }. */
+export function setValidation(sheet, areas, rule) {
+  const holder = direct(sheet.root, 'dataValidations');
+  for (const node of kids(holder, 'dataValidation')) {
+    const sqref = node.getAttribute('sqref') || '';
+    if (!sqref.split(/\s+/).map(parseArea).some(a => a && areas.some(hole => overlaps(a, hole)))) continue;
+    const left = shrinkRule(sqref, areas, [direct(node, 'formula1'), direct(node, 'formula2')].filter(Boolean));
+    if (left) node.setAttribute('sqref', left); else node.remove();
+  }
+  // Excel's newer rules (lists from other sheets) are kept in an extension.
+  for (const node of [...(direct(sheet.root, 'extLst')?.getElementsByTagNameNS(X14, 'dataValidation') || [])]) {
+    const sqrefNode = node.getElementsByTagNameNS(XM, 'sqref')[0];
+    const sqref = sqrefNode?.textContent || '';
+    if (!sqref.split(/\s+/).map(parseArea).some(a => a && areas.some(hole => overlaps(a, hole)))) continue;
+    const left = shrinkRule(sqref, areas, [...node.getElementsByTagNameNS(XM, 'f')]);
+    const list = node.parentNode;
+    if (left) sqrefNode.textContent = left;
+    else {
+      node.remove();
+      if (list && !list.getElementsByTagNameNS(X14, 'dataValidation').length) {
+        const ext = list.parentNode;
+        list.remove();
+        if (ext && !ext.children.length) ext.remove();
+      } else if (list) list.setAttribute('count', String(list.getElementsByTagNameNS(X14, 'dataValidation').length));
+    }
+  }
+  const extList = direct(sheet.root, 'extLst');
+  if (extList && !extList.children.length) extList.remove();
+  if (rule) {
+    const doc = sheet.xml;
+    const list = holder || insertWorksheetChild(sheet, doc.createElementNS(MAIN, 'dataValidations'));
+    const node = doc.createElementNS(MAIN, 'dataValidation');
+    node.setAttribute('type', rule.type);
+    if (rule.errorStyle && rule.errorStyle !== 'stop') node.setAttribute('errorStyle', rule.errorStyle);
+    if (rule.operator && rule.operator !== 'between' && rule.type !== 'list' && rule.type !== 'custom') node.setAttribute('operator', rule.operator);
+    if (rule.allowBlank) node.setAttribute('allowBlank', '1');
+    // showDropDown="1" hides the dropdown, as the format has it.
+    if (rule.type === 'list' && rule.dropdown === false) node.setAttribute('showDropDown', '1');
+    node.setAttribute('showInputMessage', '1');
+    node.setAttribute('showErrorMessage', '1');
+    for (const key of ['errorTitle', 'error', 'promptTitle', 'prompt']) if (rule[key]) node.setAttribute(key, rule[key]);
+    node.setAttribute('sqref', sqrefText(areas));
+    for (const [name, text] of [['formula1', rule.f1], ['formula2', rule.f2]]) {
+      if (text == null || text === '') continue;
+      const formula = doc.createElementNS(MAIN, name);
+      formula.textContent = text;
+      node.append(formula);
+    }
+    list.append(node);
+  }
+  const list = direct(sheet.root, 'dataValidations');
+  if (list) {
+    const count = kids(list, 'dataValidation').length;
+    if (count) list.setAttribute('count', String(count)); else list.remove();
+  }
+  sheet.rules = null;
+}
+
+/** The conditional formatting rules of a sheet that touch `areas`: { node, block, ranges, priority }. */
+export function conditionalRules(sheet, areas = null) {
+  const out = [];
+  for (const block of kids(sheet.root, 'conditionalFormatting')) {
+    const ranges = (block.getAttribute('sqref') || '').split(/\s+/).filter(Boolean).map(parseArea).filter(Boolean);
+    if (areas && !ranges.some(a => areas.some(hole => overlaps(a, hole)))) continue;
+    for (const node of kids(block, 'cfRule')) out.push({ node, block, ranges, priority: Number(node.getAttribute('priority')) || 0 });
+  }
+  return out.sort((a, b) => a.priority - b.priority);
+}
+
+/** Adds a format conditional rules can apply (a "dxf"): { fill, color, bold }. Returns its index. */
+function addDxf(model, look) {
+  const styles = model.styles;
+  if (!styles) throw new Error('This workbook has no styles, so formats cannot be added to it here.');
+  const doc = styles.xml, root = styles.root;
+  let dxfs = direct(root, 'dxfs');
+  if (!dxfs) {
+    dxfs = doc.createElementNS(MAIN, 'dxfs');
+    const later = ['tableStyles', 'colors', 'extLst'];
+    root.insertBefore(dxfs, [...root.children].find(child => later.includes(child.localName)) || null);
+  }
+  const argb = hex => `FF${hex.replace('#', '').toUpperCase()}`;
+  const dxf = doc.createElementNS(MAIN, 'dxf');
+  if (look.color || look.bold) {
+    const font = doc.createElementNS(MAIN, 'font');
+    if (look.bold) font.append(doc.createElementNS(MAIN, 'b'));
+    if (look.color) { const color = doc.createElementNS(MAIN, 'color'); color.setAttribute('rgb', argb(look.color)); font.append(color); }
+    dxf.append(font);
+  }
+  if (look.fill) {
+    const fill = doc.createElementNS(MAIN, 'fill');
+    const pattern = doc.createElementNS(MAIN, 'patternFill');
+    const color = doc.createElementNS(MAIN, 'bgColor');
+    color.setAttribute('rgb', argb(look.fill));
+    pattern.append(color);
+    fill.append(pattern);
+    dxf.append(fill);
+  }
+  dxfs.append(dxf);
+  const count = kids(dxfs, 'dxf').length;
+  dxfs.setAttribute('count', String(count));
+  model.stylesTouched = true;
+  return count - 1;
+}
+
+/**
+ * Adds a conditional formatting rule over `areas`, first in priority (as Excel puts new ones).
+ * A rule: { type, operator, formulas: [], text, rank, bottom, percent, below, colors: [], look }.
+ */
+export function addConditionalRule(model, sheet, areas, rule) {
+  const doc = sheet.xml;
+  for (const { node, priority } of conditionalRules(sheet)) node.setAttribute('priority', String(priority + 1));
+  const block = doc.createElementNS(MAIN, 'conditionalFormatting');
+  block.setAttribute('sqref', sqrefText(areas));
+  const node = doc.createElementNS(MAIN, 'cfRule');
+  node.setAttribute('type', rule.type);
+  const looks = !['colorScale', 'dataBar'].includes(rule.type);
+  if (looks) node.setAttribute('dxfId', String(addDxf(model, rule.look || {})));
+  node.setAttribute('priority', '1');
+  if (rule.type === 'cellIs') node.setAttribute('operator', rule.operator || 'equal');
+  const first = refName(areas[0].r1, areas[0].c1);
+  const quoted = `"${String(rule.text ?? '').replace(/"/g, '""')}"`;
+  let formulas = rule.formulas || [];
+  if (['containsText', 'notContainsText', 'beginsWith', 'endsWith'].includes(rule.type)) {
+    node.setAttribute('operator', { containsText: 'containsText', notContainsText: 'notContains', beginsWith: 'beginsWith', endsWith: 'endsWith' }[rule.type]);
+    node.setAttribute('text', rule.text ?? '');
+    // Excel keeps the test as a formula too, and needs it.
+    formulas = [{
+      containsText: `NOT(ISERROR(SEARCH(${quoted},${first})))`, notContainsText: `ISERROR(SEARCH(${quoted},${first}))`,
+      beginsWith: `LEFT(${first},LEN(${quoted}))=${quoted}`, endsWith: `RIGHT(${first},LEN(${quoted}))=${quoted}`,
+    }[rule.type]];
+  } else if (rule.type === 'containsBlanks') formulas = [`LEN(TRIM(${first}))=0`];
+  else if (rule.type === 'notContainsBlanks') formulas = [`LEN(TRIM(${first}))>0`];
+  else if (rule.type === 'containsErrors') formulas = [`ISERROR(${first})`];
+  else if (rule.type === 'top10') {
+    node.setAttribute('rank', String(Math.max(1, Math.round(rule.rank || 10))));
+    if (rule.bottom) node.setAttribute('bottom', '1');
+    if (rule.percent) node.setAttribute('percent', '1');
+  } else if (rule.type === 'aboveAverage' && rule.below) node.setAttribute('aboveAverage', '0');
+  for (const text of formulas) {
+    const formula = doc.createElementNS(MAIN, 'formula');
+    formula.textContent = text;
+    node.append(formula);
+  }
+  if (rule.type === 'colorScale' || rule.type === 'dataBar') {
+    const scale = doc.createElementNS(MAIN, rule.type);
+    const points = rule.type === 'colorScale' && rule.colors.length === 3 ? [['min'], ['percentile', '50'], ['max']] : [['min'], ['max']];
+    for (const [type, val] of points) {
+      const point = doc.createElementNS(MAIN, 'cfvo');
+      point.setAttribute('type', type);
+      if (val) point.setAttribute('val', val);
+      scale.append(point);
+    }
+    for (const hex of rule.colors) {
+      const color = doc.createElementNS(MAIN, 'color');
+      color.setAttribute('rgb', `FF${hex.replace('#', '').toUpperCase()}`);
+      scale.append(color);
+    }
+    node.append(scale);
+  }
+  block.append(node);
+  const blocks = kids(sheet.root, 'conditionalFormatting');
+  if (blocks.length) blocks[blocks.length - 1].after(block);
+  else insertWorksheetChild(sheet, block);
+}
+
+/** Removes one conditional rule (a node from conditionalRules), or every rule's hold on `areas`. */
+export function removeConditional(sheet, { node = null, areas = null } = {}) {
+  if (node) {
+    const block = node.parentNode;
+    node.remove();
+    if (block && !kids(block, 'cfRule').length) block.remove();
+    return;
+  }
+  for (const block of kids(sheet.root, 'conditionalFormatting')) {
+    if (!areas) { block.remove(); continue; }
+    const sqref = block.getAttribute('sqref') || '';
+    if (!sqref.split(/\s+/).map(parseArea).some(a => a && areas.some(hole => overlaps(a, hole)))) continue;
+    const left = shrinkRule(sqref, areas, kids(block, 'cfRule').flatMap(rule => kids(rule, 'formula')));
+    if (left) block.setAttribute('sqref', left); else block.remove();
+  }
+}
+
 // --- Cell edits ---------------------------------------------------------------------------------
 
 function rowElement(sheet, r) {
@@ -3689,7 +3915,13 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     if (!rule || rule.type !== 'list' || !canWrite()) return;
     const choices = validationChoices(model, active, rule, anchor.row, anchor.col);
     if (!choices.length) { notice('The list for this cell is empty, or comes from something this editor cannot read.'); return; }
-    const box = validButton.getBoundingClientRect();
+    let box = validButton.getBoundingClientRect();
+    if (validButton.hidden || !box.width) {
+      // Not placed yet (the selection moved this frame): under the cell itself.
+      layout();
+      const cell = rect(anchor.row, anchor.col, anchor.row, anchor.col), at = canvas.getBoundingClientRect();
+      box = { right: at.left + (cell.left + cell.width) * zoom, bottom: at.top + (cell.top + cell.height) * zoom };
+    }
     const { row, col } = anchor;
     const s = sheet();
     openMenu(box.right, box.bottom + 2, choices.map(choice => [choice, () => transaction(touch => writeInput(s, row, col, choice, touch))]));
@@ -4460,12 +4692,12 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     titleInput.type = 'text';
     titleInput.value = chart?.title?.text ?? item.title ?? '';
     const legendSelect = document.createElement('select');
-    for (const [value, text] of [['', 'None'], ['r', 'Right'], ['b', 'Bottom'], ['t', 'Top'], ['l', 'Left']]) legendSelect.append(new Option(text, value));
+    for (const [value, text] of [['', 'None'], ['r', 'Right'], ['b', 'Bottom'], ['t', 'Top'], ['l', 'Left']]) legendSelect.append(optionOf(text, value));
     legendSelect.value = chart?.legend && ['r', 'b', 't', 'l'].includes(chart.legend) ? chart.legend : chart?.legend ? 'r' : '';
     const kindSelect = document.createElement('select');
     const kindNow = chart?.plots.length === 1 ? (chart.plots[0].kind === 'bar' ? (chart.plots[0].horizontal ? 'bar' : 'column') : chart.plots[0].kind) : '';
-    if (!kindNow) kindSelect.append(new Option('As it is', ''));
-    for (const [value, text] of CHART_KINDS) kindSelect.append(new Option(text, value));
+    if (!kindNow) kindSelect.append(optionOf('As it is', ''));
+    for (const [value, text] of CHART_KINDS) kindSelect.append(optionOf(text, value));
     kindSelect.value = kindNow;
     const stackedBox = document.createElement('input');
     stackedBox.type = 'checkbox';
@@ -4497,6 +4729,297 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     titleInput.focus();
   }
 
+  // Validation and conditional formatting
+  const OPERATORS = [['between', 'between'], ['notBetween', 'not between'], ['equal', 'equal to'], ['notEqual', 'not equal to'],
+    ['greaterThan', 'greater than'], ['lessThan', 'less than'], ['greaterThanOrEqual', 'at least'], ['lessThanOrEqual', 'at most']];
+  const make = (tag, className, text) => { const node = document.createElement(tag); if (className) node.className = className; if (text != null) node.textContent = text; return node; };
+  const optionOf = (label, value) => { const option = document.createElement('option'); option.value = value; option.textContent = label; return option; };
+  const choiceList = (options, value) => {
+    const select = make('select');
+    for (const [key, label] of options) select.append(optionOf(label, key));
+    if (value != null) select.value = value;
+    return select;
+  };
+  const textField = (value = '', placeholder = '') => { const input = make('input'); input.type = 'text'; input.value = value; input.placeholder = placeholder; input.spellcheck = false; return input; };
+  /** A value typed for a rule, as a formula: =B2 stays a formula, numbers and dates are numbers,
+   * anything else is text in quotes. */
+  function ruleValue(text, kind = 'any') {
+    const value = String(text ?? '').trim();
+    if (!value) return null;
+    if (value.startsWith('=')) return value.slice(1);
+    const parsed = parseInput(value, separators);
+    if (parsed.kind === 'number') return String(parsed.value);
+    if (kind === 'number') throw new Error(`"${value}" is not a number or a date.`);
+    return `"${value.replace(/"/g, '""')}"`;
+  }
+  /** A rule's formula as typed back: numbers as they are, quoted text without quotes, others with =. */
+  function typedValue(formula, date) {
+    if (formula == null) return '';
+    if (/^"(?:[^"]|"")*"$/.test(formula)) return formula.slice(1, -1).replace(/""/g, '"');
+    if (/^-?\d+(\.\d+)?$/.test(formula)) return date ? formatValue(Number(formula), 'yyyy-mm-dd', formatOptions).text : formula;
+    return `=${formula}`;
+  }
+  /** The cells rules go on: every selected range (whole rows and columns stop at the used area). */
+  function ruleAreas() {
+    const used = usedSize();
+    return allRanges().map(range => ({
+      r1: range.r1, c1: range.c1,
+      r2: range.r2 >= LAST_ROW ? Math.max(range.r1, used.rows) : range.r2,
+      c2: range.c2 >= LAST_COL ? Math.max(range.c1, used.cols) : range.c2,
+    }));
+  }
+  function editValidation() {
+    if (!canWrite()) return;
+    const areas = ruleAreas();
+    const current = validationAt(sheet(), anchor.row, anchor.col);
+    const type = choiceList([['any', 'Any value'], ['list', 'A list of choices'], ['whole', 'Whole numbers'], ['decimal', 'Numbers'], ['date', 'Dates'], ['textLength', 'Text of a length'], ['custom', 'A formula that is true']], current?.type || 'list');
+    const choices = textField('', 'Yes, No, Maybe — or =$H$2:$H$9');
+    if (current?.type === 'list') choices.value = current.f1?.startsWith('"') ? validationChoices(model, active, current, anchor.row, anchor.col).join(', ') : typedValue(current.f1);
+    const dropdown = make('input');
+    dropdown.type = 'checkbox';
+    dropdown.checked = !current?.noDropdown;
+    const dropdownLabel = make('label', 'xlsx-panel-check');
+    dropdownLabel.append(dropdown, ' Show a dropdown in the cell');
+    const operator = choiceList(OPERATORS, current?.operator || 'between');
+    const date = current?.type === 'date';
+    const low = textField(current && !['list', 'custom'].includes(current.type) ? typedValue(current.f1, date) : '', 'From');
+    const high = textField(current && !['list', 'custom'].includes(current.type) ? typedValue(current.f2, date) : '', 'To');
+    const bounds = make('div', 'xlsx-panel-row');
+    bounds.append(operator, low, high);
+    const formula = textField(current?.type === 'custom' ? typedValue(current.f1) : '', `=COUNTIF($A:$A, ${refName(areas[0].r1, areas[0].c1)})=1`);
+    const blank = make('input');
+    blank.type = 'checkbox';
+    blank.checked = current ? current.allowBlank : true;
+    const blankLabel = make('label', 'xlsx-panel-check');
+    blankLabel.append(blank, ' Empty cells are allowed');
+    const prompt = textField(current?.prompt || '', 'Shown when the cell is chosen (optional)');
+    const style = choiceList([['stop', 'Refuse it'], ['warning', 'Warn, and let it be'], ['information', 'Tell, and let it be']], current?.errorStyle || 'stop');
+    const error = textField(current?.error || '', 'What to say (optional)');
+    const problem = make('p', 'xlsx-panel-problem');
+    problem.hidden = true;
+    const fields = {
+      list: [labelled('Choices', choices), dropdownLabel],
+      bounds: [labelled('Allowed', bounds)],
+      custom: [labelled('Formula', formula)],
+    };
+    const rest = [blankLabel, labelled('Message', prompt), labelled('When a value is not allowed', style), labelled('Error message', error)];
+    const update = () => {
+      const kind = type.value;
+      for (const node of fields.list) node.hidden = kind !== 'list';
+      for (const node of fields.bounds) node.hidden = !['whole', 'decimal', 'date', 'textLength'].includes(kind);
+      for (const node of fields.custom) node.hidden = kind !== 'custom';
+      high.hidden = !['between', 'notBetween'].includes(operator.value);
+      for (const node of rest) node.hidden = kind === 'any';
+      low.placeholder = kind === 'date' ? 'yyyy-mm-dd' : ['between', 'notBetween'].includes(operator.value) ? 'From' : 'Value';
+    };
+    type.addEventListener('change', update);
+    operator.addEventListener('change', update);
+    const apply = () => {
+      const kind = type.value;
+      let rule = null;
+      try {
+        if (kind !== 'any') {
+          rule = { type: kind, operator: operator.value, allowBlank: blank.checked, prompt: prompt.value.trim(), error: error.value.trim(), errorStyle: style.value, errorTitle: '' };
+          if (kind === 'list') {
+            const typed = choices.value.trim();
+            if (!typed) throw new Error('Type the choices, separated by commas, or a range such as =$H$2:$H$9.');
+            rule.f1 = typed.startsWith('=') ? typed.slice(1) : `"${typed.split(',').map(item => item.trim()).filter(Boolean).join(',').replace(/"/g, '""')}"`;
+            if (!typed.startsWith('=') && rule.f1.length > 257) throw new Error('A typed list can be at most 255 characters long: put longer lists in cells, and give their range.');
+            rule.dropdown = dropdown.checked;
+          } else if (kind === 'custom') {
+            if (!formula.value.trim()) throw new Error('Type a formula that is true for the values allowed.');
+            rule.f1 = formula.value.trim().replace(/^=/, '');
+          } else {
+            rule.f1 = ruleValue(low.value, 'number');
+            rule.f2 = ['between', 'notBetween'].includes(operator.value) ? ruleValue(high.value, 'number') : null;
+            if (rule.f1 == null || (['between', 'notBetween'].includes(operator.value) && rule.f2 == null)) throw new Error('Type the values allowed.');
+          }
+          if (rule.f1 && !rule.f1.startsWith('"')) parseFormula(rule.f1);
+          if (rule.f2 && !rule.f2.startsWith('"')) parseFormula(rule.f2);
+        }
+      } catch (problemError) {
+        problem.textContent = problemError.message;
+        problem.hidden = false;
+        return false;
+      }
+      return partsChange(s => setValidation(s, areas, rule)) || false;
+    };
+    const where = sqrefText(areas);
+    const ok = openCellPanel(`Data validation for ${where.length > 24 ? 'the selection' : where}`, [labelled('Allow', type), ...fields.list, ...fields.bounds, ...fields.custom, ...rest, problem], [
+      ...(current ? [['Remove', () => partsChange(s => setValidation(s, areas, null)), 'danger']] : []),
+      ['Cancel', () => {}],
+      ['Apply', apply, 'ok'],
+    ], null, true);
+    for (const input of [choices, low, high, formula, prompt, error]) input.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); ok.click(); } });
+    update();
+    type.focus();
+  }
+
+  const LOOKS = [
+    ['red', 'Light red fill, dark red text', { fill: '#FFC7CE', color: '#9C0006' }],
+    ['yellow', 'Yellow fill, dark yellow text', { fill: '#FFEB9C', color: '#9C5700' }],
+    ['green', 'Green fill, dark green text', { fill: '#C6EFCE', color: '#006100' }],
+    ['fill', 'Light red fill', { fill: '#FFC7CE' }],
+    ['text', 'Red text', { color: '#9C0006' }],
+    ['bold', 'Bold', { bold: true }],
+    ['custom', 'Choose…', null],
+  ];
+  /** What a conditional rule does, in words. */
+  function ruleWords(node) {
+    const type = node.getAttribute('type');
+    const formulas = kids(node, 'formula').map(item => typedValue(item.textContent));
+    const text = node.getAttribute('text') || '';
+    const op = (OPERATORS.find(([key]) => key === (node.getAttribute('operator') || 'equal')) || [, 'equal to'])[1];
+    return {
+      cellIs: () => `Value ${op} ${formulas.join(' and ')}`,
+      expression: () => `Formula ${formulas[0] || ''}`,
+      containsText: () => `Text contains "${text}"`, notContainsText: () => `Text does not contain "${text}"`,
+      beginsWith: () => `Text begins with "${text}"`, endsWith: () => `Text ends with "${text}"`,
+      containsBlanks: () => 'Empty cells', notContainsBlanks: () => 'Cells with something in them',
+      containsErrors: () => 'Errors', notContainsErrors: () => 'No errors',
+      duplicateValues: () => 'Values that repeat', uniqueValues: () => 'Values that appear once',
+      top10: () => `${flag(node.getAttribute('bottom')) ? 'Bottom' : 'Top'} ${node.getAttribute('rank') || 10}${flag(node.getAttribute('percent')) ? '%' : ''}`,
+      aboveAverage: () => (node.getAttribute('aboveAverage') === '0' ? 'Below average' : 'Above average'),
+      colorScale: () => `Colour scale (${kids(direct(node, 'colorScale'), 'color').length} colours)`,
+      dataBar: () => 'Data bars',
+      iconSet: () => 'Icons (shown in Excel)',
+    }[type]?.() || type;
+  }
+  function editConditional() {
+    if (!canWrite()) return;
+    const areas = ruleAreas();
+    const list = make('div', 'xlsx-rule-list');
+    const drawList = () => {
+      const rules = conditionalRules(sheet(), areas);
+      list.replaceChildren();
+      if (!rules.length) list.append(make('p', 'xlsx-rule-none', 'No rules here yet.'));
+      for (const { node, ranges } of rules) {
+        const row = make('div', 'xlsx-rule');
+        const look = dxfStyle(model, node.getAttribute('dxfId'));
+        const sample = make('span', 'xlsx-rule-sample', 'Aa');
+        if (look.fill) sample.style.background = look.fill;
+        if (look.color) sample.style.color = look.color;
+        if (look.bold) sample.style.fontWeight = '700';
+        const words = make('span', 'xlsx-rule-words', ruleWords(node));
+        words.title = `${ruleWords(node)} — ${sqrefText(ranges)}`;
+        const where = make('span', 'xlsx-rule-where', sqrefText(ranges));
+        const remove = make('button', 'xlsx-rule-remove', '✕');
+        remove.type = 'button';
+        remove.title = 'Delete this rule';
+        remove.setAttribute('aria-label', `Delete the rule: ${ruleWords(node)}`);
+        remove.addEventListener('click', () => {
+          const at = conditionalRules(sheet()).findIndex(item => item.node === node);
+          partsChange(s => removeConditional(s, { node: conditionalRules(s)[at].node }));
+          drawList();
+        });
+        row.append(sample, words, where, remove);
+        list.append(row);
+      }
+    };
+    drawList();
+    const kind = choiceList([
+      ['cellIs', 'Value is…'], ['containsText', 'Text contains…'], ['notContainsText', 'Text does not contain…'], ['beginsWith', 'Text begins with…'], ['endsWith', 'Text ends with…'],
+      ['containsBlanks', 'Empty'], ['containsErrors', 'Errors'], ['duplicateValues', 'Values that repeat'], ['uniqueValues', 'Values that appear once'],
+      ['top', 'Top…'], ['bottom', 'Bottom…'], ['above', 'Above average'], ['below', 'Below average'], ['expression', 'Formula is true…'],
+      ['scale2', 'Colour scale, 2 colours'], ['scale3', 'Colour scale, 3 colours'], ['dataBar', 'Data bars'],
+    ], 'cellIs');
+    const operator = choiceList(OPERATORS, 'greaterThan');
+    const first = textField('', 'Value or =B2'), second = textField('', 'and');
+    const valueRow = make('div', 'xlsx-panel-row');
+    valueRow.append(operator, first, second);
+    const text = textField('', 'Text');
+    const rank = textField('10');
+    rank.inputMode = 'numeric';
+    const percent = make('input');
+    percent.type = 'checkbox';
+    const percentLabel = make('label', 'xlsx-panel-check');
+    percentLabel.append(percent, ' percent');
+    const rankRow = make('div', 'xlsx-panel-row');
+    rankRow.append(rank, percentLabel);
+    const formula = textField('', `=${refName(areas[0].r1, areas[0].c1)}>100`);
+    const color = value => { const input = make('input'); input.type = 'color'; input.value = value; return input; };
+    const low = color('#F8696B'), mid = color('#FFEB84'), high = color('#63BE7B'), bar = color('#638EC6');
+    const scaleRow = make('div', 'xlsx-panel-row');
+    scaleRow.append(low, mid, high);
+    const look = choiceList(LOOKS.map(([key, label]) => [key, label]), 'red');
+    const fill = color('#FFC7CE'), ink = color('#9C0006');
+    const bold = make('input');
+    bold.type = 'checkbox';
+    const boldLabel = make('label', 'xlsx-panel-check');
+    boldLabel.append(bold, ' Bold');
+    const customRow = make('div', 'xlsx-panel-row');
+    customRow.append(make('span', '', 'Fill'), fill, make('span', '', 'Text'), ink, boldLabel);
+    const problem = make('p', 'xlsx-panel-problem');
+    problem.hidden = true;
+    const parts = {
+      value: labelled('Format cells whose value is', valueRow), text: labelled('Text', text), rank: labelled('How many', rankRow),
+      formula: labelled('Formula, for the first cell', formula), scale: labelled('Lowest, middle, highest', scaleRow), bar: labelled('Bar colour', bar),
+      look: labelled('With', look), custom: customRow,
+    };
+    const update = () => {
+      const k = kind.value;
+      parts.value.hidden = k !== 'cellIs';
+      second.hidden = !['between', 'notBetween'].includes(operator.value);
+      parts.text.hidden = !['containsText', 'notContainsText', 'beginsWith', 'endsWith'].includes(k);
+      parts.rank.hidden = !['top', 'bottom'].includes(k);
+      parts.formula.hidden = k !== 'expression';
+      parts.scale.hidden = !['scale2', 'scale3'].includes(k);
+      mid.hidden = k !== 'scale3';
+      parts.bar.hidden = k !== 'dataBar';
+      parts.look.hidden = ['scale2', 'scale3', 'dataBar'].includes(k);
+      parts.custom.hidden = parts.look.hidden || look.value !== 'custom';
+    };
+    for (const control of [kind, operator, look]) control.addEventListener('change', update);
+    const add = () => {
+      const k = kind.value;
+      const chosenLook = look.value === 'custom' ? { fill: fill.value, color: ink.value, bold: bold.checked } : LOOKS.find(([key]) => key === look.value)[2];
+      let rule;
+      try {
+        if (k === 'cellIs') {
+          const a = ruleValue(first.value), b = ['between', 'notBetween'].includes(operator.value) ? ruleValue(second.value) : null;
+          if (a == null || (['between', 'notBetween'].includes(operator.value) && b == null)) throw new Error('Type the value to compare with.');
+          rule = { type: 'cellIs', operator: operator.value, formulas: [a, b].filter(item => item != null) };
+        } else if (['containsText', 'notContainsText', 'beginsWith', 'endsWith'].includes(k)) {
+          if (!text.value) throw new Error('Type the text to look for.');
+          rule = { type: k, text: text.value };
+        } else if (k === 'top' || k === 'bottom') {
+          const n = Number(rank.value);
+          if (!(n >= 1 && n <= 1000)) throw new Error('Type how many, from 1 to 1000.');
+          rule = { type: 'top10', rank: n, bottom: k === 'bottom', percent: percent.checked };
+        } else if (k === 'above' || k === 'below') rule = { type: 'aboveAverage', below: k === 'below' };
+        else if (k === 'expression') {
+          const typed = formula.value.trim().replace(/^=/, '');
+          if (!typed) throw new Error('Type a formula that is true for the cells to format.');
+          parseFormula(typed);
+          rule = { type: 'expression', formulas: [typed] };
+        } else if (k === 'scale2' || k === 'scale3') rule = { type: 'colorScale', colors: k === 'scale3' ? [low.value, mid.value, high.value] : [low.value, high.value] };
+        else if (k === 'dataBar') rule = { type: 'dataBar', colors: [bar.value] };
+        else rule = { type: k };
+        for (const item of rule.formulas || []) if (!item.startsWith('"')) parseFormula(item);
+      } catch (problemError) {
+        problem.textContent = problemError.message;
+        problem.hidden = false;
+        return false;
+      }
+      rule.look = chosenLook;
+      problem.hidden = true;
+      if (!partsChange(s => addConditionalRule(model, s, areas, rule))) return false;
+      drawList();
+      return false;
+    };
+    const where = sqrefText(areas);
+    openCellPanel(`Conditional formatting for ${where.length > 24 ? 'the selection' : where}`, [
+      list, make('div', 'menu-label', 'New rule'), labelled('Format', kind), parts.value, parts.text, parts.rank, parts.formula, parts.scale, parts.bar, parts.look, parts.custom, problem,
+    ], [
+      ['Clear rules here', () => { partsChange(s => removeConditional(s, { areas })); drawList(); return false; }, 'danger'],
+      ['Close', () => {}],
+      ['Add rule', add, 'ok'],
+    ], null, true);
+    for (const input of [first, second, text, rank, formula]) input.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); add(); } });
+    update();
+    kind.focus();
+  }
+
   // Adding comments and links
   /** A change to the active sheet and the parts it links to (comments, links, charts), with undo:
    * the sheet and every part of the package as they were before and after. */
@@ -4526,10 +5049,10 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     return merge ? refName(merge.r1, merge.c1) : refName(anchor.row, anchor.col);
   }
   /** A small panel under the active cell, in the menu's place, with buttons at its foot. */
-  function openCellPanel(label, fields, actions, near = null) {
+  function openCellPanel(label, fields, actions, near = null, wide = false) {
     closeMenu();
     const make = (tag, className, text) => { const node = document.createElement(tag); if (className) node.className = className; if (text != null) node.textContent = text; return node; };
-    const close = () => { menu.hidden = true; menu.classList.remove('xlsx-format-panel'); scroll.focus({ preventScroll: true }); };
+    const close = () => { menu.hidden = true; menu.classList.remove('xlsx-format-panel', 'xlsx-rules-panel'); scroll.focus({ preventScroll: true }); };
     const foot = make('div', 'xlsx-filter-actions');
     for (const [text, action, kind] of actions) {
       const button = make('button', kind === 'ok' ? 'xlsx-filter-ok' : kind === 'danger' ? 'xlsx-panel-danger' : '', text);
@@ -4539,6 +5062,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     }
     menu.replaceChildren(make('div', 'menu-label', label), ...fields, foot);
     menu.classList.add('xlsx-format-panel');
+    menu.classList.toggle('xlsx-rules-panel', wide);
     menu.hidden = false;
     const box = near || rect(anchor.row, anchor.col, anchor.row, anchor.col);
     const at = canvas.getBoundingClientRect();
@@ -5857,11 +6381,12 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
       items.push('-', ['Paste values only', () => pasteSpecial('values')], ['Paste formats only', () => pasteSpecial('formats')], ['Paste transposed', () => pasteSpecial('all', true)]);
       items.push('-', ['Sort A to Z', () => sortRange(sortTarget(), anchor.col, false)], ['Sort Z to A', () => sortRange(sortTarget(), anchor.col, true)]);
       items.push([autoFilterOf(sheet()) ? 'Remove filter' : 'Filter', toggleFilter]);
+      items.push('-', ['Data validation…', editValidation], ['Conditional formatting…', editConditional]);
     }
     return items;
   }
   function openMenu(x, y, list = menuItems()) {
-    menu.classList.remove('xlsx-format-panel');
+    menu.classList.remove('xlsx-format-panel', 'xlsx-rules-panel');
     const items = list.filter((item, i, all) => item !== '-' || (i > 0 && all[i - 1] !== '-' && i < all.length - 1));
     menu.replaceChildren(...items.map(item => {
       if (item === '-') {
@@ -5894,7 +6419,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     const buttons = [...menu.querySelectorAll('button:not(:disabled)')];
     const at = buttons.indexOf(document.activeElement);
     if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeMenu(); scroll.focus({ preventScroll: true }); }
-    else if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && !['INPUT', 'TEXTAREA'].includes(event.target.tagName)) {
+    else if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && !['INPUT', 'TEXTAREA', 'SELECT'].includes(event.target.tagName)) {
       event.preventDefault();
       buttons[(at + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length]?.focus();
     }

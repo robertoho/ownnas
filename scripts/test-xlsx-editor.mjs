@@ -12,8 +12,10 @@ Object.defineProperty(dom.window.HTMLElement.prototype, 'clientHeight', { get() 
 Object.defineProperty(dom.window.HTMLElement.prototype, 'clientWidth', { get() { return 800; } });
 dom.window.HTMLCanvasElement.prototype.getContext = () => null;
 const { zipSync, unzipSync, strToU8, strFromU8 } = await import('../web/vendor/three/addons/libs/fflate.module.js');
-const { conditionalFormats, fillSeries, linkTarget, mountXlsxEditor, openXlsx, parseInput, readHtmlTable, restructure } = await import('../web/xlsx-editor.js');
+const { addConditionalRule, conditionalFormats, conditionalRules, fillSeries, linkTarget, mountXlsxEditor, removeConditional, setValidation, sqrefText, subtractArea, openXlsx, parseInput, readHtmlTable, restructure } = await import('../web/xlsx-editor.js');
 
+const { parseRef } = await import('../web/sheet-formula.js');
+const serializeNode = node => new XMLSerializer().serializeToString(node);
 const NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
 const sheet = `<worksheet xmlns="${NS}"><dimension ref="A1:B3"/><sheetData>
 <row r="1"><c r="A1"><v>10</v></c><c r="B1"><f t="shared" ref="B1:B2" si="0">A1*2</f><v>20</v></c></row>
@@ -1152,6 +1154,34 @@ editor.destroy();
   assert.ok(!parts['xl/comments1.xml'] && !parts['xl/drawings/vmlDrawing1.vml'], 'deleting the last comment takes its parts away');
   assert.doesNotMatch(strFromU8(parts['[Content_Types].xml']), /comments1/);
   noted.destroy();
+}
+
+// Validation and conditional rules: cells taken out of a rule split it, its formulas follow its
+// first cell, and new rules go first.
+{
+  const area = text => { const [a, b = a] = text.split(':'); const x = parseRef(a), y = parseRef(b); return { r1: x.row, c1: x.col, r2: y.row, c2: y.col }; };
+  assert.equal(sqrefText(subtractArea([area('A1:C3')], area('B2'))), 'A1:C1 A3:C3 A2 C2');
+  assert.equal(sqrefText(subtractArea([area('A1:A5'), area('C1')], area('A1:A2'))), 'A3:A5 C1');
+  const data = `<worksheet xmlns="${NS}"><sheetData><row r="1"><c r="A1"><v>5</v></c></row></sheetData>
+<conditionalFormatting sqref="A1:A5"><cfRule type="expression" dxfId="0" priority="1"><formula>A1&gt;B1</formula></cfRule></conditionalFormatting>
+<dataValidations count="1"><dataValidation type="custom" sqref="A1:A5"><formula1>A1&lt;10</formula1></dataValidation></dataValidations><pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/></worksheet>`;
+  const styles = files['xl/styles.xml'];
+  const book = openXlsx(zipSync(Object.fromEntries(Object.entries({ ...files, 'xl/worksheets/sheet1.xml': data, 'xl/styles.xml': styles }).map(([name, text]) => [name, strToU8(text)]))));
+  const s = book.sheets[0];
+  setValidation(s, [area('A1:A2')], null);
+  assert.match(serializeNode(s.root), /<dataValidation type="custom" sqref="A3:A5"><formula1>A3&lt;10<\/formula1>/, 'a rule losing its first cells moves its formula with them');
+  setValidation(s, [area('C1:C3')], { type: 'list', f1: '"a,b"', allowBlank: true, dropdown: true });
+  assert.match(serializeNode(s.root), /<dataValidations count="2">.*<dataValidation type="list" allowBlank="1" showInputMessage="1" showErrorMessage="1" sqref="C1:C3"><formula1>"a,b"<\/formula1>/s);
+  removeConditional(s, { areas: [area('A1')] });
+  assert.match(serializeNode(s.root), /<conditionalFormatting sqref="A2:A5"><cfRule type="expression" dxfId="0" priority="1"><formula>A2&gt;B2<\/formula>/);
+  addConditionalRule(book, s, [area('B1:B4')], { type: 'containsText', text: 'x"y', look: { fill: '#FFC7CE', bold: true } });
+  const text = serializeNode(s.root);
+  assert.match(text, /<conditionalFormatting sqref="A2:A5"><cfRule type="expression" dxfId="0" priority="2">/, 'rules there move down in priority');
+  assert.match(text, /<conditionalFormatting sqref="B1:B4"><cfRule type="containsText" dxfId="0" priority="1" operator="containsText" text="x&quot;y"><formula>NOT\(ISERROR\(SEARCH\("x""y",B1\)\)\)<\/formula>/);
+  assert.ok(text.indexOf('<conditionalFormatting sqref="B1:B4"') < text.indexOf('<dataValidations'), 'in its place among the sheet\'s parts');
+  assert.match(serializeNode(book.styles.root), /<dxfs count="1"><dxf><font><b\/><\/font><fill><patternFill><bgColor rgb="FFFFC7CE"\/>/);
+  removeConditional(s, { node: conditionalRules(s)[0].node });
+  assert.doesNotMatch(serializeNode(s.root), /B1:B4/);
 }
 
 const readonly = mountXlsxEditor(container, bytes, { readonly: true });
