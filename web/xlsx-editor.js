@@ -10,6 +10,7 @@ import {
   formatGeneral, formatValue, formulaWordAt, fromFileFormula, quoteSheet, renameSheet, toFileFormula, localeSeparators, moveFormula, moveSpan, moveSqref, parseFormula, parseRef,
   refName, serialParts, shiftFormula, tokenize,
 } from './sheet-formula.js';
+import { chartSvg, chartXml, readChart } from './sheet-chart.js';
 
 const MAIN = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
 const DOC_REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
@@ -1675,8 +1676,10 @@ function readDrawing(model, path) {
   const xml = parseXml(strFromU8(model.parts[path]), 'Drawing');
   const rels = relTargets(model, path);
   const items = [];
+  let index = -1;
   for (const anchor of [...xml.documentElement.children]) {
     if (!['twoCellAnchor', 'oneCellAnchor', 'absoluteAnchor'].includes(anchor.localName)) continue;
+    index++;
     const marker = name => {
       const node = kids(anchor, name, SHEET_DRAWING)[0];
       if (!node) return null;
@@ -1689,6 +1692,8 @@ function readDrawing(model, path) {
       size: ext ? { cx: Number(ext.getAttribute('cx')) || 0, cy: Number(ext.getAttribute('cy')) || 0 } : null,
       pos: pos ? { x: Number(pos.getAttribute('x')) || 0, y: Number(pos.getAttribute('y')) || 0 } : null,
       name: anchor.getElementsByTagNameNS(SHEET_DRAWING, 'cNvPr')[0]?.getAttribute('name') || '',
+      // Which anchor of which drawing part, to move or delete it.
+      drawing: path, index,
     };
     const pic = kids(anchor, 'pic', SHEET_DRAWING)[0];
     const frame = kids(anchor, 'graphicFrame', SHEET_DRAWING)[0];
@@ -1705,7 +1710,7 @@ function readDrawing(model, path) {
         const titleNode = parseXml(strFromU8(model.parts[part.path]), 'Chart').getElementsByTagNameNS(CHART, 'title')[0];
         title = titleNode ? [...titleNode.getElementsByTagNameNS(DRAWING, 't')].map(node => node.textContent).join('') : '';
       }
-      items.push({ ...item, kind: 'chart', title });
+      items.push({ ...item, kind: 'chart', title, chart: part?.path && model.parts[part.path] ? part.path : null });
     } else {
       const text = [...anchor.getElementsByTagNameNS(DRAWING, 't')].map(node => node.textContent).join(' ');
       items.push({ ...item, kind: 'shape', text });
@@ -1936,6 +1941,161 @@ export function setLink(model, sheet, ref, link) {
     holder.append(node);
   } else if (list && !kids(list, 'hyperlink').length) list.remove();
   sheet.extras = null;
+}
+
+// --- Pictures and charts: adding, moving, deleting ----------------------------------------------
+
+const DRAWING_CONTENT = 'application/vnd.openxmlformats-officedocument.drawing+xml';
+const CHART_CONTENT = 'application/vnd.openxmlformats-officedocument.drawingml.chart+xml';
+const ANCHORS = ['twoCellAnchor', 'oneCellAnchor', 'absoluteAnchor'];
+
+function drawingAnchors(xml) {
+  return [...xml.documentElement.children].filter(node => ANCHORS.includes(node.localName));
+}
+
+/** The sheet's drawing part, made (with its relationship and the sheet's <drawing>) if missing. */
+function sheetDrawing(model, sheet) {
+  const existing = sheetRel(model, sheet, 'drawing');
+  if (existing && model.parts[existing.path]) return existing.path;
+  const path = freePart(model, n => `xl/drawings/drawing${n}.xml`);
+  model.parts[path] = strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<xdr:wsDr xmlns:xdr="${SHEET_DRAWING}" xmlns:a="${DRAWING}"/>`);
+  setOverride(model, path, DRAWING_CONTENT);
+  setRelId(sheet, worksheetChild(sheet, 'drawing'), addRel(model, sheet.path, 'drawing', path));
+  return path;
+}
+
+/** Writes a marker (xdr:from or xdr:to): { col, colOff, row, rowOff }, columns and rows from 0. */
+function writeMarker(doc, node, at) {
+  node.replaceChildren();
+  for (const key of ['col', 'colOff', 'row', 'rowOff']) {
+    const part = doc.createElementNS(SHEET_DRAWING, `xdr:${key}`);
+    part.textContent = String(Math.max(0, Math.round(at[key])));
+    node.append(part);
+  }
+}
+
+/** Adds a chart over the cells from `from` to `to` (markers); returns the chart part's path. */
+export function insertChart(model, sheet, chartText, from, to) {
+  const drawingPath = sheetDrawing(model, sheet);
+  const chartPath = freePart(model, n => `xl/charts/chart${n}.xml`);
+  model.parts[chartPath] = strToU8(chartText);
+  setOverride(model, chartPath, CHART_CONTENT);
+  const id = addRel(model, drawingPath, 'chart', chartPath);
+  const xml = parseXml(strFromU8(model.parts[drawingPath]), 'Drawing');
+  const doc = xml;
+  const used = [...xml.getElementsByTagNameNS(SHEET_DRAWING, 'cNvPr')].map(node => Number(node.getAttribute('id')) || 0);
+  const number = Math.max(1, ...used) + 1;
+  const anchor = doc.createElementNS(SHEET_DRAWING, 'xdr:twoCellAnchor');
+  anchor.setAttribute('editAs', 'oneCell');
+  const fromNode = doc.createElementNS(SHEET_DRAWING, 'xdr:from'), toNode = doc.createElementNS(SHEET_DRAWING, 'xdr:to');
+  writeMarker(doc, fromNode, from);
+  writeMarker(doc, toNode, to);
+  const frame = parseXml(`<xdr:graphicFrame xmlns:xdr="${SHEET_DRAWING}" xmlns:a="${DRAWING}" macro="">`
+    + `<xdr:nvGraphicFramePr><xdr:cNvPr id="${number}" name="Chart ${number - 1}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>`
+    + '<xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm>'
+    + `<a:graphic><a:graphicData uri="${CHART}"><c:chart xmlns:c="${CHART}" xmlns:r="${DOC_REL}" r:id="${id}"/></a:graphicData></a:graphic>`
+    + '</xdr:graphicFrame>', 'Chart frame').documentElement;
+  anchor.append(fromNode, toNode, doc.importNode(frame, true), doc.createElementNS(SHEET_DRAWING, 'xdr:clientData'));
+  xml.documentElement.append(anchor);
+  model.parts[drawingPath] = strToU8(serialize(xml));
+  sheet.extras = null;
+  return chartPath;
+}
+
+/** Moves or resizes a picture or chart: its anchor goes to `from` and `to` (markers), keeping its kind. */
+export function placeDrawing(model, sheet, item, from, to, size) {
+  const xml = parseXml(strFromU8(model.parts[item.drawing]), 'Drawing');
+  const anchor = drawingAnchors(xml)[item.index];
+  if (!anchor) throw new Error('This picture or chart is no longer in the file.');
+  const marker = name => kids(anchor, name, SHEET_DRAWING)[0];
+  if (anchor.localName === 'absoluteAnchor') {
+    const pos = marker('pos'), ext = marker('ext');
+    pos?.setAttribute('x', String(Math.round(size.x)));
+    pos?.setAttribute('y', String(Math.round(size.y)));
+    ext?.setAttribute('cx', String(Math.round(size.cx)));
+    ext?.setAttribute('cy', String(Math.round(size.cy)));
+  } else {
+    if (marker('from')) writeMarker(xml, marker('from'), from);
+    if (anchor.localName === 'twoCellAnchor' && marker('to')) writeMarker(xml, marker('to'), to);
+    const ext = marker('ext');
+    if (ext) { ext.setAttribute('cx', String(Math.round(size.cx))); ext.setAttribute('cy', String(Math.round(size.cy))); }
+  }
+  // A picture also says its size in its own shape properties.
+  const xfrm = anchor.getElementsByTagNameNS(DRAWING, 'xfrm')[0];
+  const ext = xfrm && [...xfrm.children].find(node => node.localName === 'ext');
+  if (ext && kids(anchor, 'pic', SHEET_DRAWING)[0]) { ext.setAttribute('cx', String(Math.round(size.cx))); ext.setAttribute('cy', String(Math.round(size.cy))); }
+  model.parts[item.drawing] = strToU8(serialize(xml));
+  sheet.extras = null;
+}
+
+/** Deletes a picture or chart, and the chart's parts with it. */
+export function removeDrawing(model, sheet, item) {
+  const xml = parseXml(strFromU8(model.parts[item.drawing]), 'Drawing');
+  const anchor = drawingAnchors(xml)[item.index];
+  if (!anchor) return;
+  const ids = [...anchor.getElementsByTagNameNS(CHART, 'chart'), ...anchor.getElementsByTagNameNS(DRAWING, 'blip')]
+    .map(node => node.getAttributeNS(DOC_REL, 'id') || node.getAttributeNS(DOC_REL, 'embed') || node.getAttribute('r:id') || node.getAttribute('r:embed'))
+    .filter(Boolean);
+  anchor.remove();
+  const text = serialize(xml);
+  model.parts[item.drawing] = strToU8(text);
+  const rels = relTargets(model, item.drawing);
+  for (const id of ids) {
+    // Kept while another anchor still uses it.
+    if (new RegExp(`"${id}"`).test(text)) continue;
+    const target = rels.get(id);
+    removeRel(model, item.drawing, id);
+    if (target?.type === 'chart' && target.path) {
+      // The chart's own parts (its style and colours) go with it.
+      for (const own of relTargets(model, target.path).values()) {
+        if (own.path && own.path.startsWith('xl/charts/')) { delete model.parts[own.path]; setOverride(model, own.path, null); }
+      }
+      delete model.parts[target.path.replace(/([^/]+)$/, '_rels/$1.rels')];
+      delete model.parts[target.path];
+      setOverride(model, target.path, null);
+    }
+  }
+  sheet.extras = null;
+}
+
+/** Changes a chart's title (empty for none) and where its legend is (r, b, t, l, or null for none). */
+export function setChartLooks(model, path, { title, legend }) {
+  const xml = parseXml(strFromU8(model.parts[path]), 'Chart');
+  const chart = [...xml.documentElement.children].find(node => node.localName === 'chart' && node.namespaceURI === CHART);
+  if (!chart) throw new Error('This chart cannot be changed here.');
+  const own = name => [...chart.children].find(node => node.localName === name && node.namespaceURI === CHART) || null;
+  const make = (name, attrs = {}) => {
+    const node = xml.createElementNS(CHART, `c:${name}`);
+    for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+    return node;
+  };
+  if (title !== undefined) {
+    own('title')?.remove();
+    let deleted = own('autoTitleDeleted');
+    if (!deleted) { deleted = make('autoTitleDeleted'); chart.insertBefore(deleted, chart.firstChild); }
+    deleted.setAttribute('val', title ? '0' : '1');
+    if (title) {
+      const node = parseXml(`<c:title xmlns:c="${CHART}" xmlns:a="${DRAWING}"><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="1400" b="0"/></a:pPr><a:r><a:rPr lang="en-US" sz="1400" b="0"/><a:t></a:t></a:r></a:p></c:rich></c:tx><c:overlay val="0"/></c:title>`, 'Title').documentElement;
+      node.getElementsByTagNameNS(DRAWING, 't')[0].textContent = title;
+      chart.insertBefore(xml.importNode(node, true), chart.firstChild);
+    }
+  }
+  if (legend !== undefined) {
+    let node = own('legend');
+    if (!legend) node?.remove();
+    else {
+      if (!node) {
+        node = make('legend');
+        node.append(make('legendPos', { val: legend }), make('overlay', { val: '0' }));
+        // The legend comes after the plot area.
+        chart.insertBefore(node, own('plotArea')?.nextSibling || null);
+      }
+      let pos = [...node.children].find(item => item.localName === 'legendPos');
+      if (!pos) { pos = make('legendPos'); node.insertBefore(pos, node.firstChild); }
+      pos.setAttribute('val', legend);
+    }
+  }
+  model.parts[path] = strToU8(serialize(xml));
 }
 
 /** Only links that are safe to open: web pages and e-mail. */
@@ -2440,6 +2600,7 @@ const ICONS = {
   merge: '<path d="M2.5 3.5h11v9h-11z"/><path d="M5 8h6M6.5 6.5 5 8l1.5 1.5M9.5 6.5 11 8l-1.5 1.5"/>',
   border: '<path d="M2.5 2.5h11v11h-11zM8 2.5v11M2.5 8h11" stroke-dasharray="1.5 1.5"/><path d="M2.5 13.5h11"/>',
   export: '<path d="M8 2.5v7M5 6.5l3 3 3-3"/><path d="M3 10.5v3h10v-3"/>',
+  chart: '<path d="M2.5 13.5h11"/><path d="M4 13V8.5h2V13M7.5 13V4h2v9M11 13V6.5h2V13"/>',
 };
 
 const CURRENCIES = [
@@ -2863,6 +3024,11 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     tool('sortUp', 'Sort A to Z (smallest first), by the selected column', () => sortRange(sortTarget(), anchor.col, false));
     tool('sortDown', 'Sort Z to A (largest first), by the selected column', () => sortRange(sortTarget(), anchor.col, true));
     tool('filter', 'Filter: dropdowns on the header row', toggleFilter, { toggle: true });
+    tool('chart', 'Insert a chart of the selection', () => {
+      const box = buttons.chart.getBoundingClientRect();
+      openMenu(box.left, box.bottom + 4, CHART_KINDS.map(([kind, label]) => [`${label} chart`, () => addChart(kind)]));
+    });
+    buttons.chart.setAttribute('aria-haspopup', 'menu');
     divider();
     formatSelect.className = 'office-select';
     formatSelect.setAttribute('aria-label', 'Number format');
@@ -3053,6 +3219,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
   function showSheet(index, { keepEdit = false, force = false } = {}) {
     if (index === active && !force) return;
     if (!keepEdit) commitEdit();
+    chosen = null;
     if (!force && model.sheets[active]) selections.set(model.sheets[active], { anchor, focus, top: scroll.scrollTop, left: scroll.scrollLeft });
     active = index;
     extra = [];
@@ -3320,12 +3487,32 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
       mark.style.cssText = `left:${box.left + box.width - 7}px;top:${box.top}px`;
       fragment.append(mark);
     }
+    const editable = canWrite();
     for (const item of extras.drawings) {
       const box = drawingBox(item);
       if (!box || box.left > left + width || box.left + box.width < left || box.top > top + height || box.top + box.height < top) continue;
-      const node = drawingNode(item);
+      const node = drawingNode(item, box);
+      const key = `${item.drawing}#${item.index}`;
+      node.dataset.drawing = key;
+      if (editable && item.kind !== 'shape') node.classList.add('is-editable');
       node.style.cssText = `left:${box.left}px;top:${box.top}px;width:${box.width}px;height:${box.height}px`;
       fragment.append(node);
+      if (key === chosen) {
+        // The chosen one: a frame with a handle at each corner, to resize it.
+        const frameNode = document.createElement('div');
+        frameNode.className = 'xlsx-drawing-frame';
+        frameNode.dataset.drawing = key;
+        frameNode.style.cssText = node.style.cssText;
+        if (editable) {
+          for (const corner of ['nw', 'ne', 'sw', 'se']) {
+            const handle = document.createElement('div');
+            handle.className = `xlsx-drawing-handle is-${corner}`;
+            handle.dataset.corner = corner;
+            frameNode.append(handle);
+          }
+        }
+        fragment.append(frameNode);
+      }
     }
     // The filter's dropdowns, on its header row.
     const filter = autoFilterOf(s);
@@ -3989,8 +4176,8 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     if (!pictureUrls.has(item.path)) pictureUrls.set(item.path, URL.createObjectURL(new Blob([model.parts[item.path]], { type: item.type })));
     return pictureUrls.get(item.path);
   }
-  /** A picture, chart or shape, to be placed over the cells. */
-  function drawingNode(item) {
+  /** A picture, chart or shape, to be placed over the cells in `box`. */
+  function drawingNode(item, box) {
     let node;
     if (item.kind === 'picture') {
       node = document.createElement('img');
@@ -3999,11 +4186,87 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
       node.draggable = false;
     } else {
       node = document.createElement('div');
-      node.textContent = item.kind === 'chart' ? `📊 ${item.title || 'Chart'}` : item.text;
-      if (item.kind === 'chart') node.title = 'Charts are kept in the file, but not drawn here yet';
+      const chart = item.kind === 'chart' && item.chart ? chartOf(item.chart) : null;
+      if (chart?.plots.length) {
+        node.innerHTML = drawnChart(item.chart, chart, Math.max(40, Math.round(box.width)), Math.max(40, Math.round(box.height)));
+        node.setAttribute('role', 'img');
+        node.setAttribute('aria-label', item.title || item.name || 'Chart');
+      } else {
+        node.textContent = item.kind === 'chart' ? `📊 ${item.title || 'Chart'}` : item.text;
+        if (item.kind === 'chart') node.title = 'This kind of chart is kept in the file, but not drawn here';
+      }
+      if (chart?.plots.length) node.classList.add('is-drawn');
     }
-    node.className = `xlsx-drawing xlsx-${item.kind}`;
+    node.classList.add('xlsx-drawing', `xlsx-${item.kind}`);
     return node;
+  }
+  // Charts: read once for each version of their part, drawn from the cells they show.
+  const charts = new Map();
+  function chartOf(path) {
+    const bytes = model.parts[path];
+    const known = charts.get(path);
+    if (known && known.bytes === bytes) return known.chart;
+    let chart = null;
+    try { chart = bytes ? readChart(parseXml(strFromU8(bytes), 'Chart'), model.styles?.theme || []) : null; } catch { chart = null; }
+    charts.set(path, { bytes, chart, svg: null, key: null });
+    return chart;
+  }
+  function drawnChart(path, chart, width, height) {
+    const known = charts.get(path);
+    // Drawn again only after a change, or at another size.
+    const key = `${historyAt}|${history.length}|${width}|${height}`;
+    if (known.key !== key) {
+      const format = (value, code) => formatValue(value, code, formatOptions).text;
+      known.svg = chartSvg(chart, chartData(chart), width, height, { theme: model.styles?.theme || [], format });
+      known.key = key;
+    }
+    return known.svg;
+  }
+  /** The cells a chart reference such as Sheet1!$B$2:$B$9 points at, as [sheet, row, col], or
+   * null when it is not one range of one sheet (then the values the file saved are shown). */
+  function referencedCells(ref, visibleOnly) {
+    const match = /^(?:'((?:[^']|'')+)'|([^'!]+))!(\$?[A-Z]{1,3}\$?\d+(?::\$?[A-Z]{1,3}\$?\d+)?)$/i.exec(String(ref || '').trim());
+    if (!match) return null;
+    const name = (match[1] ?? match[2]).replace(/''/g, "'").toLowerCase();
+    const index = model.sheets.findIndex(item => item.name.toLowerCase() === name);
+    const area = parseArea(match[3]);
+    if (index < 0 || !area || (area.r2 - area.r1 + 1) * (area.c2 - area.c1 + 1) > 20000) return null;
+    const s = model.sheets[index];
+    const cells = [];
+    for (let r = area.r1; r <= area.r2; r++) {
+      if (visibleOnly && !rowPx(s, r)) continue;
+      for (let c = area.c1; c <= area.c2; c++) if (!visibleOnly || colPx(s, c)) cells.push([index, r, c]);
+    }
+    return cells;
+  }
+  /** Each series of each plot of a chart, with its name, categories and values as they are now. */
+  function chartData(chart) {
+    const numbers = (source, visibleOnly) => {
+      const cells = source?.ref ? referencedCells(source.ref, visibleOnly) : null;
+      if (!cells) return (source?.cache || []).map(value => (typeof value === 'number' && Number.isFinite(value) ? value : null));
+      return cells.map(([index, r, c]) => { const value = valueAt(model, index, r, c); return typeof value === 'number' ? value : null; });
+    };
+    const texts = (source, visibleOnly, scatter) => {
+      const cells = source?.ref ? referencedCells(source.ref, visibleOnly) : null;
+      if (!cells) return (source?.cache || []).map(value => (value == null ? null : scatter && typeof value === 'number' ? value : String(value)));
+      return cells.map(([index, r, c]) => {
+        const value = valueAt(model, index, r, c);
+        if (scatter) return typeof value === 'number' ? value : null;
+        return value == null || value === '' ? null : displayText(index, r, c);
+      });
+    };
+    return chart.plots.map(plot => plot.series.map(series => {
+      let name = series.name?.text ?? null;
+      if (series.name?.ref) {
+        const cells = referencedCells(series.name.ref, false);
+        name = cells?.length ? cells.map(([index, r, c]) => displayText(index, r, c)).join(' ') : series.name.cache?.[0] ?? null;
+      }
+      return {
+        name,
+        categories: series.categories ? texts(series.categories, chart.visibleOnly, plot.kind === 'scatter') : null,
+        values: numbers(series.values, chart.visibleOnly),
+      };
+    }));
   }
   /** Where a drawing sits on the canvas, from its anchor (offsets are in EMU). */
   function drawingBox(item) {
@@ -4055,6 +4318,185 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
   }
   canvas.addEventListener('pointerleave', () => { commentTip.hidden = true; });
 
+  // Charts from the selection; choosing, moving, resizing and deleting pictures and charts
+  const CHART_KINDS = [['column', 'Column'], ['bar', 'Bar'], ['line', 'Line'], ['area', 'Area'], ['pie', 'Pie'], ['doughnut', 'Doughnut'], ['scatter', 'Scatter (X Y)']];
+  /** The selection (or the block of cells around the active one) as chart series, with Excel's
+   * guesses: text along the top names the series, text down the side gives the categories, and
+   * series run down columns unless there are more columns than rows. */
+  function chartSource(kind) {
+    let range = selectedRange();
+    if (range.r1 === range.r2 && range.c1 === range.c2) range = currentRegion(range.r1, range.c1);
+    const used = usedSize();
+    range = { r1: range.r1, c1: range.c1, r2: Math.min(range.r2, Math.max(range.r1, used.rows)), c2: Math.min(range.c2, Math.max(range.c1, used.cols)) };
+    const value = (r, c) => valueAt(model, active, r, c);
+    const empty = (r, c) => { const v = value(r, c); return v == null || v === ''; };
+    const text = (r, c) => typeof value(r, c) === 'string' && value(r, c) !== '';
+    const anyIn = (test, r1, r2, c1, c2) => { for (let r = r1; r <= r2; r++) for (let c = c1; c <= c2; c++) if (test(r, c)) return true; return false; };
+    const number = (r, c) => typeof value(r, c) === 'number';
+    const header = range.r2 > range.r1 && anyIn(text, range.r1, range.r1, range.c1, range.c2) && anyIn(number, range.r1 + 1, range.r2, range.c1, range.c2);
+    const top = header ? range.r1 + 1 : range.r1;
+    const side = range.c2 > range.c1 && (kind === 'scatter' || anyIn(text, top, range.r2, range.c1, range.c1) || (header && empty(range.r1, range.c1))
+      || isDateFormat(cellStyle(model, sheet().cells.get(refName(top, range.c1))?.getAttribute('s')).numFmt));
+    const left = side ? range.c1 + 1 : range.c1;
+    if (!anyIn(number, top, range.r2, left, range.c2)) throw new Error('Select numbers to chart, with their headings if you like.');
+    const byRows = kind !== 'scatter' && range.r2 - top < range.c2 - left;
+    const name = quoteSheet(sheet().name);
+    const area = (r1, c1, r2, c2) => `${name}!$${columnName(c1)}$${r1}${r1 === r2 && c1 === c2 ? '' : `:$${columnName(c2)}$${r2}`}`;
+    const cells = (r1, c1, r2, c2) => { const out = []; for (let r = r1; r <= r2; r++) for (let c = c1; c <= c2; c++) out.push([r, c]); return out; };
+    const shownText = ([r, c]) => (empty(r, c) ? null : displayText(active, r, c));
+    const numberAt = ([r, c]) => (number(r, c) ? value(r, c) : null);
+    const series = [];
+    const lines = byRows ? cells(top, range.c1, range.r2, range.c1).map(([r]) => r) : cells(range.r1, left, range.r1, range.c2).map(([, c]) => c);
+    for (const line of lines.slice(0, kind === 'pie' || kind === 'doughnut' ? 1 : 64)) {
+      const values = byRows ? [line, left, line, range.c2] : [top, line, range.r2, line];
+      const labels = byRows ? (header ? [range.r1, left, range.r1, range.c2] : null) : side ? [top, range.c1, range.r2, range.c1] : null;
+      const title = byRows ? (side ? [line, range.c1] : null) : header ? [range.r1, line] : null;
+      series.push({
+        name: title ? { ref: area(...title, ...title), text: shownText(title) } : null,
+        categories: labels ? area(...labels) : null,
+        values: area(...values),
+        cache: {
+          name: title ? shownText(title) : null,
+          categories: labels ? cells(...labels).map(kind === 'scatter' ? numberAt : shownText) : [],
+          values: cells(...values).map(numberAt),
+        },
+      });
+    }
+    return { range, series };
+  }
+  /** Where a new chart goes: beside the cells it shows, 480 × 288 pixels as in Excel. */
+  function chartPlace(range) {
+    const s = sheet();
+    const from = { col: range.c2 + 1, colOff: 0, row: Math.max(0, range.r1 - 1), rowOff: 0 };
+    const end = (start, size, length) => {
+      let at = start + 1, left = size;
+      while (length(at) < left && at < start + 500) { left -= length(at); at++; }
+      return { index: at - 1, offset: left * EMU_PER_PX };
+    };
+    const across = end(from.col, 480, c => colPx(s, c));
+    const down = end(from.row, 288, r => rowPx(s, r));
+    return { from, to: { col: across.index, colOff: across.offset, row: down.index, rowOff: down.offset } };
+  }
+  function addChart(kind) {
+    if (!canWrite()) return;
+    commitEdit();
+    let source;
+    try { source = chartSource(kind); } catch (error) { notice(error.message); return; }
+    const { from, to } = chartPlace(source.range);
+    const title = source.series.length === 1 && source.series[0].cache.name ? source.series[0].cache.name : '';
+    let added = null;
+    partsChange(s => {
+      const path = insertChart(model, s, chartXml({ kind, title, series: source.series, legend: kind === 'pie' || kind === 'doughnut' ? 'r' : source.series.length > 1 ? 'b' : null }), from, to);
+      added = sheetExtras(model, s).drawings.find(item => item.chart === path);
+    });
+    if (added) { chosen = `${added.drawing}#${added.index}`; schedule(); }
+  }
+
+  let chosen = null;
+  const chosenItem = () => (chosen ? sheetExtras(model, sheet()).drawings.find(item => `${item.drawing}#${item.index}` === chosen) || null : null);
+  function choose(key) {
+    if (chosen === key) return;
+    chosen = key;
+    schedule();
+  }
+  /** From a place on the canvas to a drawing marker (columns and rows from 0, offsets in EMU). */
+  function markerAt(x, y) {
+    layout();
+    const col = find(geo.colX, geo.cols, Math.max(HEAD_W, x)), row = find(geo.rowY, geo.rows, Math.max(HEAD_H, y));
+    return { col: col - 1, colOff: Math.max(0, x - geo.colX[col]) * EMU_PER_PX, row: row - 1, rowOff: Math.max(0, y - geo.rowY[row]) * EMU_PER_PX };
+  }
+  /** A drag of a picture or chart (to move it), or of a corner of the chosen one (to resize it). */
+  function grabDrawing(event, key, corner) {
+    commitEdit();
+    closeMenu();
+    choose(key);
+    const item = chosenItem();
+    if (!item || !canWrite()) return;
+    layout();
+    const start = drawingBox(item);
+    if (!start) return;
+    const x0 = event.clientX, y0 = event.clientY;
+    let box = start, moved = false;
+    const move = e => {
+      const dx = (e.clientX - x0) / zoom, dy = (e.clientY - y0) / zoom;
+      if (!moved && Math.abs(dx) + Math.abs(dy) < 3) return;
+      moved = true;
+      if (!corner) box = { ...start, left: Math.max(HEAD_W, start.left + dx), top: Math.max(HEAD_H, start.top + dy) };
+      else {
+        let { left, top, width, height } = start;
+        if (corner.includes('e')) width = Math.max(16, width + dx);
+        if (corner.includes('s')) height = Math.max(16, height + dy);
+        if (corner.includes('w')) { const w = Math.max(16, width - dx); left = Math.max(HEAD_W, left + width - w); width = w; }
+        if (corner.includes('n')) { const h = Math.max(16, height - dy); top = Math.max(HEAD_H, top + height - h); height = h; }
+        box = { left, top, width, height };
+      }
+      for (const node of layer.querySelectorAll(`[data-drawing="${CSS.escape(key)}"]`)) node.style.cssText = `left:${box.left}px;top:${box.top}px;width:${box.width}px;height:${box.height}px`;
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointercancel', up);
+      if (!moved) { schedule(); return; }
+      const from = markerAt(box.left, box.top), to = markerAt(box.left + box.width, box.top + box.height);
+      const size = { x: (box.left - HEAD_W) * EMU_PER_PX, y: (box.top - HEAD_H) * EMU_PER_PX, cx: box.width * EMU_PER_PX, cy: box.height * EMU_PER_PX };
+      partsChange(s => placeDrawing(model, s, item, from, to, size));
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+    window.addEventListener('pointercancel', up);
+  }
+  function deleteDrawing() {
+    const item = chosenItem();
+    if (!item) return;
+    chosen = null;
+    partsChange(s => removeDrawing(model, s, item));
+  }
+  /** A chart's title, legend and kind. A new kind redraws it from the same cells, in the usual look. */
+  function editChart() {
+    const item = chosenItem();
+    if (!item?.chart || !canWrite()) return;
+    const chart = chartOf(item.chart);
+    const titleInput = document.createElement('input');
+    titleInput.type = 'text';
+    titleInput.value = chart?.title?.text ?? item.title ?? '';
+    const legendSelect = document.createElement('select');
+    for (const [value, text] of [['', 'None'], ['r', 'Right'], ['b', 'Bottom'], ['t', 'Top'], ['l', 'Left']]) legendSelect.append(new Option(text, value));
+    legendSelect.value = chart?.legend && ['r', 'b', 't', 'l'].includes(chart.legend) ? chart.legend : chart?.legend ? 'r' : '';
+    const kindSelect = document.createElement('select');
+    const kindNow = chart?.plots.length === 1 ? (chart.plots[0].kind === 'bar' ? (chart.plots[0].horizontal ? 'bar' : 'column') : chart.plots[0].kind) : '';
+    if (!kindNow) kindSelect.append(new Option('As it is', ''));
+    for (const [value, text] of CHART_KINDS) kindSelect.append(new Option(text, value));
+    kindSelect.value = kindNow;
+    const stackedBox = document.createElement('input');
+    stackedBox.type = 'checkbox';
+    stackedBox.checked = !!chart?.plots.some(plot => plot.grouping === 'stacked' || plot.grouping === 'percentStacked');
+    const stackedLabel = document.createElement('label');
+    stackedLabel.className = 'xlsx-panel-check';
+    stackedLabel.append(stackedBox, ' Stacked');
+    const apply = () => partsChange(() => {
+      const kind = kindSelect.value;
+      const stacked = stackedBox.checked && ['column', 'bar', 'line', 'area'].includes(kind);
+      const wasStacked = !!chart?.plots.some(plot => plot.grouping === 'stacked' || plot.grouping === 'percentStacked');
+      if (kind && chart && (kind !== kindNow || stacked !== wasStacked)) {
+        const series = chart.plots.flatMap(plot => plot.series).map(spec => ({
+          name: spec.name?.ref ? { ref: spec.name.ref, text: spec.name.cache?.[0] ?? null } : spec.name?.text ? { text: spec.name.text } : null,
+          categories: spec.categories?.ref || null,
+          values: spec.values?.ref,
+          cache: { name: spec.name?.cache?.[0] ?? spec.name?.text ?? null, categories: spec.categories?.cache || [], values: spec.values?.cache || [] },
+        })).filter(spec => spec.values);
+        if (!series.length) throw new Error('This chart does not say which cells it shows, so its kind cannot be changed here.');
+        model.parts[item.chart] = strToU8(chartXml({ kind, stacked, title: titleInput.value.trim(), series: kind === 'pie' || kind === 'doughnut' ? series.slice(0, 1) : series, legend: legendSelect.value || null }));
+      } else setChartLooks(model, item.chart, { title: titleInput.value.trim(), legend: legendSelect.value || null });
+    });
+    const ok = openCellPanel('Chart', [labelled('Title', titleInput), labelled('Legend', legendSelect), labelled('Kind', kindSelect), stackedLabel], [
+      ['Delete', deleteDrawing, 'danger'],
+      ['Cancel', () => {}],
+      ['Apply', apply, 'ok'],
+    ], drawingBox(item));
+    titleInput.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); ok.click(); } });
+    titleInput.focus();
+  }
+
   // Adding comments and links
   /** A change to the active sheet and the parts it links to (comments, links, charts), with undo:
    * the sheet and every part of the package as they were before and after. */
@@ -4084,7 +4526,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     return merge ? refName(merge.r1, merge.c1) : refName(anchor.row, anchor.col);
   }
   /** A small panel under the active cell, in the menu's place, with buttons at its foot. */
-  function openCellPanel(label, fields, actions) {
+  function openCellPanel(label, fields, actions, near = null) {
     closeMenu();
     const make = (tag, className, text) => { const node = document.createElement(tag); if (className) node.className = className; if (text != null) node.textContent = text; return node; };
     const close = () => { menu.hidden = true; menu.classList.remove('xlsx-format-panel'); scroll.focus({ preventScroll: true }); };
@@ -4098,9 +4540,9 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     menu.replaceChildren(make('div', 'menu-label', label), ...fields, foot);
     menu.classList.add('xlsx-format-panel');
     menu.hidden = false;
-    const box = rect(anchor.row, anchor.col, anchor.row, anchor.col);
+    const box = near || rect(anchor.row, anchor.col, anchor.row, anchor.col);
     const at = canvas.getBoundingClientRect();
-    const x = at.left + box.left * zoom, y = at.top + (box.top + box.height) * zoom + 4;
+    const x = at.left + box.left * zoom, y = at.top + (box.top + (near ? 0 : box.height)) * zoom + 4;
     menu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - menu.offsetWidth - 8))}px`;
     menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - menu.offsetHeight - 8))}px`;
     return foot.querySelector('.xlsx-filter-ok');
@@ -5069,6 +5511,16 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
   }
   canvas.addEventListener('pointerdown', event => {
     if (event.button !== 0 || event.target === cellEditor) return;
+    // Pictures and charts: choose one and drag it, or drag a corner of the chosen one.
+    const handle = event.target.closest?.('.xlsx-drawing-handle');
+    const drawn = handle ? null : event.target.closest?.('.xlsx-drawing.is-editable');
+    if ((handle || drawn) && !(editing && canPoint())) {
+      event.preventDefault();
+      scroll.focus({ preventScroll: true });
+      grabDrawing(event, handle ? chosen : drawn.dataset.drawing, handle?.dataset.corner || null);
+      return;
+    }
+    if (chosen) { chosen = null; schedule(); }
     const filterButton = event.target.closest?.('.xlsx-filter-button');
     if (filterButton) {
       event.preventDefault();
@@ -5205,6 +5657,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
   });
   canvas.addEventListener('dblclick', event => {
     if (event.target === cellEditor) return;
+    if (event.target.closest?.('.xlsx-drawing.is-editable, .xlsx-drawing-frame')) { if (chosenItem()?.chart) editChart(); return; }
     if (event.target === fillHandle) { fillToNeighbour(); return; }
     const p = pointAt(event);
     if (p.head.row && p.head.col) return;
@@ -5216,6 +5669,18 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     if (event.target === cellEditor) return;
     event.preventDefault();
     if (editing) commitEdit();
+    const drawn = event.target.closest?.('.xlsx-drawing.is-editable, .xlsx-drawing-frame');
+    if (drawn) {
+      choose(drawn.dataset.drawing);
+      const item = chosenItem();
+      if (item) {
+        openMenu(event.clientX, event.clientY, [
+          ...(item.chart ? [['Edit chart…', editChart]] : []),
+          [item.kind === 'chart' ? 'Delete chart' : 'Delete picture', deleteDrawing],
+        ]);
+        return;
+      }
+    }
     layout();
     const p = pointAt(event);
     const range = selectedRange();
@@ -5546,6 +6011,14 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     if (key !== 'Escape') event.stopPropagation();
     const arrows = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1] };
     if (mod && event.shiftKey && key.toLowerCase() === 'v') pasteValuesNext = true;
+    if (chosen && chosenItem()) {
+      // With a picture or chart chosen, Delete deletes it and Escape lets it go.
+      if ((key === 'Delete' || key === 'Backspace') && canWrite()) { event.preventDefault(); deleteDrawing(); return; }
+      if (key === 'Escape') { event.preventDefault(); chosen = null; schedule(); return; }
+      if (key === 'Enter' && chosenItem().chart) { event.preventDefault(); editChart(); return; }
+      chosen = null;
+      schedule();
+    }
     if (event.altKey && key === 'ArrowDown') { event.preventDefault(); openChoices(); }
     else if (arrows[key]) {
       event.preventDefault();
@@ -5717,7 +6190,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     for (const item of sheetExtras(model, s).drawings) {
       const box = drawingBox(item);
       if (!box || box.left >= end.x || box.top >= end.y || box.left + box.width <= origin.x || box.top + box.height <= origin.y) continue;
-      const node = drawingNode(item);
+      const node = drawingNode(item, box);
       node.style.cssText = `left:${box.left - origin.x}px;top:${box.top - origin.y}px;width:${box.width}px;height:${box.height}px`;
       sheetBox.append(node);
     }

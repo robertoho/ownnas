@@ -2469,6 +2469,17 @@ input, select, textarea {
 .xlsx-drawing { position: absolute; z-index: 2; box-sizing: border-box; pointer-events: none; }
 .xlsx-chart, .xlsx-shape { display: grid; place-items: center; padding: 0.4rem; overflow: hidden; border: 1px solid #c9ccc2; background: rgba(255, 255, 255, 0.92); color: #3b3f37; font: 12px/1.3 system-ui, sans-serif; text-align: center; }
 .xlsx-chart { border-style: dashed; }
+.xlsx-chart.is-drawn { display: block; padding: 0; border: 0; background: none; }
+.xlsx-chart.is-drawn svg { display: block; width: 100%; height: 100%; }
+.xlsx-drawing.is-editable { pointer-events: auto; cursor: move; touch-action: none; }
+.xlsx-drawing-frame { position: absolute; z-index: 3; box-sizing: border-box; border: 1.5px solid #1a73e8; pointer-events: none; }
+.xlsx-drawing-handle { position: absolute; width: 9px; height: 9px; box-sizing: border-box; border: 1.5px solid #1a73e8; border-radius: 50%; background: #fff; pointer-events: auto; touch-action: none; }
+.xlsx-drawing-handle.is-nw { left: -5px; top: -5px; cursor: nwse-resize; }
+.xlsx-drawing-handle.is-ne { right: -5px; top: -5px; cursor: nesw-resize; }
+.xlsx-drawing-handle.is-sw { left: -5px; bottom: -5px; cursor: nesw-resize; }
+.xlsx-drawing-handle.is-se { right: -5px; bottom: -5px; cursor: nwse-resize; }
+.xlsx-panel-field select { color: var(--text); font-size: 0.85rem; }
+.xlsx-panel-check { display: flex; align-items: center; gap: 0.35rem; margin: 0.3rem; font-size: 0.82rem; }
 .xlsx-number-tool { min-width: 1.9rem; padding: 0 0.35rem; font: 600 0.78rem var(--mono); }
 .xlsx-format-panel { width: 21rem; }
 .xlsx-panel-field { display: grid; gap: 0.2rem; margin: 0.25rem 0.3rem; color: var(--muted); font-size: 0.78rem; }

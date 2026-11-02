@@ -24,6 +24,7 @@ dom.window.HTMLCanvasElement.prototype.getContext = () => null;
 URL.createObjectURL = () => 'blob:picture';
 URL.revokeObjectURL = () => {};
 const { mountXlsxEditor } = await import('../web/xlsx-editor.js');
+const { unzipSync, strFromU8 } = await import('../web/vendor/three/addons/libs/fflate.module.js');
 
 const work = fs.mkdtempSync(path.join(os.tmpdir(), 'ownnas-xlsx-'));
 execFileSync('python3', [path.join(here, 'xlsx-fixtures.py'), work]);
@@ -76,6 +77,12 @@ async function edit(bytes) {
   menu.querySelectorAll('input')[0].value = "'Summary'!A1";
   menu.querySelectorAll('input')[1].value = 'To the summary';
   panelButton('Apply');
+  // A line chart of quantity and price, beside the chart and picture there.
+  go(2, 1);
+  key(grid, 'ArrowRight', { shiftKey: true });
+  for (let i = 0; i < 5; i++) key(grid, 'ArrowDown', { shiftKey: true });
+  container.querySelector('.xlsx-toolbar button[title="Insert a chart of the selection"]').click();
+  choose('Line chart');
   // Summary: one more formula, then renamed.
   tab('Summary').click();
   type(1, 3, 'Check');
@@ -204,6 +211,12 @@ for (const [label, source] of [['openpyxl', path.join(work, 'rich.xlsx')], ['Lib
   assert.equal(reread.texts['Sales!B2'], 'Checked twice', `${label}: LibreOffice reads the new comment`);
   assert.equal(reread.texts['Sheet3!A1'], 'First note', `${label}: and the one on the new sheet`);
   assert.equal(reread.targets['Sheet3!E1'], 'https://example.com/report', `${label}: and the links`);
+  // Both charts: the one there, and the one added, reading the cells it was made from.
+  const charts = Object.entries(unzipSync(fs.readFileSync(path.join(again, path.basename(file))))).filter(([name]) => /^xl\/charts\/chart\d+\.xml$/.test(name)).map(([, bytes]) => strFromU8(bytes));
+  assert.equal(charts.length, 2, `${label}: LibreOffice reads the new chart beside the old`);
+  const added = charts.find(text => /lineChart/.test(text));
+  assert.ok(added, `${label}: as a line chart`);
+  for (const ref of ['Sales!$B$2:$B$6', 'Sales!$C$2:$C$6', 'Sales!$B$1']) assert.ok(added.replace(/'/g, '').includes(ref), `${label}: the chart reads ${ref}`);
   assert.equal(view.images, 1, `${label}: the picture kept`);
   assert.equal(view.names.Grand.replace(/'/g, ''), 'Sales!$G$1', `${label}: names kept`);
   assert.equal(view.notesFreeze, 'A2', `${label}: the new sheet's frozen row`);

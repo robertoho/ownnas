@@ -32,6 +32,7 @@ const DOCX_EDITOR_JS: &str = include_str!("../web/docx-editor.js");
 const ODT_EDITOR_JS: &str = include_str!("../web/odt-editor.js");
 const XLSX_EDITOR_JS: &str = include_str!("../web/xlsx-editor.js");
 const SHEET_FORMULA_JS: &str = include_str!("../web/sheet-formula.js");
+const SHEET_CHART_JS: &str = include_str!("../web/sheet-chart.js");
 const SQLITE_VIEWER_JS: &str = include_str!("../web/sqlite-viewer.js");
 const THEME_JS: &str = include_str!("../web/theme.js");
 const GALLERY_JS: &str = include_str!("../web/gallery.js");
@@ -242,6 +243,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/assets/odt-editor.js", get(odt_editor_javascript))
         .route("/assets/xlsx-editor.js", get(xlsx_editor_javascript))
         .route("/assets/sheet-formula.js", get(sheet_formula_javascript))
+        .route("/assets/sheet-chart.js", get(sheet_chart_javascript))
         .route("/assets/sqlite-viewer.js", get(sqlite_viewer_javascript))
         .route("/assets/theme.js", get(theme_javascript))
         .route("/assets/gallery.js", get(gallery_javascript))
@@ -1040,6 +1042,10 @@ async fn xlsx_editor_javascript() -> impl IntoResponse {
 
 async fn sheet_formula_javascript() -> impl IntoResponse {
     app_module_javascript(SHEET_FORMULA_JS)
+}
+
+async fn sheet_chart_javascript() -> impl IntoResponse {
+    app_module_javascript(SHEET_CHART_JS)
 }
 
 async fn music_javascript() -> impl IntoResponse {
