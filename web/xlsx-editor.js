@@ -3808,6 +3808,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
       const key = `${item.drawing}#${item.index}`;
       node.dataset.drawing = key;
       if (editable && item.kind !== 'shape') node.classList.add('is-editable');
+      if (key === chosen) node.classList.add('is-chosen');
       node.style.cssText = `left:${box.left}px;top:${box.top}px;width:${box.width}px;height:${box.height}px`;
       fragment.append(node);
       if (key === chosen) {
@@ -3942,6 +3943,9 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     fillHandle.hidden = !canWrite() || !!editing || whole || extra.length > 0;
     const corner = range.r1 === range.r2 && range.c1 === range.c2 ? cellBox : box;
     fillHandle.style.cssText = `left:${corner.left + corner.width - 4}px;top:${corner.top + corner.height - 4}px`;
+    stretchStart.hidden = stretchEnd.hidden = !touchMode || !!editing || whole || extra.length > 0;
+    stretchStart.style.cssText = `left:${corner.left}px;top:${corner.top}px`;
+    stretchEnd.style.cssText = `left:${corner.left + corner.width}px;top:${corner.top + corner.height}px`;
     const rule = validationAt(sheet(), anchor.row, anchor.col);
     // showDropDown="1" means the dropdown is hidden (Excel's naming).
     validButton.hidden = !rule || rule.type !== 'list' || rule.noDropdown || !canWrite() || !!editing;
@@ -6120,8 +6124,96 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
       col: find(geo.colX, geo.cols, Math.max(HEAD_W, px)),
     };
   }
+  // Touch: a tap selects a cell (a tap on the selected one edits it), a drag scrolls, a long press
+  // opens the menu, and the round handles at the selection's corners stretch it.
+  let touchMode = false, press = null, longPressedAt = 0;
+  const stretchStart = document.createElement('div'), stretchEnd = document.createElement('div');
+  stretchStart.className = 'xlsx-touch-handle';
+  stretchStart.dataset.end = 'start';
+  stretchEnd.className = 'xlsx-touch-handle';
+  stretchEnd.dataset.end = 'end';
+  stretchStart.hidden = stretchEnd.hidden = true;
+  canvas.append(stretchStart, stretchEnd);
+  function setTouchMode(on) {
+    if (touchMode === on) return;
+    touchMode = on;
+    root.classList.toggle('is-touch', on);
+    placeSelection();
+  }
+  /** The start of a touch on the grid. True when it is taken care of here. */
+  function touchDown(event) {
+    clearTimeout(press?.timer);
+    press = null;
+    const target = event.target;
+    const stretch = target.closest?.('.xlsx-touch-handle');
+    if (stretch) {
+      if (editing) commitEdit();
+      if (stretch.dataset.end === 'start') {
+        const range = selectedRange();
+        anchor = { row: range.r2, col: range.c2 };
+        focus = { row: range.r1, col: range.c1 };
+      }
+      extra = [];
+      dragging = 'cell';
+      canvas.setPointerCapture?.(event.pointerId);
+      event.preventDefault();
+      return true;
+    }
+    // Buttons on the grid, the chosen picture or chart, and pointing at cells for a formula work as with a mouse.
+    if (target.closest?.('.xlsx-filter-button, .xlsx-drawing-handle') || target === validButton || target === cellEditor) return false;
+    const drawn = target.closest?.('.xlsx-drawing.is-editable');
+    if (drawn && drawn.dataset.drawing === chosen) return false;
+    layout();
+    const p = pointAt(event);
+    if (editing && !p.head.row && !p.head.col && canPoint()) return false;
+    const x = event.clientX, y = event.clientY;
+    press = {
+      id: event.pointerId, x, y, drawing: drawn?.dataset.drawing || null, moved: false, long: false,
+      timer: setTimeout(() => {
+        if (!press || press.moved) return;
+        press.long = true;
+        longPressedAt = Date.now();
+        // Lifting the finger would click whatever of the menu is under it: that click is let go.
+        const swallow = e => { e.preventDefault(); e.stopPropagation(); };
+        document.addEventListener('click', swallow, true);
+        window.addEventListener('pointerup', () => setTimeout(() => document.removeEventListener('click', swallow, true), 400), { capture: true, once: true });
+        (document.elementFromPoint(x, y) || canvas).dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: x, clientY: y }));
+      }, 550),
+    };
+    return true;
+  }
+  function touchTap(event, tap) {
+    if (tap.drawing) { commitEdit(); choose(tap.drawing); return; }
+    if (chosen) { chosen = null; schedule(); }
+    layout();
+    const p = pointAt(event);
+    if (p.head.row && p.head.col) { anchor = { row: 1, col: 1 }; focus = { row: LAST_ROW, col: LAST_COL }; }
+    else if (p.head.row) { anchor = { row: 1, col: p.col }; focus = { row: LAST_ROW, col: p.col }; }
+    else if (p.head.col) { anchor = { row: p.row, col: 1 }; focus = { row: p.row, col: LAST_COL }; }
+    else {
+      const merge = sheet().covered.get(refName(p.row, p.col));
+      const cell = merge ? { row: merge.r1, col: merge.c1 } : { row: p.row, col: p.col };
+      const range = expandForMerges(selectedRange());
+      const alone = !extra.length && range.r1 === anchor.row && range.c1 === anchor.col
+        && (merge ? range.r2 === merge.r2 && range.c2 === merge.c2 : range.r2 === anchor.row && range.c2 === anchor.col);
+      if (alone && cell.row === anchor.row && cell.col === anchor.col && canWrite() && !editing) {
+        // The keyboard comes up as the tap is still going on.
+        startEdit();
+        return;
+      }
+      if (editing) commitEdit();
+      extra = [];
+      select(cell.row, cell.col);
+      return;
+    }
+    if (editing) commitEdit();
+    extra = [];
+    selectionChanged();
+  }
   canvas.addEventListener('pointerdown', event => {
     if (event.button !== 0 || event.target === cellEditor) return;
+    setTouchMode(event.pointerType === 'touch');
+    if (touchMode && touchDown(event)) return;
     // Pictures and charts: choose one and drag it, or drag a corner of the chosen one.
     const handle = event.target.closest?.('.xlsx-drawing-handle');
     const drawn = handle ? null : event.target.closest?.('.xlsx-drawing.is-editable');
@@ -6215,6 +6307,11 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     selectionChanged();
   });
   canvas.addEventListener('pointermove', event => {
+    if (press && event.pointerId === press.id) {
+      // A finger that moves scrolls (the browser takes it): it is no tap or long press.
+      if (Math.hypot(event.clientX - press.x, event.clientY - press.y) > 10) { press.moved = true; clearTimeout(press.timer); }
+      return;
+    }
     if (!geo) return;
     const p = pointAt(event);
     if (!dragging) {
@@ -6249,6 +6346,13 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
   // Pointing keeps the keyboard in the formula.
   canvas.addEventListener('mousedown', event => { if (dragging === 'point') event.preventDefault(); });
   canvas.addEventListener('pointerup', event => {
+    if (press && event.pointerId === press.id) {
+      const tap = press;
+      press = null;
+      clearTimeout(tap.timer);
+      if (!tap.moved && !tap.long) touchTap(event, tap);
+      return;
+    }
     const drag = dragging;
     dragging = null;
     sizeGuide.hidden = true;
@@ -6262,6 +6366,8 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     }
   });
   canvas.addEventListener('pointercancel', () => {
+    clearTimeout(press?.timer);
+    press = null;
     dragging = null;
     sizeGuide.hidden = true;
     fillBox.hidden = true;
@@ -6279,6 +6385,14 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
   canvas.addEventListener('contextmenu', event => {
     if (event.target === cellEditor) return;
     event.preventDefault();
+    // A long press: the browser's own menu event and ours open one menu between them.
+    if (press) {
+      clearTimeout(press.timer);
+      if (press.long && event.isTrusted) return;
+      press.long = true;
+      longPressedAt = Date.now();
+    }
+    else if (event.isTrusted && touchMode && Date.now() - longPressedAt < 1500) return;
     if (editing) commitEdit();
     const drawn = event.target.closest?.('.xlsx-drawing.is-editable, .xlsx-drawing-frame');
     if (drawn) {
@@ -6434,10 +6548,10 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     if (link) items.push([link.url ? 'Open link' : 'Go to link', () => openLink(link), true]);
     if (!wholeRows && !wholeCols && rows === 1 && cols === 1 || sheet().covered.has(refName(anchor.row, anchor.col))) {
       const mod = IS_MAC ? '⌘' : 'Ctrl+';
-      items.push(link ? ['Edit link…', editLink] : [`Insert link… (${mod}K)`, editLink]);
+      items.push(link ? ['Edit link…', editLink] : [touchMode ? 'Insert link…' : `Insert link… (${mod}K)`, editLink]);
       if (link) items.push(['Remove link', () => partsChange(s => setLink(model, s, anchorRef(), null))]);
       if (extras.comments.has(anchorRef())) items.push(['Edit comment…', editComment], ['Delete comment', deleteComment]);
-      else items.push(['New comment… (Shift+F2)', editComment]);
+      else items.push([touchMode ? 'New comment…' : 'New comment… (Shift+F2)', editComment]);
     }
     items.push('-');
     if (!wholeCols) {
@@ -6463,7 +6577,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
       items.push([rows === 1 ? 'Reset height' : 'Reset heights', () => fitRows(...spanOf('row', range.r1))]);
     }
     if (!wholeRows && !wholeCols) {
-      if (rows > 1) items.push([`Fill down${IS_MAC ? ' (⌘D)' : ' (Ctrl+D)'}`, fillDown]);
+      if (rows > 1) items.push([`Fill down${touchMode ? '' : IS_MAC ? ' (⌘D)' : ' (Ctrl+D)'}`, fillDown]);
       items.push(['Clear contents', clearSelection]);
       items.push('-', ['Paste values only', () => pasteSpecial('values')], ['Paste formats only', () => pasteSpecial('formats')], ['Paste transposed', () => pasteSpecial('all', true)]);
       items.push('-', ['Sort A to Z', () => sortRange(sortTarget(), anchor.col, false)], ['Sort Z to A', () => sortRange(sortTarget(), anchor.col, true)]);

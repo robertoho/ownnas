@@ -2471,7 +2471,8 @@ input, select, textarea {
 .xlsx-chart { border-style: dashed; }
 .xlsx-chart.is-drawn { display: block; padding: 0; border: 0; background: none; }
 .xlsx-chart.is-drawn svg { display: block; width: 100%; height: 100%; }
-.xlsx-drawing.is-editable { pointer-events: auto; cursor: move; touch-action: none; }
+.xlsx-drawing.is-editable { pointer-events: auto; cursor: move; }
+.xlsx-drawing.is-chosen { touch-action: none; }
 .xlsx-drawing-frame { position: absolute; z-index: 3; box-sizing: border-box; border: 1.5px solid #1a73e8; pointer-events: none; }
 .xlsx-drawing-handle { position: absolute; width: 9px; height: 9px; box-sizing: border-box; border: 1.5px solid #1a73e8; border-radius: 50%; background: #fff; pointer-events: auto; touch-action: none; }
 .xlsx-drawing-handle.is-nw { left: -5px; top: -5px; cursor: nwse-resize; }
@@ -2492,6 +2493,24 @@ input, select, textarea {
 .xlsx-rule-where { color: var(--muted); font: 0.72rem var(--mono); }
 .xlsx-rule-remove { width: auto; min-height: 0; padding: 0.1rem 0.4rem; }
 .xlsx-rule-none { margin: 0.2rem 0; color: var(--muted); font-size: 0.8rem; }
+/* Touch: scrolling with a finger, round handles to stretch the selection, and room for fingers. */
+.xlsx-scroll { touch-action: manipulation; }
+.xlsx-canvas { -webkit-touch-callout: none; }
+.xlsx-touch-handle { position: absolute; z-index: 3; width: 28px; height: 28px; margin: -14px 0 0 -14px; border-radius: 50%; touch-action: none; }
+.xlsx-touch-handle::after { content: ""; position: absolute; inset: 8px; border: 2px solid #fff; border-radius: 50%; background: #2478dc; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35); }
+.xlsx-editor.is-touch .xlsx-fill-handle { display: none; }
+@media (max-width: 600px) {
+  .xlsx-editor .xlsx-toolbar { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+  .xlsx-editor .xlsx-toolbar > * { flex: none; }
+  .xlsx-footer { flex-wrap: wrap; }
+  .xlsx-summary { order: 3; width: 100%; overflow: hidden; text-overflow: ellipsis; }
+  .xlsx-format-panel, .xlsx-rules-panel { width: calc(100vw - 16px); }
+}
+@media (pointer: coarse) {
+  .xlsx-editor .office-tool, .xlsx-editor .office-select { min-height: 36px; }
+  .xlsx-tab { min-height: 32px; }
+  .xlsx-menu button { min-height: 40px; }
+}
 .xlsx-number-tool { min-width: 1.9rem; padding: 0 0.35rem; font: 600 0.78rem var(--mono); }
 .xlsx-format-panel { width: 21rem; }
 .xlsx-panel-field { display: grid; gap: 0.2rem; margin: 0.25rem 0.3rem; color: var(--muted); font-size: 0.78rem; }
