@@ -2569,14 +2569,14 @@ input, select, textarea {
 .xlsx-print { display: none; }
 @media print {
   @page { margin: 12mm; }
-  html:has(body.xlsx-printing), body.xlsx-printing { background: #fff !important; }
+  html:has(body.xlsx-printing), body.xlsx-printing { background: #fff !important; color-scheme: light; }
   body.xlsx-printing > :not(.xlsx-print) { display: none !important; }
   body.xlsx-printing > .xlsx-print { display: block; color: #000; }
 }
 .xlsx-print h1 { margin: 0 0 8px; color: #000; font: 600 11pt system-ui, sans-serif; }
 .xlsx-print-sheet { position: relative; width: max-content; }
 .xlsx-print table { border-collapse: collapse; table-layout: fixed; width: max-content; }
-.xlsx-print td { box-sizing: border-box; padding: 0 3px; overflow: hidden; color: #000; white-space: pre; line-height: 1.2; }
+.xlsx-print td { box-sizing: border-box; border: 0; padding: 0 3px; overflow: hidden; color: #000; white-space: pre; line-height: 1.2; }
 .xlsx-print tr { break-inside: avoid; }
 .xlsx-print .xlsx-drawing { position: absolute; object-fit: contain; }
 .table-wrap { padding: 0.35rem; }

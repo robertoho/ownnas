@@ -6846,9 +6846,21 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     commitEdit();
     const s = sheet();
     const used = usedSize();
-    const area = selectionOnly ? selectedRange() : printArea(model, s) || { r1: 1, c1: 1, r2: Math.max(1, used.rows), c2: Math.max(1, used.cols) };
-    area.r2 = Math.min(area.r2, Math.max(area.r1, used.rows));
-    area.c2 = Math.min(area.c2, Math.max(area.c1, used.cols));
+    layout();
+    const set = selectionOnly ? selectedRange() : printArea(model, s);
+    const area = set || { r1: 1, c1: 1, r2: Math.max(1, used.rows), c2: Math.max(1, used.cols) };
+    if (!set) {
+      // Everything used takes in the pictures and charts too, as spreadsheet apps print them.
+      for (const item of sheetExtras(model, s).drawings) {
+        const box = drawingBox(item);
+        if (!box) continue;
+        area.c2 = Math.max(area.c2, find(geo.colX, geo.cols, box.left + box.width - 1));
+        area.r2 = Math.max(area.r2, find(geo.rowY, geo.rows, box.top + box.height - 1));
+      }
+    } else {
+      area.r2 = Math.min(area.r2, Math.max(area.r1, used.rows));
+      area.c2 = Math.min(area.c2, Math.max(area.c1, used.cols));
+    }
     const rows = [], cols = [];
     for (let r = area.r1; r <= area.r2; r++) if (rowPx(s, r)) rows.push(r);
     for (let c = area.c1; c <= area.c2; c++) if (colPx(s, c)) cols.push(c);
@@ -6920,6 +6932,9 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
       node.style.cssText = `left:${box.left - origin.x}px;top:${box.top - origin.y}px;width:${box.width}px;height:${box.height}px`;
       sheetBox.append(node);
     }
+    // Wider than the paper (A4 or Letter, less margins: about 700 pixels): made to fit its width.
+    const wide = end.x - origin.x;
+    if (wide > 700) sheetBox.style.zoom = String(700 / wide);
     for (const old of document.querySelectorAll('body > .xlsx-print')) old.remove();
     document.body.append(page);
     document.body.classList.add('xlsx-printing');
