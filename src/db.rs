@@ -151,24 +151,53 @@ fn wal_of(path: &std::path::Path) -> std::path::PathBuf {
 pub fn checkpoint(path: &std::path::Path) -> Option<u64> {
     let [_, (_, wal), _, (_, index_wal)] = file_sizes(path);
     // Waits for readers, holding up writers meanwhile: briefly, unless a log has grown large.
-    checkpoint_waiting(path, if wal.max(index_wal) > WAL_LIMIT as u64 * 4 { 3000 } else { 500 })
+    checkpoint_waiting(path, if wal.max(index_wal) > WAL_LIMIT as u64 * 4 { 3000 } else { 500 }, false)
 }
 
-fn checkpoint_waiting(path: &std::path::Path, wait: u64) -> Option<u64> {
+/// How far each log was copied the last time it could not be copied to the end, by file.
+static COPIED_BEFORE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, i64>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Copies what it can without waiting first. Emptying the log then waits for the reads still
+/// on it (up to `wait` ms, holding up writers meanwhile), unless the copy stopped at the same
+/// page as last time: a read held that long will not end in a few seconds, and waiting for it
+/// each time would only stall every write. `insist` waits anyway.
+fn checkpoint_waiting(path: &std::path::Path, wait: u64, insist: bool) -> Option<u64> {
     let [_, (_, wal), _, (_, index_wal)] = file_sizes(path);
     let conn = Connection::open(path).ok()?;
-    conn.busy_timeout(std::time::Duration::from_millis(wait)).ok()?;
     attach_index(&conn, &index_path(path).to_string_lossy()).ok()?;
     let mut emptied = true;
     for (schema, size) in [("main", wal), ("idx", index_wal)] {
+        let file = if schema == "main" { path.to_path_buf() } else { index_path(path) };
         // (busy, pages in the log, pages copied): pages not copied are held by an open read.
-        let (busy, pages, copied): (i64, i64, i64) = conn
-            .query_row(&format!("PRAGMA {schema}.wal_checkpoint(TRUNCATE)"), [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .unwrap_or((1, -1, -1));
+        let run = |mode: &str| -> (i64, i64, i64) {
+            conn.query_row(&format!("PRAGMA {schema}.wal_checkpoint({mode})"), [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap_or((1, -1, -1))
+        };
+        let _ = conn.busy_timeout(std::time::Duration::ZERO);
+        let (mut busy, pages, mut copied) = run("PASSIVE");
+        let stuck = {
+            let mut before = COPIED_BEFORE.lock().unwrap_or_else(|err| err.into_inner());
+            let stuck = copied < pages && before.get(&file) == Some(&copied);
+            if copied < pages {
+                before.insert(file.clone(), copied);
+            } else {
+                before.remove(&file);
+            }
+            stuck
+        };
+        if busy == 0 && (insist || !stuck) {
+            let _ = conn.busy_timeout(std::time::Duration::from_millis(wait));
+            (busy, _, copied) = run("TRUNCATE");
+            if busy == 0 {
+                COPIED_BEFORE.lock().unwrap_or_else(|err| err.into_inner()).remove(&file);
+            }
+        } else {
+            busy = 1;
+        }
         if busy != 0 {
             emptied = false;
             if size > WAL_LIMIT as u64 * 4 {
-                let file = if schema == "main" { path.to_path_buf() } else { index_path(path) };
                 let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let mut text = format!(
                     "could not empty the write-ahead log of {name} ({} MB, {copied} of {pages} pages copied); open now:",
@@ -242,10 +271,27 @@ pub fn start_checkpoints(path: std::path::PathBuf) {
                 // OwnNAS's should hold the log back. Not more often than PAUSE_EVERY, in case
                 // what does is another program.
                 paused_at = Some(std::time::Instant::now());
-                let emptied = crate::db_watch::with_indexing_paused(std::time::Duration::from_secs(60), || checkpoint_waiting(&path, 10_000));
+                let emptied = crate::db_watch::with_indexing_paused(std::time::Duration::from_secs(60), || checkpoint_waiting(&path, 10_000, true));
                 if let Some(size) = emptied {
                     crate::db_watch::log(&format!("emptied the write-ahead logs ({} MB) with indexing paused", size / (1024 * 1024)));
                 }
+            }
+            // A log that cannot be emptied grows with every write until the disk is full. The
+            // indexes write the most and can wait: they are held back until it is emptied.
+            let [_, (_, wal), _, (_, index_wal)] = file_sizes(&path);
+            let largest = wal.max(index_wal);
+            let free = path.parent().and_then(crate::storage::disk).map_or(u64::MAX, |disk| disk.available);
+            let filling = largest > WAL_WARN && (largest > 8 * WAL_WARN || free < 4 * WAL_WARN);
+            if crate::db_watch::hold_indexing(filling) {
+                crate::db_watch::log(&if filling {
+                    format!(
+                        "indexing held back: a write-ahead log has grown to {} MB and cannot be emptied ({} MB free on the disk)",
+                        largest / (1024 * 1024),
+                        free / (1024 * 1024)
+                    )
+                } else {
+                    "indexing goes on: the write-ahead logs were emptied".to_string()
+                });
             }
             if round == 60 {
                 optimize();
@@ -1853,6 +1899,37 @@ mod tests {
         assert_ne!(frames(&marks), held, "{marks}");
         assert!(marks.ends_with(&format!(" {held}")) || marks.contains(&format!(" {held} ")), "{marks}");
         reader.execute_batch("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn checkpoint_stops_waiting_for_a_read_that_stays() {
+        let (path, conn) = scratch_db();
+        add_tag(&conn, "a.jpg", "one").unwrap();
+        let reader = connect(&path).unwrap();
+        reader.execute_batch("BEGIN; SELECT count(*) FROM file_tags;").unwrap();
+        let write = |from: usize| {
+            for n in from..from + 20 {
+                add_tag(&conn, &format!("{n}.jpg"), "two").unwrap();
+            }
+        };
+        write(0);
+        let timed = || {
+            let started = std::time::Instant::now();
+            let emptied = checkpoint_waiting(&path, 400, false);
+            (emptied, started.elapsed())
+        };
+        // The first time it waits for the read; then, the copy stuck at the same page, it does not.
+        let (emptied, first) = timed();
+        assert!(emptied.is_none() && first >= std::time::Duration::from_millis(350), "{first:?}");
+        write(20);
+        let (emptied, again) = timed();
+        assert!(emptied.is_none() && again < std::time::Duration::from_millis(200), "{again:?}");
+        // Insisting waits anyway, and once the read ends the log is emptied.
+        reader.execute_batch("COMMIT").unwrap();
+        assert!(checkpoint_waiting(&path, 400, true).is_some());
+        assert_eq!(file_sizes(&path)[1].1, 0);
+        write(40);
+        assert!(checkpoint(&path).is_some());
     }
 
     #[test]

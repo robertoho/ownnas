@@ -42,13 +42,25 @@ static RUNNING: LazyLock<Mutex<Running>> = LazyLock::new(Mutex::default);
 static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
 /// Set while the write-ahead logs are being emptied with the indexers waiting.
 static PAUSED: AtomicBool = AtomicBool::new(false);
+/// Set while a write-ahead log that cannot be emptied is filling the disk.
+static HELD_BACK: AtomicBool = AtomicBool::new(false);
 
 /// The background indexers call this before each piece of database work: while the logs are
-/// being emptied, they wait here, with no read open.
+/// being emptied, or indexing is held back, they wait here, with no read open.
 pub fn pause_point() {
-    while PAUSED.load(Ordering::Relaxed) {
+    while PAUSED.load(Ordering::Relaxed) || HELD_BACK.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+/// Holds the indexers at their `pause_point` until called again with `false`. Returns whether
+/// that changed anything.
+pub fn hold_indexing(hold: bool) -> bool {
+    HELD_BACK.swap(hold, Ordering::Relaxed) != hold
+}
+
+pub fn indexing_held() -> bool {
+    HELD_BACK.load(Ordering::Relaxed)
 }
 
 /// Runs `work` with the background indexers held at their `pause_point`, once the reads and

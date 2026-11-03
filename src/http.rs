@@ -6872,7 +6872,7 @@ async fn health_alerts(State(state): State<std::sync::Arc<AppState>>, headers: H
         }
         for file in db::file_sizes(&worker.db_path).into_iter().skip(1).step_by(2).filter(|(_, wal)| *wal > db::WAL_WARN) {
             let name = file.0.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            alerts.push(json!({ "level": if file.1 > 8 * db::WAL_WARN { "full" } else { "low" }, "kind": "database", "name": name, "size": file.1 }));
+            alerts.push(json!({ "level": if file.1 > 8 * db::WAL_WARN { "full" } else { "low" }, "kind": "database", "name": name, "size": file.1, "indexingHeld": crate::db_watch::indexing_held() }));
         }
         let (drives, _) = worker.health.drives(false);
         for drive in drives.into_iter().filter(|drive| drive.healthy == Some(false) || !drive.warnings.is_empty()) {

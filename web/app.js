@@ -5028,7 +5028,7 @@ async function pollHealthAlerts() {
     return;
   }
   const texts = alerts.map((alert) => {
-    if (alert.kind === "database") return `OwnNAS's database log (${alert.name}) has grown to ${formatSize(alert.size, false)}.`;
+    if (alert.kind === "database") return `OwnNAS's database log (${alert.name}) has grown to ${formatSize(alert.size, false)}.${alert.indexingHeld ? " Indexing is paused until it can be emptied: another program may have the database open." : ""}`;
     if (alert.kind === "disk") return `The disk with ${alert.what} is ${alert.level === "full" ? "nearly full" : "getting full"}: ${formatSize(alert.free, false)} free (${Math.round((alert.free / (alert.total || 1)) * 100)}%).`;
     if (alert.kind === "backup") {
       const since = alert.lastSuccess ? ` The last one that worked was on ${new Date(alert.lastSuccess * 1000).toLocaleDateString()}.` : "";

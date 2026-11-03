@@ -341,7 +341,9 @@ fn scan(
                     .prepare(
                         "INSERT INTO file_index(path, parent, name_lower, dir, size, mtime, kind) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
                          ON CONFLICT(path) DO UPDATE SET size = excluded.size, kind = excluded.kind,
-                           mtime = CASE WHEN file_index.dir = 1 THEN file_index.mtime ELSE excluded.mtime END",
+                           mtime = CASE WHEN file_index.dir = 1 THEN file_index.mtime ELSE excluded.mtime END
+                         WHERE file_index.size IS NOT excluded.size OR file_index.kind IS NOT excluded.kind
+                           OR (file_index.dir = 0 AND file_index.mtime IS NOT excluded.mtime)",
                     )
                     .map_err(sql)?;
                 for entry in &found {
@@ -354,7 +356,7 @@ fn scan(
             // The folder's own row keeps the time it had when read: changed later, it is read again.
             tx.execute(
                 "INSERT INTO file_index(path, parent, name_lower, dir, size, mtime, kind) VALUES(?1, ?2, ?3, 1, 0, ?4, 'folder')
-                 ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime",
+                 ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime WHERE file_index.mtime IS NOT excluded.mtime",
                 params![rel, if rel.is_empty() { None } else { Some(parent_of(&rel)) }, name_of(&rel).to_lowercase(), mtime],
             )
             .map_err(sql)?;
@@ -466,6 +468,10 @@ mod tests {
         // Nothing changed: only the folders' times are looked at.
         let (folders, read) = scan_all(&library, "", false);
         assert_eq!((folders, read), (6, 0));
+        // Read again in full, nothing is written.
+        let changes = library.conn.total_changes();
+        scan_all(&library, "", true);
+        assert_eq!(library.conn.total_changes(), changes);
 
         next_second();
         fs::rename(lib.join("docs/old"), lib.join("docs/archive")).unwrap();

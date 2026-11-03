@@ -22,6 +22,11 @@ const MAX_TEXT: usize = 1024 * 1024;
 const MAX_TEXT_FILE: u64 = 2 * 1024 * 1024;
 /// Files picked at a time. Finding them reads the whole name index, so not too few.
 const BATCH: usize = 2000;
+/// Words read are written to the database this many files at a time, or after `STORE_AFTER`:
+/// each write adds to the search index's own pages, and fewer, larger writes keep the
+/// database's write-ahead log from growing as fast.
+const STORE_EVERY: usize = 32;
+const STORE_AFTER: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -122,6 +127,20 @@ impl TextIndex {
                 status.waiting = waiting;
                 status.error = None;
             }
+            let mut read: Vec<(Waiting, String)> = Vec::new();
+            let mut first_read = Instant::now();
+            let flush = |read: &mut Vec<(Waiting, String)>| -> Result<(), String> {
+                if read.is_empty() {
+                    return Ok(());
+                }
+                crate::db_watch::pause_point();
+                store(&conn, read)?;
+                let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());
+                status.done += read.len() as u64;
+                status.waiting = status.waiting.max(status.done);
+                read.clear();
+                Ok(())
+            };
             // Files that failed are kept (with no text), so a batch never comes back the same.
             loop {
                 let batch = waiting_files(&conn, ocr, BATCH)?;
@@ -132,12 +151,12 @@ impl TextIndex {
                     let started = Instant::now();
                     self.status.lock().unwrap_or_else(|err| err.into_inner()).current = Some(file.path.clone());
                     let text = read_text(&root.join(&file.path), &file.path, &file.kind, cache_dir, ocr).unwrap_or_default();
-                    crate::db_watch::pause_point();
-                    store(&conn, &file, &text)?;
-                    {
-                        let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());
-                        status.done += 1;
-                        status.waiting = status.waiting.max(status.done);
+                    if read.is_empty() {
+                        first_read = Instant::now();
+                    }
+                    read.push((file, text));
+                    if read.len() >= STORE_EVERY || first_read.elapsed() >= STORE_AFTER {
+                        flush(&mut read)?;
                     }
                     let rest = speed().rest(started.elapsed());
                     if !rest.is_zero() {
@@ -145,9 +164,11 @@ impl TextIndex {
                     }
                     if self.wake.load(Ordering::SeqCst) {
                         // Reindex asked for: start over with what it cleared.
+                        flush(&mut read)?;
                         return Ok(conn);
                     }
                 }
+                flush(&mut read)?;
             }
             forget_gone(&conn, root)?;
             Ok(conn)
@@ -234,20 +255,23 @@ fn truncate(mut text: String) -> String {
     text
 }
 
-fn store(conn: &Connection, file: &Waiting, text: &str) -> Result<(), String> {
-    let lower = text.to_lowercase();
-    // PDFs often space their letters out ("H e l l o"): keep the words run together too.
-    let compact: String = if file.kind == "pdf" { lower.chars().filter(|c| !c.is_whitespace()).collect() } else { String::new() };
+/// Writes the words of the files read, in one transaction.
+fn store(conn: &Connection, read: &[(Waiting, String)]) -> Result<(), String> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate).map_err(|err| err.to_string())?;
-    tx.execute("DELETE FROM content_text WHERE path = ?1", params![file.path]).map_err(|err| err.to_string())?;
-    tx.execute(
-        "INSERT INTO content_text(path, size, mtime, body, indexed_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![file.path, file.size, file.mtime, text, crate::db::now_secs()],
-    )
-    .map_err(|err| err.to_string())?;
-    if !text.trim().is_empty() {
-        tx.execute("INSERT INTO content_fts(rowid, lower, compact) VALUES (last_insert_rowid(), ?1, ?2)", params![lower, compact])
-            .map_err(|err| err.to_string())?;
+    for (file, text) in read {
+        let lower = text.to_lowercase();
+        // PDFs often space their letters out ("H e l l o"): keep the words run together too.
+        let compact: String = if file.kind == "pdf" { lower.chars().filter(|c| !c.is_whitespace()).collect() } else { String::new() };
+        tx.execute("DELETE FROM content_text WHERE path = ?1", params![file.path]).map_err(|err| err.to_string())?;
+        tx.execute(
+            "INSERT INTO content_text(path, size, mtime, body, indexed_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![file.path, file.size, file.mtime, text, crate::db::now_secs()],
+        )
+        .map_err(|err| err.to_string())?;
+        if !text.trim().is_empty() {
+            tx.execute("INSERT INTO content_fts(rowid, lower, compact) VALUES (last_insert_rowid(), ?1, ?2)", params![lower, compact])
+                .map_err(|err| err.to_string())?;
+        }
     }
     tx.commit().map_err(|err| err.to_string())
 }
@@ -352,7 +376,7 @@ mod tests {
 
     fn add(conn: &Connection, path: &str, kind: &str, text: &str) {
         let file = Waiting { path: path.into(), kind: kind.into(), size: 1, mtime: 1 };
-        store(conn, &file, text).unwrap();
+        store(conn, &[(file, text.to_string())]).unwrap();
     }
 
     #[test]
