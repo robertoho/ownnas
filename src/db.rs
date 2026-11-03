@@ -502,6 +502,12 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             color TEXT NOT NULL DEFAULT '',
             icon TEXT NOT NULL DEFAULT 'folder'
         );
+        CREATE TABLE IF NOT EXISTS protected_paths (
+            path TEXT PRIMARY KEY,
+            contents INTEGER NOT NULL DEFAULT 0,
+            protected_by TEXT NOT NULL DEFAULT '',
+            protected_at INTEGER NOT NULL DEFAULT 0
+        );
         CREATE TABLE IF NOT EXISTS albums (
             id INTEGER PRIMARY KEY,
             parent_id INTEGER REFERENCES albums(id) ON DELETE CASCADE,
@@ -1358,6 +1364,11 @@ pub fn rewrite_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), 
          WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
         params![from, to],
     ).map_err(|_| "Could not move folder appearance".to_string())?;
+    conn.execute(
+        "UPDATE protected_paths SET path = CASE WHEN path = ?1 THEN ?2 ELSE ?2 || substr(path, length(?1) + 1) END
+         WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![from, to],
+    ).map_err(|_| "Could not move the protection from deletion".to_string())?;
     let start = (from.len() + 1) as i64;
     conn.execute(
         "UPDATE file_tags SET path = CASE
@@ -1693,6 +1704,10 @@ pub fn delete_path_meta(conn: &Connection, path: &str) -> Result<(), String> {
         params![path],
     ).map_err(|_| "Could not remove folder appearance".to_string())?;
     conn.execute(
+        "DELETE FROM protected_paths WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![path],
+    ).map_err(|_| "Could not remove the protection from deletion".to_string())?;
+    conn.execute(
         "DELETE FROM file_tags WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
         params![path],
     )
@@ -2002,6 +2017,102 @@ pub fn set_folder_appearance(conn: &Connection, paths: &[String], color: &str, i
         }.map_err(|_| "Could not save folder appearance".to_string())?;
     }
     tx.commit().map_err(|_| "Could not save folder appearance".to_string())
+}
+
+/// How an item is protected from deletion: "self" (it cannot be deleted, nor a folder holding
+/// it), "contents" (a folder, and nothing in it either), or "inside" (it is in such a folder).
+pub fn protection_for_paths(conn: &Connection, paths: &[String]) -> Result<std::collections::HashMap<String, &'static str>, String> {
+    use rusqlite::OptionalExtension;
+    let fail = |_| "Could not read the protection from deletion".to_string();
+    let mut result = std::collections::HashMap::new();
+    let any: i64 = conn.query_row("SELECT count(*) FROM protected_paths", [], |row| row.get(0)).map_err(fail)?;
+    if any == 0 {
+        return Ok(result);
+    }
+    let mut own = conn.prepare("SELECT contents FROM protected_paths WHERE path = ?1").map_err(fail)?;
+    let mut inside = conn
+        .prepare("SELECT 1 FROM protected_paths WHERE contents = 1 AND ?1 >= path || '/' AND ?1 < path || '0' LIMIT 1")
+        .map_err(fail)?;
+    for path in paths {
+        let found = match own.query_row([path], |row| row.get::<_, bool>(0)).optional().map_err(fail)? {
+            Some(true) => Some("contents"),
+            Some(false) => Some("self"),
+            None => inside.exists([path]).map_err(fail)?.then_some("inside"),
+        };
+        if let Some(how) = found {
+            result.insert(path.clone(), how);
+        }
+    }
+    Ok(result)
+}
+
+/// The protected item that stops `path` being deleted, if any: itself, something inside it,
+/// or a folder protecting everything in it.
+pub fn deletion_blocker(conn: &Connection, path: &str) -> Result<Option<String>, String> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT path FROM protected_paths
+         WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0') OR (contents = 1 AND ?1 >= path || '/' AND ?1 < path || '0')
+         ORDER BY length(path) LIMIT 1",
+        [path],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|_| "Could not read the protection from deletion".to_string())
+}
+
+/// Protects `paths` from deletion (with `contents`, everything in a folder too), or with `None`
+/// lets them be deleted again.
+pub fn set_protection(conn: &Connection, paths: &[String], protect: Option<bool>, by: &str) -> Result<(), String> {
+    let fail = |_| "Could not save the protection from deletion".to_string();
+    let tx = conn.unchecked_transaction().map_err(fail)?;
+    for path in paths {
+        match protect {
+            Some(contents) => tx.execute(
+                "INSERT INTO protected_paths(path, contents, protected_by, protected_at) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(path) DO UPDATE SET contents = excluded.contents, protected_by = excluded.protected_by, protected_at = excluded.protected_at",
+                params![path, contents, by, now_secs()],
+            ),
+            None => tx.execute("DELETE FROM protected_paths WHERE path = ?1", [path]),
+        }
+        .map_err(fail)?;
+    }
+    tx.commit().map_err(fail)
+}
+
+#[cfg(test)]
+mod protection_tests {
+    use super::*;
+
+    #[test]
+    fn protection_blocks_deletion_and_follows_moves() {
+        let conn = Connection::open_in_memory().unwrap();
+        attach_index(&conn, ":memory:").unwrap();
+        migrate(&conn).unwrap();
+        let paths = |list: &[&str]| list.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        set_protection(&conn, &paths(&["docs/tax.pdf"]), Some(false), "ana").unwrap();
+        set_protection(&conn, &paths(&["photos"]), Some(true), "ana").unwrap();
+        let blocker = |path: &str| deletion_blocker(&conn, path).unwrap();
+        assert_eq!(blocker("docs/tax.pdf").as_deref(), Some("docs/tax.pdf"));
+        assert_eq!(blocker("docs").as_deref(), Some("docs/tax.pdf"), "a folder holding it");
+        assert_eq!(blocker("docs/other.pdf"), None);
+        assert_eq!(blocker("docs/tax.pdf.bak"), None);
+        assert_eq!(blocker("photos/2024/a.jpg").as_deref(), Some("photos"), "inside a folder protecting its contents");
+        assert_eq!(blocker("photoshop"), None);
+        let how = protection_for_paths(&conn, &paths(&["docs/tax.pdf", "photos", "photos/a.jpg", "docs/x"])).unwrap();
+        assert_eq!((how["docs/tax.pdf"], how["photos"], how["photos/a.jpg"]), ("self", "contents", "inside"));
+        assert!(!how.contains_key("docs/x"));
+
+        // Moves and renames keep it; copies do not get it.
+        rewrite_path_meta(&conn, "docs", "papers").unwrap();
+        assert_eq!(blocker("papers/tax.pdf").as_deref(), Some("papers/tax.pdf"));
+        assert_eq!(blocker("docs/tax.pdf"), None);
+        copy_path_meta(&conn, "papers", "papers copy").unwrap();
+        assert_eq!(blocker("papers copy/tax.pdf"), None);
+
+        set_protection(&conn, &paths(&["papers/tax.pdf"]), None, "ana").unwrap();
+        assert_eq!(blocker("papers"), None);
+    }
 }
 
 #[cfg(test)]

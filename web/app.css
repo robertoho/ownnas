@@ -3168,6 +3168,8 @@ dialog { color: var(--text); }
 .detail-name { display: flex; align-items: center; gap: 0.6rem; padding: 0.3rem 0.6rem; min-width: 0; }
 .files.list .detail-name .thumb { flex: 0 0 30px; width: 30px; height: 30px; min-height: 30px; }
 .files.list .detail-name .name { font-size: 0.83rem; }
+.protected-mark { flex: none; display: inline-block; vertical-align: -1px; margin-right: 0.3rem; color: var(--muted); }
+.detail-name .protected-mark { margin: 0 0 0 -0.3rem; }
 .detail-cell, .files.list .detail-size {
   padding: 0.3rem 0.65rem;
   font-size: 0.78rem;

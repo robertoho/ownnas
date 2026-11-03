@@ -379,6 +379,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/copy", post(copy_item))
         .route("/api/duplicate", post(duplicate_item))
         .route("/api/folder-appearance", get(get_folder_appearance).post(set_folder_appearance))
+        .route("/api/protect", post(set_protection))
         .route("/api/annotations", get(get_annotations).post(ack_annotations))
         .route("/api/tags", post(add_tag).delete(remove_tag))
         .route("/api/tags/all", get(all_tags))
@@ -1514,6 +1515,7 @@ async fn list(
     }
     let mut payload = serde_json::to_value(listing).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not list folder"))?;
     decorate_folder_appearance(&state, &mut payload["entries"])?;
+    decorate_protection(&state, &mut payload["entries"])?;
     Ok(Json(payload))
 }
 
@@ -2592,6 +2594,7 @@ async fn block_backups(
                     db::block_backup(&conn, &photo, preview.as_deref()).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
                 }
                 if body.delete {
+                    check_deletable(&state, &resolved.rel)?;
                     let (action, new_path) = files::trash_or_delete(&state.root, &resolved.rel)?;
                     match new_path {
                         Some(to) => rewrite_meta(&state, &resolved.rel, &to),
@@ -4589,6 +4592,10 @@ async fn trash_duplicates(
                     skipped.push(json!({ "path": rel, "reason": "It changed since it was compared" }));
                     continue;
                 }
+                if check_deletable(&state, &rel).is_err() {
+                    skipped.push(json!({ "path": rel, "reason": "It is protected from deletion" }));
+                    continue;
+                }
                 let size = std::fs::metadata(state.root.join(&rel)).map(|meta| meta.len()).unwrap_or(0);
                 match files::trash_or_delete(&state.root, &rel) {
                     Ok((_, Some(to))) => {
@@ -4641,6 +4648,7 @@ async fn delete_entry(
     require_write(&state)?;
     let root = state.root.clone();
     let rel = rel_of(&query.path);
+    check_deletable(&state, &rel)?;
     let label = rel.clone();
     let (action, new_path) = tokio::task::spawn_blocking(move || files::trash_or_delete(&root, &rel))
         .await
@@ -5118,6 +5126,7 @@ async fn sync_delete(
     let (user, _) = require_user(&state, &headers)?;
     require_write(&state)?;
     let base = files::SyncBase::parse(body.base.as_deref())?;
+    check_deletable(&state, &body.path)?;
     let root = state.root.clone();
     let rel = body.path.clone();
     let outcome = tokio::task::spawn_blocking(move || files::sync_delete(&root, &rel, base))
@@ -7130,6 +7139,29 @@ fn rewrite_meta(state: &AppState, from: &str, to: &str) {
     state.media.descriptions.invalidate();
 }
 
+/// Refuses deleting `rel` (or moving it to the Trash) while it, something in it, or the folder
+/// it is in is protected from deletion.
+fn check_deletable(state: &AppState, rel: &str) -> Result<(), ApiError> {
+    let rel = files::resolve(&state.root, rel).map(|found| found.rel).unwrap_or_else(|_| rel.trim_matches('/').to_string());
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    match db::deletion_blocker(&conn, &rel).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))? {
+        None => Ok(()),
+        Some(blocker) if blocker == rel => Err(ApiError::new(StatusCode::LOCKED, format!("“{}” is protected from deletion", name_in(&rel)))),
+        Some(blocker) if blocker.len() > rel.len() => Err(ApiError::new(
+            StatusCode::LOCKED,
+            format!("“{}” holds “{}”, which is protected from deletion", name_in(&rel), name_in(&blocker)),
+        )),
+        Some(blocker) => Err(ApiError::new(
+            StatusCode::LOCKED,
+            format!("Everything in “{}” is protected from deletion", name_in(&blocker)),
+        )),
+    }
+}
+
+fn name_in(rel: &str) -> &str {
+    rel.rsplit('/').next().unwrap_or(rel)
+}
+
 fn delete_meta(state: &AppState, path: &str) {
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     let _ = db::delete_path_meta(&conn, path);
@@ -7462,6 +7494,7 @@ async fn search(
 
     let mut payload = json!({ "hits": hits });
     decorate_folder_appearance(&state, &mut payload["hits"])?;
+    decorate_protection(&state, &mut payload["hits"])?;
     Ok(Json(payload))
 }
 
@@ -7581,6 +7614,9 @@ async fn move_item(
     check_csrf(&headers)?;
     let (user, _) = require_user(&state, &headers)?;
     require_write(&state)?;
+    if files::resolve(&state.root, &body.dest).is_ok_and(|dest| files::is_under_trash(&dest.rel) || dest.rel == "Trash" || dest.rel.starts_with("Trash/")) {
+        check_deletable(&state, &body.path)?;
+    }
     let root = state.root.clone();
     let from = body.path.clone();
     let label = format!("{} → {}", body.path, body.dest);
@@ -7633,6 +7669,63 @@ async fn duplicate_item(
     invalidate_sizes(&state, &parent_rel_path(&path));
     record(&state, &user, "duplicate", &label);
     Ok(Json(json!({ "path": path })))
+}
+
+/// Marks entries protected from deletion ("self", "contents", or "inside" a protected folder).
+fn decorate_protection(state: &AppState, entries: &mut serde_json::Value) -> Result<(), ApiError> {
+    let Some(entries) = entries.as_array_mut() else { return Ok(()); };
+    let paths: Vec<String> = entries.iter().filter_map(|entry| entry["path"].as_str().map(String::from)).collect();
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let protection = db::protection_for_paths(&conn, &paths).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    for entry in entries {
+        if let Some(how) = entry["path"].as_str().and_then(|path| protection.get(path)) {
+            entry["protected"] = json!(how);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProtectBody {
+    paths: Vec<String>,
+    protect: bool,
+    /// For folders: everything in them too.
+    #[serde(default)]
+    contents: bool,
+}
+
+async fn set_protection(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<ProtectBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    if body.paths.is_empty() || body.paths.len() > 1000 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose between 1 and 1,000 items"));
+    }
+    let mut paths = Vec::new();
+    for path in &body.paths {
+        let found = files::resolve(&state.root, path)?;
+        if found.rel.is_empty() || files::is_under_trash(&found.rel) || found.rel == "Trash" || found.rel.starts_with("Trash/") {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose items outside the Trash"));
+        }
+        let contents = body.contents && found.full.is_dir();
+        paths.push((found.rel, contents));
+    }
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    for contents in [false, true] {
+        let group: Vec<String> = paths.iter().filter(|(_, c)| *c == contents).map(|(path, _)| path.clone()).collect();
+        if !group.is_empty() {
+            db::set_protection(&conn, &group, body.protect.then_some(contents), &user.username).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+        }
+    }
+    drop(conn);
+    let names: Vec<&str> = paths.iter().map(|(path, _)| path.as_str()).collect();
+    record(&state, &user, if body.protect { "protect" } else { "unprotect" }, &names.join(", "));
+    Ok(Json(json!({ "ok": true })))
 }
 
 fn decorate_folder_appearance(state: &AppState, entries: &mut serde_json::Value) -> Result<(), ApiError> {
@@ -8101,7 +8194,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&data).unwrap();
         std::fs::write(root.join("hello.txt"), b"hello ownnas").unwrap();
-        (root, data)
+        // As the server is given it (macOS's temporary folder is behind a link).
+        (root.canonicalize().unwrap(), data)
     }
 
     async fn app() -> (Router, PathBuf) {
@@ -8167,6 +8261,58 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(std::fs::read_to_string(root.join("photo (2).jpg")).unwrap(), "second");
         assert_eq!(std::fs::read_to_string(root.join("photo.jpg")).unwrap(), "first");
+    }
+
+    #[tokio::test]
+    async fn protected_items_cannot_be_deleted() {
+        let (app, root) = app().await;
+        let login = Request::builder().method("POST").uri("/api/login").header("content-type", "application/json").header("x-ownnas", "1")
+            .body(Body::from(r#"{"username":"ada","password":"longenough"}"#)).unwrap();
+        let response = app.clone().oneshot(login).await.unwrap();
+        let cookie = response.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap().split(';').next().unwrap().to_string();
+        let send = |method: &str, uri: &str, body: Option<serde_json::Value>| {
+            let mut request = Request::builder().method(method).uri(uri).header("cookie", &cookie).header("x-ownnas", "1");
+            if body.is_some() {
+                request = request.header("content-type", "application/json");
+            }
+            request.body(body.map_or_else(Body::empty, |body| Body::from(body.to_string()))).unwrap()
+        };
+        files::make_dir(&root, "", "Docs").unwrap();
+        files::make_dir(&root, "", "Photos").unwrap();
+        std::fs::write(root.join("Docs/tax.txt"), "keep").unwrap();
+        std::fs::write(root.join("Docs/draft.txt"), "x").unwrap();
+        std::fs::write(root.join("Photos/a.txt"), "x").unwrap();
+        for (paths, contents) in [(json!(["Docs/tax.txt"]), false), (json!(["Photos"]), true)] {
+            let response = app.clone().oneshot(send("POST", "/api/protect", Some(json!({"paths": paths, "protect": true, "contents": contents})))).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let status = |response: axum::response::Response| response.status();
+        for path in ["Docs/tax.txt", "Docs", "Photos", "Photos/a.txt"] {
+            let response = app.clone().oneshot(send("DELETE", &format!("/api/entry?path={}", path.replace('/', "%2F")), None)).await.unwrap();
+            assert_eq!(status(response), StatusCode::LOCKED, "{path}");
+        }
+        // What is not protected still goes (and makes the Trash).
+        let response = app.clone().oneshot(send("DELETE", "/api/entry?path=Docs%2Fdraft.txt", None)).await.unwrap();
+        assert_eq!(status(response), StatusCode::OK);
+        let response = app.clone().oneshot(send("POST", "/api/move", Some(json!({"path": "Docs/tax.txt", "dest": files::TRASH_DIR})))).await.unwrap();
+        assert_eq!(status(response), StatusCode::LOCKED);
+        let response = app.clone().oneshot(send("POST", "/api/sync/delete", Some(json!({"path": "Photos/a.txt"})))).await.unwrap();
+        assert_eq!(status(response), StatusCode::LOCKED);
+        assert!(root.join("Docs/tax.txt").exists() && root.join("Photos/a.txt").exists());
+        // A protected file keeps its protection when renamed.
+        let response = app.clone().oneshot(send("POST", "/api/rename", Some(json!({"path": "Docs/tax.txt", "name": "tax 2026.txt"})))).await.unwrap();
+        assert_eq!(status(response), StatusCode::OK);
+        let response = app.clone().oneshot(send("GET", "/api/list?path=Docs", None)).await.unwrap();
+        let listing: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(listing["entries"][0]["protected"], "self");
+        let response = app.clone().oneshot(send("GET", "/api/list?path=Photos", None)).await.unwrap();
+        let listing: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(listing["entries"][0]["protected"], "inside");
+        // Allowed again, it can be deleted.
+        let response = app.clone().oneshot(send("POST", "/api/protect", Some(json!({"paths": ["Docs/tax 2026.txt"], "protect": false})))).await.unwrap();
+        assert_eq!(status(response), StatusCode::OK);
+        let response = app.clone().oneshot(send("DELETE", "/api/entry?path=Docs", None)).await.unwrap();
+        assert_eq!(status(response), StatusCode::OK);
     }
 
     #[tokio::test]

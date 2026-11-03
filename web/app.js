@@ -713,6 +713,9 @@ function renderFiles() {
           ${modifiedLabel ? `<span title="Modified ${esc(formatDate(entry.modified))}">Modified ${esc(modifiedLabel)}</span>` : ""}
         </div>`
       : "";
+    const lock = entry.protected
+      ? `<svg class="protected-mark" viewBox="0 0 16 16" width="12" height="12" role="img" aria-label="Protected from deletion"><title>${entry.protected === "inside" ? "In a folder protected from deletion" : "Protected from deletion"}</title><path d="${ICON_LOCK}" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`
+      : "";
     const tags = entry.tags || [];
     const shownTags = tags.slice(0, 3);
     const tagStack = shownTags.length
@@ -723,7 +726,7 @@ function renderFiles() {
       : "";
     if (state.view === "list") {
       return `<article class="card details-row${selected ? " selected" : ""}${cut ? " cut" : ""}" role="row" data-path="${esc(entry.path)}" data-dir="${entry.dir ? "1" : "0"}" aria-selected="${selected ? "true" : "false"}">
-        <div class="detail-name" role="cell"><div class="thumb">${thumb}</div><span class="name" title="${esc(entry.path)}">${esc(displayName)}</span></div>
+        <div class="detail-name" role="cell"><div class="thumb">${thumb}</div><span class="name" title="${esc(entry.path)}">${esc(displayName)}</span>${lock}</div>
         <div class="sub detail-size" role="cell">${sub}</div>
         <div class="detail-cell" role="cell">${esc(fileTypeLabel(entry))}</div>
         <div class="detail-cell" role="cell" title="${esc(formatDate(entry.modified))}">${esc(modifiedLabel || "—")}</div>
@@ -734,7 +737,7 @@ function renderFiles() {
     return `<article class="card${selected ? " selected" : ""}${cut ? " cut" : ""}${archiveFolder ? " archive-folder" : ""}${trashFolder ? " trash-folder" : ""}${mediaCard ? " media-card" : ""}" data-path="${esc(entry.path)}" data-dir="${entry.dir ? "1" : "0"}" aria-selected="${selected ? "true" : "false"}">
       <div class="thumb">${thumb}${badge}${tagStack}</div>
       <div class="card-body">
-        <div class="name" title="${esc(entry.path)}">${esc(displayName)}</div>
+        <div class="name" title="${esc(entry.path)}">${lock}${esc(displayName)}</div>
         <div class="sub" title="${entry.original ? esc(entry.original) : ""}">${sub}</div>
         ${dates}
       </div>
@@ -967,6 +970,8 @@ const ICON_ROTATE = "M13 8a5 5 0 1 1-1.5-3.55 M13.5 2.5v2.5H11";
 const ICON_ARCHIVE = "M2.5 3.5h11v3h-11z M3.5 6.5v6a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1v-6 M6.5 9h3";
 const ICON_CONVERT = "M2.5 5.5h10 M10 3l2.5 2.5L10 8 M13.5 10.5h-10 M6 8l-2.5 2.5L6 13";
 const ICON_GRID = "M2.5 2.5h4.5v4.5H2.5z M9 2.5h4.5v4.5H9z M2.5 9h4.5v4.5H2.5z M9 9h4.5v4.5H9z";
+const ICON_LOCK = "M4.75 7V5.25a3.25 3.25 0 0 1 6.5 0V7 M3.5 7h9v7h-9z M8 9.75v1.5";
+
 const MENU_ICONS = {
   open: ICON_OPEN,
   popout: ICON_OPEN,
@@ -978,6 +983,9 @@ const MENU_ICONS = {
   folderWith: `${ICON_FOLDER} M8 8v5 M5.5 10.5H10.5`,
   newfile: `${ICON_FILE} M8 8v4 M6 10h4`,
   folderAppearance: "M8 2a6 6 0 1 0 0 12c1 0 1.5-.6 1.5-1.4 0-.9-.8-1.1-.8-2 0-.8.7-1.3 1.6-1.3H12a2.5 2.5 0 0 0 2.5-2.5C14.5 4.3 11.6 2 8 2z M5 7.5h.01 M7 4.75h.01 M10 5h.01",
+  protect: ICON_LOCK,
+  protectMenu: ICON_LOCK,
+  unprotect: "M4.75 7V5.25a3.25 3.25 0 0 1 6.3-1.1 M3.5 7h9v7h-9z M8 9.75v1.5",
   search: "M7 2.75a4.25 4.25 0 1 1 0 8.5a4.25 4.25 0 1 1 0-8.5z M10.25 10.25 13.5 13.5",
   library: "M2.5 2.5h3v11h-3z M6.5 2.5h3v11h-3z M10.5 3.5l3 1v9l-3-1z",
   gallery: "M2.5 3h11a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z M1.5 10.5l3.5-3.5 3 3 2-2 4.5 4 M10.5 5.5h.01",
@@ -1090,7 +1098,13 @@ function decorateMenu(menu) {
 
 function openMenuSub(kind, anchorButton) {
   let buttons = [];
-  if (kind === "pdf") {
+  if (kind === "protect") {
+    buttons = [
+      `<div class="menu-label">Protect from deletion</div>`,
+      `<button type="button" data-menu="protect" data-format="self">Only the folder itself</button>`,
+      `<button type="button" data-menu="protect" data-format="contents">The folder and everything in it</button>`,
+    ];
+  } else if (kind === "pdf") {
     buttons = [
       `<div class="menu-label">PDF</div>`,
       `<button type="button" data-menu="pdfExtract">Extract pages…</button>`,
@@ -1359,6 +1373,15 @@ function openSelectionMenu(x, y, pasteInto) {
     if (one && !one.dir) buttons.push(`<button type="button" data-menu="versions">Versions…</button>`);
     if (one && canFindSimilar(one)) buttons.push(`<button type="button" data-menu="findSimilar">Find similar photos</button>`);
     if (write && entries.every(customizableFolder)) buttons.push(`<button type="button" data-menu="folderAppearance">${entries.length === 1 ? 'Customize folder…' : 'Customize folders…'}</button>`);
+    if (write && entries.length && !allInTrash) {
+      if (entries.every((entry) => entry.protected === "self" || entry.protected === "contents")) {
+        buttons.push(`<button type="button" data-menu="unprotect">Allow deletion</button>`);
+      } else if (entries.some((entry) => entry.dir)) {
+        buttons.push(`<button type="button" class="menu-has-sub" data-menu="protectMenu">Protect from deletion</button>`);
+      } else {
+        buttons.push(`<button type="button" data-menu="protect">Protect from deletion</button>`);
+      }
+    }
     if (entries.length) buttons.push(`<button type="button" data-menu="download">Download</button>`);
     if (write && allInTrash) buttons.push(`<button type="button" data-menu="restore">Restore</button>`);
     if (entries.length) buttons.push(`<button type="button" data-menu="copy">Copy</button>`);
@@ -3616,6 +3639,14 @@ function askConfirm(message, okLabel) {
   });
 }
 
+/// Protects items from deletion (folders with `contents`: everything in them too), or allows it again.
+async function setProtection(entries, protect, contents = false) {
+  await api("/api/protect", { method: "POST", json: { paths: entries.map((entry) => entry.path), protect, contents } });
+  const what = entries.length === 1 ? `“${entries[0].name}”` : `${entries.length} items`;
+  toast(protect ? `${what} protected from deletion` : `${what} can be deleted again`);
+  await load(state.path);
+}
+
 async function renameEntry(entry) {
   await renameEntries([entry]);
 }
@@ -3626,6 +3657,13 @@ async function deleteEntry(entry) {
 
 async function deleteEntries(entries) {
   if (!entries.length) return;
+  const kept = entries.find((entry) => entry.protected);
+  if (kept) {
+    toast(kept.protected === "inside"
+      ? `“${kept.name}” is in a folder protected from deletion`
+      : `“${kept.name}” is protected from deletion. Choose Allow deletion first.`, true);
+    return;
+  }
   const forever = entries.every((entry) => inTrashPath(entry.path));
   const message = forever
     ? (entries.length === 1
@@ -5446,6 +5484,8 @@ function runMenuAction(button, entries, pasteInto) {
   const action = button.getAttribute("data-menu");
   const one = entries.length === 1 ? entries[0] : null;
   if (action === "folderAppearance") customizeFolders(entries).catch(err => toast(err.message, true));
+  if (action === "protect") setProtection(entries, true, format === "contents").catch((err) => toast(err.message, true));
+  if (action === "unprotect") setProtection(entries, false).catch((err) => toast(err.message, true));
   if (action === "open" && one) openEntry(one).catch((err) => toast(err.message, true));
   if (action === "download") {
     downloadEntries(entries).catch((err) => {
@@ -5528,6 +5568,10 @@ $("menu").addEventListener("click", (event) => {
   }
   if (action === "pdfMenu") {
     openMenuSub("pdf", button);
+    return;
+  }
+  if (action === "protectMenu") {
+    openMenuSub("protect", button);
     return;
   }
   const entries = state.menuEntries.slice();
