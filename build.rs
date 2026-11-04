@@ -10,6 +10,17 @@ fn main() {
     if !target.contains("android") && target != "x86_64-apple-darwin" {
         println!("cargo:rustc-cfg=ownnas_ml");
     }
+    // The unrar library asks to link pthread, which on Android is part of libc and has no library
+    // of its own, so the linker gets an empty one to find.
+    if target.contains("android") {
+        let out = std::env::var("OUT_DIR").expect("cargo sets OUT_DIR");
+        std::fs::write(std::path::Path::new(&out).join("libpthread.a"), "!<arch>\n").expect("write libpthread.a");
+        println!("cargo:rustc-link-search=native={out}");
+        // Its C++ needs the C++ library, which Android phones do not provide: built in, so the app
+        // can load without shipping another file. (Link arguments, so they follow unrar itself.)
+        println!("cargo:rustc-link-arg=-lc++_static");
+        println!("cargo:rustc-link-arg=-lc++abi");
+    }
     if !target.ends_with("apple-darwin") {
         return;
     }
