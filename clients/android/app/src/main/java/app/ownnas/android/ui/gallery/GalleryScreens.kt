@@ -32,7 +32,12 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.People
+import androidx.compose.material.icons.filled.Photo
+import androidx.compose.material.icons.filled.PhotoAlbum
+import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Sell
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.DropdownMenu
@@ -98,12 +103,21 @@ import kotlin.math.roundToInt
 
 // ---- The Gallery: tabs for photos, albums, people, places, and tags ----
 
+/// A tab shows only its icon; `label` is what screen readers say.
+private class GalleryTab(val key: String, val label: String, val icon: androidx.compose.ui.graphics.vector.ImageVector)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun GalleryScreen(vm: AppViewModel, serverId: String, startTab: String) {
     var smart by remember { mutableStateOf(SmartFeatures(search = false, faces = false)) }
     LaunchedEffect(serverId) { runCatching { vm.call(serverId) { it.smartFeatures() } }.onSuccess { smart = it } }
-    val tabs = listOfNotNull("photos" to "Photos", "albums" to "Albums", if (smart.faces) "people" to "People" else null, "places" to "Places", "tags" to "Tags")
+    val tabs = listOfNotNull(
+        GalleryTab("photos", "Photos", Icons.Filled.Photo),
+        GalleryTab("albums", "Albums", Icons.Filled.PhotoAlbum),
+        if (smart.faces) GalleryTab("people", "People", Icons.Filled.People) else null,
+        GalleryTab("places", "Places", Icons.Filled.Place),
+        GalleryTab("tags", "Tags", Icons.Filled.Sell),
+    )
     // The workspace showing (remembered per server); every tab reloads when it changes.
     var workspaces by remember { mutableStateOf<List<Workspace>>(emptyList()) }
     var workspace by remember { mutableStateOf(vm.galleryWorkspace(serverId)) }
@@ -173,9 +187,9 @@ fun GalleryScreen(vm: AppViewModel, serverId: String, startTab: String) {
         snackbarHost = { SnackbarHost(snackbar) },
     ) { padding ->
         Column(Modifier.padding(padding).fillMaxSize()) {
-            PrimaryTabRow(selectedTabIndex = tabs.indexOfFirst { it.first == tab }.coerceAtLeast(0)) {
-                for ((key, label) in tabs) {
-                    Tab(selected = tab == key, onClick = { tab = key; selection.clear() }, text = { Text(label) })
+            PrimaryTabRow(selectedTabIndex = tabs.indexOfFirst { it.key == tab }.coerceAtLeast(0)) {
+                for (item in tabs) {
+                    Tab(selected = tab == item.key, onClick = { tab = item.key; selection.clear() }, icon = { Icon(item.icon, contentDescription = item.label) })
                 }
             }
             Box(Modifier.weight(1f)) {

@@ -7,7 +7,20 @@ struct GalleryView: View {
     @EnvironmentObject private var hub: Hub
     let server: String
 
-    enum Tab: String, CaseIterable { case photos = "Photos", albums = "Albums", people = "People", places = "Places", tags = "Tags" }
+    enum Tab: String, CaseIterable {
+        case photos = "Photos", albums = "Albums", people = "People", places = "Places", tags = "Tags"
+
+        /// A tab shows only this; its name is what VoiceOver says.
+        var icon: String {
+            switch self {
+            case .photos: "photo"
+            case .albums: "rectangle.stack"
+            case .people: "person.2"
+            case .places: "mappin.and.ellipse"
+            case .tags: "tag"
+            }
+        }
+    }
 
     @State private var tab: Tab = .photos
     @State private var smart = SmartFeatures(search: false, faces: false)
@@ -21,7 +34,7 @@ struct GalleryView: View {
     var body: some View {
         VStack(spacing: 0) {
             Picker("Show", selection: $tab) {
-                ForEach(tabs, id: \.self) { Text($0.rawValue).tag($0) }
+                ForEach(tabs, id: \.self) { Image(systemName: $0.icon).accessibilityLabel($0.rawValue).tag($0) }
             }
             .pickerStyle(.segmented).padding(.horizontal).padding(.bottom, 8)
             Group {
