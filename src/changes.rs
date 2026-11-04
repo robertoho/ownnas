@@ -216,6 +216,9 @@ mod tests {
             if found.iter().any(|path| path == "Docs/note.txt") {
                 break;
             }
+            // `wait` returns at once when an earlier change is already there (Linux reports the
+            // folder first), so give the file's own change time to arrive.
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(found.iter().any(|path| path == "Docs/note.txt"), "{found:?}");
         std::fs::remove_dir_all(&root).ok();
