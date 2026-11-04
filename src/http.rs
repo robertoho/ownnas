@@ -306,6 +306,10 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/users/password", post(admin_set_password))
         .route("/api/users/admin", post(set_user_admin))
         .route("/api/users/remove", post(remove_managed_user))
+        .route("/mcp", post(crate::mcp::handle).get(crate::mcp::not_offered).delete(crate::mcp::not_offered).layer(DefaultBodyLimit::max(crate::mcp::MAX_REQUEST)))
+        .route("/api/agent-keys", get(list_agent_keys).post(create_agent_key))
+        .route("/api/agent-keys/revoke", post(revoke_agent_key))
+        .route("/api/agent-keys/log", get(agent_key_log))
         .route("/api/list", get(list))
         .route("/api/meta", get(meta))
         .route("/api/raw", get(raw))
@@ -665,7 +669,7 @@ fn open_url(url: &str) {
     }
 }
 
-struct ApiError {
+pub(crate) struct ApiError {
     status: StatusCode,
     body: serde_json::Value,
 }
@@ -865,7 +869,7 @@ fn check_csrf(headers: &HeaderMap) -> Result<(), ApiError> {
     }
 }
 
-fn bearer_token(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let token = raw.strip_prefix("Bearer ")?.trim();
     (!token.is_empty()).then(|| token.to_string())
@@ -1344,6 +1348,7 @@ async fn create_managed_user(
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     db::create_user_with_admin(&conn, &body.username, &body.password, body.admin)
         .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    drop(conn);
     record(
         &state,
         &user,
@@ -1371,6 +1376,7 @@ async fn admin_set_password(
     db::set_password(&conn, &body.username, &body.password)
         .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
     forget_sessions(&state);
+    drop(conn);
     record(&state, &user, "user-password", body.username.trim());
     Ok(Json(json!({ "ok": true })))
 }
@@ -1393,6 +1399,7 @@ async fn set_user_admin(
     db::set_user_admin(&conn, &body.username, body.admin)
         .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
     forget_sessions(&state);
+    drop(conn);
     record(
         &state,
         &user,
@@ -1425,6 +1432,7 @@ async fn remove_managed_user(
     db::delete_user(&conn, &body.username)
         .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
     forget_sessions(&state);
+    drop(conn);
     record(&state, &user, "user-remove", body.username.trim());
     Ok(Json(json!({ "ok": true })))
 }
@@ -5447,7 +5455,7 @@ async fn close_terminal(
 }
 
 /// Browsers send cookies on cross-site WebSocket requests, so the Origin must match.
-fn same_origin(headers: &HeaderMap) -> bool {
+pub(crate) fn same_origin(headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get(header::ORIGIN).and_then(|value| value.to_str().ok()) else {
         return true;
     };
@@ -7357,9 +7365,16 @@ async fn search(
     Query(query): Query<SearchQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
+    let hits = search_hits(&state, rel_of(&query.path), query.q.unwrap_or_default()).await?;
+    let mut payload = json!({ "hits": hits });
+    decorate_folder_appearance(&state, &mut payload["hits"])?;
+    decorate_protection(&state, &mut payload["hits"])?;
+    Ok(Json(payload))
+}
+
+/// What a search finds under the folder `rel`: names, words inside files, and tags.
+pub(crate) async fn search_hits(state: &std::sync::Arc<AppState>, rel: String, raw: String) -> Result<Vec<files::SearchHit>, ApiError> {
     let root = state.root.clone();
-    let rel = rel_of(&query.path);
-    let raw = query.q.unwrap_or_default();
     let trimmed = raw.trim();
     let (tag_only, exact_tag, needle) = if let Some(rest) = trimmed
         .strip_prefix("tag:")
@@ -7492,10 +7507,7 @@ async fn search(
         hits.extend(extras);
     }
 
-    let mut payload = json!({ "hits": hits });
-    decorate_folder_appearance(&state, &mut payload["hits"])?;
-    decorate_protection(&state, &mut payload["hits"])?;
-    Ok(Json(payload))
+    Ok(hits)
 }
 
 async fn folder_usage(
@@ -8143,6 +8155,86 @@ async fn send_temp_zip(tmp: PathBuf, name: &str) -> Result<Response, ApiError> {
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .body(body)
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not send the zip"))
+}
+
+/// The keys that let AI agents use `/mcp`. Only an administrator can see or make them.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentKeyBody {
+    name: String,
+    #[serde(default = "read_level")]
+    level: String,
+    folders: Vec<String>,
+    expires_at: Option<i64>,
+}
+
+fn read_level() -> String {
+    "read".to_string()
+}
+
+#[derive(Deserialize)]
+struct AgentKeyId {
+    id: i64,
+}
+
+#[derive(Deserialize)]
+struct AgentKeyLogQuery {
+    id: Option<i64>,
+    limit: Option<i64>,
+}
+
+async fn list_agent_keys(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let keys = crate::agent_keys::list(&conn).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(Json(json!({ "keys": keys })))
+}
+
+/// Makes a key. The answer is the only time its secret is shown.
+async fn create_agent_key(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AgentKeyBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let mut conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let (id, token) = crate::agent_keys::create(&mut conn, &state.root, user.id, &body.name, &body.level, &body.folders, body.expires_at, chrono::Utc::now().timestamp())
+        .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    drop(conn);
+    record(&state, &user, "agent-key-create", body.name.trim());
+    Ok(Json(json!({ "id": id, "token": token })))
+}
+
+async fn revoke_agent_key(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AgentKeyId>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let revoked = crate::agent_keys::revoke(&conn, body.id, chrono::Utc::now().timestamp()).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    drop(conn);
+    if revoked {
+        record(&state, &user, "agent-key-revoke", &body.id.to_string());
+    }
+    Ok(Json(json!({ "ok": true, "revoked": revoked })))
+}
+
+async fn agent_key_log(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AgentKeyLogQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let entries = crate::agent_keys::read_log(&conn, query.id, query.limit.unwrap_or(200)).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(Json(json!({ "entries": entries })))
 }
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+mod agent_keys;
 mod agents;
 mod archives;
 mod audio_info;
@@ -30,6 +31,7 @@ mod smart;
 mod ml;
 mod http;
 mod mail;
+mod mcp;
 mod music;
 mod nas_backup;
 mod map_tiles;

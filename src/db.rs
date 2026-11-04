@@ -502,6 +502,34 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             color TEXT NOT NULL DEFAULT '',
             icon TEXT NOT NULL DEFAULT 'folder'
         );
+        CREATE TABLE IF NOT EXISTS agent_keys (
+            id INTEGER PRIMARY KEY,
+            token_hash TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            level TEXT NOT NULL DEFAULT 'read',
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER,
+            revoked_at INTEGER,
+            last_used_at INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS agent_key_folders (
+            key_id INTEGER NOT NULL REFERENCES agent_keys(id) ON DELETE CASCADE,
+            path TEXT NOT NULL,
+            PRIMARY KEY (key_id, path)
+        );
+        CREATE INDEX IF NOT EXISTS agent_key_folders_path ON agent_key_folders(path);
+        CREATE TABLE IF NOT EXISTS agent_key_log (
+            id INTEGER PRIMARY KEY,
+            key_id INTEGER NOT NULL,
+            key_name TEXT NOT NULL,
+            at INTEGER NOT NULL,
+            tool TEXT NOT NULL,
+            path TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            outcome TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS agent_key_log_key ON agent_key_log(key_id, id);
         CREATE TABLE IF NOT EXISTS protected_paths (
             path TEXT PRIMARY KEY,
             contents INTEGER NOT NULL DEFAULT 0,
@@ -1365,6 +1393,11 @@ pub fn rewrite_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), 
         params![from, to],
     ).map_err(|_| "Could not move folder appearance".to_string())?;
     conn.execute(
+        "UPDATE agent_key_folders SET path = CASE WHEN path = ?1 THEN ?2 ELSE ?2 || substr(path, length(?1) + 1) END
+         WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![from, to],
+    ).map_err(|_| "Could not move an agent key's folder".to_string())?;
+    conn.execute(
         "UPDATE protected_paths SET path = CASE WHEN path = ?1 THEN ?2 ELSE ?2 || substr(path, length(?1) + 1) END
          WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
         params![from, to],
@@ -1703,6 +1736,10 @@ pub fn delete_path_meta(conn: &Connection, path: &str) -> Result<(), String> {
         "DELETE FROM folder_appearance WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
         params![path],
     ).map_err(|_| "Could not remove folder appearance".to_string())?;
+    conn.execute(
+        "DELETE FROM agent_key_folders WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![path],
+    ).map_err(|_| "Could not remove an agent key's folder".to_string())?;
     conn.execute(
         "DELETE FROM protected_paths WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
         params![path],

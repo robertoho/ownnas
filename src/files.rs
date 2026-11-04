@@ -934,7 +934,7 @@ fn write_archive_mark(archive: &Path) -> Result<(), FileError> {
     .map_err(map_io)
 }
 
-fn is_trash_folder(path: &Path) -> bool {
+pub(crate) fn is_trash_folder(path: &Path) -> bool {
     if !path.is_dir() {
         return false;
     }
@@ -1442,7 +1442,7 @@ pub fn entry_stats(root: &Path, rel: &str) -> Result<(u64, i64), FileError> {
     Ok((meta.len(), modified_secs(&meta)))
 }
 
-fn entry_hidden(path: &Path, name: &str) -> bool {
+pub(crate) fn entry_hidden(path: &Path, name: &str) -> bool {
     if name.starts_with('.') {
         return true;
     }

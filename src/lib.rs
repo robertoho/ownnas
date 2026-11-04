@@ -4,6 +4,7 @@
 //! modules for tests and provides the Android JNI entry points when compiled
 //! for Android.
 
+pub mod agent_keys;
 pub mod agents;
 pub mod archives;
 pub mod audio_info;
@@ -36,6 +37,7 @@ pub mod smart;
 pub mod ml;
 pub mod http;
 pub mod mail;
+pub mod mcp;
 pub mod music;
 pub mod nas_backup;
 pub mod map_tiles;
