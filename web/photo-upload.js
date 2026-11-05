@@ -74,7 +74,7 @@ export class Sha256 {
 
 const CHUNK = 4 * 1024 * 1024;
 const AT_ONCE = 3;
-const MEDIA = /\.(jpe?g|png|gif|webp|avif|heic|heif|jxl|bmp|tiff?|dng|cr2|cr3|nef|arw|raf|orf|rw2|pef|srw|mp4|m4v|mov|webm|mkv|avi|3gp|mts|m2ts|mpe?g)$/i;
+export const MEDIA = /\.(jpe?g|png|gif|webp|avif|heic|heif|jxl|bmp|tiff?|dng|cr2|cr3|nef|arw|raf|orf|rw2|pef|srw|mp4|m4v|mov|webm|mkv|avi|3gp|mts|m2ts|mpe?g)$/i;
 
 export async function hashFile(file, stopped = () => false) {
   const hash = new Sha256();

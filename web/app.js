@@ -479,10 +479,10 @@ const FILE_ICONS = {
   "word": "<path d=\"M8 3h11l7 7v17a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z\" fill=\"#2f6fde\"/><path d=\"M6 26.5v.5a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-.5z\" fill=\"#000000\" fill-opacity=\"0.16\"/><path d=\"M19 8.5V10h7v-.2l-1.3-1.3z\" fill=\"#000000\" fill-opacity=\"0.14\"/><path d=\"M19 3l7 7h-5a2 2 0 0 1-2-2z\" fill=\"#ffffff\" fill-opacity=\"0.55\"/><path d=\"M10.500 15.500l2.600 9 2.900-7.500 2.900 7.500 2.600-9\" fill=\"none\" stroke=\"#ffffff\" stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"2\"/>",
 };
 const FILE_ICON_EXTENSIONS = {
-  "word": "doc docx docm dot dotx odt ott rtf pages",
-  "spreadsheet": "xls xlsx xlsm xlsb ods numbers",
+  "word": "doc docx docm dot dotx dotm odt ott rtf pages",
+  "spreadsheet": "xls xlsx xlsm xltx xltm xlam xlsb ods ots numbers",
   "csv": "csv tsv",
-  "presentation": "ppt pptx pptm odp keynote",
+  "presentation": "ppt pptx pptm potx potm ppsx odp otp key keynote",
   "markdown": "md markdown mdx",
   "text": "txt nfo",
   "html": "html htm xhtml",
@@ -491,7 +491,7 @@ const FILE_ICON_EXTENSIONS = {
   "json": "json jsonl",
   "config": "yaml yml toml ini conf cfg env properties xml plist",
   "script": "sh bash zsh fish ps1 bat cmd",
-  "code": "py rs go java c h cpp hpp cs rb php lua vue svelte swift kt dart",
+  "code": "py rs go java c h cpp hpp cs rb php lua vue svelte swift kt kts dart scala r pl hs ex exs zig nim jl diff patch",
   "database": "db db3 sqlite sqlite3 mdb sql",
   "font": "ttf otf woff woff2",
   "ebook": "epub mobi azw azw3 cbz cbr cb7",
@@ -854,6 +854,13 @@ async function load(path, options = {}) {
   syncBookmarkBtn();
   $("empty-trash-btn").hidden = !(state.me && !state.me.readonly && inTrashPath(state.path));
   scheduleFolderSizes();
+  // An item to show selected once its folder is in (from the search's "open the folder").
+  const reveal = state.reveal;
+  state.reveal = "";
+  if (reveal && parentPath(reveal) === state.path && findEntry(reveal)) {
+    selectOnly(reveal);
+    scrollSelectedIntoView(reveal);
+  }
 }
 
 /// While a folder loads: a spinner over the files, and the folder being left dimmed.
@@ -1560,6 +1567,14 @@ function setSettingsTab(tab) {
   const indexingTab = tab === "indexing";
   const healthTab = tab === "health";
   const backupTab = tab === "backup";
+  const agentsTab = tab === "agents";
+  $("settings-tab-agents").setAttribute("aria-selected", agentsTab ? "true" : "false");
+  $("settings-agents").hidden = !agentsTab;
+  if (agentsTab) {
+    agentKeysModule()
+      .then((module) => module.renderSettings($("settings-agents")))
+      .catch((err) => toast(err.message, true));
+  }
   $("settings-tab-backup").setAttribute("aria-selected", backupTab ? "true" : "false");
   $("settings-backup").hidden = !backupTab;
   if (backupTab) {
@@ -1982,6 +1997,7 @@ $("gallery-index-link").addEventListener("click", () => setSettingsTab("indexing
 $("settings-tab-indexing").addEventListener("click", () => setSettingsTab("indexing"));
 $("settings-tab-health").addEventListener("click", () => setSettingsTab("health"));
 $("settings-tab-backup").addEventListener("click", () => setSettingsTab("backup"));
+$("settings-tab-agents").addEventListener("click", () => setSettingsTab("agents"));
 
 $("settings-tab-gallery").addEventListener("click", () => setSettingsTab("gallery"));
 $("settings-tab-storage").addEventListener("click", () => setSettingsTab("storage"));
@@ -2071,6 +2087,17 @@ async function music() {
     });
   }
   return musicModule;
+}
+
+let agentKeys = null;
+
+/// Loads Settings → AI agents on first use.
+async function agentKeysModule() {
+  if (!agentKeys) {
+    agentKeys = await import("/assets/agent-keys.js");
+    agentKeys.init({ api, toast, askConfirm, pickFolder });
+  }
+  return agentKeys;
 }
 
 let nasBackup = null;
@@ -2344,7 +2371,8 @@ function openSettings(tab) {
   $("settings-tab-terminal").hidden = !admin;
   $("settings-tab-gallery").hidden = !admin;
   $("settings-tab-backup").hidden = !admin;
-  if (!admin && (tab === "users" || tab === "terminal" || tab === "gallery" || tab === "backup")) tab = "theme";
+  $("settings-tab-agents").hidden = !admin;
+  if (!admin && (tab === "users" || tab === "terminal" || tab === "gallery" || tab === "agents" || tab === "backup")) tab = "theme";
   if (!tab) tab = "theme";
   setSettingsTab(tab);
   renderThemeGrid();
@@ -2582,6 +2610,14 @@ async function openEntry(entry) {
     mountViewer(body, entry, (module) => module.mountCue(body, entry), () => openMetaPreview(body, entry));
   } else if (/\.torrent$/i.test(entry.name)) {
     mountViewer(body, entry, (module) => module.mountTorrent(body, entry), () => openMetaPreview(body, entry));
+  } else if (/\.(diff|patch)$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountDiff(body, entry), () => openMetaPreview(body, entry));
+  } else if (/\.(pem|crt|cer|der)$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountCertificate(body, entry), () => openMetaPreview(body, entry));
+  } else if (/\.(rss|atom|opml)$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountFeed(body, entry), () => openMetaPreview(body, entry));
+  } else if (/\.har$/i.test(entry.name)) {
+    mountViewer(body, entry, (module) => module.mountHar(body, entry), () => openMetaPreview(body, entry));
   } else if (/\.plist$/i.test(entry.name)) {
     mountViewer(body, entry, (module) => module.mountPlist(body, entry), () => openMetaPreview(body, entry));
   } else if (/\.(url|webloc|desktop)$/i.test(entry.name)) {
@@ -2797,7 +2833,7 @@ async function showPhotoMotion(body, entry, photo) {
 }
 
 /// Documents, presentations, and spreadsheets the server reads for the preview.
-const DOCUMENT_VIEW = /\.(pptx|ppsx|odp|doc|ppt|pps|rtf|xls|xlsb|ods|pages|numbers|key|parquet|pq|arrow|feather|arrows|avro|jsonl|ndjson|mobi|azw|azw3|prc|fb2)$/i;
+const DOCUMENT_VIEW = /\.(docm|dotx|dotm|ott|ots|otp|xlsm|xltx|xltm|xlam|pptm|potx|potm|pptx|ppsx|odp|doc|ppt|pps|rtf|xls|xlsb|ods|pages|numbers|key|parquet|pq|arrow|feather|arrows|avro|jsonl|ndjson|mobi|azw|azw3|prc|fb2)$/i;
 
 /// Opens a preview from the viewers module (formats the browser does not show by itself).
 async function mountViewer(body, entry, mount, fallback = null) {
@@ -3118,6 +3154,10 @@ function renderMeta(body, entry, meta) {
   }
   if (meta.archive) {
     mountArchiveBrowser(body, meta.archive, !!meta.archiveTruncated, entry.path);
+    return;
+  }
+  if (meta.text?.binary && entry.size > 0) {
+    mountViewer(body, entry, (module) => module.mountBytes(body, entry));
     return;
   }
   body.innerHTML = `<p class="muted">${esc(meta.note || "No inline preview for this file. Download it to open it locally.")}</p>`;
@@ -4589,6 +4629,73 @@ function askUploadConflict(item, info) {
   });
 }
 
+/// The photos and videos among `files` that the library already has (same contents, anywhere
+/// outside the Trash), by their index, with where. Only files with the size of something in the
+/// library are read and hashed, so a batch of new photos costs one question to the server.
+async function findMediaCopies(files, progress, stopped) {
+  const module = await import("/assets/photo-upload.js");
+  const media = files.map((item, index) => ({ item, index })).filter(({ item }) => item.file.size > 0 && module.MEDIA.test(item.name));
+  const copies = new Map();
+  if (!media.length) return copies;
+  const sizes = [...new Set(media.map(({ item }) => item.file.size))];
+  const known = new Set();
+  for (let at = 0; at < sizes.length; at += 5000) {
+    const answer = await api("/api/upload/same-size", { method: "POST", json: { sizes: sizes.slice(at, at + 5000) } });
+    for (const size of answer.sizes || []) known.add(size);
+  }
+  const toHash = media.filter(({ item }) => known.has(item.file.size));
+  const hashed = [];
+  for (const [done, entry] of toHash.entries()) {
+    if (stopped()) return copies;
+    progress(done, toHash.length, entry.item.name);
+    const sha256 = await module.hashFile(entry.item.file, stopped);
+    if (sha256) hashed.push({ ...entry, sha256 });
+  }
+  for (let at = 0; at < hashed.length; at += 500) {
+    const part = hashed.slice(at, at + 500);
+    const answer = await api("/api/upload/duplicates", { method: "POST", json: { files: part.map(({ item, sha256 }) => ({ size: item.file.size, sha256 })) } });
+    part.forEach((entry, i) => {
+      const copy = answer.copies?.[i];
+      if (copy) copies.set(entry.index, copy);
+    });
+  }
+  return copies;
+}
+
+/// Asks what to do with photos and videos the library has already: "skip", "upload", or null to cancel.
+function askMediaCopies(files, copies) {
+  const count = copies.size;
+  const media = count === 1 ? "photo or video is" : "photos and videos are";
+  $("media-copies-copy").textContent = `${count} ${media} already on the server, with exactly the same contents.${files.length > count ? " The other files upload as usual." : ""}`;
+  const rows = [...copies].slice(0, 200).map(([index, path]) => {
+    const row = document.createElement("li");
+    const name = document.createElement("span");
+    name.className = "media-copies-name";
+    name.textContent = files[index].name;
+    const where = document.createElement("span");
+    where.className = "muted media-copies-where";
+    where.textContent = `already in ${parentPath(path) || (state.me && state.me.rootName) || "Library"}/${path.split("/").pop()}`;
+    row.append(name, where);
+    return row;
+  });
+  if (count > 200) {
+    const more = document.createElement("li");
+    more.className = "muted";
+    more.textContent = `and ${count - 200} more`;
+    rows.push(more);
+  }
+  $("media-copies-list").replaceChildren(...rows);
+  const dialog = $("media-copies-dialog");
+  dialog.showModal();
+  dialog.querySelector('button[value="skip"]').focus();
+  return new Promise((resolve) => {
+    dialog.addEventListener("close", () => {
+      const choice = dialog.returnValue;
+      resolve(choice === "skip" || choice === "upload" ? choice : null);
+    }, { once: true });
+  });
+}
+
 function choiceFits(choice, info) {
   if (!info.dir) return true;
   return choice === "keep" || choice === "ignore";
@@ -4657,16 +4764,45 @@ async function sendUploads(files, destination = state.path) {
     Object.assign(batch.files[index], { status }, details);
     saveUploadBatch(batch);
   };
-  const skip = (index, item) => {
+  const skip = (index, item, details = {}) => {
     skipped += 1;
     loadedBefore += item.file.size;
-    settle(index, "skipped");
+    settle(index, "skipped", details);
   };
+  // Photos and videos the library already has (anywhere), skipped when the person says so.
+  const copyOf = new Map();
   let cancelled = null;
   try {
+    if (!planError) {
+      let copies = new Map();
+      try {
+        copies = await findMediaCopies(files, (done, total, name) => upsertJob("transfer", {
+          title: "Looking for photos and videos already on the server…",
+          detail: name,
+          stats: `${done + 1} of ${total}`,
+          percent: (done / total) * 100,
+          cancelable: true,
+          onCancel: () => cancelActiveTransfer(),
+        }), () => uploadAbort);
+      } catch (err) {
+        // Not being able to look is no reason not to upload.
+        console.warn("Could not look for copies already on the server", err);
+      }
+      if (uploadAbort) throw cancelledError();
+      if (copies.size) {
+        hideStatus();
+        const answer = await askMediaCopies(files, copies);
+        if (!answer) throw cancelledError();
+        if (answer === "skip") for (const [index, path] of copies) copyOf.set(index, path);
+      }
+    }
     for (let index = 0; index < files.length; index += 1) {
       if (uploadAbort) throw cancelledError();
       const item = files[index];
+      if (copyOf.has(index)) {
+        skip(index, item, { copyOf: copyOf.get(index) });
+        continue;
+      }
       if (planError) {
         failures.push({ item, choice: item.choice || null, message: planError.message });
         settle(index, "failed", { error: planError.message });
@@ -4928,6 +5064,7 @@ function batchTally(batch) {
 function uploadRowNote(file) {
   if (file.check) return UPLOAD_CHECKS[file.check];
   if (file.status === "failed") return file.error || "Failed";
+  if (file.status === "skipped" && file.copyOf) return `Skipped: already on the server, in ${file.copyOf}`;
   if (file.status === "skipped") return "Skipped: the file already there was kept";
   if (file.status === "cancelled") return "Not sent: the upload was cancelled";
   if (file.status === "waiting") return "Did not finish: the page closed during the upload";
@@ -7726,14 +7863,15 @@ async function runDeepSearch() {
         const image = !hit.dir && (kind === "image" || kind === "video" || kind === "svg")
           ? `<img alt="" loading="lazy" src="${kind === "svg" ? "/api/raw" : "/api/thumb"}?path=${encodeURIComponent(hit.path)}">`
           : "";
-        return `<button class="search-hit" type="button" data-hit="${esc(hit.path)}" data-dir="${hit.dir ? "1" : "0"}" title="${esc(hit.path)}">
+        const where = folder || (state.me && state.me.rootName) || "Library";
+        return `<div class="search-hit-card"><button class="search-hit" type="button" data-hit="${esc(hit.path)}" data-dir="${hit.dir ? "1" : "0"}" title="${esc(hit.path)}">
           <span class="search-hit-thumb"><span class="glyph kind-${esc(kind)}" aria-hidden="true">${entryIcon({ ...hit, name, kind })}</span>${image}${model}</span>
           <span class="search-hit-details">
             <span class="search-hit-name">${esc(name)}</span>
-            <span class="search-hit-path">${esc(folder || (state.me && state.me.rootName) || "Library")}</span>
+            <span class="search-hit-path">${esc(where)}</span>
             ${extras.join("")}
           </span>
-        </button>`;
+        </button><button class="search-hit-folder" type="button" data-hit-folder="${esc(hit.path)}" title="Open the containing folder (${esc(where)})" aria-label="Open the folder containing ${esc(name)}"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="${ICON_FOLDER}" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg></button></div>`;
       }).join("")
       : `<span class="search-message muted">No matches under this folder</span>`;
     observeModelThumbnails(box);
@@ -7756,6 +7894,17 @@ async function runDeepSearch() {
 }
 
 $("search-results").addEventListener("click", (event) => {
+  // The folder a match is in, with the match selected there.
+  const folderButton = event.target.closest("[data-hit-folder]");
+  if (folderButton) {
+    const path = folderButton.dataset.hitFolder;
+    resetSearch();
+    renderFiles();
+    state.reveal = path;
+    // Reloaded even when it is the folder shown, so the selection is made once it is listed.
+    go(parentPath(path)).catch((err) => toast(err.message, true));
+    return;
+  }
   const button = event.target.closest("[data-hit]");
   if (!button) return;
   const hit = state.searchHits.find((hit) => hit.path === button.dataset.hit);

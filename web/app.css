@@ -2743,6 +2743,38 @@ td, th { border: 1px solid var(--line); padding: 0.3rem 0.45rem; text-align: lef
   background: var(--bg);
 }
 .search-hit:hover { background: var(--bg-3); }
+.media-copies-list {
+  list-style: none;
+  margin: 0.5rem 0;
+  padding: 0;
+  max-height: min(40vh, 20rem);
+  overflow: auto;
+  display: grid;
+  gap: 0.35rem;
+}
+.media-copies-list li { display: grid; gap: 0.1rem; min-width: 0; }
+.media-copies-name, .media-copies-where { overflow-wrap: anywhere; }
+.media-copies-where { font-size: 0.8rem; }
+.search-hit-card { position: relative; min-width: 0; display: flex; }
+.search-hit-card > .search-hit { flex: 1; }
+/* Opens the folder a match is in. Always shown, since touch screens have no hover. */
+.search-hit-folder {
+  position: absolute;
+  top: 0.4rem;
+  right: 0.4rem;
+  display: grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text);
+  opacity: 0.85;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.2);
+}
+.search-hit-folder:hover, .search-hit-folder:focus-visible { opacity: 1; background: var(--bg-3); }
 .search-hit-thumb {
   display: flex;
   align-items: center;
@@ -4434,6 +4466,55 @@ a.archive-entry-name:hover { text-decoration: underline; }
 .preview-body > .gcode-view { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 0.6rem; overflow: auto; }
 .gcode-canvas { flex: 1 0 auto; height: min(56vh, 30rem); min-height: 16rem; border-radius: 12px; overflow: hidden; border: 1px solid var(--line); }
 .gcode-toggle { display: flex; gap: 0.3rem; align-items: center; font-size: 0.85rem; white-space: nowrap; }
+
+/* Settings: AI agents */
+.agent-settings h3 { margin: 1.1rem 0 0.4rem; }
+.agent-settings h3:first-child { margin-top: 0.2rem; }
+.agent-settings code { overflow-wrap: anywhere; }
+.agent-form { gap: 0.8rem; margin-top: 0; }
+.agent-field { display: grid; gap: 0.3rem; max-width: 26rem; }
+.agent-scope { border: 0; margin: 0; padding: 0; display: grid; gap: 0.45rem; }
+.agent-scope legend { padding: 0; margin-bottom: 0.3rem; }
+.agent-scope-choice { display: flex; align-items: center; gap: 0.5rem; }
+.agent-scope-folders { display: grid; gap: 0.5rem; justify-items: start; margin-left: 1.5rem; }
+.agent-scope-folders[hidden], .agent-log[hidden] { display: none; }
+.agent-scope > .muted { margin: 0 0 0 1.5rem; }
+.agent-folders { display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center; }
+.agent-folders .muted { margin: 0; }
+.agent-chip { overflow-wrap: anywhere; }
+.agent-chip-whole { font-weight: 600; }
+.agent-chip-remove { min-height: 0; min-width: 0; padding: 0 0.25rem; margin-left: 0.25rem; border: 0; background: none; color: inherit; cursor: pointer; }
+.agent-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.agent-copy { min-height: 0; padding: 0.1rem 0.6rem; }
+.agent-key-inactive { opacity: 0.6; }
+.agent-key-name::before { background: #22c55e; }
+.agent-key-inactive .agent-key-name::before { background: var(--muted); }
+.agent-token { display: block; padding: 0.5rem 0.6rem; border: 1px solid var(--line); border-radius: 8px; user-select: all; }
+.agent-log-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.25rem; font-size: 0.85rem; max-height: 16rem; overflow: auto; }
+/* Patches, certificates, feeds, network recordings, raw bytes. */
+.diff-view, .hex-view, .har-view { min-width: 0; }
+.diff-file summary { cursor: pointer; padding: 0.3rem 0; overflow-wrap: anywhere; }
+.diff-lines, .hex-lines { margin: 0; padding: 0.5rem; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--bg-2); font: 0.76rem/1.45 ui-monospace, Menlo, Consolas, monospace; }
+.diff-lines > div { white-space: pre; min-width: max-content; }
+.diff-add { color: #2fa35a; }
+.diff-del { color: #e0574f; }
+.diff-lines .diff-add { background: color-mix(in srgb, #2fa35a 16%, transparent); color: inherit; }
+.diff-lines .diff-del { background: color-mix(in srgb, #e0574f 16%, transparent); color: inherit; }
+.diff-hunk { color: var(--accent); }
+.diff-meta { color: var(--muted); }
+.cert-row { display: grid; grid-template-columns: 7rem 1fr; gap: 0.5rem; padding: 0.15rem 0; overflow-wrap: anywhere; font-size: 0.86rem; }
+.cert-good { color: #2fa35a; }
+.cert-bad { color: #e0574f; font-weight: 650; }
+.feed-item { padding: 0.5rem 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.feed-item p { margin: 0.25rem 0 0; }
+.feed-outline { margin: 0.2rem 0; padding-left: 1.2rem; }
+.har-view { overflow: auto; }
+.har-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
+.har-table th, .har-table td { padding: 0.2rem 0.5rem; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
+.har-table .har-url { white-space: normal; overflow-wrap: anywhere; min-width: 12rem; }
+.har-bad { color: #e0574f; }
+.hex-lines { white-space: pre; }
+.xlsx-tab.has-color { border-bottom: 3px solid var(--tab-color); }
 
 /* Upload report and recent uploads */
 .jobs-item.problem .jobs-item-title { color: var(--danger); }

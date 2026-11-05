@@ -72,6 +72,7 @@ const TERMINAL_HTML: &str = include_str!("../web/terminal.html");
 const TERMINAL_JS: &str = include_str!("../web/terminal.js");
 const TERMINAL_PANEL_JS: &str = include_str!("../web/terminal-panel.js");
 const NAS_BACKUP_JS: &str = include_str!("../web/nas-backup.js");
+const AGENT_KEYS_JS: &str = include_str!("../web/agent-keys.js");
 const MUSIC_JS: &str = include_str!("../web/music.js");
 const TERMINAL_CSS: &str = include_str!("../web/terminal.css");
 const XTERM_JS: &str = include_str!("../web/vendor/xterm/xterm.mjs");
@@ -375,6 +376,8 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/rename", post(rename))
         .route("/api/upload", post(upload).layer(DefaultBodyLimit::disable()))
         .route("/api/upload/conflicts", post(upload_conflicts))
+        .route("/api/upload/same-size", post(upload_same_size))
+        .route("/api/upload/duplicates", post(upload_duplicates))
         .route("/api/upload/directories", post(upload_directories))
         .route("/api/entry", axum::routing::delete(delete_entry))
         .route("/api/restore", post(restore_item))
@@ -466,6 +469,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/assets/terminal.js", get(terminal_javascript))
         .route("/assets/terminal-panel.js", get(terminal_panel_javascript))
         .route("/assets/nas-backup.js", get(nas_backup_javascript))
+        .route("/assets/agent-keys.js", get(agent_keys_javascript))
         .route("/assets/music.js", get(music_javascript))
         .route("/assets/terminal.css", get(terminal_css))
         .route("/assets/vendor/xterm/xterm.mjs", get(xterm_module))
@@ -1069,6 +1073,10 @@ async fn sheet_chart_javascript() -> impl IntoResponse {
 
 async fn music_javascript() -> impl IntoResponse {
     app_module_javascript(MUSIC_JS)
+}
+
+async fn agent_keys_javascript() -> impl IntoResponse {
+    app_module_javascript(AGENT_KEYS_JS)
 }
 
 async fn nas_backup_javascript() -> impl IntoResponse {
@@ -2549,6 +2557,46 @@ fn find_resized_copy(state: &AppState, sha256: &str) -> Option<String> {
     })
 }
 
+/// Every file in the library (outside the Trash) with exactly these contents. Only files of the
+/// same size are compared, each read once and its hash kept, so the whole library is never read.
+fn library_copies(state: &AppState, size: u64, sha256: &str) -> Vec<String> {
+    if size == 0 {
+        return Vec::new();
+    }
+    // Files known to have had this hash (kept with them when moved through OwnNAS), then every
+    // file of this size the indexes know.
+    let candidates = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        let mut paths: Vec<String> = db::paths_with_hash(&conn, sha256).into_iter().map(|(path, _, _)| path).collect();
+        for path in db::paths_of_size(&conn, size) {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+        paths
+    };
+    candidates
+        .into_iter()
+        .filter(|path| {
+            if files::is_under_trash(path) {
+                return false;
+            }
+            let Ok(found) = files::resolve(&state.root, path) else { return false };
+            let Ok(meta) = std::fs::metadata(&found.full) else { return false };
+            meta.is_file() && meta.len() == size && file_sha256(state, path, &found.full, &meta).is_some_and(|hash| hash.eq_ignore_ascii_case(sha256))
+        })
+        .collect()
+}
+
+/// Where the server already has a phone's photo: in its month folder, anywhere else in the
+/// library (moved there to be organised), or as a smaller copy made from it.
+fn find_existing(state: &AppState, target: &str, size: Option<u64>, sha256: Option<&str>) -> Option<String> {
+    find_backup_copy(state, target, size, sha256).or_else(|| {
+        let sha256 = sha256?;
+        size.and_then(|size| library_copies(state, size, sha256).into_iter().next()).or_else(|| find_resized_copy(state, sha256))
+    })
+}
+
 fn backup_blocked(state: &AppState, sha256: &str) -> bool {
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     db::is_backup_blocked(&conn, sha256)
@@ -2704,10 +2752,7 @@ async fn backup_has(
     if query.sha256.as_deref().is_some_and(|hash| backup_blocked(&state, hash)) {
         return Ok(Json(json!({ "path": null, "blocked": true })));
     }
-    let found = tokio::task::spawn_blocking(move || {
-        find_backup_copy(&state, &target, query.size, query.sha256.as_deref())
-            .or_else(|| query.sha256.as_deref().and_then(|hash| find_resized_copy(&state, hash)))
-    })
+    let found = tokio::task::spawn_blocking(move || find_existing(&state, &target, query.size, query.sha256.as_deref()))
     .await
     .unwrap_or(None);
     Ok(Json(json!({ "path": found })))
@@ -2743,10 +2788,7 @@ async fn backup_upload(
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "The photo's hash is not valid"));
     }
     let probe = (state.clone(), rel.clone(), query.size, sha256.clone());
-    let already = tokio::task::spawn_blocking(move || {
-        find_backup_copy(&probe.0, &probe.1, probe.2, probe.3.as_deref())
-            .or_else(|| probe.3.as_deref().and_then(|hash| find_resized_copy(&probe.0, hash)))
-    })
+    let already = tokio::task::spawn_blocking(move || find_existing(&probe.0, &probe.1, probe.2, probe.3.as_deref()))
     .await
     .unwrap_or(None);
     if let Some(path) = already {
@@ -2795,6 +2837,15 @@ async fn backup_upload(
     if complete && !damaged && matches!(&written, Some((_, got)) if backup_blocked(&state, got)) {
         let _ = tokio::fs::remove_file(&partial).await;
         return Ok(Json(json!({ "path": "", "skipped": true, "blocked": true })));
+    }
+    // Nor is a photo the library has somewhere else stored twice.
+    if let (true, false, None, Some((size, got))) = (complete, damaged, &sha256, &written) {
+        let (worker, size, got) = (state.clone(), *size, got.clone());
+        let elsewhere = tokio::task::spawn_blocking(move || library_copies(&worker, size, &got).into_iter().next()).await.unwrap_or(None);
+        if let Some(path) = elsewhere {
+            let _ = tokio::fs::remove_file(&partial).await;
+            return Ok(Json(json!({ "path": path, "skipped": true })));
+        }
     }
     if !complete || damaged || tokio::fs::rename(&partial, &dest).await.is_err() {
         let _ = tokio::fs::remove_file(&partial).await;
@@ -4134,23 +4185,17 @@ async fn gallery_upload_check(
     let answer = tokio::task::spawn_blocking(move || {
         let state = worker;
         let sha256 = body.sha256.to_ascii_lowercase();
-        let (candidates, folders) = {
+        let folders = {
             let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-            let folders = body.workspace.and_then(|id| crate::workspaces::folders(&conn, id).ok()).unwrap_or_default();
-            (if body.size == 0 { Vec::new() } else { db::paths_of_size(&conn, body.size) }, folders)
+            body.workspace.and_then(|id| crate::workspaces::folders(&conn, id).ok()).unwrap_or_default()
         };
         let mut copies: Vec<String> = Vec::new();
         if let Some(folder) = body.folder.as_deref().map(|folder| folder.trim_matches('/')).filter(|folder| !folder.is_empty()) {
             let target = format!("{folder}/{}", safe_name(&body.name, "photo.jpg"));
             copies.extend(find_backup_copy(&state, &target, Some(body.size), Some(&sha256)));
         }
-        for path in candidates {
-            if files::is_under_trash(&path) || copies.contains(&path) {
-                continue;
-            }
-            let Ok(found) = files::resolve(&state.root, &path) else { continue };
-            let Ok(meta) = std::fs::metadata(&found.full) else { continue };
-            if meta.is_file() && meta.len() == body.size && file_sha256(&state, &path, &found.full, &meta).as_deref() == Some(sha256.as_str()) {
+        for path in library_copies(&state, body.size, &sha256) {
+            if !copies.contains(&path) {
                 copies.push(path);
             }
         }
@@ -4169,6 +4214,67 @@ async fn gallery_upload_check(
     .await
     .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not check the photo"))?;
     Ok(Json(answer))
+}
+
+#[derive(Deserialize)]
+struct SizesBody {
+    sizes: Vec<u64>,
+}
+
+/// Which of these sizes some file in the library (outside the Trash) has: only files of those
+/// sizes can be copies, so only they need hashing before an upload.
+async fn upload_same_size(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<SizesBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    require_user(&state, &headers)?;
+    if body.sizes.len() > files::MAX_LIST {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Too many files at once"));
+    }
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let mut found: Vec<u64> = body
+        .sizes
+        .into_iter()
+        .filter(|size| *size > 0 && db::paths_of_size(&conn, *size).iter().any(|path| !files::is_under_trash(path)))
+        .collect();
+    found.sort_unstable();
+    found.dedup();
+    Ok(Json(json!({ "sizes": found })))
+}
+
+#[derive(Deserialize)]
+struct DuplicatesBody {
+    files: Vec<DuplicateQuestion>,
+}
+
+#[derive(Deserialize)]
+struct DuplicateQuestion {
+    size: u64,
+    sha256: String,
+}
+
+/// For each file about to be uploaded, a file in the library with exactly its contents, if any.
+async fn upload_duplicates(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<DuplicatesBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    require_user(&state, &headers)?;
+    if body.files.len() > files::MAX_LIST {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Too many files at once"));
+    }
+    if body.files.iter().any(|file| file.sha256.len() != 64 || !file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "That is not a SHA-256"));
+    }
+    let copies = tokio::task::spawn_blocking(move || {
+        body.files.iter().map(|file| library_copies(&state, file.size, &file.sha256.to_ascii_lowercase()).into_iter().next()).collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not check the files"))?;
+    Ok(Json(json!({ "copies": copies })))
 }
 
 /// How many moving thumbnails are made at once, however many tiles are asked for.
@@ -8646,6 +8752,57 @@ mod tests {
 
         let left: Vec<String> = std::fs::read_dir(&root).unwrap().flatten().map(|item| item.file_name().to_string_lossy().into_owned()).filter(|name| name.starts_with(".ownnas-part-")).collect();
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[tokio::test]
+    async fn a_backed_up_photo_moved_elsewhere_is_not_sent_again() {
+        use sha2::Digest;
+        let (app, root) = app().await;
+        let login = Request::builder().method("POST").uri("/api/login").header("content-type", "application/json").header("x-ownnas", "1")
+            .body(Body::from(r#"{"username":"ada","password":"longenough"}"#)).unwrap();
+        let response = app.clone().oneshot(login).await.unwrap();
+        let cookie = response.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap().split(';').next().unwrap().to_string();
+        let send = |method: &str, uri: &str, body: Body, json_body: bool| {
+            let mut request = Request::builder().method(method).uri(uri).header("cookie", &cookie).header("x-ownnas", "1");
+            if json_body {
+                request = request.header("content-type", "application/json");
+            }
+            request.body(body).unwrap()
+        };
+        let answer = |response: Response| async move {
+            assert_eq!(response.status(), StatusCode::OK);
+            serde_json::from_slice::<serde_json::Value>(&body_bytes(response).await).unwrap()
+        };
+        answer(app.clone().oneshot(send("POST", "/api/backup", Body::from(r#"{"folder":"Phone"}"#), true)).await.unwrap()).await;
+        let photo = b"\xff\xd8 a photo from the phone".to_vec();
+        let sha = hex::encode(sha2::Sha256::digest(&photo));
+        let query = |name: &str, hash: bool| {
+            let hash = if hash { format!("&sha256={sha}") } else { String::new() };
+            format!("device=Pixel&name={name}&mtime=1700000000000&size={}{hash}", photo.len())
+        };
+
+        let sent = answer(app.clone().oneshot(send("POST", &format!("/api/backup/upload?{}", query("IMG_1.jpg", true)), Body::from(photo.clone()), false)).await.unwrap()).await;
+        assert_eq!(sent["skipped"], false);
+        let month = sent["path"].as_str().unwrap().rsplit_once('/').unwrap().0.to_string();
+
+        // Organised into a folder of its own.
+        files::make_dir(&root, "", "Trips").unwrap();
+        answer(app.clone().oneshot(send("POST", "/api/move", Body::from(json!({"path": sent["path"], "dest": "Trips"}).to_string()), true)).await.unwrap()).await;
+        let has = answer(app.clone().oneshot(send("GET", &format!("/api/backup/has?{}", query("IMG_1.jpg", true)), Body::empty(), false)).await.unwrap()).await;
+        assert_eq!(has["path"], "Trips/IMG_1.jpg");
+
+        // Sent anyway (a phone that doesn't ask first, or one without the hash under another name): not kept twice.
+        let again = answer(app.clone().oneshot(send("POST", &format!("/api/backup/upload?{}", query("IMG_1.jpg", true)), Body::from(photo.clone()), false)).await.unwrap()).await;
+        assert_eq!((again["skipped"].as_bool(), again["path"].as_str()), (Some(true), Some("Trips/IMG_1.jpg")));
+        let older = answer(app.clone().oneshot(send("POST", &format!("/api/backup/upload?{}", query("renamed.jpg", false)), Body::from(photo.clone()), false)).await.unwrap()).await;
+        assert_eq!((older["skipped"].as_bool(), older["path"].as_str()), (Some(true), Some("Trips/IMG_1.jpg")));
+        let left: Vec<_> = std::fs::read_dir(root.join(&month)).unwrap().flatten().map(|entry| entry.file_name()).collect();
+        assert!(left.is_empty(), "{left:?}");
+
+        // In the Trash it no longer counts.
+        answer(app.clone().oneshot(send("DELETE", "/api/entry?path=Trips%2FIMG_1.jpg", Body::empty(), false)).await.unwrap()).await;
+        let has = answer(app.clone().oneshot(send("GET", &format!("/api/backup/has?{}", query("IMG_1.jpg", true)), Body::empty(), false)).await.unwrap()).await;
+        assert_eq!(has["path"], serde_json::Value::Null);
     }
 
     #[tokio::test]

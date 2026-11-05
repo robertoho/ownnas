@@ -341,6 +341,7 @@
       <button id="settings-tab-terminal" type="button" role="tab" aria-selected="false" data-settings-tab="terminal" hidden>Terminal</button>
       <button id="settings-tab-gallery" type="button" role="tab" aria-selected="false" data-settings-tab="gallery" hidden>Gallery</button>
       <button id="settings-tab-backup" type="button" role="tab" aria-selected="false" data-settings-tab="backup" hidden>Backup</button>
+      <button id="settings-tab-agents" type="button" role="tab" aria-selected="false" data-settings-tab="agents" hidden>AI agents</button>
       <button id="settings-tab-storage" type="button" role="tab" aria-selected="false" data-settings-tab="storage">Storage</button>
       <button id="settings-tab-indexing" type="button" role="tab" aria-selected="false" data-settings-tab="indexing">Indexing</button>
       <button id="settings-tab-health" type="button" role="tab" aria-selected="false" data-settings-tab="health">Health</button>
@@ -409,6 +410,7 @@
       <p id="storage-measured" class="muted"></p>
       <button id="storage-measure" type="button">Measure again</button>
     </section>
+    <section id="settings-agents" class="settings-panel agent-settings" role="tabpanel" aria-labelledby="settings-tab-agents" hidden></section>
     <section id="settings-health" class="settings-panel health-settings" role="tabpanel" aria-labelledby="settings-tab-health" hidden>
       <h3>Disks</h3>
       <div id="health-volumes" class="health-list"></div>
@@ -623,6 +625,19 @@
         <button value="archive-older" type="submit">Archive older</button>
         <button value="archive-existing" type="submit">Archive existing</button>
         <button value="ignore" type="submit">Ignore</button>
+        <button value="cancel" type="submit">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="media-copies-dialog">
+    <form method="dialog">
+      <h3>Already on the server</h3>
+      <p id="media-copies-copy"></p>
+      <ul id="media-copies-list" class="media-copies-list"></ul>
+      <div class="dialog-actions">
+        <button value="skip" type="submit">Skip these</button>
+        <button value="upload" type="submit">Upload anyway</button>
         <button value="cancel" type="submit">Cancel</button>
       </div>
     </form>
