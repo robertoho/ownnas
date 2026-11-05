@@ -3285,6 +3285,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ownnascli"
+version = "0.9.1"
+dependencies = [
+ "clap",
+ "ownnas-core",
+ "rpassword",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "page_size"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

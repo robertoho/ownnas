@@ -124,6 +124,8 @@ impl Api {
             .tls_config(tls.clone())
             .timeout_connect(Duration::from_secs(15))
             .timeout_read(Duration::from_secs(120))
+            // Enough for transfers running side by side to reuse their connections.
+            .max_idle_connections_per_host(64)
             .build();
         Ok(Self {
             agent,
@@ -202,6 +204,32 @@ impl Api {
             _ => return Err(ApiError::Other("The server did not send a file version".into())),
         };
         Ok((response.into_reader(), stamp))
+    }
+
+    /// Streams a file from byte `from` on. Returns the reader, the server's stamp for the whole
+    /// file, and where the bytes really start: 0 from a server that sends the file from the top.
+    pub fn download_from(&self, path: &str, from: u64) -> Result<(Box<dyn Read + Send + Sync>, Stamp, u64), ApiError> {
+        let mut request = self.request("GET", "/api/sync/file").query("path", path);
+        if from > 0 {
+            request = request.set("Range", &format!("bytes={from}-"));
+        }
+        let response = request.fetch()?;
+        let header = |name: &str| response.header(name).and_then(|value| value.parse::<i64>().ok());
+        let stamp = match (header("x-ownnas-size"), header("x-ownnas-mtime")) {
+            (Some(size), Some(mtime)) => Stamp { size: size as u64, mtime },
+            _ => return Err(ApiError::Other("The server did not send a file version".into())),
+        };
+        let start = if response.status() == 206 {
+            response
+                .header("content-range")
+                .and_then(|range| range.strip_prefix("bytes "))
+                .and_then(|range| range.split('-').next())
+                .and_then(|start| start.parse().ok())
+                .ok_or_else(|| ApiError::Other("The server sent a part of the file without saying which".into()))?
+        } else {
+            0
+        };
+        Ok((response.into_reader(), stamp, start))
     }
 
     /// Uploads a file if the server still has `base` (`None` = nothing) at `path`.

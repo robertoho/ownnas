@@ -5049,7 +5049,7 @@ async fn sync_download(
     if resolved.full.is_dir() {
         return Err(FileError::IsADirectory.into());
     }
-    let file = tokio::fs::File::open(&resolved.full)
+    let mut file = tokio::fs::File::open(&resolved.full)
         .await
         .map_err(|_| ApiError::from(FileError::NotFound))?;
     // Stamp from the open handle so the version matches the bytes being sent.
@@ -5063,14 +5063,34 @@ async fn sync_download(
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0);
-    let len = meta.len();
-    Response::builder()
-        .status(StatusCode::OK)
+    let total = meta.len();
+    // A part of the file, for a download going on from where it was cut off. The stamp is the
+    // whole file's, so the client can tell if the file changed in between.
+    let range = headers.get(header::RANGE).and_then(|value| value.to_str().ok());
+    let (status, start, len) = match range_request(range, total) {
+        RangeReq::Full => (StatusCode::OK, 0, total),
+        RangeReq::Partial(span) => (StatusCode::PARTIAL_CONTENT, span.start, span.len),
+        RangeReq::Unsatisfiable => {
+            return Ok((StatusCode::RANGE_NOT_SATISFIABLE, [(header::CONTENT_RANGE, format!("bytes */{total}"))]).into_response());
+        }
+    };
+    if start > 0 {
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the file"))?;
+    }
+    let mut response = Response::builder()
+        .status(status)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::CONTENT_LENGTH, len)
-        .header("x-ownnas-size", len)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header("x-ownnas-size", total)
         .header("x-ownnas-mtime", mtime)
-        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::CACHE_CONTROL, "no-store");
+    if status == StatusCode::PARTIAL_CONTENT {
+        response = response.header(header::CONTENT_RANGE, format!("bytes {start}-{}/{total}", start + len.saturating_sub(1)));
+    }
+    response
         .body(Body::from_stream(ReaderStream::new(file.take(len))))
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not send the file"))
 }
