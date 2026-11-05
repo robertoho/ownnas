@@ -20,6 +20,7 @@
 		B388B4C872C6C308DA22661A /* ItemIds.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A6FA63E8D7911CEE6FE1140 /* ItemIds.swift */; };
 		BF45262C6F8469F6846E63B3 /* ownnas_ffi.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04AA69F933C6090E0AE462DC /* ownnas_ffi.swift */; };
 		C0A888123E890A9EE5EF8FCA /* ServerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F571EC2CEC1266E622DBDA6B /* ServerStore.swift */; };
+		D916547837499449BDD6549F /* KeepActions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71CFD84F82198DA7B1E6AD07 /* KeepActions.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -51,6 +52,7 @@
 		0F80043E30B73B1A00B12A8D /* OwnNAS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = OwnNAS.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		325060305FF2FCA1E785F8DA /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		4A6FA63E8D7911CEE6FE1140 /* ItemIds.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ItemIds.swift; sourceTree = "<group>"; };
+		71CFD84F82198DA7B1E6AD07 /* KeepActions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeepActions.swift; sourceTree = "<group>"; };
 		84F4DCE50B99BA2D5ADC98A9 /* FileProviderExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileProviderExtension.swift; sourceTree = "<group>"; };
 		8610BB03CF3B539129516725 /* SignInView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignInView.swift; sourceTree = "<group>"; };
 		928AE3C0126BC1ABA1DEC5F2 /* OwnNASCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = OwnNASCore.xcframework; path = Generated/OwnNASCore.xcframework; sourceTree = "<group>"; };
@@ -87,6 +89,7 @@
 			children = (
 				84F4DCE50B99BA2D5ADC98A9 /* FileProviderExtension.swift */,
 				4A6FA63E8D7911CEE6FE1140 /* ItemIds.swift */,
+				71CFD84F82198DA7B1E6AD07 /* KeepActions.swift */,
 			);
 			path = OwnNASFiles;
 			sourceTree = "<group>";
@@ -309,6 +312,7 @@
 			files = (
 				5326BE77B2E0517444C8505B /* FileProviderExtension.swift in Sources */,
 				B388B4C872C6C308DA22661A /* ItemIds.swift in Sources */,
+				D916547837499449BDD6549F /* KeepActions.swift in Sources */,
 				90CE6B143A81BC022C302486 /* ServerStore.swift in Sources */,
 				5070C8488EC0955B5B70CBCD /* ownnas_ffi.swift in Sources */,
 			);

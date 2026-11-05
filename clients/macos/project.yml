@@ -106,6 +106,13 @@ targets:
           NSExtensionPointIdentifier: com.apple.fileprovider-nonui
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).FileProviderExtension
           NSExtensionFileProviderSupportsEnumeration: true
+          NSExtensionFileProviderActions:
+            - NSExtensionFileProviderActionIdentifier: app.ownnas.keep-downloaded
+              NSExtensionFileProviderActionName: Keep Downloaded
+              NSExtensionFileProviderActionActivationRule: "SUBQUERY(fileproviderItems, $item, $item.userInfo.keptDownloaded != YES).@count > 0"
+            - NSExtensionFileProviderActionIdentifier: app.ownnas.keep-online-only
+              NSExtensionFileProviderActionName: Keep Online Only
+              NSExtensionFileProviderActionActivationRule: "fileproviderItems.@count > 0"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.ownnas.mac.files

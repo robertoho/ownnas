@@ -12,6 +12,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
     private let lock = NSLock()
     private var connection: Server?
     private var account: Account?
+    private var policyChanges: Set<String> = []
 
     required init(domain: NSFileProviderDomain) {
         self.domain = domain
@@ -51,6 +52,20 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension, 
         account = fetched
         lock.unlock()
         return !fetched.readonly
+    }
+
+    func addPolicyChanges(_ paths: [String]) {
+        lock.lock()
+        defer { lock.unlock() }
+        policyChanges.formUnion(paths)
+    }
+
+    /// The items whose keep choice changed since this was last asked.
+    func takePolicyChanges() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        defer { policyChanges = [] }
+        return Array(policyChanges)
     }
 
     var rootName: String { store.load().first { $0.id == domain.identifier.rawValue }?.name ?? domain.displayName }
@@ -297,6 +312,9 @@ final class FileItem: NSObject, NSFileProviderItem {
     let writable: Bool
     let itemIdentifier: NSFileProviderItemIdentifier
     let parentItemIdentifier: NSFileProviderItemIdentifier
+    /// Keep downloaded (true), online only (false), or as its folder (nil).
+    let keepChoice: Bool?
+    let keptDownloaded: Bool
 
     init(path: String, name: String, isFolder: Bool, size: UInt64, modified: Int64, writable: Bool, ids: ItemIds) {
         self.path = path
@@ -307,6 +325,8 @@ final class FileItem: NSObject, NSFileProviderItem {
         self.size = size
         self.modified = modified
         self.writable = writable
+        keepChoice = ids.keepChoice(path)
+        keptDownloaded = ids.keptDownloaded(path)
     }
 
     convenience init(_ entry: Entry, writable: Bool, ids: ItemIds) {
@@ -351,8 +371,23 @@ final class FileItem: NSObject, NSFileProviderItem {
 
     var itemVersion: NSFileProviderItemVersion {
         let content = Data("\(modified)-\(size)".utf8)
-        return NSFileProviderItemVersion(contentVersion: content, metadataVersion: Data("\(modified)-\(size)-\(name)".utf8))
+        // The choice is part of the metadata version, or the system would ignore a change of it.
+        let choice = keepChoice.map { $0 ? "keep" : "online" } ?? ""
+        return NSFileProviderItemVersion(contentVersion: content, metadataVersion: Data("\(modified)-\(size)-\(name)-\(choice)".utf8))
     }
+
+    #if os(macOS)
+    var contentPolicy: NSFileProviderContentPolicy {
+        switch keepChoice {
+        case true?: return .downloadEagerlyAndKeepDownloaded
+        case false?: return .downloadLazily
+        case nil: return .inherited
+        }
+    }
+
+    /// What the Finder menu's rules look at (`NSExtensionFileProviderActions`).
+    var userInfo: [AnyHashable: Any]? { ["keptDownloaded": keptDownloaded] }
+    #endif
 }
 
 /// A folder's files and folders, listed from the server each time Files looks.
@@ -437,6 +472,15 @@ enum ChangeFeed {
                 return
             }
             do {
+                #if os(macOS)
+                // Told first: the rest can end early, and a choice should not wait for a change.
+                if folder == nil {
+                    let chosen = provider.takePolicyChanges().compactMap { path in
+                        path.isEmpty ? FileItem.root(name: provider.rootName, writable: provider.writable(), ids: provider.ids) : try? provider.lookUp(path)
+                    }
+                    if !chosen.isEmpty { observer.didUpdate(chosen) }
+                }
+                #endif
                 let cursor = String(data: anchor.rawValue, encoding: .utf8) ?? ""
                 let feed: Changes
                 do {

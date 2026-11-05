@@ -2,7 +2,8 @@
 
 A menu bar app that puts each OwnNAS server you sign in to in Finder's sidebar, as Dropbox and
 OneDrive do. Files show without being downloaded ("online-only") and download when you open
-them. Finder's **Remove Download** frees the space again, and what you add, change, rename or
+them. In Finder's menu, **Keep Downloaded** downloads a file or folder and keeps new versions
+coming, and **Keep Online Only** frees the space and stops that. What you add, change, rename or
 delete there goes back to the server (deleting moves to the server's Trash).
 
 The Finder part is a File Provider extension, the same code as the iPhone app's Files location
