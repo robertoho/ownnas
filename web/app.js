@@ -5062,7 +5062,20 @@ function transferPath(value) {
 }
 
 async function readTransfer(dataTransfer) {
-  const items = [...(dataTransfer?.items || [])];
+  // The browser empties what was dropped or pasted as soon as this first waits for anything, so
+  // everything is taken out of it now, before the first `await`. Waiting inside the loop below
+  // would leave only the first item.
+  const items = [...(dataTransfer?.items || [])].filter((item) => item.kind === "file").map((item) => {
+    const take = (read) => {
+      try { return read(); } catch { return null; }
+    };
+    return {
+      handle: typeof item.getAsFileSystemHandle === "function" ? take(() => item.getAsFileSystemHandle()?.catch(() => null)) : null,
+      entry: typeof item.webkitGetAsEntry === "function" ? take(() => item.webkitGetAsEntry()) : null,
+      file: typeof item.getAsFile === "function" ? take(() => item.getAsFile()) : null,
+    };
+  });
+  const plainFiles = [...(dataTransfer?.files || [])];
   const files = [];
   const directories = new Set();
   const seenFiles = new Set();
@@ -5111,34 +5124,22 @@ async function readTransfer(dataTransfer) {
   // preserve directories that contain no files.
   let handledItems = 0;
   for (const item of items) {
-    if (item.kind !== "file") continue;
-    let handle = null;
-    if (typeof item.getAsFileSystemHandle === "function") {
-      try {
-        handle = await item.getAsFileSystemHandle();
-      } catch { /* Try the legacy entry and file APIs. */ }
-    }
+    const handle = await item.handle;
     if (handle) {
       await walkHandle(handle);
       handledItems += 1;
       continue;
     }
-    let entry = null;
-    if (typeof item.webkitGetAsEntry === "function") {
-      try {
-        entry = item.webkitGetAsEntry();
-      } catch { /* Try the plain File fallback. */ }
-    }
-    if (entry) {
-      await walkEntry(entry);
+    if (item.entry) {
+      await walkEntry(item.entry);
       handledItems += 1;
       continue;
     }
-    if (typeof item.getAsFile === "function") addFile(item.getAsFile());
+    addFile(item.file);
   }
 
-  if (!handledItems && !files.length && dataTransfer?.files) {
-    for (const file of dataTransfer.files) {
+  if (!handledItems && !files.length) {
+    for (const file of plainFiles) {
       addFile(file, file.webkitRelativePath || pasteFileName(file));
     }
   }
@@ -6523,6 +6524,7 @@ function draggingFiles(event) {
 }
 
 function showDrop() {
+  $("drop").textContent = $("gallery").hidden ? "Drop to upload into this folder" : "Drop to upload to the Gallery";
   $("drop").hidden = false;
   $("drop").classList.add("show");
 }
@@ -6557,7 +6559,9 @@ window.addEventListener("drop", async (event) => {
   const destination = state.path;
   try {
     const transfer = await readDrop(event.dataTransfer);
-    await pasteExternalTransfer(transfer, destination);
+    // On the Gallery they go to the workspace shown, with what is already there found first.
+    if (!$("gallery").hidden && galleryApi) await galleryApi.uploadPhotos(transfer.files.map((item) => item.file));
+    else await pasteExternalTransfer(transfer, destination);
   } catch (err) {
     toast(err.cancel ? "Upload cancelled" : err.message, !err.cancel);
   }

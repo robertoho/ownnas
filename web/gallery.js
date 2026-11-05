@@ -854,10 +854,10 @@ export function mountGallery(root, ctx) {
   /// Upload, in the Photos tab, for those who may write.
   function uploadButton() {
     if (!ctx.canWrite()) return [];
-    return [el("button", { type: "button", class: "gallery-upload-button", title: "Add photos and videos here. Those already in the library are found and skipped.", onclick: uploadPhotos }, "Upload")];
+    return [el("button", { type: "button", class: "gallery-upload-button", title: "Add photos and videos here. Those already in the library are found and skipped.", onclick: () => uploadPhotos() }, "Upload")];
   }
 
-  async function uploadPhotos() {
+  async function uploadPhotos(files = []) {
     try {
       const module = await import("/assets/photo-upload.js");
       await loadWorkspaces();
@@ -869,6 +869,7 @@ export function mountGallery(root, ctx) {
         api: ctx.api,
         toast: ctx.toast,
         pickFolder: ctx.pickFolder,
+        files,
         // Their dates and thumbnails come from the scan, which then shows them here.
         onUploaded: rescan,
       });
@@ -2141,6 +2142,7 @@ export function mountGallery(root, ctx) {
     hide,
     pickAlbum,
     handleKey,
+    uploadPhotos,
     /// The album the page shows, so changes elsewhere can refresh it.
     refresh() {
       if (!root.hidden) show(location.hash);

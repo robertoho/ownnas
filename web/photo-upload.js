@@ -135,7 +135,7 @@ function send(file, folder, onProgress, onStart) {
 }
 
 /// The window: where the photos go, then a line for each photo as it is checked and sent.
-export function openPhotoUpload({ workspace, name, folders, api, toast, pickFolder, onUploaded }) {
+export function openPhotoUpload({ workspace, name, folders, api, toast, pickFolder, onUploaded, files = [] }) {
   let folder = folders[0] ?? null;
   let running = false;
   let stopping = false;
@@ -156,6 +156,11 @@ export function openPhotoUpload({ workspace, name, folders, api, toast, pickFold
   } }, "Stop");
   const close = el("button", { type: "button", class: "photo-upload-close", onclick: () => dialog.close() }, "Close");
 
+  // Dropped on the Gallery: they wait here only if there is a folder to choose first.
+  const startDropped = el("button", { type: "button", class: "photo-upload-start", hidden: true, onclick: () => {
+    startDropped.hidden = true;
+    start(files);
+  } }, `Upload ${files.length === 1 ? "1 file" : `${files.length} files`}`);
   const whereText = el("span", {});
   const where = el("div", { class: "photo-upload-where" }, whereText);
   if (folders.length > 1) {
@@ -176,6 +181,7 @@ export function openPhotoUpload({ workspace, name, folders, api, toast, pickFold
       if (picked === null || picked === undefined) return;
       folder = picked;
       choose.disabled = false;
+      startDropped.disabled = false;
       paint();
     } }, "Choose folder…"));
   }
@@ -184,7 +190,7 @@ export function openPhotoUpload({ workspace, name, folders, api, toast, pickFold
     el("h3", {}, workspace === null ? "Upload to the Gallery" : `Upload to ${name}`),
     el("p", { class: "muted" }, "Each photo is compared with the library before it is sent, so what is already there is not sent again."),
     where, summary, rows,
-    el("div", { class: "dialog-actions" }, choose, stop, close, input));
+    el("div", { class: "dialog-actions" }, startDropped, choose, stop, close, input));
   dialog.addEventListener("cancel", (event) => { if (running) event.preventDefault(); });
   dialog.addEventListener("close", () => {
     dialog.remove();
@@ -330,14 +336,26 @@ export function openPhotoUpload({ workspace, name, folders, api, toast, pickFold
     if (counts.failed) toast(`${counts.failed} could not be uploaded: see the list`, true);
   }
 
-  input.addEventListener("change", () => {
-    const items = [...input.files].map(row);
-    input.value = "";
+  function start(chosen) {
+    const items = chosen.map(row);
     if (!items.length) return;
     rows.prepend(...items.map((item) => item.node));
     begin(items);
+  }
+
+  input.addEventListener("change", () => {
+    const chosen = [...input.files];
+    input.value = "";
+    start(chosen);
   });
 
   document.body.append(dialog);
   dialog.showModal();
+  if (files.length) {
+    if (workspace !== null && folders.length === 1) start(files);
+    else if (workspace === null || folders.length) {
+      startDropped.hidden = false;
+      startDropped.disabled = workspace === null;
+    }
+  }
 }
