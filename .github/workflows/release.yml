@@ -93,6 +93,16 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         shell: bash
 
+      # Not worth holding the server's release back for, if it fails on some system.
+      - name: Build and package ownnascli
+        continue-on-error: true
+        run: |
+          cargo build --locked --release --target ${{ matrix.target }} -p ownnascli
+          python scripts/package-cli.py "$RELEASE_TAG" "${{ matrix.target }}"
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        shell: bash
+
       - name: Build and package the desktop sync client
         if: contains(matrix.target, 'linux') || contains(matrix.target, 'windows')
         run: |
