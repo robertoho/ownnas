@@ -354,12 +354,62 @@ pub fn download_and_replace(config: &UpdateConfig) -> Result<String, String> {
     Ok(manifest.version)
 }
 
-pub fn spawn_replaced_binary() -> Result<(), String> {
+/// Where this program runs from. Once its file has been replaced, Linux reports the running
+/// program as "<path> (deleted)", so that ending is taken off to find the new one at the path.
+fn program_path() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|_| "Could not locate the OwnNAS binary".to_string())?;
+    let shown = exe.to_string_lossy();
+    Ok(match shown.strip_suffix(" (deleted)") {
+        Some(path) => PathBuf::from(path),
+        None => exe,
+    })
+}
+
+pub fn spawn_replaced_binary() -> Result<(), String> {
+    let exe = program_path()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
-    Command::new(exe)
+    Command::new(&exe)
         .args(args)
         .spawn()
-        .map_err(|_| "Could not start the updated OwnNAS process".to_string())?;
+        .map_err(|err| format!("Could not start the updated OwnNAS process ({}): {err}", exe.display()))?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod restart_tests {
+    use super::*;
+
+    /// Runs in a copy of the tests, whose file it replaces while it runs, as an update does.
+    #[test]
+    fn replaced_program_helper() {
+        if std::env::var_os("OWNNAS_REPLACE_HELPER").is_none() {
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let new = exe.with_extension("new");
+        fs::copy(&exe, &new).unwrap();
+        fs::rename(&new, &exe).unwrap();
+        #[cfg(target_os = "linux")]
+        assert!(std::env::current_exe().unwrap().to_string_lossy().ends_with(" (deleted)"), "what this guards against");
+        let found = program_path().unwrap();
+        assert_eq!(found, exe, "the path it was started from");
+        // The new file starts. Listing runs no tests, so this does not go round again.
+        let listed = Command::new(found).arg("--list").env_remove("OWNNAS_REPLACE_HELPER").output().unwrap();
+        assert!(listed.status.success());
+    }
+
+    #[test]
+    fn a_replaced_program_can_be_started_again() {
+        let dir = std::env::temp_dir().join(format!("ownnas-replace-{}-{}", std::process::id(), rand::random::<u32>()));
+        fs::create_dir_all(&dir).unwrap();
+        let copy = dir.join("ownnas-copy");
+        fs::copy(std::env::current_exe().unwrap(), &copy).unwrap();
+        let run = Command::new(&copy)
+            .args(["update::restart_tests::replaced_program_helper", "--exact", "--nocapture"])
+            .env("OWNNAS_REPLACE_HELPER", "1")
+            .output()
+            .unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(run.status.success(), "{}{}", String::from_utf8_lossy(&run.stdout), String::from_utf8_lossy(&run.stderr));
+    }
 }
