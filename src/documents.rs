@@ -75,15 +75,21 @@ pub fn view(path: &Path) -> Result<View, String> {
     }
     let extension = path.extension().map(|ext| ext.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     match extension.as_str() {
-        "pptx" | "ppsx" => pptx(path),
-        "odp" => odp(path),
+        "pptx" | "ppsx" | "pptm" | "potx" | "potm" => pptx(path),
+        "odp" | "otp" => odp(path),
+        // Word with macros, templates: shown as text here. Only plain .docx and .odt open to edit,
+        // so that saving can never disturb macros.
+        "docm" | "dotx" | "dotm" | "ott" => {
+            let text = plain_text(path).ok_or("This document could not be read")?;
+            Ok(View::Document { blocks: paragraphs(&text), note: None })
+        }
         "doc" => doc(path),
         "ppt" | "pps" => ppt(path),
         "rtf" => {
             let bytes = std::fs::read(path).map_err(|_| "Could not read the file".to_string())?;
             Ok(View::Document { blocks: paragraphs(&rtf_text(&bytes)), note: None })
         }
-        "xls" | "xlsb" | "ods" => spreadsheet(path),
+        "xls" | "xlsb" | "ods" | "xlsm" | "xltx" | "xltm" | "xlam" | "ots" => spreadsheet(path),
         "pages" | "numbers" | "key" => iwork(path),
         "mobi" | "azw" | "azw3" | "prc" | "fb2" => crate::books::view(path),
         "parquet" | "pq" | "arrow" | "feather" | "ipc" | "arrows" | "avro" | "jsonl" | "ndjson" => crate::data_tables::view(path),
@@ -97,7 +103,8 @@ pub fn has_text(name: &str) -> bool {
     TEXT_FORMATS.contains(&extension.as_str())
 }
 
-pub const TEXT_FORMATS: [&str; 24] = [
+pub const TEXT_FORMATS: [&str; 37] = [
+    "docm", "dotx", "dotm", "ott", "ots", "otp", "xlsm", "xltx", "xltm", "xlam", "pptm", "potx", "potm",
     "docx", "odt", "ods", "odp", "xlsx", "xls", "xlsb", "pptx", "ppsx", "doc", "ppt", "pps", "rtf", "pages", "numbers", "key", "epub", "mobi", "azw",
     "azw3", "prc", "fb2", "eml", "msg",
 ];
@@ -111,7 +118,7 @@ pub fn plain_text(path: &Path) -> Option<String> {
     }
     let extension = path.extension().map(|ext| ext.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     match extension.as_str() {
-        "docx" => {
+        "docx" | "docm" | "dotx" | "dotm" => {
             let mut zip = open_zip(path).ok()?;
             let mut out = String::new();
             for name in ["word/document.xml", "word/footnotes.xml", "word/endnotes.xml"] {
@@ -121,13 +128,13 @@ pub fn plain_text(path: &Path) -> Option<String> {
             }
             Some(out)
         }
-        "odt" | "ods" | "odp" => {
+        "odt" | "ods" | "odp" | "ott" | "ots" | "otp" => {
             let mut zip = open_zip(path).ok()?;
             let mut out = String::new();
             xml_words(&read_part(&mut zip, "content.xml")?, &mut out);
             Some(out)
         }
-        "xlsx" => view_text(spreadsheet(path).ok()?),
+        "xlsx" | "xlsm" | "xltx" | "xltm" | "xlam" => view_text(spreadsheet(path).ok()?),
         "epub" => {
             let book = crate::ebook::read(path).ok()?;
             let mut zip = open_zip(path).ok()?;

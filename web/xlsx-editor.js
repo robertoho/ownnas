@@ -1812,6 +1812,11 @@ const WORKSHEET_ORDER = ['sheetPr', 'dimension', 'sheetViews', 'sheetFormatPr', 
   'drawingHF', 'picture', 'oleObjects', 'controls', 'webPublishItems', 'tableParts', 'extLst'];
 
 /** A child of the worksheet element, added in its place if missing. */
+/** The color set on a sheet's tab, as #rrggbb, when it is a plain color. */
+function sheetTabColor(sheet) {
+  const rgb = direct(direct(sheet.root, 'sheetPr'), 'tabColor')?.getAttribute('rgb');
+  return /^[0-9a-f]{8}$/i.test(rgb || '') ? `#${rgb.slice(2)}` : null;
+}
 function worksheetChild(sheet, name) {
   let node = direct(sheet.root, name);
   if (node) return node;
@@ -2893,6 +2898,9 @@ export function parseInput(text, { decimal = '.', date1904 = false } = {}) {
 // --- Editor -------------------------------------------------------------------------------------
 
 const ICONS = {
+  sum: '<path d="M12 3.500H4.500L8.500 8l-4 4.500H12"/>',
+  painter: '<path d="M3 3h8v3H3zM11 4.500h2v3H7.500v2M6.500 9.500h2V14h-2z"/>',
+  tools: '<path d="M3 4.500h6M12 4.500h1M3 11.500h1M7 11.500h6"/><circle cx="10.500" cy="4.500" r="1.500"/><circle cx="5.500" cy="11.500" r="1.500"/>',
   undo: '<path d="M4 7h7a3 3 0 0 1 0 6H8"/><path d="M6.5 4.5 4 7l2.5 2.5"/>',
   redo: '<path d="M12 7H5a3 3 0 0 0 0 6h3"/><path d="M9.5 4.5 12 7 9.5 9.5"/>',
   bold: '<path d="M5 3h4a2.5 2.5 0 0 1 0 5H5zM5 8h4.5a2.5 2.5 0 0 1 0 5H5z"/>',
@@ -3380,6 +3388,23 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     textTool('fewer', '.0←', 'Fewer decimal places', () => stepDecimals(-1));
     textTool('more', '.00→', 'More decimal places', () => stepDecimals(1));
   }
+  if (!readonly) {
+    tool('sum', 'AutoSum (Alt+=)', autoSum);
+    tool('painter', 'Copy formatting: then select the cells to apply it to', usePainter, { toggle: true });
+    tool('tools', 'More tools', () => {
+      const box = buttons.tools.getBoundingClientRect();
+      openMenu(box.left, box.bottom + 4, [
+        ['Remove duplicates', removeDuplicates],
+        ['Text to columns…', textToColumns],
+        '-',
+        ['Clear formatting', clearFormatting],
+        [gridHidden() ? 'Show gridlines' : 'Hide gridlines', toggleGridlines],
+        ['Tab color…', () => editTabColor(active)],
+      ]);
+    });
+    buttons.tools.setAttribute('aria-haspopup', 'menu');
+    divider();
+  }
   tool('export', 'Download as CSV, or print', () => {
     const box = buttons.export.getBoundingClientRect();
     const range = selectedRange();
@@ -3454,6 +3479,8 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
       tab.textContent = model.sheets[index].name;
       tab.setAttribute('role', 'tab');
       tab.setAttribute('aria-selected', String(index === active));
+      const tabColor = sheetTabColor(model.sheets[index]);
+      if (tabColor) { tab.classList.add('has-color'); tab.style.setProperty('--tab-color', tabColor); }
       if (!readonly) tab.title = 'Double-click to rename; right-click for more';
       // Typing a formula, the keyboard stays in it: another sheet's cells can go into it.
       tab.addEventListener('mousedown', event => { if (editing) event.preventDefault(); });
@@ -3495,6 +3522,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
         }
       }],
     ];
+    items.push(['Tab color…', () => editTabColor(index)]);
     if (index > 0) items.push(['Move left', () => bookChange(() => moveSheet(model, index, -1))]);
     if (index < model.sheets.length - 1) items.push(['Move right', () => bookChange(() => moveSheet(model, index, 1))]);
     items.push('-', [`Delete "${sheetNow.name}"`, () => {
@@ -3670,6 +3698,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     const fragment = document.createDocumentFragment();
     let dx = 0, dy = 0, pinned = false;
     const lines = (rowFrom, rowTo, colFrom, colTo) => {
+      if (gridHidden()) return;
       const x1 = geo.colX[colFrom], x2 = geo.colX[colTo + 1], y1 = geo.rowY[rowFrom], y2 = geo.rowY[rowTo + 1];
       for (let r = rowFrom; r <= rowTo + 1; r++) {
         const line = document.createElement('div');
@@ -4211,6 +4240,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     // A snapshot of every part also takes away parts added since.
     if (state.every) for (const path of Object.keys(model.parts)) if (!(path in state.parts)) delete model.parts[path];
     Object.assign(model.parts, state.parts);
+    drawTabs();
   }
   /** A change to the workbook's sheets (adding, renaming, deleting, moving), with undo: it keeps
    * the list of sheets and every part of the workbook as they were before and after. `work`
@@ -5637,6 +5667,175 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     });
     if (done && lost) notice('Merged: only the top-left cell kept its contents (Undo brings the others back).');
   }
+  /** Sums the numbers next to the cell, or under each column of a selection. */
+  function autoSum() {
+    if (!canWrite()) return;
+    commitEdit();
+    const s = sheet(), range = selectedRange();
+    const isNumber = (row, col) => typeof valueAt(model, active, row, col) === 'number';
+    const sums = [];
+    if (range.r1 === range.r2 && range.c1 === range.c2) {
+      const { r1: row, c1: col } = range;
+      let top = row, left = col;
+      while (top > 1 && isNumber(top - 1, col)) top--;
+      while (left > 1 && isNumber(row, left - 1)) left--;
+      if (top < row) sums.push([row, col, `${refName(top, col)}:${refName(row - 1, col)}`]);
+      else if (left < col) sums.push([row, col, `${refName(row, left)}:${refName(row, col - 1)}`]);
+      else { startEdit('=SUM('); return; }
+    } else {
+      const c2 = Math.min(range.c2, s.maxCol), r2 = Math.min(range.r2, s.maxRow);
+      for (let col = range.c1; col <= c2; col++) {
+        // The total goes into the selection's empty last row, or else just under it.
+        const lastHasValue = filled(r2, col);
+        let bottom = r2;
+        while (bottom >= range.r1 && !isNumber(bottom, col)) bottom--;
+        if (bottom < range.r1) continue;
+        sums.push(lastHasValue ? [r2 + 1, col, `${refName(range.r1, col)}:${refName(r2, col)}`] : [r2, col, `${refName(range.r1, col)}:${refName(bottom, col)}`]);
+      }
+      if (!sums.length) { notice('There are no numbers to add up in the selection.'); return; }
+    }
+    transaction(touch => { for (const [row, col, area] of sums) writeInput(s, row, col, `=SUM(${area})`, touch); });
+    selectionChanged();
+  }
+  let painter = null;
+  /** The next cells selected take on the format of this one. */
+  function usePainter() {
+    if (!canWrite()) return;
+    if (painter) { window.removeEventListener('pointerup', painter.apply, true); painter = null; buttons.painter.setAttribute('aria-pressed', 'false'); return; }
+    const style = sheet().cells.get(refName(anchor.row, anchor.col))?.getAttribute('s') ?? null;
+    const apply = () => {
+      // After the grid's own handler has settled the selection.
+      setTimeout(() => {
+        window.removeEventListener('pointerup', apply, true);
+        painter = null;
+        buttons.painter.setAttribute('aria-pressed', 'false');
+        applyStyleIndex(style);
+      }, 0);
+    };
+    painter = { apply };
+    buttons.painter.setAttribute('aria-pressed', 'true');
+    window.addEventListener('pointerup', apply, true);
+  }
+  function applyStyleIndex(style) {
+    if (!canWrite()) return;
+    commitEdit();
+    const s = sheet();
+    transaction(touch => {
+      for (const { row, col } of selectionCells({ create: style != null })) {
+        touch(refName(row, col));
+        const cell = style != null ? cellElement(s, row, col) : s.cells.get(refName(row, col));
+        if (!cell) continue;
+        if (style != null) cell.setAttribute('s', style); else cell.removeAttribute('s');
+      }
+    });
+    scroll.focus({ preventScroll: true });
+  }
+  const clearFormatting = () => applyStyleIndex(null);
+  /** Takes out rows whose values all repeat an earlier row; the rest close up. Formulas move with
+   * their rows, and only the range's own columns move. */
+  function removeDuplicates() {
+    if (!canWrite()) return;
+    commitEdit();
+    const s = sheet(), target = sortTarget(), top = target.header ? target.r1 + 1 : target.r1;
+    if (top > target.r2) { notice('There is nothing to check here: select a table, or a cell in one.'); return; }
+    if (s.merges.some(m => !(m.r2 < top || m.r1 > target.r2 || m.c2 < target.c1 || m.c1 > target.c2))) { notice('Ranges with merged cells cannot be checked for duplicates.'); return; }
+    const seen = new Set(), kept = [];
+    for (let r = top; r <= target.r2; r++) {
+      const key = [];
+      for (let c = target.c1; c <= target.c2; c++) { const v = valueAt(model, active, r, c); key.push(v == null ? '' : `${typeof v}:${v}`); }
+      const text = JSON.stringify(key);
+      if (!seen.has(text) || key.every(part => part === '')) { seen.add(text); kept.push(r); }
+    }
+    const removed = target.r2 - top + 1 - kept.length;
+    if (!removed) { notice('No duplicate rows found.'); return; }
+    const done = structural(sh => {
+      for (let r = top; r <= target.r2; r++) for (let c = target.c1; c <= target.c2; c++) { const cell = sh.cells.get(refName(r, c)); if (cell) unshare(sh, cell, () => {}); }
+      remapCommentRows(model, sh, new Map(kept.map((from, i) => [from, top + i])), target.c1, target.c2);
+      const copies = kept.map(r => Array.from({ length: target.c2 - target.c1 + 1 }, (_, k) => sh.cells.get(refName(r, target.c1 + k))?.cloneNode(true) ?? null));
+      for (let r = top; r <= target.r2; r++) for (let c = target.c1; c <= target.c2; c++) { const ref = refName(r, c); sh.cells.get(ref)?.remove(); sh.cells.delete(ref); }
+      kept.forEach((from, i) => {
+        const to = top + i;
+        copies[i].forEach((copy, k) => {
+          if (!copy) return;
+          const ref = refName(to, target.c1 + k);
+          copy.setAttribute('r', ref);
+          const f = direct(copy, 'f');
+          if (f && to !== from) f.textContent = shiftFormula(f.textContent, to - from, 0);
+          placeCell(sh, ref, copy);
+        });
+      });
+      rereadSheet(sh);
+    });
+    if (done) { model.dependencies = null; notice(`Removed ${removed} duplicate row${removed === 1 ? '' : 's'}; ${kept.length} left.`); }
+  }
+  /** Splits the text of one column into the columns to its right. */
+  function textToColumns() {
+    if (!canWrite()) return;
+    commitEdit();
+    const s = sheet(), range = selectedRange();
+    if (range.c1 !== range.c2) { notice('Select one column to split.'); return; }
+    const area = range.r1 === range.r2 ? currentRegion(range.r1, range.c1) : range;
+    const col = range.c1, r1 = area.r1, r2 = Math.min(area.r2, s.maxRow);
+    const choice = document.createElement('select');
+    for (const [value, label] of [[',', 'Comma'], [';', 'Semicolon'], ['\t', 'Tab'], [' ', 'Space'], ['|', 'Vertical bar']]) { const o = document.createElement('option'); o.value = value; o.textContent = label; choice.append(o); }
+    const problem = document.createElement('p');
+    problem.className = 'xlsx-panel-problem'; problem.hidden = true;
+    let warned = false;
+    const apply = () => {
+      const rows = [];
+      for (let r = r1; r <= r2; r++) {
+        const cell = s.cells.get(refName(r, col)), value = valueAt(model, active, r, col);
+        if (cell && !direct(cell, 'f') && typeof value === 'string' && value.includes(choice.value)) rows.push([r, value.split(choice.value)]);
+      }
+      if (!rows.length) { problem.textContent = 'None of these cells holds that separator.'; problem.hidden = false; return false; }
+      const taken = rows.some(([r, parts]) => parts.slice(1).some((_, k) => filled(r, col + k + 1)));
+      if (taken && !warned) { warned = true; problem.textContent = 'The cells to the right hold data, and will be replaced. Choose Split again to go on.'; problem.hidden = false; return false; }
+      transaction(touch => {
+        for (const [r, parts] of rows) parts.forEach((part, k) => writeInput(s, r, col + k, part.trim(), touch));
+      });
+      selectionChanged();
+      return true;
+    };
+    openCellPanel('Text to columns', [labelled('Separated by', choice), problem], [['Cancel', () => {}], ['Split', apply, 'ok']]);
+    choice.focus();
+  }
+  const sheetView = s => direct(direct(s.root, 'sheetViews'), 'sheetView');
+  function gridHidden() { const view = sheetView(sheet()); return !!view && ['0', 'false'].includes(view.getAttribute('showGridLines')); }
+  function toggleGridlines() {
+    const hide = !gridHidden();
+    structural(s => {
+      let view = sheetView(s);
+      if (!view) {
+        view = s.xml.createElementNS(MAIN, 'sheetView');
+        view.setAttribute('workbookViewId', '0');
+        worksheetChild(s, 'sheetViews').append(view);
+      }
+      if (hide) view.setAttribute('showGridLines', '0'); else view.removeAttribute('showGridLines');
+    });
+    geo = null;
+    selectionChanged();
+  }
+  function editTabColor(index) {
+    if (!canWrite()) return;
+    const target = model.sheets[index];
+    const input = document.createElement('input');
+    input.type = 'color';
+    input.value = sheetTabColor(target) ?? '#2f6fdf';
+    const set = value => {
+      const was = active;
+      active = index;
+      const made = structural(s => {
+        const pr = worksheetChild(s, 'sheetPr');
+        direct(pr, 'tabColor')?.remove();
+        if (value) { const node = s.xml.createElementNS(MAIN, 'tabColor'); node.setAttribute('rgb', `FF${value.slice(1).toUpperCase()}`); pr.prepend(node); }
+        else if (!pr.children.length && !pr.attributes.length) pr.remove();
+      });
+      active = was;
+      drawTabs();
+      return made;
+    };
+    openCellPanel(`Color of the tab "${target.name}"`, [labelled('Color', input)], [['No color', () => { set(null); }], ['Cancel', () => {}], ['Apply', () => { set(input.value); }, 'ok']]);
+  }
   function clearSelection() {
     if (!canWrite()) return;
     const s = sheet();
@@ -6579,6 +6778,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
     if (!wholeRows && !wholeCols) {
       if (rows > 1) items.push([`Fill down${touchMode ? '' : IS_MAC ? ' (⌘D)' : ' (Ctrl+D)'}`, fillDown]);
       items.push(['Clear contents', clearSelection]);
+      items.push(['Clear formatting', clearFormatting]);
       items.push('-', ['Paste values only', () => pasteSpecial('values')], ['Paste formats only', () => pasteSpecial('formats')], ['Paste transposed', () => pasteSpecial('all', true)]);
       items.push('-', ['Sort A to Z', () => sortRange(sortTarget(), anchor.col, false)], ['Sort Z to A', () => sortRange(sortTarget(), anchor.col, true)]);
       items.push([autoFilterOf(sheet()) ? 'Remove filter' : 'Filter', toggleFilter]);
@@ -6746,6 +6946,7 @@ export function mountXlsxEditor(container, bytes, { readonly = false, name = 'Sp
       schedule();
     }
     if (event.altKey && key === 'ArrowDown') { event.preventDefault(); openChoices(); }
+    if (event.altKey && key === '=' && canWrite()) { event.preventDefault(); autoSum(); return; }
     else if (arrows[key]) {
       event.preventDefault();
       const [dr, dc] = arrows[key];

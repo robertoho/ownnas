@@ -1941,3 +1941,270 @@ export async function mountGcode(body, entry) {
     },
   };
 }
+
+// ---- Patches: what changed, file by file ----
+
+/// Reads a unified or git diff into files, each with its added and removed line counts.
+export function parseDiff(text) {
+  const files = [];
+  let current = null;
+  const start = (name) => { current = { name, added: 0, removed: 0, lines: [] }; files.push(current); };
+  for (const line of text.split(/\r?\n/)) {
+    const git = /^diff --git a\/(.*) b\/(.*)$/.exec(line);
+    if (git) { start(git[2]); current.lines.push(["meta", line]); continue; }
+    if (line.startsWith("--- ") && (!current || current.lines.some(([kind]) => kind === "hunk"))) start(line.slice(4).replace(/^a\//, "").split("\t")[0]);
+    if (!current) start("Patch");
+    if (line.startsWith("+++ ")) {
+      const name = line.slice(4).replace(/^b\//, "").split("\t")[0];
+      if (name !== "/dev/null") current.name = name;
+      current.lines.push(["meta", line]);
+    } else if (line.startsWith("--- ") || /^(index |new file|deleted file|similarity|rename |old mode|new mode|Binary files)/.test(line)) current.lines.push(["meta", line]);
+    else if (line.startsWith("@@")) current.lines.push(["hunk", line]);
+    else if (line.startsWith("+")) { current.added++; current.lines.push(["add", line]); }
+    else if (line.startsWith("-")) { current.removed++; current.lines.push(["del", line]); }
+    else current.lines.push(["same", line]);
+  }
+  return files;
+}
+
+export async function mountDiff(body, entry) {
+  const files = parseDiff(await fetchText(entry));
+  const added = files.reduce((sum, file) => sum + file.added, 0), removed = files.reduce((sum, file) => sum + file.removed, 0);
+  body.replaceChildren(h("div", "subtitle-view diff-view",
+    h("p", "muted", `${files.length} file${files.length === 1 ? "" : "s"} · +${added} −${removed}`),
+    files.map((file) => h("details", "diff-file",
+      h("summary", "", h("strong", "", file.name), " ", h("span", "diff-add", `+${file.added}`), " ", h("span", "diff-del", `−${file.removed}`)),
+      h("pre", "diff-lines", file.lines.map(([kind, line]) => h("div", `diff-${kind}`, line || " ")))))));
+  for (const details of body.querySelectorAll("details")) details.open = files.length <= 40;
+  return { destroy() {} };
+}
+
+// ---- Certificates ----
+
+/// One DER value: its tag, its contents, and where the next value starts.
+function derValue(bytes, at) {
+  const tag = bytes[at++];
+  if (tag === undefined) throw new Error("Not a certificate");
+  let length = bytes[at++];
+  if (length & 0x80) {
+    const count = length & 0x7f;
+    if (count > 4) throw new Error("Not a certificate");
+    length = 0;
+    for (let i = 0; i < count; i++) length = length * 256 + bytes[at++];
+  }
+  if (at + length > bytes.length) throw new Error("Not a certificate");
+  return { tag, start: at, end: at + length, next: at + length };
+}
+function derChildren(bytes, value) {
+  const out = [];
+  for (let at = value.start; at < value.end;) { const child = derValue(bytes, at); out.push(child); at = child.next; }
+  return out;
+}
+const OID_NAMES = { "2.5.4.3": "Name", "2.5.4.6": "Country", "2.5.4.7": "City", "2.5.4.8": "State", "2.5.4.10": "Organization", "2.5.4.11": "Unit", "1.2.840.113549.1.9.1": "Email", "1.2.840.113549.1.1.1": "RSA", "1.2.840.10045.2.1": "Elliptic curve", "1.3.101.112": "Ed25519", "1.2.840.113549.1.1.11": "SHA-256 with RSA", "1.2.840.113549.1.1.12": "SHA-384 with RSA", "1.2.840.113549.1.1.13": "SHA-512 with RSA", "1.2.840.113549.1.1.5": "SHA-1 with RSA", "1.2.840.10045.4.3.2": "SHA-256 with ECDSA", "1.2.840.10045.4.3.3": "SHA-384 with ECDSA", "1.2.840.10045.3.1.7": "P-256", "1.3.132.0.34": "P-384" };
+function derOid(bytes, value) {
+  const parts = [Math.floor(bytes[value.start] / 40), bytes[value.start] % 40];
+  let number = 0;
+  for (let at = value.start + 1; at < value.end; at++) {
+    number = number * 128 + (bytes[at] & 0x7f);
+    if (!(bytes[at] & 0x80)) { parts.push(number); number = 0; }
+  }
+  return parts.join(".");
+}
+const derText = (bytes, value) => new TextDecoder(value.tag === 0x1e ? "utf-16be" : "utf-8").decode(bytes.subarray(value.start, value.end));
+function derName(bytes, value) {
+  return derChildren(bytes, value).flatMap((set) => derChildren(bytes, set).map((pair) => {
+    const [oid, text] = derChildren(bytes, pair);
+    return [OID_NAMES[derOid(bytes, oid)] ?? derOid(bytes, oid), derText(bytes, text)];
+  }));
+}
+function derTime(bytes, value) {
+  const text = derText(bytes, value), long = value.tag === 0x18;
+  const year = long ? Number(text.slice(0, 4)) : (Number(text.slice(0, 2)) < 50 ? 2000 : 1900) + Number(text.slice(0, 2));
+  const rest = text.slice(long ? 4 : 2);
+  return new Date(Date.UTC(year, Number(rest.slice(0, 2)) - 1, Number(rest.slice(2, 4)), Number(rest.slice(4, 6)), Number(rest.slice(6, 8)), Number(rest.slice(8, 10)) || 0));
+}
+const hexOf = (bytes) => Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(":");
+/// The readable parts of an X.509 certificate.
+export function parseCertificate(bytes) {
+  const certificate = derChildren(bytes, derValue(bytes, 0));
+  let fields = derChildren(bytes, certificate[0]);
+  if (fields[0].tag === 0xa0) fields = fields.slice(1); // the version, when it is there
+  const [serial, , issuer, validity, subject, keyInfo] = fields;
+  const [from, until] = derChildren(bytes, validity);
+  const [keyAlgorithm] = derChildren(bytes, keyInfo);
+  const algorithm = derChildren(bytes, keyAlgorithm);
+  const key = [OID_NAMES[derOid(bytes, algorithm[0])] ?? derOid(bytes, algorithm[0])];
+  if (algorithm[1]?.tag === 6) key.push(OID_NAMES[derOid(bytes, algorithm[1])] ?? derOid(bytes, algorithm[1]));
+  const signature = derOid(bytes, derChildren(bytes, certificate[1])[0]);
+  const names = [];
+  const extensionsHolder = fields.find((field) => field.tag === 0xa3);
+  if (extensionsHolder) {
+    for (const extension of derChildren(bytes, derChildren(bytes, extensionsHolder)[0])) {
+      const parts = derChildren(bytes, extension);
+      if (derOid(bytes, parts[0]) !== "2.5.29.17") continue;
+      for (const name of derChildren(bytes, derValue(bytes, parts[parts.length - 1].start))) {
+        if (name.tag === 0x82 || name.tag === 0x81 || name.tag === 0x86) names.push(new TextDecoder().decode(bytes.subarray(name.start, name.end)));
+        if (name.tag === 0x87) names.push(name.end - name.start === 4 ? Array.from(bytes.subarray(name.start, name.end)).join(".") : hexOf(bytes.subarray(name.start, name.end)));
+      }
+    }
+  }
+  return { subject: derName(bytes, subject), issuer: derName(bytes, issuer), from: derTime(bytes, from), until: derTime(bytes, until), serial: hexOf(bytes.subarray(serial.start, serial.end)), key: key.join(" "), signature: OID_NAMES[signature] ?? signature, names };
+}
+/// The PEM blocks in a text, as kinds and bytes. Private keys are only named, never decoded.
+export function parsePem(text) {
+  const blocks = [];
+  for (const match of text.matchAll(/-----BEGIN ([A-Z0-9 ]+)-----([\s\S]*?)-----END \1-----/g)) {
+    const kind = match[1];
+    if (/PRIVATE KEY/.test(kind)) { blocks.push({ kind, secret: true }); continue; }
+    blocks.push({ kind, bytes: Uint8Array.from(atob(match[2].replace(/\s+/g, "")), (c) => c.charCodeAt(0)) });
+  }
+  return blocks;
+}
+export async function mountCertificate(body, entry) {
+  const response = await fetch(`/api/raw?path=${enc(entry.path)}`, { credentials: "same-origin" });
+  if (!response.ok) throw new Error("Could not load the certificate");
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const text = new TextDecoder().decode(bytes);
+  const blocks = text.includes("-----BEGIN ") ? parsePem(text) : [{ kind: "CERTIFICATE", bytes }];
+  if (!blocks.length) throw new Error("No certificate in this file");
+  const row = (label, value) => h("div", "cert-row", h("span", "muted", label), h("span", "", value));
+  const nameText = (name) => name.map(([key, value]) => `${key}: ${value}`).join(", ") || "None";
+  const now = Date.now();
+  const cards = await Promise.all(blocks.map(async (block) => {
+    if (block.secret) return h("div", "backup-card cert-card cert-secret", h("p", "backup-headline", "Private key"), h("p", "", "This file holds a private key, so it is not shown here. Anyone with this file can act as its owner."));
+    if (block.kind !== "CERTIFICATE" && block.kind !== "TRUSTED CERTIFICATE") return h("div", "backup-card cert-card", h("p", "backup-headline", block.kind.toLowerCase()), h("p", "muted", `${block.bytes.length} bytes`));
+    const info = parseCertificate(block.bytes);
+    const expired = info.until.getTime() < now, early = info.from.getTime() > now;
+    let fingerprint = "";
+    if (crypto.subtle) fingerprint = hexOf(new Uint8Array(await crypto.subtle.digest("SHA-256", block.bytes))).toUpperCase();
+    const title = info.subject.find(([key]) => key === "Name")?.[1] ?? nameText(info.subject);
+    return h("div", "backup-card cert-card",
+      h("p", "backup-headline", title),
+      h("p", expired || early ? "cert-bad" : "cert-good", expired ? `Expired ${info.until.toLocaleDateString()}` : early ? `Not valid until ${info.from.toLocaleDateString()}` : `Valid until ${info.until.toLocaleDateString()}`),
+      row("Issued to", nameText(info.subject)), row("Issued by", nameText(info.issuer)),
+      info.names.length ? row("Also for", info.names.join(", ")) : null,
+      row("Valid from", info.from.toLocaleString()), row("Valid until", info.until.toLocaleString()),
+      row("Key", info.key), row("Signature", info.signature), row("Serial", info.serial),
+      fingerprint ? row("SHA-256", fingerprint) : null);
+  }));
+  body.replaceChildren(h("div", "subtitle-view cert-view", cards));
+  return { destroy() {} };
+}
+
+// ---- News feeds and outlines ----
+
+const safeLink = (url) => (/^https?:\/\//i.test(url || "") ? url : null);
+function linkTo(url, text) {
+  const target = safeLink(url);
+  if (!target) return h("span", "", text);
+  const link = h("a", "", text);
+  link.href = target; link.target = "_blank"; link.rel = "noopener noreferrer";
+  return link;
+}
+/// Words only: a feed's summaries are HTML, and are shown as plain text.
+const plainWords = (html) => (new DOMParser().parseFromString(html || "", "text/html").body.textContent || "").replace(/\s+/g, " ").trim();
+export function parseFeed(text) {
+  if (/<!DOCTYPE[^>]*\[|<!ENTITY/i.test(text)) throw new Error("This feed uses XML features that are not read");
+  const xml = new DOMParser().parseFromString(text, "application/xml");
+  if (xml.getElementsByTagName("parsererror").length) throw new Error("This feed could not be read");
+  const child = (node, ...names) => { for (const name of names) { const found = [...node.children].find((n) => n.localName === name); if (found) return found; } return null; };
+  const value = (node, ...names) => child(node, ...names)?.textContent.trim() ?? "";
+  const root = xml.documentElement;
+  if (root.localName === "opml") {
+    const walk = (node) => [...node.children].filter((n) => n.localName === "outline").map((n) => ({ title: n.getAttribute("title") || n.getAttribute("text") || "Untitled", url: n.getAttribute("xmlUrl") || n.getAttribute("htmlUrl") || "", items: walk(n) }));
+    return { kind: "outline", title: value(child(root, "head") ?? root, "title") || "Outline", items: walk(child(root, "body") ?? root) };
+  }
+  const holder = root.localName === "feed" ? root : child(root, "channel") ?? root;
+  const nodes = [...holder.children, ...(root.localName === "RDF" ? root.children : [])].filter((n) => n.localName === "item" || n.localName === "entry");
+  const linkOf = (node) => { const atom = [...node.children].filter((n) => n.localName === "link"); const best = atom.find((n) => (n.getAttribute("rel") ?? "alternate") === "alternate") ?? atom[0]; return best?.getAttribute("href") || best?.textContent.trim() || ""; };
+  return { kind: "feed", title: value(holder, "title") || "Feed", about: plainWords(value(holder, "description", "subtitle")), items: nodes.map((n) => ({ title: plainWords(value(n, "title")) || "Untitled", url: linkOf(n), date: value(n, "pubDate", "published", "updated", "date"), summary: plainWords(value(n, "description", "summary", "content", "encoded")).slice(0, 400) })) };
+}
+export async function mountFeed(body, entry) {
+  const feed = parseFeed(await fetchText(entry));
+  const outline = (items) => h("ul", "feed-outline", items.map((item) => h("li", "", linkTo(item.url, item.title), item.items.length ? outline(item.items) : null)));
+  body.replaceChildren(h("div", "subtitle-view feed-view",
+    h("h3", "", feed.title), feed.about ? h("p", "muted", feed.about) : null,
+    feed.kind === "outline" ? outline(feed.items) : feed.items.map((item) => {
+      const date = new Date(item.date);
+      return h("article", "feed-item", h("strong", "", linkTo(item.url, item.title)), item.date ? h("div", "muted", Number.isNaN(date.getTime()) ? item.date : date.toLocaleString()) : null, item.summary ? h("p", "", item.summary) : null);
+    }),
+    feed.kind === "feed" && !feed.items.length ? h("p", "muted", "This feed has no items.") : null));
+  return { destroy() {} };
+}
+
+// ---- Browser network recordings ----
+
+export async function mountHar(body, entry) {
+  let log;
+  try { log = JSON.parse(await fetchText(entry)).log; } catch { throw new Error("This recording could not be read"); }
+  const entries = log?.entries ?? [];
+  const size = (bytes) => (bytes > 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : bytes > 1024 ? `${Math.round(bytes / 1024)} KB` : `${Math.max(bytes, 0)} B`);
+  const total = entries.reduce((sum, item) => sum + Math.max(item.response?.content?.size ?? 0, 0), 0);
+  const failed = entries.filter((item) => (item.response?.status ?? 0) >= 400 || !item.response?.status).length;
+  const rows = entries.map((item) => {
+    const status = item.response?.status ?? 0;
+    let path = item.request?.url ?? "";
+    try { const url = new URL(path); path = `${url.host}${url.pathname}`; } catch { /* as it is */ }
+    return h("tr", status >= 400 || !status ? "har-bad" : "", h("td", "", item.request?.method ?? ""), h("td", "", status || "failed"), h("td", "har-url", path), h("td", "", (item.response?.content?.mimeType ?? "").split(";")[0]), h("td", "", size(item.response?.content?.size ?? 0)), h("td", "", `${Math.round(item.time ?? 0)} ms`));
+  });
+  body.replaceChildren(h("div", "subtitle-view har-view",
+    h("p", "muted", `${entries.length} requests · ${size(total)}${failed ? ` · ${failed} failed` : ""}`),
+    h("table", "har-table", h("thead", "", h("tr", "", ["Method", "Status", "Address", "Type", "Size", "Time"].map((name) => h("th", "", name)))), h("tbody", "", rows))));
+  return { destroy() {} };
+}
+
+// ---- Anything else: what kind of file it is, and its bytes ----
+
+const SIGNATURES = [
+  [[0x7f, 0x45, 0x4c, 0x46], "Linux or Unix program (ELF)"], [[0x4d, 0x5a], "Windows program or library"],
+  [[0xcf, 0xfa, 0xed, 0xfe], "Mac program (Mach-O)"], [[0xce, 0xfa, 0xed, 0xfe], "Mac program (Mach-O, 32-bit)"], [[0xca, 0xfe, 0xba, 0xbe], "Universal Mac program, or Java class"],
+  [[0x00, 0x61, 0x73, 0x6d], "WebAssembly module"], [[0x50, 0x4b, 0x03, 0x04], "ZIP-based file"], [[0x1f, 0x8b], "gzip compressed data"], [[0x28, 0xb5, 0x2f, 0xfd], "Zstandard compressed data"],
+  [[0xfd, 0x37, 0x7a, 0x58, 0x5a], "xz compressed data"], [[0x42, 0x5a, 0x68], "bzip2 compressed data"], [[0x37, 0x7a, 0xbc, 0xaf], "7-Zip archive"], [[0x52, 0x61, 0x72, 0x21], "RAR archive"],
+  [[0x25, 0x50, 0x44, 0x46], "PDF document"], [[0x89, 0x50, 0x4e, 0x47], "PNG picture"], [[0xff, 0xd8, 0xff], "JPEG picture"], [[0x47, 0x49, 0x46, 0x38], "GIF picture"],
+  [[0x53, 0x51, 0x4c, 0x69, 0x74, 0x65], "SQLite database"], [[0xd0, 0xcf, 0x11, 0xe0], "Older Microsoft Office file"], [[0x4f, 0x67, 0x67, 0x53], "Ogg media"], [[0x1a, 0x45, 0xdf, 0xa3], "Matroska or WebM media"],
+  [[0x49, 0x44, 0x33], "MP3 audio"], [[0x66, 0x4c, 0x61, 0x43], "FLAC audio"], [[0x21, 0x3c, 0x61, 0x72, 0x63, 0x68], "Debian package or static library"], [[0xed, 0xab, 0xee, 0xdb], "RPM package"],
+  [[0x78, 0x01, 0x73, 0x0d], "Apple disk image"], [[0x4d, 0x53, 0x43, 0x46], "Windows cabinet archive"],
+];
+export const fileSignature = (bytes) => SIGNATURES.find(([magic]) => magic.every((byte, at) => bytes[at] === byte))?.[1] ?? null;
+const HEX_CHUNK = 64 * 1024;
+export function hexLines(bytes, offset = 0) {
+  const lines = [];
+  for (let at = 0; at < bytes.length; at += 16) {
+    const row = bytes.subarray(at, at + 16);
+    const hex = Array.from(row, (byte) => byte.toString(16).padStart(2, "0")).join(" ").replace(/^((?:\S\S ){8})/, "$1 ");
+    const text = Array.from(row, (byte) => (byte >= 32 && byte < 127 ? String.fromCharCode(byte) : "·")).join("");
+    lines.push(`${(offset + at).toString(16).padStart(8, "0")}  ${hex.padEnd(48)}  ${text}`);
+  }
+  return lines;
+}
+export async function mountBytes(body, entry) {
+  const raw = `/api/raw?path=${enc(entry.path)}`;
+  const size = Number(entry.size) || 0;
+  const read = async (from) => {
+    const response = await fetch(raw, { credentials: "same-origin", headers: { Range: `bytes=${from}-${from + HEX_CHUNK - 1}` } });
+    if (!response.ok) throw new Error("Could not read the file");
+    // A server that ignores the range sends the whole file: only the asked part is used.
+    const all = new Uint8Array(await response.arrayBuffer());
+    return response.status === 206 ? all : all.subarray(from, from + HEX_CHUNK);
+  };
+  const first = await read(0);
+  const lines = h("pre", "hex-lines", hexLines(first).join("\n"));
+  let shown = first.length;
+  const more = h("button", "", "Show more");
+  more.type = "button";
+  more.hidden = shown >= size;
+  more.addEventListener("click", async () => {
+    more.disabled = true;
+    try {
+      const next = await read(shown);
+      lines.append(document.createTextNode(`\n${hexLines(next, shown).join("\n")}`));
+      shown += next.length;
+      more.hidden = !next.length || shown >= size;
+    } finally { more.disabled = false; }
+  });
+  const kind = fileSignature(first);
+  body.replaceChildren(h("div", "subtitle-view hex-view",
+    h("p", "muted", `${kind ? `${kind}. ` : ""}OwnNAS has no preview for this kind of file, so these are its bytes. Download it to open it on your computer.`),
+    lines, more));
+  return { destroy() {} };
+}

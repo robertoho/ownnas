@@ -1,20 +1,64 @@
-.docx-editor { width: 100%; padding: 12px; box-sizing: border-box; }
-.docx-toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; position: sticky; top: 0; z-index: 1; background: var(--bg, #202020); padding: 8px; }
-.docx-status { margin-left: auto; font-size: 12px; }
-.docx-page { background: white; color: #202020; padding: clamp(16px, 5vw, 64px); max-width: 800px; margin: 16px auto; min-height: 600px; font: 16px/1.5 Georgia, serif; overflow-wrap: anywhere; }
-.docx-page p { margin: 0 0 12px; min-height: 1.5em; }
-.docx-page table { width: 100%; border-collapse: collapse; margin: 12px 0; }
-.docx-page td { border: 1px solid #bbb; padding: 8px; vertical-align: top; }
-.docx-run { white-space: pre-wrap; }
-.docx-run[contenteditable=true] { min-width: 4px; min-height: 1em; display: inline-block; }
-.docx-run[contenteditable=true]:focus { outline: 1px solid #597eb8; background: #edf4ff; }
+/* Word document editor: a page on a grey desk, edited directly. */
+.docx-editor { display: flex; flex-direction: column; gap: 6px; flex: 1 1 auto; width: 100%; min-height: 24rem; box-sizing: border-box; }
+.docx-editor [hidden] { display: none !important; }
+.docx-editor > .office-toolbar { flex: none; }
+.docx-toolbar .office-select { max-width: 7.5rem; }
+.docx-find-bar { gap: 6px; }
+.docx-find-only .docx-replace { display: none; }
+.docx-find-input { height: 30px; width: 11rem; max-width: 40vw; padding: 0 0.5rem; font-size: 0.82rem; border-radius: 7px; }
+.docx-find-case { display: inline-flex; align-items: center; gap: 4px; font-size: 0.78rem; }
+.docx-workspace { display: flex; flex: 1 1 auto; min-height: 16rem; gap: 6px; }
+.docx-outline { flex: 0 0 200px; overflow: auto; padding: 8px; border: 1px solid var(--line, #d0d2cb); border-radius: 8px; background: var(--bg-2, #f4f4f2); color: var(--text, #1d1d1d); }
+.docx-outline[hidden] { display: none; }
+.docx-outline h3 { margin: 0 0 6px; font-size: 0.82rem; }
+.docx-outline-item { display: block; width: 100%; padding: 3px 6px; border: 0; border-radius: 5px; background: transparent; color: inherit; font-size: 0.8rem; text-align: left; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.docx-outline-item:hover { background: var(--bg-3, #e6e7e2); }
+.docx-scroller { flex: 1 1 auto; min-width: 0; overflow: auto; border: 1px solid var(--line, #d0d2cb); border-radius: 8px; background: #e9eae6; padding: 18px 12px 40px; overscroll-behavior: contain; container: docx-desk / inline-size; }
+.docx-sheet { box-sizing: border-box; max-width: 100%; margin: 0 auto; display: flex; flex-direction: column; background: #fff; color: #1d1d1d; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18), 0 6px 22px rgba(0, 0, 0, 0.08); color-scheme: light; }
+/* When the desk is narrower than the page, the page's margins give way before its text does. */
+@container docx-desk (max-width: 860px) { .docx-sheet { width: 100% !important; padding: 28px 28px !important; } }
+@container docx-desk (max-width: 460px) { .docx-sheet { padding: 18px 14px !important; } }
+.docx-margin { color: #6b6f66; font-size: 0.8em; white-space: pre-wrap; }
+.docx-margin[hidden], .docx-notes[hidden] { display: none; }
+.docx-header { margin-bottom: 18px; }
+.docx-footer { margin-top: 18px; }
+.docx-notes { margin-top: 24px; padding-top: 8px; border-top: 1px solid #c9cbc4; font-size: 0.8em; color: #444; }
+.docx-note { margin: 0 0 4px; }
+.docx-page { flex: 1 1 auto; font: 11pt/1.2 Calibri, Carlito, Arial, sans-serif; overflow-wrap: anywhere; outline: none; caret-color: #1a5fd0; tab-size: 4; white-space: pre-wrap; min-height: 10em; }
+.docx-page p { margin: 0 0 8pt; min-height: 1.2em; }
+.docx-page p[data-marker] { position: relative; }
+.docx-page p[data-marker]::before { content: attr(data-marker); display: inline-block; width: var(--docx-hang, 24px); margin-left: calc(-1 * var(--docx-hang, 24px)); user-select: none; -webkit-user-select: none; white-space: nowrap; }
+.docx-page p.docx-break-before { border-top: 1px dashed #b9bcb4; padding-top: 6px; }
+.docx-page table { border-collapse: collapse; margin: 6px 0 10px; max-width: 100%; }
+.docx-page td { border: 1px solid #9c9f97; padding: 3px 6px; vertical-align: top; min-width: 1.5em; }
+.docx-page td > p:last-child { margin-bottom: 0; }
+.docx-page td:focus-within { box-shadow: inset 0 0 0 2px rgba(26, 95, 208, 0.35); }
+.docx-page a.docx-link { color: #1a5fd0; text-decoration: underline; cursor: text; }
+.docx-image { display: inline-block; max-width: 100%; height: auto; vertical-align: bottom; cursor: default; }
+.docx-image-picked { outline: 2px solid #1a5fd0; outline-offset: 1px; box-shadow: 4px 4px 0 -1px #1a5fd0; cursor: nwse-resize; }
+.docx-object { display: inline-block; padding: 0 4px; border: 1px dashed #b9bcb4; border-radius: 4px; color: #6b6f66; font-size: 0.85em; }
+.docx-field { padding: 0 2px; border-radius: 3px; background: #ececea; }
+.docx-pagebreak { display: block; margin: 8px 0; border-top: 1px dashed #9c9f97; color: #6b6f66; font-size: 0.72em; text-align: center; line-height: 1.6; user-select: none; -webkit-user-select: none; }
+.docx-noteref { color: #1a5fd0; }
+.docx-comment-mark { color: #b26a00; cursor: help; font-size: 0.8em; vertical-align: super; }
+.docx-added { color: #16723a; text-decoration: underline; }
+.docx-removed { color: #b3261e; text-decoration: line-through; }
+.docx-locked { margin: 0 0 8pt; padding: 4px 8px; border: 1px dashed #b9bcb4; border-radius: 6px; background: #f6f6f4; color: #555; white-space: pre-wrap; }
+.docx-footerbar { flex: none; display: flex; justify-content: flex-end; }
+.docx-dialog { width: min(24rem, 90vw); padding: 16px; border: 1px solid var(--line, #d0d2cb); border-radius: 10px; background: var(--bg, #fff); color: var(--text, #1d1d1d); }
+.docx-dialog h3 { margin: 0 0 10px; font-size: 1rem; }
+.docx-dialog-row { display: grid; grid-template-columns: 9rem 1fr; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 0.85rem; }
+.docx-dialog-row input, .docx-dialog-row select { width: 100%; box-sizing: border-box; }
+.docx-dialog-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 12px; }
+@media print {
+  html:has(body.docx-printing), body.docx-printing { background: #fff !important; color-scheme: light; }
+  body.docx-printing > :not(.docx-print) { display: none !important; }
+  body.docx-printing > .docx-print { display: block; color: #000; }
+  .docx-print .docx-sheet { box-shadow: none; width: auto !important; max-width: none; min-height: 0 !important; padding: 0 !important; }
+  .docx-print .docx-pagebreak { break-after: page; visibility: hidden; margin: 0; }
+  .docx-print p.docx-break-before { break-before: page; border: 0; padding: 0; }
+}
 
-.docx-run[contenteditable=true]:empty::before { content: "Type here"; color: #888; }
-
-.docx-toolbar select { width: auto; max-width: 130px; }
-.docx-color { display: inline-flex; align-items: center; gap: 6px; font: 12px system-ui; }
-.docx-color input { width: 32px; height: 28px; padding: 2px; }
-.docx-toolbar button[aria-pressed=true] { outline: 2px solid var(--accent, #597eb8); }
 /* Office editors: a compact icon toolbar shared by the spreadsheet and document editors.
    The colour variables are OwnNAS's theme; the fallbacks suit a light page elsewhere. */
 .office-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; padding: 4px; border: 1px solid var(--line, #d0d2cb); border-radius: 10px; background: var(--bg-2, #f4f4f2); }

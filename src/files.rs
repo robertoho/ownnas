@@ -1311,6 +1311,10 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 pub fn kind_of(name: &str) -> &'static str {
     let lower = name.to_ascii_lowercase();
+    // Well-known text files that have no extension.
+    if matches!(lower.as_str(), "dockerfile" | "containerfile" | "makefile" | "gnumakefile" | "rakefile" | "gemfile" | "procfile" | "jenkinsfile" | "vagrantfile" | "brewfile" | "justfile" | "readme" | "license" | "licence" | "copying" | "authors" | "changelog" | "notice" | "todo" | "cmakelists.txt" | ".gitignore" | ".gitattributes" | ".gitmodules" | ".dockerignore" | ".editorconfig" | ".npmrc" | ".nvmrc" | ".bashrc" | ".zshrc" | ".profile" | ".vimrc") {
+        return "text";
+    }
     if lower.ends_with(".tar.gz")
         || lower.ends_with(".tgz")
         || lower.ends_with(".tar.bz2")
@@ -1323,8 +1327,8 @@ pub fn kind_of(name: &str) -> &'static str {
         | "heif" | "avif" | "jfif" | "jxl" => "image",
         ext if crate::photo_formats::handles(ext) => "image",
         "svg" | "svgz" => "svg",
-        "mp4" | "m4v" | "webm" | "mkv" | "mov" | "avi" | "ogv" | "mpeg" | "mpg" | "wmv" => "video",
-        "mp3" | "wav" | "flac" | "ogg" | "opus" | "m4a" | "aac" | "wma" => "audio",
+        "mp4" | "m4v" | "webm" | "mkv" | "mov" | "avi" | "ogv" | "mpeg" | "mpg" | "wmv" | "3gp" | "3g2" | "m2ts" | "mts" | "flv" | "f4v" | "vob" | "asf" => "video",
+        "mp3" | "wav" | "flac" | "ogg" | "opus" | "m4a" | "aac" | "wma" | "aif" | "aiff" | "oga" | "caf" | "mka" | "ape" | "wv" | "amr" | "ac3" | "spx" => "audio",
         "pdf" => "pdf",
         "xlsx" => "spreadsheet",
         "zip" | "jar" | "cbz" | "cbr" | "cb7" | "apk" | "tar" | "gz" | "tgz" | "bz2" | "tbz2" | "xz" | "txz" | "7z" | "rar" | "iso" => "archive",
@@ -1332,12 +1336,41 @@ pub fn kind_of(name: &str) -> &'static str {
         | "toml" | "ini" | "conf" | "cfg" | "env" | "nfo" | "properties" | "html" | "htm"
         | "css" | "js" | "mjs" | "ts" | "tsx" | "jsx" | "py" | "rs" | "go" | "java" | "c"
         | "h" | "cpp" | "hpp" | "cs" | "sh" | "bash" | "zsh" | "ps1" | "sql" | "rb" | "php"
-        | "lua" | "vue" | "svelte" => "text",
+        | "lua" | "vue" | "svelte"
+        // More languages and markup, read and edited as text.
+        | "kt" | "kts" | "swift" | "scala" | "dart" | "r" | "pl" | "pm" | "vb" | "fs" | "clj" | "ex" | "exs" | "erl"
+        | "hs" | "jl" | "nim" | "zig" | "m" | "mm" | "groovy" | "gradle" | "tf" | "tfvars" | "nix" | "proto" | "graphql" | "gql"
+        | "scss" | "sass" | "less" | "tex" | "bib" | "rst" | "adoc" | "asciidoc" | "org" | "mdx" | "xhtml" | "xsd" | "xsl" | "xslt" | "wsdl"
+        | "bat" | "cmd" | "fish" | "awk" | "sed" | "vim" | "el" | "lisp" | "asm" | "s" | "cmake" | "mk" | "pro" | "cjs" | "cts"
+        | "patch" | "diff" | "rss" | "atom" | "opml" | "srv" | "service" | "timer" | "lock" | "gitignore" | "dockerignore" | "editorconfig" | "sum" => "text",
         "dxf" | "dwg" => "cad2d",
         "obj" | "stl" | "gltf" | "glb" | "ply" | "3mf" | "fbx" | "dae" | "3ds" | "amf" | "usdz" | "stp" | "step" | "iges" | "igs" => {
             "model3d"
         }
         _ => "file",
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::kind_of;
+
+    #[test]
+    fn more_formats_have_a_kind() {
+        for name in ["Dockerfile", "Makefile", ".gitignore", "app.kt", "main.swift", "notes.rst", "paper.tex", "fix.patch", "news.rss", "subs.opml", "run.bat"] {
+            assert_eq!(kind_of(name), "text", "{name}");
+        }
+        for name in ["clip.3gp", "cam.mts", "old.flv"] {
+            assert_eq!(kind_of(name), "video", "{name}");
+        }
+        for name in ["take.aiff", "voice.amr", "disc.mka"] {
+            assert_eq!(kind_of(name), "audio", "{name}");
+        }
+        // What can hold secrets stays out of the text kind, so out of the search index.
+        for name in ["server.pem", "id.key", "site.crt", "session.har", "cert.p12"] {
+            assert_eq!(kind_of(name), "file", "{name}");
+        }
+        assert_eq!(kind_of("types.ts"), "text", "still TypeScript, not video");
     }
 }
 
