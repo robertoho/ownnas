@@ -90,7 +90,7 @@ fn temporary(err: &ApiError) -> bool {
         .any(|known| message.contains(known))
 }
 
-fn with_retries<T>(mut work: impl FnMut() -> Result<T, ApiError>) -> Result<T, ApiError> {
+pub fn with_retries<T>(mut work: impl FnMut() -> Result<T, ApiError>) -> Result<T, ApiError> {
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -101,7 +101,7 @@ fn with_retries<T>(mut work: impl FnMut() -> Result<T, ApiError>) -> Result<T, A
     }
 }
 
-fn io_failure(err: io::Error) -> ApiError {
+pub fn io_failure(err: io::Error) -> ApiError {
     ApiError::Other(format!("Could not use a local file: {err}"))
 }
 

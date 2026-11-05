@@ -1,4 +1,5 @@
 //! `ownnascli`: copies files to and from an OwnNAS server from the command line.
+mod photos;
 mod transfer;
 
 use std::collections::BTreeMap;
@@ -17,7 +18,7 @@ use ownnas_core::trust::{server_fingerprint, Trust};
 
 use transfer::{join, plan, Listing, Options, Plan, Report, Way};
 
-const REMOTE_PREFIX: &str = "ownnas:";
+pub(crate) const REMOTE_PREFIX: &str = "ownnas:";
 
 #[derive(Parser)]
 #[command(name = "ownnascli", version, about = "Fast file transfer with an OwnNAS server", after_help = "Paths on the server start with ownnas: (ownnas:Photos). ownnas: alone is the top of the library.")]
@@ -67,6 +68,29 @@ enum Command {
         destination: String,
         #[command(flatten)]
         flags: Flags,
+    },
+    /// Upload photos and videos to the Gallery, telling and skipping those already in the
+    /// library, whatever they are called and wherever they are. Everything goes straight into the
+    /// destination folder, and a name already taken gets a number.
+    Photos {
+        /// Files, or folders to look through.
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// The Gallery workspace to upload to.
+        #[arg(short, long)]
+        workspace: Option<String>,
+        /// The folder on the server: needed without --workspace, or for a workspace of several.
+        #[arg(long)]
+        to: Option<String>,
+        /// Upload those already there as well.
+        #[arg(long)]
+        force: bool,
+        /// How many files to handle at once.
+        #[arg(short, long, default_value_t = 4)]
+        parallel: usize,
+        /// Say what would happen, without uploading anything.
+        #[arg(short = 'n', long)]
+        dry_run: bool,
     },
     /// Move or rename a file or folder on the server.
     Mv { source: String, destination: String },
@@ -484,6 +508,9 @@ fn main() -> ExitCode {
         Command::Mkdir { path } => signed_in().and_then(|api| api.mkdir(&on_server(&path)).map_err(|err| say(&err))),
         Command::Cp { source, destination, flags } => copy(&source, &destination, false, &flags),
         Command::Sync { source, destination, flags } => copy(&source, &destination, true, &flags),
+        Command::Photos { paths, workspace, to, force, parallel, dry_run } => signed_in().and_then(|api| {
+            photos::run(&api, &paths, workspace.as_deref(), to.as_deref().map(on_server).as_deref(), &photos::Options { force, parallel, dry_run })
+        }),
         Command::Mv { source, destination } => move_item(&source, &destination),
         Command::Rm { path, recursive } => remove(&path, recursive),
     };

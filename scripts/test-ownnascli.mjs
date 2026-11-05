@@ -48,6 +48,7 @@ const write = (root, rel, data) => {
 };
 const read = (root, rel) => fs.readFileSync(path.join(root, rel), 'utf8');
 const exists = (root, rel) => fs.existsSync(path.join(root, rel));
+const there = (rel) => exists(library, rel);
 const sha = (file) => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 const inTrash = () => {
   const found = [];
@@ -206,6 +207,53 @@ try {
   assert.equal(partial.headers.get('content-range'), 'bytes 67108860-67108863/67108864');
   assert.equal(partial.headers.get('x-ownnas-size'), '67108864', 'the stamp is the whole file\'s');
   assert.equal((await partial.arrayBuffer()).byteLength, 4);
+
+  // Photos to a workspace: what is already there is told and not sent.
+  const JPEG = (seed) => Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xd9]), Buffer.from(seed)]);
+  const call = async (method, url, body) => (await fetch(`${address}${url}`, { method, headers: { authorization: `Bearer ${token}`, 'x-ownnas': '1', 'content-type': 'application/json' }, body: body && JSON.stringify(body) })).json();
+  fs.mkdirSync(path.join(library, 'Family'));
+  fs.mkdirSync(path.join(library, 'Work'));
+  fs.writeFileSync(path.join(library, 'Family/here.jpg'), JPEG('in family'));
+  fs.writeFileSync(path.join(library, 'Work/there.jpg'), JPEG('in work'));
+  await call('POST', '/api/workspaces', { name: 'Family', folders: ['Family'] });
+  await call('POST', '/api/workspaces', { name: 'Both', folders: ['Family', 'Work'] });
+  await call('POST', '/api/gallery/rescan');
+  for (let i = 0; i < 100; i++) {
+    const page = await call('GET', '/api/gallery/timeline?limit=200');
+    if (page.items.some((item) => item.path === 'Work/there.jpg') && page.items.some((item) => item.path === 'Family/here.jpg')) break;
+    await new Promise((done) => setTimeout(done, 100));
+  }
+  const shots = path.join(here, 'shots');
+  fs.mkdirSync(path.join(shots, 'trip'), { recursive: true });
+  fs.writeFileSync(path.join(shots, 'copy-of-here.jpg'), JPEG('in family'));
+  fs.writeFileSync(path.join(shots, 'copy-of-there.jpg'), JPEG('in work'));
+  fs.writeFileSync(path.join(shots, 'new.jpg'), JPEG('new'));
+  fs.writeFileSync(path.join(shots, 'trip/new-twin.jpg'), JPEG('new'));
+  fs.writeFileSync(path.join(shots, 'here.jpg'), JPEG('same name, other photo'));
+  fs.writeFileSync(path.join(shots, 'trip/deep.MOV'), JPEG('a video, deeper down'));
+  fs.writeFileSync(path.join(shots, 'notes.txt'), 'not a photo');
+  refused(/Say where/, 'photos', shots);
+  refused(/no workspace called “Nope”.*Family/, 'photos', shots, '--workspace', 'Nope');
+  refused(/several folders.*Family, Work/, 'photos', shots, '--workspace', 'Both');
+  refused(/is not in “Family”/, 'photos', shots, '--workspace', 'Family', '--to', 'ownnas:Work');
+  let told = ok('photos', shots, '--workspace', 'family', '--dry-run');
+  assert.match(told, /^3 to upload, 3 already there, 1 not photos or videos, of 6/m, told);
+  assert.ok(!there('Family/new.jpg'), 'a dry run sends nothing');
+  told = ok('photos', shots, '--workspace', 'family');
+  assert.match(told, /already there: .*copy-of-here\.jpg is ownnas:Family\/here\.jpg\n/, told);
+  assert.match(told, /already there: .*copy-of-there\.jpg is ownnas:Work\/there\.jpg \(outside this workspace\)/, told);
+  assert.match(told, /in this upload/, told);
+  assert.match(told, /^3 uploaded .*, 3 already there, 1 not photos or videos, of 6/m, told);
+  assert.equal(read(library, 'Family/here.jpg').length, JPEG('in family').length, 'what was there stays');
+  assert.ok(fs.readFileSync(path.join(library, 'Family/here (2).jpg')).equals(JPEG('same name, other photo')));
+  assert.ok(there('Family/deep.MOV'), 'everything goes straight into the folder');
+  assert.ok(!there('Family/copy-of-here.jpg') && !there('Family/notes.txt'));
+  // Again straight away, before any scan could have seen them.
+  told = ok('photos', shots, '--workspace', 'Family');
+  assert.match(told, /^0 uploaded .*6 already there/m, told);
+  // --force sends one anyway, under a new name.
+  ok('photos', path.join(shots, 'copy-of-here.jpg'), '--to', 'ownnas:Work', '--force');
+  assert.ok(there('Work/copy-of-here.jpg'));
 
   ok('logout');
   refused(/Not signed in/, 'ls');

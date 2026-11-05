@@ -37,6 +37,29 @@ impl<R: Read> Read for Counted<'_, R> {
 
 const CANCELLED: &str = "Cancelled";
 
+/// What the library already has of a photo.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PhotoCheck {
+    /// A file with the same contents.
+    pub copy: Option<String>,
+    /// That copy is in the workspace asked about.
+    #[serde(default)]
+    pub in_workspace: bool,
+    /// A smaller copy made from it.
+    pub resized: Option<String>,
+    /// It was deleted, and kept from being backed up again.
+    #[serde(default)]
+    pub blocked: bool,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct WorkspaceInfo {
+    pub id: i64,
+    pub name: String,
+    pub folders: Vec<String>,
+}
+
 /// What to do when an upload's name is taken: the web app's choices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Conflict {
@@ -102,6 +125,8 @@ struct CheckResponse {
 #[derive(Deserialize)]
 struct UploadResponse {
     saved: u32,
+    #[serde(default)]
+    paths: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -156,6 +181,32 @@ impl Api {
         body.path.ok_or_else(|| ApiError::Other("The server did not say where the item went".into()))
     }
 
+    /// Whether the library already has a photo with these contents.
+    pub fn check_photo(&self, name: &str, size: u64, sha256: &str, folder: &str, workspace: Option<i64>) -> Result<PhotoCheck, ApiError> {
+        let response = self.post_json(
+            "/api/gallery/upload/check",
+            json!({ "name": name, "size": size, "sha256": sha256, "folder": folder, "workspace": workspace }),
+        )?;
+        response.into_json().map_err(|err| ApiError::Other(err.to_string()))
+    }
+
+    /// The Gallery's workspaces.
+    pub fn workspaces(&self) -> Result<Vec<WorkspaceInfo>, ApiError> {
+        #[derive(Deserialize)]
+        struct Answer {
+            workspaces: Vec<WorkspaceInfo>,
+        }
+        let response = self.request("GET", "/api/workspaces").fetch()?;
+        let answer: Answer = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
+        Ok(answer.workspaces)
+    }
+
+    /// Has the Gallery look through the library again, to show what was added.
+    pub fn rescan_gallery(&self) -> Result<(), ApiError> {
+        self.post_json("/api/gallery/rescan", json!({}))?;
+        Ok(())
+    }
+
     /// Moves a file or folder to the server's Trash, or deletes it if it is already there.
     pub fn trash(&self, path: &str) -> Result<(), ApiError> {
         self.request("DELETE", "/api/entry")
@@ -186,6 +237,22 @@ impl Api {
         body: impl Read,
         progress: Progress,
     ) -> Result<Uploaded, ApiError> {
+        self.upload_file_at(dir, name, conflict, mtime, size, body, progress).map(|(uploaded, _)| uploaded)
+    }
+
+    /// [`Api::upload_file`], also saying where the file was saved (a server from before this
+    /// does not say).
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_file_at(
+        &self,
+        dir: &str,
+        name: &str,
+        conflict: Option<Conflict>,
+        mtime: Option<i64>,
+        size: Option<u64>,
+        body: impl Read,
+        progress: Progress,
+    ) -> Result<(Uploaded, Option<String>), ApiError> {
         let boundary = format!("----OwnNAS{}", hex::encode(rand::random::<[u8; 12]>()));
         let (head, tail) = form_parts(&boundary, name);
         let mut request = self
@@ -214,13 +281,14 @@ impl Api {
         match request.send(form) {
             Ok(response) => {
                 let body: UploadResponse = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
-                Ok(if body.saved > 0 { Uploaded::Saved } else { Uploaded::Skipped })
+                let path = body.paths.into_iter().next();
+                Ok((if body.saved > 0 { Uploaded::Saved } else { Uploaded::Skipped }, path))
             }
             Err(_) if cancelled.get() => Err(ApiError::Cancelled),
             Err(ureq::Error::Status(409, response)) => {
                 let body: ConflictResponse = response.into_json().unwrap_or(ConflictResponse { exists: false, existing: None });
                 match body.existing.filter(|_| body.exists) {
-                    Some(existing) => Ok(Uploaded::Exists(existing)),
+                    Some(existing) => Ok((Uploaded::Exists(existing), None)),
                     None => Err(ApiError::Conflict),
                 }
             }
