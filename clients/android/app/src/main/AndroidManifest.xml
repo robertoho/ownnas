@@ -17,6 +17,9 @@
     <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
+    <!-- Without it Android removes the location from photos as they are read: the backup would
+         lose it, and its SHA-256 would not match the same photo copied to the server another way. -->
+    <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
     <!-- A notification shows a backup's progress while it runs. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />

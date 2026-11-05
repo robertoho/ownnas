@@ -91,6 +91,12 @@ fun BackupScreen(vm: AppViewModel) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) wanted += Manifest.permission.POST_NOTIFICATIONS
         ask.launch(wanted.toTypedArray())
     }
+    LaunchedEffect(settings.serverId) {
+        if (settings.serverId != null && allowed && vm.backup.wantsLocation()) {
+            vm.backup.askedLocation()
+            askPermissions()
+        }
+    }
     LaunchedEffect(settings.serverId, checked) {
         folder = null
         folderError = null

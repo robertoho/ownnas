@@ -78,6 +78,8 @@ data class BackupState(
 /** A photo or video a run sent, or found on the server already. */
 data class BackedUpItem(val uri: Uri, val name: String, val size: Long, val at: Long, val skipped: Boolean, val blocked: Boolean = false)
 
+private const val LOCATION = Manifest.permission.ACCESS_MEDIA_LOCATION
+
 class Backup(private val context: Context) {
     private val prefs = context.getSharedPreferences("backup", Context.MODE_PRIVATE)
     private val doneFile = File(context.filesDir, "backup-done.txt")
@@ -187,13 +189,32 @@ class Backup(private val context: Context) {
     private fun constraints(settings: BackupSettings) =
         Constraints.Builder().setRequiredNetworkType(if (settings.wifiOnly) NetworkType.UNMETERED else NetworkType.CONNECTED).build()
 
-    fun hasPermission(): Boolean = permissions().all { context.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
+    /** Whether backups can run: the photo location is wanted, not needed. */
+    fun hasPermission(): Boolean = permissions().filter { it != LOCATION }.all { context.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
 
-    fun permissions(): List<String> = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+    fun permissions(): List<String> = (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         listOfNotNull(Manifest.permission.READ_MEDIA_IMAGES, if (settingsFlow.value.videos) Manifest.permission.READ_MEDIA_VIDEO else null)
     } else {
         listOf(Manifest.permission.READ_EXTERNAL_STORAGE)
-    }
+    }) + listOfNotNull(if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) LOCATION else null)
+
+    /** Whether to ask for the photo location (once, for phones set up before it was asked for). */
+    fun wantsLocation(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && context.checkSelfPermission(LOCATION) != PackageManager.PERMISSION_GRANTED &&
+            !prefs.getBoolean("askedLocation", false)
+
+    fun askedLocation() = prefs.edit { putBoolean("askedLocation", true) }
+
+    /**
+     * The photo exactly as it was taken. Without this, Android removes its location as it is read:
+     * the backup would lose it, and would not match the same photo already on the server.
+     */
+    fun original(uri: Uri): Uri =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && context.checkSelfPermission(LOCATION) == PackageManager.PERMISSION_GRANTED) {
+            runCatching { MediaStore.setRequireOriginal(uri) }.getOrDefault(uri)
+        } else {
+            uri
+        }
 
     fun deviceName(): String =
         Settings.Global.getString(context.contentResolver, Settings.Global.DEVICE_NAME)?.takeIf { it.isNotBlank() } ?: Build.MODEL
@@ -378,7 +399,10 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
             if (index > 0 && index % 5 == 0) runCatching { setForeground(foreground(index, pending.size, item.name)) }
             var lastShown = 0L
             val outcome = runCatching {
-                val fd = applicationContext.contentResolver.openFileDescriptor(item.uri, "r")?.detachFd() ?: error("Could not open ${item.name}")
+                val resolver = applicationContext.contentResolver
+                val file = runCatching { resolver.openFileDescriptor(backup.original(item.uri), "r") }.getOrNull()
+                    ?: resolver.openFileDescriptor(item.uri, "r")
+                val fd = file?.detachFd() ?: error("Could not open ${item.name}")
                 app.servers.call(serverId) {
                     it.backupFd(device, item.name, fd, item.size.toULong(), item.takenMs, object : Transfer {
                         override fun keepGoing(done: ULong): Boolean {
