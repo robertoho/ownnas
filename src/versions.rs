@@ -291,8 +291,8 @@ mod tests {
         assert_eq!(list(&s.conn, "b/doc.txt").unwrap().len(), 1);
         crate::db::delete_path_meta(&s.conn, "b").unwrap();
         assert!(list(&s.conn, "b/doc.txt").unwrap().is_empty());
-        LAST_SWEEP.store(0, Ordering::Relaxed);
-        prune(&s.conn, &s.store, "", 1_800_000_000);
+        // Called directly: the hour between sweeps is shared with the tests running alongside.
+        sweep_orphans(&s.conn, &s.store);
         assert!(!file_of(&s, id).exists(), "its copy is swept");
     }
 

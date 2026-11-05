@@ -128,11 +128,15 @@ impl<R: Read> Read for Counted<'_, R> {
 }
 
 /// Uploads a file, as long as the server still has `base` there.
-pub fn upload_one(api: &Api, file: &Path, remote: &str, stamp: Stamp, base: Option<Stamp>, moved: &AtomicU64) -> Result<(), ApiError> {
+pub fn upload_one(api: &Api, file: &Path, remote: &str, stamp: Stamp, base: Option<Stamp>, later: bool, moved: &AtomicU64) -> Result<(), ApiError> {
     with_retries(|| {
         let opened = fs::File::open(file).map_err(io_failure)?;
         let mut body = Counted::new(opened.take(stamp.size), moved);
-        let sent = api.upload(remote, base, stamp.mtime, stamp.size, &mut body);
+        let sent = if later {
+            api.upload_unflushed(remote, base, stamp.mtime, stamp.size, &mut body)
+        } else {
+            api.upload(remote, base, stamp.mtime, stamp.size, &mut body)
+        };
         let this_try = body.this_try;
         if sent.is_err() {
             moved.fetch_sub(this_try, Ordering::Relaxed);
@@ -151,8 +155,9 @@ fn name_hash(name: &str) -> u64 {
 /// Downloads a file beside `dest` and moves it into place once complete. A large one cut off
 /// goes on from where it stopped, even in a later run, as long as the file on the server is the
 /// same version; the result is then checked against the server's checksum.
-/// Returns the byte it went on from, if it did.
-pub fn download_one(api: &Api, remote: &str, dest: &Path, stamp: Stamp, moved: &AtomicU64) -> Result<Option<u64>, ApiError> {
+/// Returns the byte it went on from, if it did. With `later`, the caller makes sure of the file
+/// on the disk afterwards (`local::flush_files`).
+pub fn download_one(api: &Api, remote: &str, dest: &Path, stamp: Stamp, later: bool, moved: &AtomicU64) -> Result<Option<u64>, ApiError> {
     let parent = dest.parent().ok_or_else(|| ApiError::Other("Nowhere to save the file".into()))?;
     fs::create_dir_all(parent).map_err(io_failure)?;
     let name = dest.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
@@ -168,7 +173,7 @@ pub fn download_one(api: &Api, remote: &str, dest: &Path, stamp: Stamp, moved: &
             }
         }
     }
-    let result = with_retries(|| fetch_part(api, remote, &part, stamp, moved));
+    let result = with_retries(|| fetch_part(api, remote, &part, stamp, later, moved));
     if result.is_err() && stamp.size < RESUME_MIN {
         let _ = fs::remove_file(&part);
     }
@@ -177,7 +182,7 @@ pub fn download_one(api: &Api, remote: &str, dest: &Path, stamp: Stamp, moved: &
     Ok(resumed)
 }
 
-fn fetch_part(api: &Api, remote: &str, part: &Path, stamp: Stamp, moved: &AtomicU64) -> Result<Option<u64>, ApiError> {
+fn fetch_part(api: &Api, remote: &str, part: &Path, stamp: Stamp, later: bool, moved: &AtomicU64) -> Result<Option<u64>, ApiError> {
     let have = fs::metadata(part).map_or(0, |meta| meta.len());
     let from = if stamp.size >= RESUME_MIN && have <= stamp.size { have } else { 0 };
     let mut file = fs::OpenOptions::new().create(true).truncate(false).write(true).open(part).map_err(io_failure)?;
@@ -205,7 +210,9 @@ fn fetch_part(api: &Api, remote: &str, part: &Path, stamp: Stamp, moved: &Atomic
     }
     file.flush().map_err(io_failure)?;
     file.set_modified(UNIX_EPOCH + Duration::from_millis(stamp.mtime.max(0) as u64)).map_err(io_failure)?;
-    file.sync_all().map_err(io_failure)?;
+    if !later {
+        file.sync_all().map_err(io_failure)?;
+    }
     drop(file);
     if started == 0 {
         return Ok(None);
@@ -217,6 +224,31 @@ fn fetch_part(api: &Api, remote: &str, part: &Path, stamp: Stamp, moved: &Atomic
         return Err(ApiError::Other("The resumed file does not match the server's checksum".into()));
     }
     Ok(Some(started))
+}
+
+/// Of the files that look the same on both sides, those whose contents are not. One that cannot
+/// be compared counts as different, which only means copying it again.
+pub fn differing(api: &Api, way: &Way, paths: Vec<String>, parallel: usize) -> Vec<String> {
+    let (root, remote) = match way {
+        Way::Up { local, remote } | Way::Down { remote, local } => (local, remote),
+    };
+    let queue = Mutex::new(paths.into_iter().collect::<VecDeque<_>>());
+    let found = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..parallel.clamp(1, 64) {
+            scope.spawn(|| loop {
+                let Some(path) = queue.lock().unwrap_or_else(|poison| poison.into_inner()).pop_front() else { break };
+                let same = match (local::sha256(&local::full_path(root, &path)), api.sha256(&join(remote, &path))) {
+                    (Ok(here), Ok(there)) => here.eq_ignore_ascii_case(&there),
+                    _ => false,
+                };
+                if !same {
+                    found.lock().unwrap_or_else(|poison| poison.into_inner()).push(path);
+                }
+            });
+        }
+    });
+    found.into_inner().unwrap_or_else(|poison| poison.into_inner())
 }
 
 fn human_rate(bytes: u64, took: Duration) -> String {
@@ -231,6 +263,7 @@ pub fn run(api: &Api, way: &Way, plan: &Plan, source: &Listing, dest: &Listing, 
     let done = AtomicBool::new(false);
     let failed = Mutex::new(Vec::new());
     let queue = Mutex::new(plan.copy.iter().collect::<VecDeque<_>>());
+    let downloaded = Mutex::new(Vec::new());
     let total_bytes: u64 = plan.copy.iter().filter_map(|path| source.get(path)).map(|node| node.stamp.size).sum();
     let fail = |path: &str, err: ApiError| failed.lock().unwrap_or_else(|poison| poison.into_inner()).push((path.to_string(), crate::say(&err)));
 
@@ -271,9 +304,16 @@ pub fn run(api: &Api, way: &Way, plan: &Plan, source: &Listing, dest: &Listing, 
                     let base = dest.get(path).filter(|node| !node.dir).map(|node| node.stamp);
                     let copied = match way {
                         Way::Up { local: root, remote } => {
-                            upload_one(api, &local::full_path(root, path), &join(remote, path), stamp, base, &moved).map(|()| None)
+                            upload_one(api, &local::full_path(root, path), &join(remote, path), stamp, base, true, &moved).map(|()| None)
                         }
-                        Way::Down { remote, local: root } => download_one(api, &join(remote, path), &local::full_path(root, path), stamp, &moved),
+                        Way::Down { remote, local: root } => {
+                            let target = local::full_path(root, path);
+                            let got = download_one(api, &join(remote, path), &target, stamp, true, &moved);
+                            if got.is_ok() {
+                                downloaded.lock().unwrap_or_else(|poison| poison.into_inner()).push(target);
+                            }
+                            got
+                        }
                     };
                     match copied {
                         Ok(resumed) => {
@@ -297,6 +337,16 @@ pub fn run(api: &Api, way: &Way, plan: &Plan, source: &Listing, dest: &Listing, 
     });
 
     let mut failed = failed.into_inner().unwrap_or_else(|poison| poison.into_inner());
+    // Only now is it safe to call them copied, and to remove anything because of them.
+    if finished.load(Ordering::Relaxed) > 0 {
+        let flushed = match way {
+            Way::Up { .. } => with_retries(|| api.flush()),
+            Way::Down { .. } => local::flush_files(&downloaded.into_inner().unwrap_or_else(|poison| poison.into_inner())).map_err(io_failure),
+        };
+        if let Err(err) = flushed {
+            failed.push(("(all files)".to_string(), format!("Could not make sure they are safely on the disk: {}", crate::say(&err))));
+        }
+    }
     let failed_paths: BTreeSet<&String> = failed.iter().map(|(path, _)| path).collect();
     let bytes = plan.copy.iter().filter(|path| !failed_paths.contains(path)).filter_map(|path| source.get(path)).map(|node| node.stamp.size).sum();
     let mut report = Report { copied: finished.load(Ordering::Relaxed), bytes, ..Report::default() };

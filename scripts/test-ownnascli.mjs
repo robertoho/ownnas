@@ -102,6 +102,19 @@ try {
   assert.equal(read(library, 'Backup/many/f1.txt'), 'changed');
   assert.ok(exists(library, 'Backup/many/f2.txt'));
 
+  // --checksum finds what size and date cannot: the same size and date, other contents.
+  // (A whole second, which comes back exactly: a date with milliseconds can come back 1 ms off.)
+  const damaged = path.join(library, 'Backup/many/f3.txt');
+  fs.utimesSync(path.join(up, 'many/f3.txt'), 1_700_000_000, 1_700_000_000);
+  assert.match(ok('cp', up, 'ownnas:Backup'), /^1 copied/);
+  fs.writeFileSync(damaged, 'FILE 3');
+  fs.utimesSync(damaged, 1_700_000_000, 1_700_000_000);
+  assert.match(ok('cp', up, 'ownnas:Backup'), /^0 copied/, 'without it, the damage goes unseen');
+  assert.equal(read(library, 'Backup/many/f3.txt'), 'FILE 3');
+  assert.match(ok('cp', up, 'ownnas:Backup', '--checksum', '-n'), /would copy many\/f3\.txt/);
+  assert.match(ok('cp', up, 'ownnas:Backup', '--checksum'), /^1 copied/);
+  assert.equal(read(library, 'Backup/many/f3.txt'), 'file 3');
+
   // Sync removes to the Trash, and refuses to empty a destination from an empty source.
   assert.match(ok('sync', up, 'ownnas:Backup', '-n'), /would remove many\/f2\.txt/);
   assert.ok(exists(library, 'Backup/many/f2.txt'));

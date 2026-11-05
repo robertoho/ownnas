@@ -16,3 +16,6 @@ tungstenite = { version = "0.29", default-features = false, features = ["handsha
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 vt100 = "0.16"
 webpki-roots = "0.26"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

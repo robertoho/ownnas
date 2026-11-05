@@ -769,6 +769,66 @@ pub fn upload_status(root: &Path, dir_rel: &str, filename: &str) -> Result<Uploa
     })
 }
 
+/// Makes sure these files are safely on the disk, in one go where the system allows it, which is
+/// far quicker than one at a time. Files since gone are passed over.
+pub fn flush_files(paths: &[PathBuf]) -> io::Result<()> {
+    let open = |path: &PathBuf| -> io::Result<Option<fs::File>> {
+        match fs::File::open(path) {
+            Ok(file) => Ok(Some(file)),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err),
+        }
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        // One file from each disk stands for all it holds.
+        let mut seen = std::collections::HashSet::new();
+        for path in paths {
+            let Some(file) = open(path)? else { continue };
+            if seen.insert(file.metadata()?.dev()) {
+                // SAFETY: the descriptor is open for the length of the call.
+                if unsafe { libc::syncfs(file.as_raw_fd()) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        // Each file to the disk, then the disk told once to store what it holds.
+        let mut last = std::collections::HashMap::new();
+        for path in paths {
+            let Some(file) = open(path)? else { continue };
+            // SAFETY: the descriptor is open for the length of the call.
+            if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            last.insert(file.metadata()?.dev(), file);
+        }
+        for file in last.values() {
+            file.sync_all()?;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = open;
+        for path in paths {
+            match fs::OpenOptions::new().write(true).open(path) {
+                Ok(file) => file.sync_all()?,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Where an upload is written until all of it has arrived, beside its destination, so a dropped
 /// connection never leaves part of a file under its name or costs the file it was replacing.
 pub fn upload_temp(dest: &Path) -> PathBuf {

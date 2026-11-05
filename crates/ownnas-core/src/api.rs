@@ -241,8 +241,29 @@ impl Api {
         size: u64,
         body: impl Read,
     ) -> Result<Stamp, ApiError> {
-        let response = self
-            .request("PUT", "/api/sync/file")
+        self.send_file(self.request("PUT", "/api/sync/file"), path, base, mtime, size, body)
+    }
+
+    /// Like [`Api::upload`], for many files in a row: the server does not make sure of each on its
+    /// disk, which is what takes the time. [`Api::flush`] does that for all of them afterwards,
+    /// and until it has answered they could be lost if the server loses power.
+    pub fn upload_unflushed(&self, path: &str, base: Option<Stamp>, mtime: i64, size: u64, body: impl Read) -> Result<Stamp, ApiError> {
+        self.send_file(self.request("PUT", "/api/sync/file").query("flush", "later"), path, base, mtime, size, body)
+    }
+
+    /// Asks the server to make sure of what [`Api::upload_unflushed`] sent. A server from before
+    /// this made sure of each file as it arrived, so there is nothing to ask of it.
+    pub fn flush(&self) -> Result<(), ApiError> {
+        // It can take minutes after a lot of writing to a slow disk.
+        let request = self.request("POST", "/api/sync/flush").timeout(Duration::from_secs(60 * 60));
+        match request.send_json(json!({})).map_err(map_err) {
+            Ok(_) | Err(ApiError::NotFound) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn send_file(&self, request: ureq::Request, path: &str, base: Option<Stamp>, mtime: i64, size: u64, body: impl Read) -> Result<Stamp, ApiError> {
+        let response = request
             .query("path", path)
             .query("base", &base_param(base))
             .query("mtime", &mtime.to_string())

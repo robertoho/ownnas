@@ -115,6 +115,10 @@ pub struct AppState {
     pub text_index: std::sync::Arc<crate::text_index::TextIndex>,
     /// Copies of files from before OwnNAS saved over them (`versions.rs`).
     pub versions: PathBuf,
+    /// Files uploaded with `flush=later`, not yet made sure of on the disk.
+    pub unflushed: std::sync::Mutex<Vec<PathBuf>>,
+    /// Held while flushing, so one client's flush also waits for what another one has taken.
+    pub flushing: tokio::sync::Mutex<()>,
     /// The drives' health reports, asked for now and then.
     pub health: std::sync::Arc<crate::health::Health>,
     /// How full the disk is, and how much the library and OwnNAS's data take.
@@ -221,6 +225,8 @@ pub fn new_state(
         file_index: std::sync::Arc::default(),
         text_index: std::sync::Arc::default(),
         versions: crate::versions::store_dir(&data_dir),
+        unflushed: std::sync::Mutex::default(),
+        flushing: tokio::sync::Mutex::const_new(()),
         health: std::sync::Arc::default(),
         storage: {
             let storage = std::sync::Arc::new(crate::storage::Storage::default());
@@ -482,6 +488,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
                 .put(sync_upload)
                 .layer(DefaultBodyLimit::disable()),
         )
+        .route("/api/sync/flush", post(sync_flush))
         .route("/api/sync/mkdir", post(sync_mkdir))
         .route("/api/sync/delete", post(sync_delete))
         .route("/api/sync/changes", get(sync_changes))
@@ -4905,6 +4912,8 @@ async fn upload(
             }
             // Written out before answering: a dropped tokio file may still be writing its last bytes.
             tokio::io::AsyncWriteExt::flush(&mut out).await.map_err(|_| store_failed())?;
+            // And on the disk before saying it was saved.
+            out.sync_all().await.map_err(|_| store_failed())?;
             // Keep the file's original modification time when the client sends it.
             if let Some(mtime) = query.mtime.filter(|mtime| *mtime > 0) {
                 let file = out.into_std().await;
@@ -4959,6 +4968,37 @@ struct SyncQuery {
     base: Option<String>,
     /// Modification time (ms since the Unix epoch) to give an uploaded file.
     mtime: Option<i64>,
+    /// `later`: the client asks for `/api/sync/flush` once it has sent all its files.
+    flush: Option<String>,
+}
+
+/// More waiting than this and they are flushed without waiting to be asked.
+const UNFLUSHED_LIMIT: usize = 100_000;
+
+/// Makes sure of the files uploaded with `flush=later`, for every client.
+async fn flush_uploads(state: &AppState) -> Result<usize, ApiError> {
+    let _turn = state.flushing.lock().await;
+    let files = std::mem::take(&mut *state.unflushed.lock().unwrap_or_else(|err| err.into_inner()));
+    let count = files.len();
+    if count == 0 {
+        return Ok(0);
+    }
+    let (flushed, files) = tokio::task::spawn_blocking(move || (files::flush_files(&files), files))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not write the files to the disk"))?;
+    if flushed.is_err() {
+        state.unflushed.lock().unwrap_or_else(|err| err.into_inner()).extend(files);
+        return Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not write the files to the disk"));
+    }
+    Ok(count)
+}
+
+async fn sync_flush(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    require_user(&state, &headers)?;
+    require_write(&state)?;
+    let files = flush_uploads(&state).await?;
+    Ok(Json(json!({ "ok": true, "files": files })))
 }
 
 #[derive(Deserialize)]
@@ -5107,6 +5147,7 @@ async fn sync_upload(
     let base = files::SyncBase::parse(query.base.as_deref())?;
     let root = state.root.clone();
     let rel = rel_of(&query.path);
+    let later = query.flush.as_deref() == Some("later");
     let (rel, dest, temp) = tokio::task::spawn_blocking(move || files::sync_prepare_write(&root, &rel))
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload"))?
@@ -5119,7 +5160,11 @@ async fn sync_upload(
             tokio::io::AsyncWriteExt::write_all(&mut out, &chunk).await?;
         }
         tokio::io::AsyncWriteExt::flush(&mut out).await?;
-        out.sync_all().await
+        if later {
+            Ok(())
+        } else {
+            out.sync_all().await
+        }
     }
     .await;
     if let Err(err) = stored {
@@ -5133,12 +5178,23 @@ async fn sync_upload(
     let mtime = query.mtime;
     let committed_rel = rel.clone();
     let keep = keeper(&state, &user, "sync");
+    let saved_at = dest.clone();
     let outcome = tokio::task::spawn_blocking(move || files::sync_commit_write(&committed_rel, &dest, &temp, base, mtime, &keep))
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload"))?
         .map_err(ApiError::from)?;
     match outcome {
         files::SyncOutcome::Done(entry) => {
+            if later {
+                let waiting = {
+                    let mut unflushed = state.unflushed.lock().unwrap_or_else(|err| err.into_inner());
+                    unflushed.push(saved_at);
+                    unflushed.len()
+                };
+                if waiting >= UNFLUSHED_LIMIT {
+                    flush_uploads(&state).await?;
+                }
+            }
             invalidate_sizes(&state, &rel);
             record(&state, &user, "sync-upload", &rel);
             Ok(Json(json!({ "entry": entry })))
@@ -8448,6 +8504,25 @@ mod tests {
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(std::fs::read_to_string(root.join("photo.jpg")).unwrap(), "newer");
+        // Many files in a row: sent without flushing each, then flushed together.
+        let send = |method: &str, uri: String, body: &'static str| {
+            Request::builder().method(method).uri(uri).header("cookie", &cookie).header("x-ownnas", "1").body(Body::from(body)).unwrap()
+        };
+        for name in ["one", "two"] {
+            let response = app.clone().oneshot(send("PUT", format!("/api/sync/file?path=batch/{name}&base=none&flush=later"), "x")).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        // One is removed before the flush, which is no reason for it to fail.
+        std::fs::remove_file(root.join("batch/two")).unwrap();
+        let response = app.clone().oneshot(send("POST", "/api/sync/flush".to_string(), "")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let answer: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(answer["files"], 2);
+        let response = app.clone().oneshot(send("POST", "/api/sync/flush".to_string(), "")).await.unwrap();
+        let answer: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(answer["files"], 0, "and nothing is left waiting");
+        assert_eq!(std::fs::read_to_string(root.join("batch/one")).unwrap(), "x");
+
         let left: Vec<String> = std::fs::read_dir(&root).unwrap().flatten().map(|item| item.file_name().to_string_lossy().into_owned()).filter(|name| name.starts_with(".ownnas-part-")).collect();
         assert!(left.is_empty(), "{left:?}");
     }

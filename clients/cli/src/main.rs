@@ -90,6 +90,10 @@ struct Flags {
     /// Print each file.
     #[arg(short, long)]
     verbose: bool,
+    /// Also compare the contents of files with the same size and date, by their checksums.
+    /// Slower. For after a copy was cut off by a crash or a power cut.
+    #[arg(long)]
+    checksum: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -257,7 +261,14 @@ fn folder_transfer(api: &Api, way: Way, source: &Listing, dest: &Listing, delete
     if delete && !dest.is_empty() && !source.values().any(|node| !node.dir) {
         return Err("The source has no files, so this would remove everything in the destination. Nothing was changed.".into());
     }
-    let work = plan(source, dest, delete);
+    let mut work = plan(source, dest, delete);
+    if flags.checksum {
+        let same: Vec<String> = source.iter().filter(|(path, node)| !node.dir && dest.get(*path) == Some(node)).map(|(path, _)| path.clone()).collect();
+        let changed = transfer::differing(api, &way, same, flags.parallel);
+        work.unchanged -= changed.len() as u64;
+        work.copy.extend(changed);
+        work.copy.sort();
+    }
     if flags.dry_run {
         show_plan(&work, source);
         return Ok(());
@@ -305,7 +316,7 @@ fn upload(api: &Api, source: &Path, remote: String, delete: bool, flags: &Flags)
         println!("Already there.");
         return Ok(());
     }
-    transfer::upload_one(api, source, &target, stamp, base, &AtomicU64::new(0)).map_err(|err| say(&err))?;
+    transfer::upload_one(api, source, &target, stamp, base, false, &AtomicU64::new(0)).map_err(|err| say(&err))?;
     println!("Copied to {REMOTE_PREFIX}{target} ({})", human_size(stamp.size));
     Ok(())
 }
@@ -333,7 +344,7 @@ fn download(api: &Api, remote: String, dest: &Path, delete: bool, flags: &Flags)
         println!("Already there.");
         return Ok(());
     }
-    let resumed = transfer::download_one(api, &remote, &target, stamp, &AtomicU64::new(0)).map_err(|err| say(&err))?;
+    let resumed = transfer::download_one(api, &remote, &target, stamp, false, &AtomicU64::new(0)).map_err(|err| say(&err))?;
     let from = resumed.map_or(String::new(), |from| format!(", went on from {}", human_size(from)));
     println!("Copied to {} ({}{from})", target.display(), human_size(stamp.size));
     Ok(())
