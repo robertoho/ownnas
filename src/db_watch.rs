@@ -6,7 +6,7 @@
 //! The log goes to the console and to `database.log` in the data folder.
 
 use rusqlite::trace::{TraceEvent, TraceEventCodes};
-use rusqlite::Connection;
+use rusqlite::{ffi, Connection};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
@@ -88,9 +88,96 @@ pub fn log_to(data_dir: &std::path::Path) {
     let _ = LOG_FILE.set(data_dir.join("database.log"));
 }
 
-/// Follows what `conn` runs.
+/// Follows what `conn` runs, and lets `open_reads` ask SQLite about it.
 pub fn watch(conn: &Connection) {
     conn.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT | TraceEventCodes::SQLITE_TRACE_PROFILE, Some(traced));
+    // SAFETY: the handle stays valid until the connection closes, and SQLite calls `closing`
+    // while closing it, which takes it out of the list before it goes away.
+    unsafe {
+        let db = conn.handle();
+        let opened = Opened { thread: thread_name(&std::thread::current()), at: Instant::now(), reading_since: HashMap::new() };
+        connections().insert(db as usize, opened);
+        ffi::sqlite3_set_clientdata(db, c"ownnas-watch".as_ptr(), db.cast(), Some(closing));
+    }
+}
+
+/// A connection being watched.
+struct Opened {
+    thread: String,
+    at: Instant,
+    /// Since when `open_reads` has seen it holding a read on a database file.
+    reading_since: HashMap<std::path::PathBuf, Instant>,
+}
+
+static CONNECTIONS: LazyLock<Mutex<HashMap<usize, Opened>>> = LazyLock::new(Mutex::default);
+
+fn connections() -> std::sync::MutexGuard<'static, HashMap<usize, Opened>> {
+    CONNECTIONS.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+unsafe extern "C" fn closing(db: *mut std::ffi::c_void) {
+    connections().remove(&(db as usize));
+}
+
+/// The connections SQLite itself says hold a read on `file`, one line each. What `held` knows is
+/// worked out from the statements seen starting and ending, by thread, so a second connection on
+/// the thread can hide a read. This cannot be fooled that way. A connection in the middle of
+/// something is skipped rather than waited for: `held` sees those.
+pub fn open_reads(file: &std::path::Path) -> Vec<String> {
+    let wanted = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    let mut lines = Vec::new();
+    let mut connections = connections();
+    for (&db, opened) in connections.iter_mut() {
+        let db = db as *mut ffi::sqlite3;
+        // SAFETY: `closing` takes a connection out of the list, under the lock held here, before
+        // it goes away. Only its mutex is taken, and without waiting, so a connection closing
+        // (which waits for the list while holding its mutex) cannot deadlock with this.
+        unsafe {
+            let mutex = ffi::sqlite3_db_mutex(db);
+            // Without a mutex (not opened by `db::open_file`) it may not be asked from here.
+            if mutex.is_null() || ffi::sqlite3_mutex_try(mutex) != ffi::SQLITE_OK {
+                continue;
+            }
+            for schema in [c"main", c"idx"] {
+                let name = ffi::sqlite3_db_filename(db, schema.as_ptr());
+                if name.is_null() {
+                    continue;
+                }
+                let name = std::path::PathBuf::from(std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned());
+                if name.canonicalize().unwrap_or_else(|_| name.clone()) != wanted {
+                    continue;
+                }
+                let state = ffi::sqlite3_txn_state(db, schema.as_ptr());
+                if state <= ffi::SQLITE_TXN_NONE {
+                    opened.reading_since.remove(&wanted);
+                    continue;
+                }
+                let since = *opened.reading_since.entry(wanted.clone()).or_insert_with(Instant::now);
+                let mut unfinished = Vec::new();
+                let mut stmt = ffi::sqlite3_next_stmt(db, std::ptr::null_mut());
+                while !stmt.is_null() {
+                    if ffi::sqlite3_stmt_busy(stmt) != 0 {
+                        let sql = ffi::sqlite3_sql(stmt);
+                        if !sql.is_null() {
+                            unfinished.push(short(&std::ffi::CStr::from_ptr(sql).to_string_lossy()));
+                        }
+                    }
+                    stmt = ffi::sqlite3_next_stmt(db, stmt);
+                }
+                lines.push(format!(
+                    "connection opened by thread {} {} ago holds a {} (seen for {}), {}, {}",
+                    opened.thread,
+                    seconds(opened.at.elapsed()),
+                    if state == ffi::SQLITE_TXN_WRITE { "write" } else { "read" },
+                    seconds(since.elapsed()),
+                    if ffi::sqlite3_get_autocommit(db) == 0 { "inside a transaction left open" } else { "with no transaction begun" },
+                    if unfinished.is_empty() { "no statement unfinished".to_string() } else { format!("unfinished: {}", unfinished.join(" | ")) },
+                ));
+            }
+            ffi::sqlite3_mutex_leave(mutex);
+        }
+    }
+    lines
 }
 
 fn running() -> std::sync::MutexGuard<'static, Running> {

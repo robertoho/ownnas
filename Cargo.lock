@@ -3182,6 +3182,7 @@ dependencies = [
  "jni",
  "jxl-oxide",
  "kamadak-exif",
+ "libc",
  "lofty",
  "lopdf",
  "mail-parser",

@@ -24,7 +24,7 @@ pub fn open(path: &std::path::Path) -> Result<Connection, String> {
         std::fs::create_dir_all(parent)
             .map_err(|_| format!("Could not create {}", parent.display()))?;
     }
-    let conn = Connection::open(path)
+    let conn = open_file(path)
         .map_err(|_| format!("Could not open the database at {}", path.display()))?;
     crate::db_watch::watch(&conn);
     conn.busy_timeout(std::time::Duration::from_secs(5))
@@ -38,6 +38,13 @@ pub fn open(path: &std::path::Path) -> Result<Connection, String> {
         .map_err(|_| "Could not enable SQLite foreign keys".to_string())?;
     migrate(&conn)?;
     Ok(conn)
+}
+
+/// Opens the file with SQLite's own mutex on: `db_watch::open_reads` asks each connection what
+/// it holds from another thread, which is only safe with one.
+fn open_file(path: &std::path::Path) -> rusqlite::Result<Connection> {
+    use rusqlite::OpenFlags;
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_FULL_MUTEX)
 }
 
 /// The second database file, beside the first: what OwnNAS can build again by reading the
@@ -82,7 +89,7 @@ fn tune(conn: &Connection) -> rusqlite::Result<()> {
 /// A further connection to the database (already made by `open`), for background work and
 /// anything slow that should not hold up the shared one.
 pub fn connect(path: &std::path::Path) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(path)?;
+    let conn = open_file(path)?;
     crate::db_watch::watch(&conn);
     conn.busy_timeout(std::time::Duration::from_secs(10))?;
     attach_index(&conn, &index_path(path).to_string_lossy())?;
@@ -164,7 +171,8 @@ static COPIED_BEFORE: std::sync::LazyLock<std::sync::Mutex<std::collections::Has
 /// each time would only stall every write. `insist` waits anyway.
 fn checkpoint_waiting(path: &std::path::Path, wait: u64, insist: bool) -> Option<u64> {
     let [_, (_, wal), _, (_, index_wal)] = file_sizes(path);
-    let conn = Connection::open(path).ok()?;
+    let conn = open_file(path).ok()?;
+    crate::db_watch::watch(&conn);
     attach_index(&conn, &index_path(path).to_string_lossy()).ok()?;
     let mut emptied = true;
     for (schema, size) in [("main", wal), ("idx", index_wal)] {
@@ -195,8 +203,15 @@ fn checkpoint_waiting(path: &std::path::Path, wait: u64, insist: bool) -> Option
         } else {
             busy = 1;
         }
+        let mut known = HOLDERS.lock().unwrap_or_else(|err| err.into_inner());
+        known.remove(&file);
+        drop(known);
         if busy != 0 {
             emptied = false;
+            let holders = other_programs(&file);
+            if !holders.is_empty() {
+                HOLDERS.lock().unwrap_or_else(|err| err.into_inner()).insert(file.clone(), holders.clone());
+            }
             if size > WAL_LIMIT as u64 * 4 {
                 let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let mut text = format!(
@@ -206,12 +221,17 @@ fn checkpoint_waiting(path: &std::path::Path, wait: u64, insist: bool) -> Option
                 if let Some(marks) = read_marks(&file) {
                     text.push_str(&format!(" [{marks}]"));
                 }
-                let open = crate::db_watch::held(std::time::Duration::from_secs(1));
-                if open.is_empty() {
-                    text.push_str(
+                let mut open = crate::db_watch::held(std::time::Duration::from_secs(1));
+                open.extend(crate::db_watch::open_reads(&file));
+                if !holders.is_empty() {
+                    text.push_str(&format!(" held by {}: close it, or keep it away from the data folder", holders.join(" and ")));
+                } else if open.is_empty() {
+                    text.push_str(if cfg!(unix) {
+                        " no connection of OwnNAS's has a read open, and no other program holds this file now"
+                    } else {
                         " no read in OwnNAS. If the pages copied stay the same, another program has this file open \
-                         (a SQLite viewer, or a backup, sync, or antivirus tool): close it, or keep it away from the data folder",
-                    );
+                         (a SQLite viewer, or a backup, sync, or antivirus tool): close it, or keep it away from the data folder"
+                    });
                 }
                 for line in open {
                     text.push_str("\n    ");
@@ -224,13 +244,107 @@ fn checkpoint_waiting(path: &std::path::Path, wait: u64, insist: bool) -> Option
     emptied.then_some(wal + index_wal)
 }
 
+/// Empties the logs as hard as can be done on request: the indexers wait, and it waits for
+/// reads even when the copy has not moved since last time. Takes up to half a minute.
+pub fn checkpoint_now(path: &std::path::Path) -> Option<u64> {
+    crate::db_watch::with_indexing_paused(std::time::Duration::from_secs(20), || checkpoint_waiting(path, 5000, true))
+}
+
+/// The programs seen holding a database's logs the last time they could not be emptied.
+pub fn log_holders(path: &std::path::Path) -> Vec<String> {
+    let known = HOLDERS.lock().unwrap_or_else(|err| err.into_inner());
+    let mut names: Vec<String> = [path.to_path_buf(), index_path(path)].iter().filter_map(|file| known.get(file)).flatten().cloned().collect();
+    names.dedup();
+    names
+}
+
+static HOLDERS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<String>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The logs' shared memory files, kept open once looked at. On Unix a process loses all its
+/// locks on a file when it closes any handle to that file, even one only used to read. Closing
+/// one here would drop the locks SQLite holds on it, leaving another program free to think
+/// nobody else is using the database.
+static SHM_FILES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::fs::File>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn with_shm<T>(file: &std::path::Path, work: impl FnOnce(&std::fs::File) -> Option<T>) -> Option<T> {
+    let shm = std::path::PathBuf::from(format!("{}-shm", file.display()));
+    let mut files = SHM_FILES.lock().unwrap_or_else(|err| err.into_inner());
+    // SQLite deletes the file when the last connection closes, and makes a new one after.
+    #[cfg(unix)]
+    if let Some(kept) = files.get(&shm) {
+        use std::os::unix::fs::MetadataExt;
+        let same = matches!((kept.metadata(), std::fs::metadata(&shm)), (Ok(a), Ok(b)) if a.dev() == b.dev() && a.ino() == b.ino());
+        if !same {
+            files.remove(&shm);
+        }
+    }
+    let kept = match files.entry(shm) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let opened = std::fs::OpenOptions::new().read(true).write(true).open(entry.key()).ok()?;
+            entry.insert(opened)
+        }
+    };
+    work(kept)
+}
+
+/// The other programs holding a lock that keeps a log from being emptied, as "name (process 12)".
+/// The system answers this itself, so it is what is true now rather than a guess. A process is
+/// not told of its own locks, so reads inside OwnNAS are not in this list.
+#[cfg(unix)]
+fn other_programs(file: &std::path::Path) -> Vec<String> {
+    use std::os::fd::AsRawFd;
+    // Where SQLite's locks start in the file: writing, copying, recovery, then the reader slots.
+    // (The byte after them only says a program has the database open.)
+    const LOCKS: std::ops::Range<i64> = 120..128;
+    let pids = with_shm(file, |shm| {
+        let mut pids = Vec::new();
+        for byte in LOCKS {
+            // SAFETY: flock is plain data, and fcntl only reads and fills in the one passed.
+            let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+            lock.l_type = libc::F_WRLCK as _;
+            lock.l_whence = libc::SEEK_SET as _;
+            lock.l_start = byte as _;
+            lock.l_len = 1;
+            let asked = unsafe { libc::fcntl(shm.as_raw_fd(), libc::F_GETLK, &mut lock) };
+            if asked == 0 && i32::from(lock.l_type) != libc::F_UNLCK as i32 && !pids.contains(&lock.l_pid) {
+                pids.push(lock.l_pid);
+            }
+        }
+        Some(pids)
+    });
+    pids.unwrap_or_default().into_iter().map(program_named).collect()
+}
+
+#[cfg(not(unix))]
+fn other_programs(_file: &std::path::Path) -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(unix)]
+fn program_named(pid: i32) -> String {
+    // No process number comes back from a network disk or across containers.
+    if pid <= 0 {
+        return "another program".to_string();
+    }
+    let output = std::process::Command::new("ps").args(["-o", "comm=", "-p", &pid.to_string()]).output();
+    let name = output.map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string()).unwrap_or_default();
+    let name = name.rsplit('/').next().unwrap_or_default();
+    format!("{} (process {pid})", if name.is_empty() { "another program" } else { name })
+}
+
 /// What SQLite's shared memory file says of a log: its length, how far it was copied, and the
 /// frame each reader slot holds the copy back to (a slot in use at that mark is the read that
 /// stops it).
 fn read_marks(file: &std::path::Path) -> Option<String> {
-    use std::io::Read;
+    use std::io::{Read, Seek};
     let mut head = [0u8; 132];
-    std::fs::File::open(format!("{}-shm", file.display())).ok()?.read_exact(&mut head).ok()?;
+    with_shm(file, |mut shm| {
+        shm.rewind().ok()?;
+        shm.read_exact(&mut head).ok()
+    })?;
     let word = |at: usize| u32::from_le_bytes([head[at], head[at + 1], head[at + 2], head[at + 3]]);
     let marks: Vec<String> = (0..5)
         .map(|slot| match word(100 + slot * 4) {
@@ -1937,6 +2051,61 @@ mod tests {
     }
 
     #[test]
+    fn a_read_begun_on_an_empty_log_stops_all_copying_and_is_named() {
+        let (path, writer) = scratch_db();
+        let index = index_path(&path);
+        writer.execute_batch("CREATE TABLE idx.probe(x); INSERT INTO idx.probe VALUES (1);").unwrap();
+        assert!(checkpoint_now(&path).is_some(), "nothing holds the log yet");
+
+        // Begun with the log empty, so it reads the database file itself.
+        let first = connect(&path).unwrap();
+        let mut stmt = first.prepare("SELECT x FROM idx.probe /* first */").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        rows.next().unwrap();
+        writer.execute("INSERT INTO idx.probe VALUES (2)", []).unwrap();
+
+        // Then one on the log, then more writing.
+        let second = connect(&path).unwrap();
+        second.execute_batch("BEGIN; SELECT count(*) FROM idx.probe;").unwrap();
+        writer.execute("INSERT INTO idx.probe VALUES (3)", []).unwrap();
+
+        let pass = open_file(&path).unwrap();
+        attach_index(&pass, &index.to_string_lossy()).unwrap();
+        let (busy, pages, copied): (i64, i64, i64) =
+            pass.query_row("PRAGMA idx.wal_checkpoint(PASSIVE)", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+        assert_eq!((busy, copied), (0, 0), "of {pages} pages, nothing is copied: the log on the server looked like this");
+        let marks = read_marks(&index).unwrap();
+        assert!(marks.contains("copied 0, reader slots 0 "), "{marks}");
+
+        let reads = crate::db_watch::open_reads(&index);
+        assert!(reads.iter().any(|line| line.contains("with no transaction begun") && line.contains("/* first */")), "{reads:?}");
+        assert!(reads.iter().any(|line| line.contains("inside a transaction left open")), "{reads:?}");
+
+        drop(rows);
+        second.execute_batch("COMMIT").unwrap();
+        assert!(crate::db_watch::open_reads(&index).is_empty());
+        assert!(checkpoint_now(&path).is_some(), "and with them closed it empties");
+    }
+
+    #[test]
+    fn a_read_the_statement_log_loses_is_still_named() {
+        let (path, writer) = scratch_db();
+        writer.execute_batch("CREATE TABLE idx.probe(x); INSERT INTO idx.probe VALUES (1), (2);").unwrap();
+        const SQL: &str = "SELECT x FROM idx.probe /* hidden read */";
+        let holder = connect(&path).unwrap();
+        let mut stmt = holder.prepare(SQL).unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        rows.next().unwrap();
+        // The same statement finishing on this thread, on another connection.
+        let other = connect(&path).unwrap();
+        other.prepare(SQL).unwrap().query_map([], |_| Ok(())).unwrap().for_each(drop);
+        let seen = crate::db_watch::held(std::time::Duration::ZERO);
+        assert!(!seen.iter().any(|line| line.contains("hidden read")), "the blind spot this covers: {seen:?}");
+        let reads = crate::db_watch::open_reads(&index_path(&path));
+        assert!(reads.iter().any(|line| line.contains("hidden read")), "{reads:?}");
+    }
+
+    #[test]
     fn read_marks_name_the_frame_a_read_holds() {
         let (path, conn) = scratch_db();
         add_tag(&conn, "a.jpg", "one").unwrap();
@@ -1951,6 +2120,68 @@ mod tests {
         assert_ne!(frames(&marks), held, "{marks}");
         assert!(marks.ends_with(&format!(" {held}")) || marks.contains(&format!(" {held} ")), "{marks}");
         reader.execute_batch("COMMIT").unwrap();
+    }
+
+    /// Not a test by itself: the second process `a_program_holding_the_log_is_named` starts.
+    #[cfg(unix)]
+    #[test]
+    fn log_helper_process() {
+        let Ok(job) = std::env::var("OWNNAS_LOG_HELPER") else { return };
+        let (what, path) = job.split_once(':').unwrap();
+        if what == "read" {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch("BEGIN; SELECT count(*) FROM sqlite_schema;").unwrap();
+            println!("HELPER ready");
+            // Holds the read until the test closes this pipe.
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).unwrap();
+        } else {
+            println!("HELPER {:?}", other_programs(std::path::Path::new(path)));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_holding_the_log_is_named() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        let helper = |job: String| {
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "db::tests::log_helper_process", "--nocapture"])
+                .env("OWNNAS_LOG_HELPER", job)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let (path, conn) = scratch_db();
+        add_tag(&conn, "a.jpg", "one").unwrap();
+
+        // A read of our own is not "another program", and looking must not lose its lock: the
+        // lock has to stay visible to a second process.
+        let reader = connect(&path).unwrap();
+        reader.execute_batch("BEGIN; SELECT count(*) FROM file_tags;").unwrap();
+        assert!(other_programs(&path).is_empty());
+        assert!(read_marks(&path).is_some());
+        let seen = helper(format!("look:{}", path.display())).wait_with_output().unwrap();
+        let seen = String::from_utf8_lossy(&seen.stdout).into_owned();
+        assert!(seen.contains(&format!("process {})", std::process::id())), "our lock was lost: {seen}");
+        reader.execute_batch("COMMIT").unwrap();
+
+        // Another process holding a read is named, and the log can't be emptied until it ends.
+        let mut holder = helper(format!("read:{}", path.display()));
+        let mut lines = std::io::BufReader::new(holder.stdout.take().unwrap()).lines();
+        assert!(lines.any(|line| line.unwrap().contains("HELPER ready")));
+        add_tag(&conn, "b.jpg", "two").unwrap();
+        assert!(checkpoint_waiting(&path, 100, true).is_none());
+        let named = log_holders(&path);
+        assert!(named.iter().any(|name| name.contains(&format!("process {})", holder.id()))), "{named:?}");
+
+        drop(holder.stdin.take());
+        holder.wait().unwrap();
+        assert!(checkpoint_waiting(&path, 400, true).is_some());
+        assert_eq!(file_sizes(&path)[1].1, 0);
+        assert!(log_holders(&path).is_empty(), "the holder is forgotten once the log is emptied");
     }
 
     #[test]
