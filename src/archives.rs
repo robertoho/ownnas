@@ -202,6 +202,18 @@ pub fn extractable(name: &str) -> bool {
 /// and paths leading out of the folder are left out, and unpacking stops before the disk fills.
 /// Returns the new file or folder.
 pub fn extract(path: &Path, cancel: &CancelFlag) -> Result<PathBuf, FileError> {
+    unpack_then(path, cancel, place)
+}
+
+/// Unpacks the archive straight into the folder it is in, with no folder around what it holds.
+/// As with `extract`, nothing is overwritten: a name already taken gets a number (a folder is
+/// not merged into one of the same name). Nothing lands in the folder until the whole archive
+/// has been read. Returns what was added.
+pub fn extract_here(path: &Path, cancel: &CancelFlag) -> Result<Vec<PathBuf>, FileError> {
+    unpack_then(path, cancel, place_here)
+}
+
+fn unpack_then<T>(path: &Path, cancel: &CancelFlag, finish: impl FnOnce(&Path, &Path, &str) -> Result<T, FileError>) -> Result<T, FileError> {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     if !extractable(&name) {
         return Err(FileError::Rejected("OwnNAS cannot unpack this kind of file"));
@@ -212,7 +224,7 @@ pub fn extract(path: &Path, cancel: &CancelFlag) -> Result<PathBuf, FileError> {
     std::fs::create_dir(&tmp).map_err(files::map_io)?;
     let free = fs4::available_space(parent).unwrap_or(u64::MAX);
     let mut out = Unpack { dir: tmp.clone(), left: free.saturating_sub(SPARE_BYTES), entries: 0, cancel: cancel.clone() };
-    let unpacked = unpack(path, &name, &mut out).and_then(|()| place(&tmp, parent, &name));
+    let unpacked = unpack(path, &name, &mut out).and_then(|()| finish(&tmp, parent, &name));
     if unpacked.is_err() {
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -445,6 +457,31 @@ fn place(tmp: &Path, parent: &Path, archive: &str) -> Result<PathBuf, FileError>
     let dest = unique_name(parent, archive_stem(archive));
     std::fs::rename(tmp, &dest).map_err(files::map_io)?;
     Ok(dest)
+}
+
+/// Moves everything at the top of `tmp` into `parent`. Should a move fail, those already made are
+/// taken back, so a failed extract adds nothing. OwnNAS's own special names (its Trash, say) stay
+/// out: an archive must not be able to make one in a folder.
+fn place_here(tmp: &Path, parent: &Path, _archive: &str) -> Result<Vec<PathBuf>, FileError> {
+    let mut top: Vec<_> = std::fs::read_dir(tmp).map_err(files::map_io)?.flatten().collect();
+    top.retain(|item| !files::sync_internal_name(&item.file_name().to_string_lossy()));
+    top.sort_by_key(|item| item.file_name());
+    if top.is_empty() {
+        return Err(FileError::Rejected("There was nothing in the archive to unpack"));
+    }
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for item in top {
+        let dest = unique_name(parent, &item.file_name().to_string_lossy());
+        if let Err(err) = std::fs::rename(item.path(), &dest) {
+            for (from, to) in moved {
+                let _ = std::fs::rename(to, from);
+            }
+            return Err(files::map_io(err));
+        }
+        moved.push((item.path(), dest));
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+    Ok(moved.into_iter().map(|(_, dest)| dest).collect())
 }
 
 /// `name` in `parent`, or "name 2", "name 3"… (before the extension) when it is taken.
@@ -727,6 +764,49 @@ mod tests {
 
         assert!(extractable("a.7z") && extractable("a.tar.xz") && extractable("a.bz2") && !extractable("a.docx") && !extractable(".gz"));
         assert_eq!(archive_stem("Photos.Tar.GZ"), "Photos");
+        let leftovers = std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with(".ownnas-extract")).count();
+        assert_eq!(leftovers, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn extracts_here_without_a_folder_and_overwrites_nothing() {
+        let dir = std::env::temp_dir().join(format!("ownnas-extract-here-{}-{}", std::process::id(), rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cancel = CancelFlag::new();
+        let zip_path = dir.join("photos.zip");
+        let mut zip = zip::ZipWriter::new(File::create(&zip_path).unwrap());
+        for (name, body) in [("a.txt", "new a"), ("b.txt", "b"), ("sub/c.txt", "c"), ("../escape.txt", "x"), (".ownnas-trash/fake.txt", "x")] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+        std::fs::write(dir.join("a.txt"), "mine").unwrap();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/keep.txt"), "mine too").unwrap();
+
+        let made = extract_here(&zip_path, &cancel).unwrap();
+        assert_eq!(made, [dir.join("a 2.txt"), dir.join("b.txt"), dir.join("sub 2")]);
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"mine", "what was here stays");
+        assert_eq!(std::fs::read(dir.join("a 2.txt")).unwrap(), b"new a");
+        assert_eq!(std::fs::read(dir.join("sub/keep.txt")).unwrap(), b"mine too");
+        assert_eq!(std::fs::read(dir.join("sub 2/c.txt")).unwrap(), b"c");
+        assert!(!dir.join("photos").exists(), "no folder around them");
+        assert!(!dir.join("escape.txt").exists() && !dir.join(".ownnas-trash").exists());
+        assert!(zip_path.exists(), "the archive stays");
+
+        // A damaged archive adds nothing.
+        std::fs::write(dir.join("broken.zip"), b"not a zip").unwrap();
+        let before = std::fs::read_dir(&dir).unwrap().count();
+        assert!(extract_here(&dir.join("broken.zip"), &cancel).is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), before);
+        // Nor one with only OwnNAS's own names in it.
+        let only = dir.join("only.zip");
+        let mut zip = zip::ZipWriter::new(File::create(&only).unwrap());
+        zip.start_file(".ownnas-trash/fake.txt", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(b"x").unwrap();
+        zip.finish().unwrap();
+        assert!(extract_here(&only, &cancel).is_err());
         let leftovers = std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with(".ownnas-extract")).count();
         assert_eq!(leftovers, 0);
         let _ = std::fs::remove_dir_all(dir);

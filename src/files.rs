@@ -2996,7 +2996,7 @@ fn sync_stamp(meta: &Metadata) -> SyncStamp {
     SyncStamp { size: meta.len(), mtime }
 }
 
-fn sync_internal_name(name: &str) -> bool {
+pub(crate) fn sync_internal_name(name: &str) -> bool {
     name.starts_with(SYNC_PART_PREFIX)
         || matches!(
             name,

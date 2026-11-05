@@ -4451,3 +4451,4 @@ a.archive-entry-name:hover { text-decoration: underline; }
 .upload-log-files li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 0.6rem; overflow-wrap: anywhere; }
 .upload-log-note { grid-column: 1 / -1; color: var(--muted); font-size: 0.78rem; }
 .upload-log-files li.bad .upload-log-note { color: var(--danger); }
+.archive-extract-actions { display: flex; flex: none; flex-wrap: wrap; justify-content: flex-end; gap: 0.4rem; }

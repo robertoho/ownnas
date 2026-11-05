@@ -8151,20 +8151,29 @@ async fn compress_entries(
     Ok(Json(json!({ "ok": true, "path": created })))
 }
 
+#[derive(Deserialize)]
+struct ExtractBody {
+    path: String,
+    /// Straight into the folder the archive is in, with no folder around what it holds.
+    #[serde(default)]
+    here: bool,
+}
+
 /// Unpacks an archive into the folder it is in.
 async fn extract_archive(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<PathBody>,
+    Json(body): Json<ExtractBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     check_csrf(&headers)?;
     let (user, _) = require_user(&state, &headers)?;
     require_write(&state)?;
     let root = state.root.clone();
     let requested = body.path;
+    let here = body.here;
     let cancel = files::CancelFlag::new();
     let _guard = CancelOnDrop(cancel.clone());
-    let created = tokio::task::spawn_blocking(move || -> Result<String, FileError> {
+    let created = tokio::task::spawn_blocking(move || -> Result<Vec<String>, FileError> {
         let resolved = files::resolve(&root, &requested)?;
         if resolved.full.is_dir() {
             return Err(FileError::IsADirectory);
@@ -8172,17 +8181,28 @@ async fn extract_archive(
         if files::is_under_trash(&resolved.rel) {
             return Err(FileError::Rejected("Restore the archive from the Trash to unpack it"));
         }
-        let made = crate::archives::extract(&resolved.full, &cancel)?;
-        let name = made.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let made = if here {
+            crate::archives::extract_here(&resolved.full, &cancel)?
+        } else {
+            vec![crate::archives::extract(&resolved.full, &cancel)?]
+        };
         let parent = parent_rel_path(&resolved.rel);
-        Ok(if parent.is_empty() { name } else { format!("{parent}/{name}") })
+        Ok(made
+            .iter()
+            .map(|item| {
+                let name = item.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                if parent.is_empty() { name } else { format!("{parent}/{name}") }
+            })
+            .collect())
     })
     .await
     .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not unpack the archive"))?
     .map_err(ApiError::from)?;
-    invalidate_sizes(&state, &parent_rel_path(&created));
-    record(&state, &user, "extract", &created);
-    Ok(Json(json!({ "ok": true, "path": created })))
+    let first = created.first().cloned().unwrap_or_default();
+    invalidate_sizes(&state, &parent_rel_path(&first));
+    let detail = if created.len() == 1 { first.clone() } else { format!("{} items into {}", created.len(), parent_rel_path(&first)) };
+    record(&state, &user, "extract", &detail);
+    Ok(Json(json!({ "ok": true, "path": first, "paths": created })))
 }
 
 async fn send_temp_zip(tmp: PathBuf, name: &str) -> Result<Response, ApiError> {

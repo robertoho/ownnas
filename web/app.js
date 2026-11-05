@@ -1077,6 +1077,7 @@ const MENU_ICONS = {
   compressMenu: ICON_ARCHIVE,
   compress: ICON_ARCHIVE,
   extract: `${ICON_ARCHIVE} M8 1.5v4 M6.3 3.8 8 5.5l1.7-1.7`,
+  extractHere: `${ICON_ARCHIVE} M8 1.5v4 M6.3 3.8 8 5.5l1.7-1.7`,
   rename: ICON_RENAME,
   folder: ICON_FOLDER,
   edited: `${ICON_FILE} M6 8.5h4 M6 11h2.5`,
@@ -1464,7 +1465,8 @@ function openSelectionMenu(x, y, pasteInto) {
       buttons.push(`<button type="button" class="menu-has-sub" data-menu="compressMenu">Compress to…</button>`);
     }
     if (write && entries.length && entries.every(isExtractable) && !allInTrash) {
-      buttons.push(`<button type="button" data-menu="extract">Extract here</button>`);
+      buttons.push(`<button type="button" data-menu="extract" title="Into a folder named after the archive">Extract in folder</button>`);
+      buttons.push(`<button type="button" data-menu="extractHere" title="Straight into this folder">Extract here</button>`);
     }
     if (write && entries.length >= 2 && !allInTrash) {
       buttons.push(`<button type="button" data-menu="folderWith">New folder with selection</button>`);
@@ -3142,16 +3144,24 @@ function mountArchiveBrowser(body, entries, truncated, archivePath) {
   notice.textContent = "Archived contents · read-only · files remain compressed";
   const archiveName = String(archivePath || "").split("/").pop();
   if (state.me && !state.me.readonly && isExtractable({ name: archiveName }) && !inTrashPath(archivePath)) {
-    const unpack = document.createElement("button");
-    unpack.type = "button";
-    unpack.className = "archive-extract";
-    unpack.textContent = "Extract here";
-    unpack.title = "Unpack into the folder the archive is in";
-    unpack.addEventListener("click", () => {
-      closePreview();
-      extractEntries([{ name: archiveName, path: archivePath }]);
-    });
-    notice.append(unpack);
+    const actions = document.createElement("div");
+    actions.className = "archive-extract-actions";
+    for (const [label, title, here] of [
+      ["Extract in folder", "Into a folder named after the archive", false],
+      ["Extract here", "Straight into the folder the archive is in", true],
+    ]) {
+      const unpack = document.createElement("button");
+      unpack.type = "button";
+      unpack.className = "archive-extract";
+      unpack.textContent = label;
+      unpack.title = title;
+      unpack.addEventListener("click", () => {
+        closePreview();
+        extractEntries([{ name: archiveName, path: archivePath }], { here });
+      });
+      actions.append(unpack);
+    }
+    notice.append(actions);
   }
   const breadcrumbs = document.createElement("nav"); breadcrumbs.className = "archive-breadcrumbs"; breadcrumbs.setAttribute("aria-label", "Archive folder path");
   const list = document.createElement("ul"); list.className = "archive-list";
@@ -5868,6 +5878,7 @@ function runMenuAction(button, entries, pasteInto) {
   if (action === "convertVideo") convertVideos(entries.map((entry) => entry.path)).catch((err) => toast(err.message, true));
   if (action === "compress") compressEntries(entries, format).catch((err) => toast(err.message, true));
   if (action === "extract") extractEntries(entries).catch((err) => toast(err.message, true));
+  if (action === "extractHere") extractEntries(entries, { here: true }).catch((err) => toast(err.message, true));
   if (action === "pdfExtract") pdfExtractPages(entries).catch((err) => toast(err.message, true));
   if (action === "pdfSplit") pdfSplitPages(entries).catch((err) => toast(err.message, true));
   if (action === "pdfRotate") pdfRotatePages(entries).catch((err) => toast(err.message, true));
@@ -6837,7 +6848,7 @@ async function compressEntries(entries, format) {
 }
 
 // Unpacks each archive beside itself, one after another.
-async function extractEntries(entries) {
+async function extractEntries(entries, { here = false } = {}) {
   const items = (entries || []).filter(isExtractable);
   if (!items.length) return;
   const id = `extract-${++jobState.seq}`;
@@ -6854,8 +6865,9 @@ async function extractEntries(entries) {
       onCancel: () => controller.abort(),
     });
     try {
-      const data = await api("/api/extract", { method: "POST", json: { path: entry.path }, signal: controller.signal });
-      made.push((data.path || "").split("/").pop());
+      const data = await api("/api/extract", { method: "POST", json: { path: entry.path, here }, signal: controller.signal });
+      const paths = data.paths || [data.path || ""];
+      made.push(...paths.map((path) => path.split("/").pop()));
     } catch (err) {
       if (isCancelError(err)) {
         cancelled = true;
@@ -6869,7 +6881,7 @@ async function extractEntries(entries) {
     invalidateFolderSizes();
     await load(state.path);
   }
-  const done = made.length === 1 ? `Extracted ${made[0]}.` : made.length ? `Extracted ${made.length} archives.` : "";
+  const done = made.length === 1 ? `Extracted ${made[0]}.` : made.length ? `Extracted ${made.length} ${here ? "items here" : "archives"}.` : "";
   if (failed.length) toast([done, ...failed].filter(Boolean).join(" "), true);
   else if (cancelled) toast(`${done} Extracting cancelled`.trim());
   else toast(done.replace(/\.$/, ""));
