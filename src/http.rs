@@ -35,6 +35,7 @@ const SHEET_FORMULA_JS: &str = include_str!("../web/sheet-formula.js");
 const SHEET_CHART_JS: &str = include_str!("../web/sheet-chart.js");
 const SQLITE_VIEWER_JS: &str = include_str!("../web/sqlite-viewer.js");
 const MOTION_THUMBS_JS: &str = include_str!("../web/motion-thumbs.js");
+const PHOTO_UPLOAD_JS: &str = include_str!("../web/photo-upload.js");
 const THEME_JS: &str = include_str!("../web/theme.js");
 const GALLERY_JS: &str = include_str!("../web/gallery.js");
 const VIEWERS_JS: &str = include_str!("../web/viewers.js");
@@ -253,6 +254,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/assets/sheet-chart.js", get(sheet_chart_javascript))
         .route("/assets/sqlite-viewer.js", get(sqlite_viewer_javascript))
         .route("/assets/motion-thumbs.js", get(motion_thumbs_javascript))
+        .route("/assets/photo-upload.js", get(photo_upload_javascript))
         .route("/assets/theme.js", get(theme_javascript))
         .route("/assets/gallery.js", get(gallery_javascript))
         .route("/assets/viewers.js", get(viewers_javascript))
@@ -333,6 +335,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/photo/motion", get(photo_motion))
         .route("/api/photo/motion/video", get(photo_motion_video))
         .route("/api/photo/motion/clip", get(photo_motion_clip))
+        .route("/api/gallery/upload/check", post(gallery_upload_check))
         .route("/api/photo/motion/known", post(photo_motion_known))
         .route("/api/audio/info", get(audio_info))
         .route("/api/audio/cover", get(audio_cover))
@@ -1070,6 +1073,10 @@ async fn music_javascript() -> impl IntoResponse {
 
 async fn nas_backup_javascript() -> impl IntoResponse {
     app_module_javascript(NAS_BACKUP_JS)
+}
+
+async fn photo_upload_javascript() -> impl IntoResponse {
+    app_module_javascript(PHOTO_UPLOAD_JS)
 }
 
 async fn motion_thumbs_javascript() -> impl IntoResponse {
@@ -4096,6 +4103,72 @@ async fn photo_motion_known(
     }
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     Ok(Json(json!({ "moving": db::moving_photos(&conn, &body.paths) })))
+}
+
+#[derive(Deserialize)]
+struct UploadCheckBody {
+    name: String,
+    size: u64,
+    sha256: String,
+    /// Where it is going: it may have arrived there too recently to be indexed.
+    #[serde(default)]
+    folder: Option<String>,
+    #[serde(default)]
+    workspace: Option<i64>,
+}
+
+/// Whether the library already has a photo with these contents, before it is sent. Only files of
+/// the same size are compared, each read once and its hash kept, so the whole library never has
+/// to be read for this.
+async fn gallery_upload_check(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<UploadCheckBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    require_user(&state, &headers)?;
+    if body.sha256.len() != 64 || !body.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "That is not a SHA-256"));
+    }
+    let worker = state.clone();
+    let answer = tokio::task::spawn_blocking(move || {
+        let state = worker;
+        let sha256 = body.sha256.to_ascii_lowercase();
+        let (candidates, folders) = {
+            let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+            let folders = body.workspace.and_then(|id| crate::workspaces::folders(&conn, id).ok()).unwrap_or_default();
+            (if body.size == 0 { Vec::new() } else { db::paths_of_size(&conn, body.size) }, folders)
+        };
+        let mut copies: Vec<String> = Vec::new();
+        if let Some(folder) = body.folder.as_deref().map(|folder| folder.trim_matches('/')).filter(|folder| !folder.is_empty()) {
+            let target = format!("{folder}/{}", safe_name(&body.name, "photo.jpg"));
+            copies.extend(find_backup_copy(&state, &target, Some(body.size), Some(&sha256)));
+        }
+        for path in candidates {
+            if files::is_under_trash(&path) || copies.contains(&path) {
+                continue;
+            }
+            let Ok(found) = files::resolve(&state.root, &path) else { continue };
+            let Ok(meta) = std::fs::metadata(&found.full) else { continue };
+            if meta.is_file() && meta.len() == body.size && file_sha256(&state, &path, &found.full, &meta).as_deref() == Some(sha256.as_str()) {
+                copies.push(path);
+            }
+        }
+        // The copy to mention: one in this workspace, when there is one.
+        let inside = copies.iter().find(|path| crate::workspaces::contains(&folders, path)).cloned();
+        let in_workspace = inside.is_some();
+        let copy = inside.or_else(|| copies.first().cloned());
+        let resized = if copy.is_none() { find_resized_copy(&state, &sha256) } else { None };
+        json!({
+            "copy": copy,
+            "inWorkspace": in_workspace,
+            "resized": resized,
+            "blocked": backup_blocked(&state, &sha256),
+        })
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not check the photo"))?;
+    Ok(Json(answer))
 }
 
 /// How many moving thumbnails are made at once, however many tiles are asked for.

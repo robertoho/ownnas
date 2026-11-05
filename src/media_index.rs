@@ -154,6 +154,8 @@ impl Indexer {
     pub fn status(&self) -> Status {
         let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner()).clone();
         status.speed = Some(self.speed());
+        // Asked for and about to begin: whoever asked should wait for it to end.
+        status.scanning = status.scanning || *self.wake.lock().unwrap_or_else(|err| err.into_inner());
         status
     }
 

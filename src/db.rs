@@ -483,6 +483,18 @@ fn move_to_index(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// The files of exactly this size, the only ones that can have the same contents.
+pub fn paths_of_size(conn: &Connection, size: u64) -> Vec<String> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT path FROM file_index WHERE size = ?1 AND dir = 0
+         UNION SELECT path FROM media_index WHERE size = ?1 LIMIT 200",
+    ) else {
+        return Vec::new();
+    };
+    let rows = stmt.query_map([size as i64], |row| row.get::<_, String>(0));
+    rows.into_iter().flatten().filter_map(Result::ok).collect()
+}
+
 /// Which of these photos the index knows to move.
 pub fn moving_photos(conn: &Connection, paths: &[String]) -> Vec<String> {
     let mut found = Vec::new();
@@ -509,6 +521,7 @@ fn index_schema(conn: &Connection) -> Result<(), String> {
             kind TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx.file_index_parent ON file_index(parent);
+        CREATE INDEX IF NOT EXISTS idx.file_index_size ON file_index(size);
         CREATE TABLE IF NOT EXISTS idx.content_text (
             path TEXT NOT NULL UNIQUE,
             size INTEGER NOT NULL,
@@ -528,6 +541,7 @@ fn index_schema(conn: &Connection) -> Result<(), String> {
             indexed_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx.media_index_taken ON media_index(taken_at DESC, path DESC);
+        CREATE INDEX IF NOT EXISTS idx.media_index_size ON media_index(size);
         CREATE TABLE IF NOT EXISTS idx.image_vectors (
             path TEXT PRIMARY KEY,
             size INTEGER NOT NULL,

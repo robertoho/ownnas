@@ -607,7 +607,7 @@ export function mountGallery(root, ctx) {
   async function showPhotos() {
     const mine = ++generation;
     months = [];
-    actions.replaceChildren(el("button", { type: "button", onclick: rescan, title: "Look through the library again for new or changed photos" }, "Rescan"));
+    actions.replaceChildren(...uploadButton(), el("button", { type: "button", onclick: rescan, title: "Look through the library again for new or changed photos" }, "Rescan"));
     body.replaceChildren(el("p", { class: "muted gallery-message" }, "Loading photos…"));
     let data;
     try {
@@ -848,6 +848,32 @@ export function mountGallery(root, ctx) {
       }, 3000);
     } else {
       status.textContent = info.error ? `Could not finish looking for photos: ${info.error}` : plural(info.total, "photo or video", "photos and videos");
+    }
+  }
+
+  /// Upload, in the Photos tab, for those who may write.
+  function uploadButton() {
+    if (!ctx.canWrite()) return [];
+    return [el("button", { type: "button", class: "gallery-upload-button", title: "Add photos and videos here. Those already in the library are found and skipped.", onclick: uploadPhotos }, "Upload")];
+  }
+
+  async function uploadPhotos() {
+    try {
+      const module = await import("/assets/photo-upload.js");
+      await loadWorkspaces();
+      const space = workspaces.find((entry) => entry.id === workspace);
+      module.openPhotoUpload({
+        workspace: space ? space.id : null,
+        name: space ? space.name : "",
+        folders: space ? space.folders : [],
+        api: ctx.api,
+        toast: ctx.toast,
+        pickFolder: ctx.pickFolder,
+        // Their dates and thumbnails come from the scan, which then shows them here.
+        onUploaded: rescan,
+      });
+    } catch (err) {
+      ctx.toast(err.message, true);
     }
   }
 
