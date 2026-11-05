@@ -1,6 +1,6 @@
 [package]
 name = "ownnas-cloud"
-version = "0.9.2"
+version = "0.9.3"
 edition = "2021"
 description = "OwnNAS servers in Windows Explorer, with online-only files (Cloud Files API)"
 
