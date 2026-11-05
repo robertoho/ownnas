@@ -2781,7 +2781,16 @@ async function showPhotoMotion(body, entry, photo) {
     video.autoplay = true;
     video.className = "motion-video";
     video.addEventListener("ended", back, { once: true });
-    video.addEventListener("error", () => { back(); toast("The moving part could not be played", true); }, { once: true });
+    // A video this browser cannot play (iPhones film in HEVC): the moving thumbnail, which any can.
+    video.addEventListener("error", () => {
+      if (video && !video.dataset.clip) {
+        video.dataset.clip = "1";
+        video.src = `/api/photo/motion/clip?path=${encodeURIComponent(entry.path)}`;
+        return;
+      }
+      back();
+      toast("The moving part could not be played", true);
+    });
     photo.replaceWith(video);
     button.textContent = "■ Photo";
   });
@@ -8003,3 +8012,6 @@ $("recents").addEventListener("click", async (event) => {
 });
 
 window.addEventListener("beforeunload", event => { if (state.editor?.dirty) { event.preventDefault(); event.returnValue = ""; } });
+
+// Moving thumbnails for Live and Motion Photos, in the Gallery and the file list.
+import("/assets/motion-thumbs.js").then((module) => module.start()).catch(() => {});

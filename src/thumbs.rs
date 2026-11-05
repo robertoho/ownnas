@@ -352,6 +352,44 @@ fn run(command: &mut Command) -> Result<(), String> {
     }
 }
 
+/// The moving thumbnail of a Live or Motion Photo: a small, silent clip every browser can play
+/// (iPhones film in HEVC, which many cannot), made once and kept with the thumbnails.
+pub fn motion_clip(photo: &Path, cache_root: &Path) -> Result<PathBuf, String> {
+    let meta = std::fs::metadata(photo).map_err(|_| "Could not read the file".to_string())?;
+    let dest = cache_base(cache_root, photo, &meta).with_extension("motion.mp4");
+    if dest.is_file() {
+        return Ok(dest);
+    }
+    let found = crate::photo_formats::motion(photo).ok_or("This photo does not move")?;
+    let parent = dest.parent().ok_or("Could not create the thumbnail cache")?;
+    std::fs::create_dir_all(parent).map_err(|_| "Could not create the thumbnail cache".to_string())?;
+    let stamp = std::time::SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let temp = |what: &str| parent.join(format!(".{}.{stamp}.{what}.mp4", std::process::id()));
+    let inside = temp("source");
+    let out = temp("clip");
+    let input = match found {
+        crate::photo_formats::Motion::Beside(video) => video,
+        crate::photo_formats::Motion::Inside { start, end } => {
+            let data = std::fs::read(photo).map_err(|_| "Could not read the file".to_string())?;
+            let part = data.get(start as usize..end as usize).ok_or("Could not read the video")?;
+            std::fs::write(&inside, part).map_err(|_| "Could not read the video".to_string())?;
+            inside.clone()
+        }
+    };
+    let made = run(tool("ffmpeg")
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(&input)
+        .args(["-an", "-t", "5", "-r", "24", "-vf", "scale=480:480:force_original_aspect_ratio=decrease:force_divisible_by=2"])
+        .args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-f", "mp4"])
+        .arg(&out));
+    let _ = std::fs::remove_file(&inside);
+    let placed = made.and_then(|()| std::fs::rename(&out, &dest).map_err(|_| "Could not keep the clip".to_string()));
+    if placed.is_err() {
+        let _ = std::fs::remove_file(&out);
+    }
+    placed.map(|()| dest)
+}
+
 fn render_video(source: &Path, dest: &Path) -> Result<(), String> {
     if render_video_at(source, dest, "1").is_ok() {
         return Ok(());

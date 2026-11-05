@@ -404,6 +404,7 @@ fn scan_paced(conn: &Connection, root: &Path, progress: &dyn Fn(u64, u64), pace:
         rows.filter_map(Result::ok).collect()
     };
     let mut seen = HashSet::new();
+    let mut live = Vec::new();
     let mut pending = Vec::new();
     let mut read = 0u64;
     let mut stack = vec![(root.to_path_buf(), String::new())];
@@ -431,7 +432,9 @@ fn scan_paced(conn: &Connection, root: &Path, progress: &dyn Fn(u64, u64), pace:
             // A Live Photo's video belongs to its photo, and plays from there.
             if kind == "video" && extension == "mov" {
                 let stem = name.rsplit_once('.').map_or(name.as_str(), |(stem, _)| stem);
-                if ["HEIC", "heic", "JPG", "jpg", "JPEG", "jpeg"].iter().any(|ext| dir.join(format!("{stem}.{ext}")).is_file()) {
+                let photo = ["HEIC", "heic", "JPG", "jpg", "JPEG", "jpeg"].iter().map(|ext| format!("{stem}.{ext}")).find(|photo| dir.join(photo).is_file());
+                if let Some(photo) = photo {
+                    live.push(if rel_dir.is_empty() { photo } else { format!("{rel_dir}/{photo}") });
                     continue;
                 }
             }
@@ -466,8 +469,48 @@ fn scan_paced(conn: &Connection, root: &Path, progress: &dyn Fn(u64, u64), pace:
         tx.commit().map_err(|err| err.to_string())?;
     }
     crate::smart::forget_unindexed(conn)?;
+    note_moving(conn, root, &live, pace)?;
     progress(seen.len() as u64, read);
     Ok(())
+}
+
+/// Marks the photos that move: those not looked at yet (from before this was kept), and those
+/// whose Live Photo video arrived after them.
+fn note_moving(conn: &Connection, root: &Path, live: &[String], pace: &dyn Fn(std::time::Instant)) -> Result<(), String> {
+    let sql = |err: rusqlite::Error| err.to_string();
+    for part in live.chunks(BATCH) {
+        let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate).map_err(sql)?;
+        for path in part {
+            tx.execute("UPDATE media_index SET motion = 1 WHERE path = ?1 AND motion IS NOT 1", [path]).map_err(sql)?;
+        }
+        tx.commit().map_err(sql)?;
+        crate::db_watch::pause_point();
+    }
+    loop {
+        let waiting: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT path FROM media_index WHERE kind = 'image' AND motion IS NULL LIMIT ?1").map_err(sql)?;
+            let rows = stmt.query_map([BATCH as i64], |row| row.get(0)).map_err(sql)?;
+            rows.filter_map(Result::ok).collect()
+        };
+        if waiting.is_empty() {
+            return Ok(());
+        }
+        // Read before the transaction, so the database is locked only to write.
+        let looked: Vec<(String, bool)> = waiting
+            .into_iter()
+            .map(|path| {
+                let started = std::time::Instant::now();
+                let moving = crate::photo_formats::moves(&root.join(&path));
+                pace(started);
+                (path, moving)
+            })
+            .collect();
+        let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate).map_err(sql)?;
+        for (path, moving) in looked {
+            tx.execute("UPDATE media_index SET motion = ?2 WHERE path = ?1", rusqlite::params![path, moving]).map_err(sql)?;
+        }
+        tx.commit().map_err(sql)?;
+    }
 }
 
 fn store(conn: &Connection, found: Vec<Found>, pace: &dyn Fn(std::time::Instant)) -> Result<(), String> {
@@ -475,24 +518,25 @@ fn store(conn: &Connection, found: Vec<Found>, pace: &dyn Fn(std::time::Instant)
         return Ok(());
     }
     // Reading dates happens before the transaction, so the database is locked only to write.
-    let rows: Vec<(Found, Taken)> = found.into_iter().map(|item| {
+    let rows: Vec<(Found, Taken, bool)> = found.into_iter().map(|item| {
         let started = std::time::Instant::now();
         let taken = if item.kind == "image" { read_photo(&item.full) } else { read_video(&item.full) };
+        let moving = item.kind == "image" && crate::photo_formats::moves(&item.full);
         pace(started);
-        (item, taken)
+        (item, taken, moving)
     }).collect();
     let now = crate::db::now_secs();
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate).map_err(|err| err.to_string())?;
-    for (item, taken) in rows {
+    for (item, taken, moving) in rows {
         let (taken_at, source) = match taken.at {
             Some(at) => (at, taken.source.unwrap_or("exif")),
             None => (item.mtime, "file"),
         };
         let (lat, lon) = taken.place.map_or((None, None), |(lat, lon)| (Some(lat), Some(lon)));
         tx.execute(
-            "INSERT OR REPLACE INTO media_index(path, kind, size, mtime, taken_at, date_source, width, height, indexed_at, lat, lon)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![item.rel, item.kind, item.size, item.mtime, taken_at, source, taken.width, taken.height, now, lat, lon],
+            "INSERT OR REPLACE INTO media_index(path, kind, size, mtime, taken_at, date_source, width, height, indexed_at, lat, lon, motion)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![item.rel, item.kind, item.size, item.mtime, taken_at, source, taken.width, taken.height, now, lat, lon, moving],
         )
         .map_err(|err| err.to_string())?;
     }

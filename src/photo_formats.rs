@@ -717,18 +717,48 @@ pub fn may_move(extension: &str) -> bool {
     matches!(extension, "jpg" | "jpeg" | "heic" | "heif")
 }
 
+/// An Apple Live Photo's video, beside the photo.
+fn video_beside(path: &Path) -> Option<std::path::PathBuf> {
+    let stem = path.file_stem()?.to_string_lossy().into_owned();
+    let dir = path.parent()?;
+    ["MOV", "mov", "Mov"].iter().map(|ext| dir.join(format!("{stem}.{ext}"))).find(|beside| beside.is_file())
+}
+
+/// Whether a photo moves, for indexing a whole library: only photos whose start or end mention
+/// a Motion Photo (Google's and Samsung's marks) are read through. Their mark can also say "not
+/// moving", which is why they are.
+pub fn moves(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    const HEAD: u64 = 512 * 1024;
+    const TAIL: u64 = 64 * 1024;
+    if !may_move(&extension_of(path)) {
+        return false;
+    }
+    if video_beside(path).is_some() {
+        return true;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    let size = file.metadata().map_or(0, |meta| meta.len());
+    let mut data = Vec::new();
+    if file.by_ref().take(HEAD).read_to_end(&mut data).is_err() {
+        return false;
+    }
+    if size > HEAD {
+        let from = size.saturating_sub(TAIL).max(HEAD);
+        if file.seek(SeekFrom::Start(from)).is_err() || file.read_to_end(&mut data).is_err() {
+            return false;
+        }
+    }
+    let marked = [b"MotionPhoto".as_slice(), b"MicroVideo".as_slice()].iter().any(|mark| data.windows(mark.len()).any(|window| window == *mark));
+    marked && motion(path).is_some()
+}
+
 pub fn motion(path: &Path) -> Option<Motion> {
     if !may_move(&extension_of(path)) {
         return None;
     }
-    let stem = path.file_stem()?.to_string_lossy().into_owned();
-    if let Some(dir) = path.parent() {
-        for ext in ["MOV", "mov", "Mov"] {
-            let beside = dir.join(format!("{stem}.{ext}"));
-            if beside.is_file() {
-                return Some(Motion::Beside(beside));
-            }
-        }
+    if let Some(beside) = video_beside(path) {
+        return Some(Motion::Beside(beside));
     }
     let size = std::fs::metadata(path).ok()?.len();
     if size > 200 * 1024 * 1024 {
@@ -805,6 +835,15 @@ mod motion_tests {
         assert_eq!(motion(&dir.join("PXL_2.MP.jpg")), Some(Motion::Inside { start: start as u64, end: end as u64 }));
         std::fs::write(dir.join("plain.jpg"), [0xFF, 0xD8, 0xFF, 0xD9]).unwrap();
         assert_eq!(motion(&dir.join("plain.jpg")), None);
+        assert!(moves(&dir.join("IMG_1.HEIC")), "beside it");
+        assert!(!moves(&dir.join("PXL_2.MP.jpg")), "a video without a mark is not looked for");
+        assert!(!moves(&dir.join("plain.jpg")));
+        let mut marked = std::fs::read(dir.join("PXL_2.MP.jpg")).unwrap();
+        marked.splice(2..2, b"GCamera:MotionPhoto=1 ".iter().copied());
+        std::fs::write(dir.join("PXL_3.MP.jpg"), &marked).unwrap();
+        assert!(moves(&dir.join("PXL_3.MP.jpg")), "marked, with a video");
+        std::fs::write(dir.join("off.jpg"), b"\xff\xd8 GCamera:MotionPhoto=0 and no video").unwrap();
+        assert!(!moves(&dir.join("off.jpg")), "marked, with none");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

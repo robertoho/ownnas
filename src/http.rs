@@ -34,6 +34,7 @@ const XLSX_EDITOR_JS: &str = include_str!("../web/xlsx-editor.js");
 const SHEET_FORMULA_JS: &str = include_str!("../web/sheet-formula.js");
 const SHEET_CHART_JS: &str = include_str!("../web/sheet-chart.js");
 const SQLITE_VIEWER_JS: &str = include_str!("../web/sqlite-viewer.js");
+const MOTION_THUMBS_JS: &str = include_str!("../web/motion-thumbs.js");
 const THEME_JS: &str = include_str!("../web/theme.js");
 const GALLERY_JS: &str = include_str!("../web/gallery.js");
 const VIEWERS_JS: &str = include_str!("../web/viewers.js");
@@ -251,6 +252,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/assets/sheet-formula.js", get(sheet_formula_javascript))
         .route("/assets/sheet-chart.js", get(sheet_chart_javascript))
         .route("/assets/sqlite-viewer.js", get(sqlite_viewer_javascript))
+        .route("/assets/motion-thumbs.js", get(motion_thumbs_javascript))
         .route("/assets/theme.js", get(theme_javascript))
         .route("/assets/gallery.js", get(gallery_javascript))
         .route("/assets/viewers.js", get(viewers_javascript))
@@ -330,6 +332,8 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/display", get(display_image))
         .route("/api/photo/motion", get(photo_motion))
         .route("/api/photo/motion/video", get(photo_motion_video))
+        .route("/api/photo/motion/clip", get(photo_motion_clip))
+        .route("/api/photo/motion/known", post(photo_motion_known))
         .route("/api/audio/info", get(audio_info))
         .route("/api/audio/cover", get(audio_cover))
         .route("/api/music/folder", get(music_folder))
@@ -1066,6 +1070,10 @@ async fn music_javascript() -> impl IntoResponse {
 
 async fn nas_backup_javascript() -> impl IntoResponse {
     app_module_javascript(NAS_BACKUP_JS)
+}
+
+async fn motion_thumbs_javascript() -> impl IntoResponse {
+    app_module_javascript(MOTION_THUMBS_JS)
 }
 
 async fn sqlite_viewer_javascript() -> impl IntoResponse {
@@ -4073,6 +4081,46 @@ async fn photo_motion(
         Some(crate::photo_formats::Motion::Inside { .. }) => json!({ "kind": "motion", "url": format!("/api/photo/motion/video?path={}", url_encode(&rel)) }),
         None => json!({ "kind": null }),
     }))
+}
+
+/// Which of these photos move, as far as the photo index knows.
+async fn photo_motion_known(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<PathsBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    require_user(&state, &headers)?;
+    if body.paths.len() > files::MAX_LIST {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Too many photos at once"));
+    }
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    Ok(Json(json!({ "moving": db::moving_photos(&conn, &body.paths) })))
+}
+
+/// How many moving thumbnails are made at once, however many tiles are asked for.
+static MOTION_CLIPS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// The moving thumbnail of a Live or Motion Photo.
+async fn photo_motion_clip(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Result<Response, ApiError> {
+    require_user(&state, &headers)?;
+    let none = || ApiError::new(StatusCode::NOT_FOUND, "No moving thumbnail");
+    if !state.ffmpeg {
+        return Err(none());
+    }
+    let resolved = files::resolve(&state.root, &rel_of(&query.path))?;
+    let cache = state.thumbs.clone();
+    let turn = MOTION_CLIPS.acquire().await.map_err(|_| none())?;
+    let clip = tokio::task::spawn_blocking(move || thumbs::motion_clip(&resolved.full, &cache))
+        .await
+        .map_err(|_| none())?
+        .map_err(|_| none())?;
+    drop(turn);
+    send_file(&headers, &clip, "motion.mp4", false).await
 }
 
 /// The video a Motion Photo keeps after its picture.

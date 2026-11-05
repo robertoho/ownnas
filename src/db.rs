@@ -483,6 +483,18 @@ fn move_to_index(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// Which of these photos the index knows to move.
+pub fn moving_photos(conn: &Connection, paths: &[String]) -> Vec<String> {
+    let mut found = Vec::new();
+    for part in paths.chunks(500) {
+        let marks = vec!["?"; part.len()].join(",");
+        let Ok(mut stmt) = conn.prepare(&format!("SELECT path FROM media_index WHERE motion = 1 AND path IN ({marks})")) else { continue };
+        let rows = stmt.query_map(rusqlite::params_from_iter(part), |row| row.get::<_, String>(0));
+        found.extend(rows.into_iter().flatten().filter_map(Result::ok));
+    }
+    found
+}
+
 /// The tables in `INDEX_FILE`.
 fn index_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
@@ -761,6 +773,13 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             conn.execute(&format!("ALTER TABLE media_index ADD COLUMN {column} REAL"), [])
                 .map_err(|_| "Could not update the photo index".to_string())?;
         }
+    }
+    // Whether a photo moves (Live and Motion Photos). Empty until the next scan looks, which reads
+    // only the ends of the photos, so nothing has to be read again in full for it.
+    let has_motion: bool = conn.prepare("SELECT 1 FROM pragma_table_info('media_index') WHERE name = 'motion'").and_then(|mut stmt| stmt.exists([])).unwrap_or(false);
+    if !has_motion {
+        conn.execute("ALTER TABLE media_index ADD COLUMN motion INTEGER", [])
+            .map_err(|_| "Could not update the photo index".to_string())?;
     }
     let has_workspace: bool = conn.prepare("SELECT 1 FROM pragma_table_info('albums') WHERE name = 'workspace_id'").and_then(|mut stmt| stmt.exists([])).unwrap_or(false);
     if !has_workspace {
@@ -1642,9 +1661,9 @@ pub fn copy_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), Str
     .map_err(|_| "Could not copy fingerprints".to_string())?;
     // The copy shows in the timeline right away; it is not added to the original's albums.
     conn.execute(
-        "INSERT OR REPLACE INTO media_index(path, kind, size, mtime, taken_at, date_source, width, height, indexed_at, lat, lon)
+        "INSERT OR REPLACE INTO media_index(path, kind, size, mtime, taken_at, date_source, width, height, indexed_at, lat, lon, motion)
          SELECT CASE WHEN path = ?1 THEN ?2 ELSE ?2 || substr(path, length(?1) + 1) END,
-                kind, size, mtime, taken_at, date_source, width, height, indexed_at, lat, lon
+                kind, size, mtime, taken_at, date_source, width, height, indexed_at, lat, lon, NULL
          FROM media_index WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
         params![from, to],
     )
