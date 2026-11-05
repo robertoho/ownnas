@@ -1025,6 +1025,7 @@ const MENU_ICONS = {
   downloadZip: "M4 2.5h5.5L13.5 6v7.5a1 1 0 0 1-1 1h-8.5a1 1 0 0 1-1-1v-10a1 1 0 0 1 1-1z M9.5 2.5V6H13.5 M7 4.5v1 M7 6.5v1 M7 8.5v1 M6 10.5h2v2H6z",
   upload: "M8 11.5V3.5 M5 6l3-3 3 3 M2.5 12.5v1a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-1",
   uploadFolder: `${ICON_FOLDER} M8 12V7.5 M5.75 9.25 8 7l2.25 2.25`,
+  uploadsLog: "M3 8.5 6.5 12 13 4",
   mkdir: `${ICON_FOLDER} M8 8v5 M5.5 10.5H10.5`,
   folderWith: `${ICON_FOLDER} M8 8v5 M5.5 10.5H10.5`,
   newfile: `${ICON_FILE} M8 8v4 M6 10h4`,
@@ -1374,6 +1375,7 @@ function openSelectionMenu(x, y, pasteInto) {
       buttons.push(`<button type="button" data-menu="newfile">New file…</button>`);
       buttons.push(`<button type="button" data-menu="upload">Upload files…</button>`);
       buttons.push(`<button type="button" data-menu="uploadFolder">Upload folder…</button>`);
+      buttons.push(`<button type="button" data-menu="uploadsLog">Recent uploads…</button>`);
     }
     if (write && customizableFolder({ path: state.path, dir: true, kind: 'folder' })) buttons.push('<button type="button" data-menu="folderAppearance">Customize folder…</button>');
     buttons.push(`<button type="button" data-menu="downloadZip">Download folder zip</button>`);
@@ -4150,7 +4152,7 @@ const jobState = {
   seq: 0,
 };
 
-function upsertJob(id, { title, detail = "", stats = "", percent = null, cancelable = false, onCancel = null }) {
+function upsertJob(id, { title, detail = "", stats = "", percent = null, cancelable = false, onCancel = null, problem = false, lines = [], actions = [] }) {
   const existing = jobState.items.get(id) || {};
   jobState.items.set(id, {
     id,
@@ -4160,6 +4162,9 @@ function upsertJob(id, { title, detail = "", stats = "", percent = null, cancela
     percent,
     cancelable,
     onCancel: onCancel || existing.onCancel || null,
+    problem,
+    lines,
+    actions,
   });
   if (!jobState.hidden) renderJobsPanel(true);
   else syncJobsButton();
@@ -4200,7 +4205,13 @@ function renderJobsPanel(show) {
     const cancel = job.cancelable
       ? `<button type="button" data-job-cancel="${esc(job.id)}">Cancel</button>`
       : "";
-    return `<li class="jobs-item" data-job="${esc(job.id)}">
+    const lines = job.lines.length
+      ? `<ul class="jobs-item-lines">${job.lines.map((line) => `<li>${esc(line)}</li>`).join("")}</ul>`
+      : "";
+    const actions = job.actions.length
+      ? `<div class="jobs-item-actions">${job.actions.map((action, index) => `<button type="button" data-job-action="${index}">${esc(action.label)}</button>`).join("")}</div>`
+      : "";
+    return `<li class="jobs-item${job.problem ? " problem" : ""}" data-job="${esc(job.id)}">
       <div class="jobs-item-head">
         <span class="jobs-item-title">${esc(job.title)}</span>
         ${cancel}
@@ -4208,6 +4219,8 @@ function renderJobsPanel(show) {
       <span class="jobs-item-detail">${esc(job.detail || "")}</span>
       ${job.stats ? `<span class="jobs-item-stats">${esc(job.stats)}</span>` : ""}
       <div class="status-track"><div class="${barClass}"${width}></div></div>
+      ${lines}
+      ${actions}
     </li>`;
   }).join("");
   panel.hidden = !show || jobState.hidden;
@@ -4540,7 +4553,7 @@ function askUploadConflict(item, info) {
     : `“${label}” already exists.`;
   $("conflict-meta").textContent = conflictNote(item, info);
   $("conflict-rest").checked = false;
-  for (const value of ["overwrite", "archive-older", "archive-existing"]) {
+  for (const value of ["keep-newer", "overwrite", "archive-older", "archive-existing"]) {
     const button = document.querySelector(`#conflict-dialog button[value="${value}"]`);
     button.hidden = !!info.dir;
   }
@@ -4563,14 +4576,22 @@ function choiceFits(choice, info) {
 }
 
 async function sendUploads(files, destination = state.path) {
-  const plan = await api("/api/upload/conflicts", {
-    method: "POST",
-    json: { path: destination, names: files.map((item) => item.name) },
-  });
-  const byName = new Map((plan.items || []).map((item) => [item.name, item]));
+  const batch = startUploadLog(files, destination);
+  let byName = new Map();
+  let planError = null;
+  try {
+    const plan = await api("/api/upload/conflicts", {
+      method: "POST",
+      json: { path: destination, names: files.map((item) => item.name) },
+    });
+    byName = new Map((plan.items || []).map((item) => [item.name, item]));
+  } catch (err) {
+    planError = err;
+  }
   let restChoice = null;
   let saved = 0;
   let skipped = 0;
+  const failures = [];
   const totalBytes = files.reduce((sum, item) => sum + item.file.size, 0) || 1;
   let loadedBefore = 0;
   // Bytes actually sent (skipped files do not count), for the speed.
@@ -4600,7 +4621,7 @@ async function sendUploads(files, destination = state.path) {
       parts.push("Measuring speed…");
     }
     upsertJob("transfer", {
-      title: "Uploading…",
+      title: failures.length ? `Uploading… (${failures.length} failed so far)` : "Uploading…",
       detail: label,
       stats: parts.filter(Boolean).join(" · "),
       percent: overall,
@@ -4608,59 +4629,83 @@ async function sendUploads(files, destination = state.path) {
       onCancel: () => cancelActiveTransfer(),
     });
   };
+  const cancelledError = () => {
+    const error = new Error("Upload cancelled");
+    error.cancel = true;
+    return error;
+  };
+  const settle = (index, status, details = {}) => {
+    Object.assign(batch.files[index], { status }, details);
+    saveUploadBatch(batch);
+  };
+  const skip = (index, item) => {
+    skipped += 1;
+    loadedBefore += item.file.size;
+    settle(index, "skipped");
+  };
+  let cancelled = null;
   try {
     for (let index = 0; index < files.length; index += 1) {
-      if (uploadAbort) {
-        const error = new Error("Upload cancelled");
-        error.cancel = true;
-        throw error;
-      }
+      if (uploadAbort) throw cancelledError();
       const item = files[index];
+      if (planError) {
+        failures.push({ item, choice: item.choice || null, message: planError.message });
+        settle(index, "failed", { error: planError.message });
+        continue;
+      }
       const info = byName.get(item.name);
       let choice = null;
       if (info && info.exists) {
-        if (restChoice && choiceFits(restChoice, info)) choice = restChoice;
+        if (item.choice && choiceFits(item.choice, info)) choice = item.choice;
+        else if (restChoice && choiceFits(restChoice, info)) choice = restChoice;
         else {
           hideStatus();
           const answer = await askUploadConflict(item, info);
-          if (!answer) {
-            const error = new Error("Upload cancelled");
-            error.cancel = true;
-            throw error;
-          }
+          if (!answer) throw cancelledError();
           choice = answer.choice;
           if (answer.rest) restChoice = choice;
         }
       }
-      if (choice === "ignore") {
-        skipped += 1;
-        loadedBefore += item.file.size;
+      // Decided here when it can be, so a large file is not sent only to be thrown away.
+      if (choice === "ignore" || (choice === "keep-newer" && info.modified >= Math.floor(item.file.lastModified / 1000))) {
+        skip(index, item);
         continue;
       }
-      updateProgress(item, index, 0);
-      let posted = await postFile(item, choice, (loaded) => updateProgress(item, index, loaded), destination);
-      if (posted && posted.exists) {
-        hideStatus();
-        const answer = await askUploadConflict(item, posted);
-        if (!answer) {
-          const error = new Error("Upload cancelled");
-          error.cancel = true;
-          throw error;
+      try {
+        updateProgress(item, index, 0);
+        let posted = await postFile(item, choice, (loaded) => updateProgress(item, index, loaded), destination);
+        if (posted.exists) {
+          hideStatus();
+          const answer = await askUploadConflict(item, posted);
+          if (!answer) throw cancelledError();
+          choice = answer.choice;
+          if (answer.rest) restChoice = choice;
+          if (choice === "ignore") {
+            skip(index, item);
+            continue;
+          }
+          updateProgress(item, index, 0);
+          posted = await postFile(item, choice, (loaded) => updateProgress(item, index, loaded), destination);
+          if (posted.exists) throw new Error("An item with that name already exists");
         }
-        if (answer.rest) restChoice = answer.choice;
-        if (answer.choice === "ignore") {
-          skipped += 1;
-          loadedBefore += item.file.size;
+        if (posted.skipped && !posted.saved) {
+          skip(index, item);
           continue;
         }
-        updateProgress(item, index, 0);
-        posted = await postFile(item, answer.choice, (loaded) => updateProgress(item, index, loaded), destination);
-        if (posted && posted.exists) throw new Error("An item with that name already exists");
+        loadedBefore += item.file.size;
+        sentBefore += item.file.size;
+        saved += 1;
+        settle(index, "saved", { path: posted.paths?.[0] || null, choice });
+      } catch (err) {
+        if (err.cancel) throw err;
+        loadedBefore += item.file.size;
+        failures.push({ item, choice, message: err.message });
+        settle(index, "failed", { error: err.message, choice });
       }
-      loadedBefore += item.file.size;
-      sentBefore += item.file.size;
-      saved += 1;
     }
+  } catch (err) {
+    if (!err.cancel) throw err;
+    cancelled = err;
   } finally {
     activeUpload = null;
     hideStatus();
@@ -4670,7 +4715,261 @@ async function sendUploads(files, destination = state.path) {
       thin.style.width = "0";
     }
   }
-  return { saved, skipped };
+  for (const file of batch.files) {
+    if (file.status === "waiting") file.status = "cancelled";
+  }
+  saveUploadBatch(batch, true);
+
+  // Asks the server what it now has, rather than trusting what was answered along the way.
+  let confirmed = null;
+  if (saved && !planError) {
+    try {
+      await checkUploadBatch(batch);
+      confirmed = 0;
+      batch.files.forEach((file, index) => {
+        if (file.status !== "saved") return;
+        if (file.check === "confirmed") {
+          confirmed += 1;
+          return;
+        }
+        saved -= 1;
+        failures.push({ item: files[index], choice: "overwrite", message: UPLOAD_CHECKS[file.check] || "It could not be confirmed on the server" });
+      });
+    } catch {
+      confirmed = null;
+    }
+  }
+  if (failures.length) showUploadReport({ batch, files, failures, destination, stopped: !!cancelled });
+  if (cancelled) throw cancelled;
+  return { saved, skipped, failed: failures.length, confirmed };
+}
+
+const UPLOAD_LOG_KEY = "ownnas-upload-log";
+const UPLOAD_LOG_BATCHES = 30;
+const UPLOAD_LOG_FILES = 5000;
+const UPLOAD_CHECKS = {
+  confirmed: "On the server",
+  arrived: "On the server, even though the upload reported a problem",
+  missing: "Not on the server now",
+  different: "On the server, but its size is different now",
+  absent: "Not on the server",
+};
+/// What can be sent again, by batch, while the page stays open: browsers do not let a page keep
+/// hold of chosen files after that.
+const uploadRetries = new Map();
+
+function readUploadLog() {
+  try {
+    const list = JSON.parse(localStorage.getItem(UPLOAD_LOG_KEY) || "[]");
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeUploadLog(list) {
+  // Newest first; the oldest go when there are too many, or when the browser has no more room.
+  let kept = list.slice(0, UPLOAD_LOG_BATCHES);
+  let files = 0;
+  kept = kept.filter((batch, index) => {
+    files += batch.files.length;
+    return index === 0 || files <= UPLOAD_LOG_FILES;
+  });
+  if (!kept.length) {
+    try { localStorage.removeItem(UPLOAD_LOG_KEY); } catch { /* nothing to clear */ }
+  }
+  while (kept.length) {
+    try {
+      localStorage.setItem(UPLOAD_LOG_KEY, JSON.stringify(kept));
+      return;
+    } catch {
+      kept.pop();
+    }
+  }
+}
+
+let uploadLogSavedAt = 0;
+function saveUploadBatch(batch, now = false) {
+  if (!now && performance.now() - uploadLogSavedAt < 1000) return;
+  uploadLogSavedAt = performance.now();
+  writeUploadLog([batch, ...readUploadLog().filter((other) => other.id !== batch.id)]);
+}
+
+function startUploadLog(files, destination) {
+  const batch = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    at: Math.floor(Date.now() / 1000),
+    user: state.me?.username || "",
+    destination,
+    files: files.map((item) => ({
+      name: item.name,
+      size: item.file.size,
+      modified: Math.floor(item.file.lastModified / 1000),
+      status: "waiting",
+    })),
+  };
+  // Saved before anything is sent: if the page closes part way, the rest show up as not finished.
+  saveUploadBatch(batch, true);
+  return batch;
+}
+
+/// Compares each file of a batch with what the server has now.
+async function checkUploadBatch(batch) {
+  const folders = new Map();
+  for (const file of batch.files) {
+    if (file.status === "skipped" || file.status === "cancelled") continue;
+    const path = file.path || (batch.destination ? `${batch.destination}/${file.name}` : file.name);
+    const slash = path.lastIndexOf("/");
+    const folder = slash < 0 ? "" : path.slice(0, slash);
+    if (!folders.has(folder)) folders.set(folder, []);
+    folders.get(folder).push({ file, name: path.slice(slash + 1) });
+  }
+  for (const [folder, wanted] of folders) {
+    for (let start = 0; start < wanted.length; start += 5000) {
+      const part = wanted.slice(start, start + 5000);
+      const answer = await api("/api/upload/conflicts", { method: "POST", json: { path: folder, names: part.map((item) => item.name) } });
+      const found = new Map((answer.items || []).map((item) => [item.name, item]));
+      for (const { file, name } of part) {
+        const here = found.get(name);
+        const present = here && here.exists && !here.dir;
+        if (file.status === "saved") {
+          file.check = !present ? "missing" : here.size === file.size ? "confirmed" : "different";
+        } else {
+          file.check = present && here.size === file.size && here.modified === file.modified ? "arrived" : "absent";
+        }
+      }
+    }
+  }
+  batch.checkedAt = Math.floor(Date.now() / 1000);
+  saveUploadBatch(batch, true);
+}
+
+function reloadAfterUpload(destination) {
+  if (!state.me) return;
+  invalidateFolderSizes();
+  if (state.path === destination) load(destination, { keepPreview: true }).catch((err) => toast(err.message, true));
+}
+
+async function retryUploads(batchId, destination) {
+  const failures = uploadRetries.get(batchId);
+  if (!failures) return;
+  uploadRetries.delete(batchId);
+  removeJob(`upload-report-${batchId}`);
+  const files = failures.map(({ item, choice }) => ({ ...item, choice }));
+  try {
+    toast(uploadSummary(await sendUploads(files, destination)));
+  } catch (err) {
+    toast(err.cancel ? "Upload cancelled" : err.message, !err.cancel);
+  }
+  reloadAfterUpload(destination);
+  if (!$("uploads-dialog").hidden && $("uploads-dialog").open) renderUploadLog();
+}
+
+/// Stays open until closed: how far it got, what is left, and what went wrong.
+function showUploadReport({ batch, files, failures, destination, stopped }) {
+  uploadRetries.set(batch.id, failures);
+  const total = files.reduce((sum, item) => sum + item.file.size, 0);
+  const left = failures.reduce((sum, { item }) => sum + item.file.size, 0)
+    + batch.files.reduce((sum, file) => sum + (file.status === "cancelled" ? file.size : 0), 0);
+  const done = total - left;
+  const percent = total ? (done / total) * 100 : 0;
+  const notSent = batch.files.filter((file) => file.status === "cancelled").length;
+  const count = `${failures.length} of ${files.length} ${files.length === 1 ? "file" : "files"} failed`;
+  const shown = failures.slice(0, 8).map(({ item, message }) => `${item.name}: ${message}`);
+  if (failures.length > shown.length) shown.push(`and ${failures.length - shown.length} more`);
+  const id = `upload-report-${batch.id}`;
+  upsertJob(id, {
+    title: stopped ? "Upload stopped, with problems" : "Upload finished, with problems",
+    detail: notSent ? `${count}, ${notSent} not sent` : count,
+    stats: `${Math.floor(percent)}% done, ${Math.ceil(100 - percent)}% left (${formatSize(left, false)} of ${formatSize(total, false)})`,
+    percent,
+    problem: true,
+    lines: shown,
+    actions: [
+      { label: "Retry failed", run: () => retryUploads(batch.id, destination) },
+      { label: "Check uploads", run: () => openUploadLog() },
+      { label: "Close", run: () => { uploadRetries.delete(batch.id); removeJob(id); } },
+    ],
+  });
+  openJobsPanel();
+}
+
+function batchTally(batch) {
+  const tally = { confirmed: 0, problems: 0, skipped: 0, cancelled: 0, unchecked: 0 };
+  for (const file of batch.files) {
+    if (file.status === "skipped") tally.skipped += 1;
+    else if (file.status === "cancelled") tally.cancelled += 1;
+    else if (file.check === "confirmed" || file.check === "arrived") tally.confirmed += 1;
+    else if (file.check || file.status === "failed") tally.problems += 1;
+    else tally.unchecked += 1;
+  }
+  return tally;
+}
+
+function uploadRowNote(file) {
+  if (file.check) return UPLOAD_CHECKS[file.check];
+  if (file.status === "failed") return file.error || "Failed";
+  if (file.status === "skipped") return "Skipped: the file already there was kept";
+  if (file.status === "cancelled") return "Not sent: the upload was cancelled";
+  if (file.status === "waiting") return "Did not finish: the page closed during the upload";
+  return "Not checked yet";
+}
+
+function renderUploadLog() {
+  const list = readUploadLog().filter((batch) => !state.me || !batch.user || batch.user === state.me.username);
+  $("uploads-empty").hidden = list.length > 0;
+  $("uploads-clear").hidden = !list.length;
+  $("uploads-list").innerHTML = list.map((batch, index) => {
+    const tally = batchTally(batch);
+    const parts = [];
+    if (tally.confirmed) parts.push(`${tally.confirmed} confirmed`);
+    if (tally.problems) parts.push(`${tally.problems} with problems`);
+    if (tally.unchecked) parts.push(`${tally.unchecked} not checked`);
+    if (tally.skipped) parts.push(`${tally.skipped} skipped`);
+    if (tally.cancelled) parts.push(`${tally.cancelled} not sent`);
+    const rows = [...batch.files].sort((a, b) => Number(isUploadOk(a)) - Number(isUploadOk(b))).slice(0, 200);
+    const more = batch.files.length - rows.length;
+    const retry = uploadRetries.has(batch.id) ? `<button type="button" data-upload-retry="${esc(batch.id)}">Retry failed</button>` : "";
+    return `<details class="upload-log-batch${tally.problems ? " has-problems" : ""}"${index === 0 || tally.problems ? " open" : ""}>
+      <summary>
+        <strong>${esc(formatDate(batch.at))}</strong>
+        <span>to ${esc(batch.destination || "Library")}</span>
+        <span class="upload-log-tally">${esc(parts.join(", ") || "No files")}</span>
+      </summary>
+      <div class="dialog-actions">
+        <button type="button" data-upload-check="${esc(batch.id)}">Check again</button>
+        ${retry}
+      </div>
+      <ul class="upload-log-files">${rows.map((file) => `<li class="${isUploadOk(file) ? "ok" : "bad"}">
+        <span class="upload-log-name">${esc(file.name)}</span>
+        <span class="muted">${esc(formatSize(file.size, false))}</span>
+        <span class="upload-log-note">${esc(uploadRowNote(file))}</span>
+      </li>`).join("")}${more > 0 ? `<li class="muted">and ${more} more</li>` : ""}</ul>
+    </details>`;
+  }).join("");
+}
+
+function isUploadOk(file) {
+  return file.status === "skipped" || file.check === "confirmed" || file.check === "arrived" || (!file.check && file.status === "saved");
+}
+
+async function openUploadLog() {
+  const dialog = $("uploads-dialog");
+  renderUploadLog();
+  if (!dialog.open) dialog.showModal();
+  const latest = readUploadLog().find((batch) => !state.me || !batch.user || batch.user === state.me.username);
+  if (latest) await checkAndShow(latest.id);
+}
+
+async function checkAndShow(id) {
+  const batch = readUploadLog().find((other) => other.id === id);
+  if (!batch) return;
+  try {
+    await checkUploadBatch(batch);
+  } catch (err) {
+    toast(`Could not check: ${err.message}`, true);
+  }
+  renderUploadLog();
 }
 
 function postFile(item, choice, onProgress, destination = state.path) {
@@ -4688,7 +4987,7 @@ function postFile(item, choice, onProgress, destination = state.path) {
     if (choice) params.set("conflict", choice);
     // The server gives the saved file this time, so it keeps its original date.
     if (item.file.lastModified) params.set("mtime", String(item.file.lastModified));
-    if (choice === "archive-older") params.set("modified", String(Math.floor(item.file.lastModified / 1000)));
+    if (choice === "archive-older" || choice === "keep-newer") params.set("modified", String(Math.floor(item.file.lastModified / 1000)));
     xhr.open("POST", `/api/upload?${params}`);
     xhr.setRequestHeader("X-OwnNAS", "1");
     xhr.upload.onprogress = (event) => {
@@ -4696,9 +4995,12 @@ function postFile(item, choice, onProgress, destination = state.path) {
     };
     xhr.onload = () => {
       if (activeUpload === xhr) activeUpload = null;
-      if (xhr.status >= 200 && xhr.status < 300) resolve(null);
-      else if (xhr.status === 409) {
+      if (xhr.status >= 200 && xhr.status < 300) {
         try { resolve(JSON.parse(xhr.responseText)); }
+        catch { resolve({}); }
+      }
+      else if (xhr.status === 409) {
+        try { resolve({ exists: true, ...JSON.parse(xhr.responseText) }); }
         catch { reject(new Error("An item with that name already exists")); }
       } else {
         let message = "Upload failed";
@@ -4708,7 +5010,7 @@ function postFile(item, choice, onProgress, destination = state.path) {
     };
     xhr.onerror = () => {
       if (activeUpload === xhr) activeUpload = null;
-      reject(new Error("Upload failed"));
+      reject(new Error("The connection to the server was lost"));
     };
     xhr.onabort = () => {
       if (activeUpload === xhr) activeUpload = null;
@@ -4723,11 +5025,13 @@ function postFile(item, choice, onProgress, destination = state.path) {
 }
 
 function uploadSummary(result) {
+  if (result.failed) return `Uploaded ${result.saved}, ${result.failed} failed`;
   if (!result.saved && result.skipped) {
-    return result.skipped === 1 ? "Ignored 1 file" : `Ignored ${result.skipped} files`;
+    return result.skipped === 1 ? "Skipped 1 file" : `Skipped ${result.skipped} files`;
   }
-  if (result.skipped) return `Uploaded ${result.saved}, ignored ${result.skipped}`;
-  return "Upload finished";
+  const check = result.confirmed === result.saved ? ", confirmed on the server" : ", but it could not be confirmed";
+  if (result.skipped) return `Uploaded ${result.saved}, skipped ${result.skipped}${check}`;
+  return `Upload finished${check}`;
 }
 
 function transferPath(value) {
@@ -5570,6 +5874,7 @@ function runMenuAction(button, entries, pasteInto) {
   if (action === "pdfMerge") pdfMergeEntries(entries).catch((err) => toast(err.message, true));
   if (action === "upload") $("upload-input").click();
   if (action === "uploadFolder") $("folder-input").click();
+  if (action === "uploadsLog") openUploadLog().catch((err) => toast(err.message, true));
   if (action === "downloadZip") $("zip-link").click();
   if (action === "search") focusSearch();
   if (action === "library") $("library-btn").click();
@@ -5899,6 +6204,19 @@ $("newfile-btn").addEventListener("click", () => {
 });
 
 $("upload-btn").addEventListener("click", () => $("upload-input").click());
+$("uploads-list").addEventListener("click", (event) => {
+  const check = event.target.closest("[data-upload-check]");
+  if (check) checkAndShow(check.dataset.uploadCheck);
+  const retry = event.target.closest("[data-upload-retry]");
+  if (retry) {
+    const batch = readUploadLog().find((other) => other.id === retry.dataset.uploadRetry);
+    if (batch) retryUploads(batch.id, batch.destination);
+  }
+});
+$("uploads-clear").addEventListener("click", () => {
+  writeUploadLog([]);
+  renderUploadLog();
+});
 $("folder-btn").addEventListener("click", () => $("folder-input").click());
 
 async function onPicked(input) {
@@ -6418,6 +6736,12 @@ $("jobs-hide").addEventListener("click", () => {
   $("jobs-panel").hidden = true;
 });
 $("jobs-list").addEventListener("click", (event) => {
+  const action = event.target.closest("[data-job-action]");
+  if (action) {
+    const owner = jobState.items.get(action.closest("[data-job]").dataset.job);
+    owner?.actions[Number(action.dataset.jobAction)]?.run();
+    return;
+  }
   const button = event.target.closest("[data-job-cancel]");
   if (!button) return;
   const job = jobState.items.get(button.dataset.jobCancel);

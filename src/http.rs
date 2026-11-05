@@ -4767,6 +4767,12 @@ fn upload_choice(query: &UploadQuery) -> Result<Option<files::UploadChoice>, Api
         "keep" => Ok(Some(files::UploadChoice::KeepBoth)),
         "archive-existing" => Ok(Some(files::UploadChoice::ArchiveExisting)),
         "ignore" => Ok(Some(files::UploadChoice::Ignore)),
+        "keep-newer" => {
+            let incoming_modified = query.modified.ok_or_else(|| {
+                ApiError::new(StatusCode::BAD_REQUEST, "Keep newer needs the file date")
+            })?;
+            Ok(Some(files::UploadChoice::KeepNewer { incoming_modified }))
+        }
         "archive-older" => {
             let incoming_modified = query.modified.ok_or_else(|| {
                 ApiError::new(StatusCode::BAD_REQUEST, "Archive older needs the file date")
@@ -4848,6 +4854,7 @@ async fn upload(
     let choice = upload_choice(&query)?;
     let dir_rel = rel_of(&query.path);
     let mut saved = 0u32;
+    let mut paths: Vec<String> = Vec::new();
     let mut skipped = 0u32;
     while let Some(field) = multipart
         .next_field()
@@ -4884,35 +4891,46 @@ async fn upload(
             files::PreparedUpload::Write(dest) => (dest, None),
             files::PreparedUpload::StoreInArchive { path, original_name } => (path, Some(original_name)),
         };
+        let store_failed = || ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload");
+        let temp = files::upload_temp(&dest);
+        let mut field = field;
+        let written = async {
+            let mut out = tokio::fs::File::create(&temp).await.map_err(|_| store_failed())?;
+            while let Some(chunk) = field
+                .chunk()
+                .await
+                .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "The upload was interrupted"))?
+            {
+                tokio::io::AsyncWriteExt::write_all(&mut out, &chunk).await.map_err(|_| store_failed())?;
+            }
+            // Written out before answering: a dropped tokio file may still be writing its last bytes.
+            tokio::io::AsyncWriteExt::flush(&mut out).await.map_err(|_| store_failed())?;
+            // Keep the file's original modification time when the client sends it.
+            if let Some(mtime) = query.mtime.filter(|mtime| *mtime > 0) {
+                let file = out.into_std().await;
+                let _ = file.set_modified(std::time::UNIX_EPOCH + Duration::from_millis(mtime as u64));
+            }
+            Ok::<(), ApiError>(())
+        }
+        .await;
+        if let Err(err) = written {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(err);
+        }
         if archived_as.is_none() && dest.is_file() {
             // Uploaded over a file: keep what was there.
             let keep = keeper(&state, &user, "upload");
             let replaced = dest.clone();
             let _ = tokio::task::spawn_blocking(move || keep(&replaced)).await;
         }
-        let mut out = tokio::fs::File::create(&dest).await.map_err(|_| {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload")
-        })?;
-        let mut field = field;
-        while let Some(chunk) = field
-            .chunk()
-            .await
-            .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "The upload was interrupted"))?
-        {
-            tokio::io::AsyncWriteExt::write_all(&mut out, &chunk)
-                .await
-                .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload"))?;
+        if tokio::fs::rename(&temp, &dest).await.is_err() {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(store_failed());
         }
-        // Written out before answering: a dropped tokio file may still be writing its last bytes.
-        tokio::io::AsyncWriteExt::flush(&mut out)
-            .await
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not store the upload"))?;
-        // Keep the file's original modification time when the client sends it.
-        if let Some(mtime) = query.mtime.filter(|mtime| *mtime > 0) {
-            let file = out.into_std().await;
-            let _ = file.set_modified(std::time::UNIX_EPOCH + Duration::from_millis(mtime as u64));
-        } else {
-            drop(out);
+        if let Ok(root) = state.root.canonicalize() {
+            if let Ok(rel) = dest.strip_prefix(&root) {
+                paths.push(rel.to_string_lossy().replace('\\', "/"));
+            }
         }
         if let Some(original_name) = archived_as {
             let root = state.root.clone();
@@ -4931,7 +4949,7 @@ async fn upload(
         invalidate_sizes(&state, &dir_rel);
         record(&state, &user, "upload", &format!("{saved} file(s)"));
     }
-    Ok(Json(json!({ "saved": saved, "skipped": skipped })))
+    Ok(Json(json!({ "saved": saved, "skipped": skipped, "paths": paths })))
 }
 
 #[derive(Deserialize)]
@@ -8359,6 +8377,39 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(std::fs::read_to_string(root.join("photo (2).jpg")).unwrap(), "second");
         assert_eq!(std::fs::read_to_string(root.join("photo.jpg")).unwrap(), "first");
+
+        // Keep newer: an older upload is skipped, a newer one replaces the file.
+        let seconds = original / 1000;
+        let response = app.clone().oneshot(upload(&format!("conflict=keep-newer&modified={}", seconds - 10), "older")).await.unwrap();
+        let answer: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!((answer["saved"].as_u64(), answer["skipped"].as_u64()), (Some(0), Some(1)));
+        assert_eq!(std::fs::read_to_string(root.join("photo.jpg")).unwrap(), "first");
+        let response = app.clone().oneshot(upload(&format!("conflict=keep-newer&modified={}", seconds + 10), "newer")).await.unwrap();
+        let answer: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(answer["paths"], json!(["photo.jpg"]), "the answer says where it went");
+        assert_eq!(std::fs::read_to_string(root.join("photo.jpg")).unwrap(), "newer");
+        let response = app.clone().oneshot(upload("conflict=keep-newer", "no date")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // An upload cut off part way leaves the file it was replacing, and nothing else.
+        let start = "--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"photo.jpg\"\r\nContent-Type: application/octet-stream\r\n\r\npartial bytes";
+        let cut = futures_util::stream::iter(vec![
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(start.as_bytes())),
+            Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection lost")),
+        ]);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/upload?path=&conflict=overwrite")
+            .header("cookie", &cookie)
+            .header("x-ownnas", "1")
+            .header("content-type", "multipart/form-data; boundary=B")
+            .body(Body::from_stream(cut))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(std::fs::read_to_string(root.join("photo.jpg")).unwrap(), "newer");
+        let left: Vec<String> = std::fs::read_dir(&root).unwrap().flatten().map(|item| item.file_name().to_string_lossy().into_owned()).filter(|name| name.starts_with(".ownnas-part-")).collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[tokio::test]

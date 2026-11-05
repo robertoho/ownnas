@@ -617,12 +617,26 @@
       <p id="conflict-meta" class="muted"></p>
       <label class="check" for="conflict-rest"><input id="conflict-rest" type="checkbox"> Use this choice for the remaining files</label>
       <div class="dialog-actions">
+        <button value="keep-newer" type="submit" title="Replaces the file if this upload is newer. Otherwise skips it.">Keep newer</button>
         <button value="overwrite" type="submit">Overwrite</button>
         <button value="keep" type="submit">Keep both</button>
         <button value="archive-older" type="submit">Archive older</button>
         <button value="archive-existing" type="submit">Archive existing</button>
         <button value="ignore" type="submit">Ignore</button>
         <button value="cancel" type="submit">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="uploads-dialog">
+    <form method="dialog">
+      <h3>Recent uploads</h3>
+      <p class="muted">Checks each file against what the server has now. This list is kept in this browser.</p>
+      <p id="uploads-empty" class="muted" hidden>No uploads from this browser yet.</p>
+      <div id="uploads-list" class="upload-log"></div>
+      <div class="dialog-actions">
+        <button id="uploads-clear" type="button">Clear list</button>
+        <button value="close" type="submit">Close</button>
       </div>
     </form>
   </dialog>

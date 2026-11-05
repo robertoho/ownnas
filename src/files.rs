@@ -715,6 +715,8 @@ pub enum UploadChoice {
     ArchiveOlder { incoming_modified: i64 },
     ArchiveExisting,
     Ignore,
+    /// Saves over the file only if the upload is newer; otherwise the upload is skipped.
+    KeepNewer { incoming_modified: i64 },
 }
 
 #[derive(Clone, Copy)]
@@ -767,6 +769,14 @@ pub fn upload_status(root: &Path, dir_rel: &str, filename: &str) -> Result<Uploa
     })
 }
 
+/// Where an upload is written until all of it has arrived, beside its destination, so a dropped
+/// connection never leaves part of a file under its name or costs the file it was replacing.
+pub fn upload_temp(dest: &Path) -> PathBuf {
+    let mut suffix = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut suffix);
+    dest.with_file_name(format!("{SYNC_PART_PREFIX}{}", hex::encode(suffix)))
+}
+
 /// Chooses where an uploaded file will be written.
 /// Intermediate folders in `filename` (from a folder upload) are created only when writing.
 /// Without a choice, an existing file is returned as `Ask` so the caller can prompt.
@@ -791,6 +801,11 @@ pub fn prepare_upload(
     }
     match choice {
         UploadChoice::Ignore => Ok(PreparedUpload::Skip),
+        UploadChoice::KeepNewer { incoming_modified } if incoming_modified <= existing.modified => Ok(PreparedUpload::Skip),
+        UploadChoice::KeepNewer { .. } => {
+            create_dirs(&located.pending_dirs)?;
+            Ok(PreparedUpload::Write(located.full))
+        }
         UploadChoice::KeepBoth => {
             create_dirs(&located.pending_dirs)?;
             Ok(PreparedUpload::Write(unique_path(located.full)))
@@ -3442,6 +3457,20 @@ mod tests {
             prepare_upload(&root, "sub", "note.txt", None).unwrap(),
             PreparedUpload::Ask(_)
         ));
+
+        // Keep newer: replaces an older file, and skips for a newer one or one of the same age.
+        set_mtime(&note, 1_000);
+        for (incoming, replaces) in [(2_000, true), (1_000, false), (500, false)] {
+            let prepared = prepare_upload(&root, "sub", "note.txt", Some(UploadChoice::KeepNewer { incoming_modified: incoming })).unwrap();
+            match prepared {
+                PreparedUpload::Write(path) => {
+                    assert!(replaces, "{incoming} should be skipped");
+                    assert_eq!(path, note);
+                }
+                PreparedUpload::Skip => assert!(!replaces, "{incoming} should replace"),
+                _ => panic!("keep newer only writes or skips"),
+            }
+        }
 
         let ignored = prepare_upload(&root, "sub", "note.txt", Some(UploadChoice::Ignore)).unwrap();
         assert!(matches!(ignored, PreparedUpload::Skip));
