@@ -1,6 +1,6 @@
 [package]
 name = "ownnas-mount"
-version = "0.9.4"
+version = "0.9.5"
 edition = "2021"
 description = "OwnNAS servers as folders on Linux, with online-only files (FUSE)"
 
