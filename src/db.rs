@@ -829,6 +829,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         conn.execute("ALTER TABLE media_index ADD COLUMN motion INTEGER", [])
             .map_err(|_| "Could not update the photo index".to_string())?;
     }
+    conn.execute_batch(crate::oauth::SCHEMA).map_err(|_| "Could not set up MCP sign-in".to_string())?;
     let has_key_limits: bool = conn.prepare("SELECT 1 FROM pragma_table_info('agent_keys') WHERE name = 'tools'").and_then(|mut stmt| stmt.exists([])).unwrap_or(false);
     if !has_key_limits {
         // Per key: the tools it may use (all its level allows when empty), its own limits, and

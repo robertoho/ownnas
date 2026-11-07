@@ -75,7 +75,9 @@ pub async fn handle(State(state): State<Arc<AppState>>, headers: HeaderMap, body
         None => None,
     };
     let Some(key) = key else {
-        return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Bearer")], "An agent key is required").into_response();
+        // Where to sign in (MCP authorization, RFC 9728), for clients that connect with OAuth.
+        let metadata = format!("{}/.well-known/oauth-protected-resource", crate::http::public_origin(&state, &headers));
+        return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, format!("Bearer resource_metadata=\"{metadata}\""))], "An agent key is required").into_response();
     };
     if let Some(wait) = over_limit(key.id, key.calls_per_minute) {
         return (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, wait.to_string())], format!("Too many requests from this key: wait {wait} seconds")).into_response();

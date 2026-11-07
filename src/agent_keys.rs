@@ -286,6 +286,18 @@ fn find(conn: &Connection, which: &str, value: &str, now: i64) -> Result<Option<
     }))
 }
 
+/// Gives a key a new secret (the old one stops working at once) and returns it.
+pub fn new_secret(conn: &Connection, id: i64) -> Result<String, String> {
+    let token = format!("{PREFIX}{}", auth::new_token());
+    let changed = conn
+        .execute("UPDATE agent_keys SET token_hash = ?2 WHERE id = ?1 AND revoked_at IS NULL", params![id, auth::token_hash(&token)])
+        .map_err(|_| "Could not change the key".to_string())?;
+    if changed == 0 {
+        return Err("That key is no longer there".into());
+    }
+    Ok(token)
+}
+
 /// Whether an organising key's changes wait for approval.
 pub fn set_approve(conn: &Connection, id: i64, approve: bool) -> Result<bool, String> {
     let changed = conn

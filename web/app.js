@@ -2392,8 +2392,89 @@ async function notes() {
   return notesApi;
 }
 
+/// An MCP client (Claude, say) asking to connect with OAuth: an administrator chooses what it
+/// may reach and do, or says no. Either way the browser goes back to the client.
+async function showOAuthApproval(query) {
+  const params = Object.fromEntries(new URLSearchParams(query));
+  document.querySelector("dialog.oauth-dialog")?.remove();
+  const dialog = document.createElement("dialog");
+  dialog.className = "sort-dialog oauth-dialog";
+  document.body.append(dialog);
+  const leave = () => { history.replaceState(null, "", "/#/"); dialog.close(); };
+  dialog.addEventListener("close", () => dialog.remove());
+  if (!(state.me && state.me.admin)) {
+    dialog.innerHTML = `<form method="dialog"><h3>Connect an app</h3><p>Only an administrator can connect apps to this OwnNAS. Sign in as one and try again.</p><div class="dialog-actions"><span class="spacer"></span><button value="cancel" type="submit">Close</button></div></form>`;
+    dialog.showModal();
+    return;
+  }
+  let client;
+  try {
+    client = await api(`/api/oauth/client?${new URLSearchParams(params)}`);
+  } catch (err) {
+    dialog.innerHTML = `<form method="dialog"><h3>Connect an app</h3><p class="sort-problem">${esc(err.message)}</p><div class="dialog-actions"><span class="spacer"></span><button value="cancel" type="submit">Close</button></div></form>`;
+    dialog.addEventListener("close", leave, { once: true });
+    dialog.showModal();
+    return;
+  }
+  const folders = [];
+  dialog.innerHTML = `<form method="dialog">
+    <h3>Connect “${esc(client.name)}” to OwnNAS</h3>
+    <p class="muted">It will reach your library over MCP as an agent key, which you can watch, limit and revoke in Settings → AI agents. After you answer, you go back to ${esc(client.backTo)}.</p>
+    <fieldset class="agent-scope"><legend>Which folders</legend>
+      <label class="sort-check"><input type="radio" name="oauth-scope" value="folders" checked> Only these folders</label>
+      <div class="oauth-folders" data-oauth="folders"></div>
+      <button type="button" data-oauth="add">Add folder…</button>
+      <label class="sort-check"><input type="radio" name="oauth-scope" value="whole"> The whole library</label>
+    </fieldset>
+    <fieldset class="agent-scope"><legend>What it can do</legend>
+      <label class="sort-check"><input type="radio" name="oauth-level" value="read" checked> Read: list, search, read and look at files</label>
+      <label class="sort-check"><input type="radio" name="oauth-level" value="organise"> Read and organise: also tag, rename, move, sort, Trash and albums</label>
+      <label class="sort-check"><input type="radio" name="oauth-level" value="write"> Read, organise and write: also make and change files</label>
+      <label class="sort-check"><input type="checkbox" data-oauth="approve" checked> Ask me before each change</label>
+    </fieldset>
+    <div class="dialog-actions">
+      <button type="button" data-oauth="deny">Don't allow</button>
+      <span class="spacer"></span>
+      <button type="button" class="primary" data-oauth="allow">Allow</button>
+    </div>
+  </form>`;
+  const field = (name) => dialog.querySelector(`[data-oauth="${name}"]`);
+  const paintFolders = () => {
+    field("folders").innerHTML = folders.length ? folders.map((folder) => `<span class="tag-chip agent-chip">${esc(folder)}</span>`).join(" ") : `<p class="muted">No folders chosen yet.</p>`;
+  };
+  paintFolders();
+  field("add").addEventListener("click", async () => {
+    const folder = await pickFolder({ title: "A folder it can use", ok: "Add this folder" });
+    if (folder === null || folder === undefined || folder === "") return;
+    if (!folders.includes(folder)) folders.push(folder);
+    paintFolders();
+  });
+  const answer = async (deny) => {
+    const scope = dialog.querySelector('input[name="oauth-scope"]:checked').value;
+    const chosen = scope === "whole" ? [""] : folders;
+    if (!deny && !chosen.length) return toast("Add at least one folder, or choose the whole library", true);
+    for (const button of dialog.querySelectorAll("button")) button.disabled = true;
+    try {
+      const level = dialog.querySelector('input[name="oauth-level"]:checked').value;
+      const result = await api("/api/oauth/approve", { method: "POST", json: { ...params, deny, folders: chosen, level, approve: level !== "read" && field("approve").checked } });
+      location.href = result.redirect;
+    } catch (err) {
+      toast(err.message, true);
+      for (const button of dialog.querySelectorAll("button")) button.disabled = false;
+    }
+  };
+  field("deny").addEventListener("click", () => answer(true));
+  field("allow").addEventListener("click", () => answer(false));
+  dialog.addEventListener("cancel", (event) => event.preventDefault());
+  dialog.showModal();
+}
+
 /// Shows what the address names: the Gallery (#gallery…), Notes (#notes…), or a folder (#/path).
 async function route() {
+  if (location.hash.startsWith("#oauth?")) {
+    await showOAuthApproval(location.hash.slice("#oauth?".length));
+    return;
+  }
   if (location.hash.startsWith("#notes")) {
     if (galleryOpen()) {
       document.body.classList.remove("is-gallery");

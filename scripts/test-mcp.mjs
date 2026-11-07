@@ -684,6 +684,54 @@ try {
   for (let i = 0; i < 4; i++) quick.push((await mcp(limited, 'ping')).status);
   assert.equal(quick.at(-1), 429, JSON.stringify(quick));
 
+  // Connecting with OAuth (as Claude's custom connectors do): discovery, registration, approval
+  // by an administrator, a code traded with PKCE, refreshing, and revoking.
+  const unsigned = await fetch(`${base}/mcp`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"jsonrpc":"2.0","id":1,"method":"ping"}' });
+  assert.equal(unsigned.status, 401);
+  assert.match(unsigned.headers.get('www-authenticate'), /resource_metadata="http:\/\/127\.0\.0\.1:\d+\/\.well-known\/oauth-protected-resource"/);
+  const protectedResource = await (await fetch(`${base}/.well-known/oauth-protected-resource`)).json();
+  assert.equal(protectedResource.resource, `${base}/mcp`);
+  const authServer = await (await fetch(`${protectedResource.authorization_servers[0]}/.well-known/oauth-authorization-server`)).json();
+  assert.deepEqual(authServer.code_challenge_methods_supported, ['S256']);
+  const registered = await fetch(authServer.registration_endpoint, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ client_name: 'Test Client', redirect_uris: ['http://localhost:4567/callback'] }) });
+  assert.equal(registered.status, 201);
+  const clientId = (await registered.json()).client_id;
+  assert.equal((await fetch(authServer.registration_endpoint, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ redirect_uris: ['http://evil.example/cb'] }) })).status, 400, 'plain http elsewhere');
+  const verifier = createHash('sha256').update('a verifier long enough to be random').digest('base64url') + 'xyz';
+  const challenge = createHash('sha256').update(verifier).digest('base64url');
+  const ask = { response_type: 'code', client_id: clientId, redirect_uri: 'http://localhost:4567/callback', code_challenge: challenge, code_challenge_method: 'S256', state: 'st4te' };
+  const authorize = await fetch(`${authServer.authorization_endpoint}?${new URLSearchParams(ask)}`, { redirect: 'manual' });
+  assert.equal(authorize.status, 302);
+  assert.match(authorize.headers.get('location'), /^\/#oauth\?/);
+  assert.equal((await fetch(`${authServer.authorization_endpoint}?${new URLSearchParams({ ...ask, code_challenge_method: 'plain' })}`, { redirect: 'manual' })).status, 400, 'PKCE S256 only');
+  assert.equal((await api('GET', `/api/oauth/client?${new URLSearchParams(ask)}`)).json.name, 'Test Client');
+  const denied = (await api('POST', '/api/oauth/approve', { ...ask, deny: true })).json.redirect;
+  assert.match(denied, /^http:\/\/localhost:4567\/callback\?error=access_denied&state=st4te/);
+  const allowed = (await api('POST', '/api/oauth/approve', { ...ask, folders: ['docs'], level: 'read' })).json.redirect;
+  const code = new URL(allowed).searchParams.get('code');
+  assert.equal(new URL(allowed).searchParams.get('state'), 'st4te');
+  const tokenFor = (fields) => fetch(authServer.token_endpoint, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(fields) }).then(async (r) => ({ status: r.status, json: await r.json() }));
+  const wrong = await tokenFor({ grant_type: 'authorization_code', code, client_id: clientId, redirect_uri: ask.redirect_uri, code_verifier: 'not it' });
+  assert.equal(wrong.json.error, 'invalid_grant', 'a wrong verifier');
+  const allowed2 = (await api('POST', '/api/oauth/approve', { ...ask, folders: ['docs'], level: 'read' })).json.redirect;
+  const code2 = new URL(allowed2).searchParams.get('code');
+  const tokens = await tokenFor({ grant_type: 'authorization_code', code: code2, client_id: clientId, redirect_uri: ask.redirect_uri, code_verifier: verifier });
+  assert.equal(tokens.status, 200, JSON.stringify(tokens.json));
+  assert.equal(tokens.json.token_type, 'Bearer');
+  assert.equal((await tokenFor({ grant_type: 'authorization_code', code: code2, client_id: clientId, redirect_uri: ask.redirect_uri, code_verifier: verifier })).json.error, 'invalid_grant', 'a code works once');
+  assert.ok((await mcp(tokens.json.access_token, 'tools/list')).json.result.tools.length > 5);
+  await refused(tokens.json.access_token, 'read_text', { path: 'secret/private.txt' });
+  const connectedKey = (await api('GET', '/api/agent-keys')).json.keys.find((k) => k.name === 'Test Client (connected)' && !k.revokedAt && k.lastUsedAt);
+  assert.ok(connectedKey, 'an agent key, like any other');
+  const refreshed = await tokenFor({ grant_type: 'refresh_token', refresh_token: tokens.json.refresh_token, client_id: clientId });
+  assert.equal(refreshed.status, 200);
+  assert.equal((await mcp(tokens.json.access_token, 'ping')).status, 401, 'the old token stops');
+  assert.equal((await mcp(refreshed.json.access_token, 'ping')).status, 200);
+  assert.equal((await tokenFor({ grant_type: 'refresh_token', refresh_token: tokens.json.refresh_token, client_id: clientId })).json.error, 'invalid_grant', 'a refresh token works once');
+  assert.equal((await api('POST', '/api/agent-keys/revoke', { id: connectedKey.id })).status, 200);
+  assert.equal((await mcp(refreshed.json.access_token, 'ping')).status, 401);
+  assert.equal((await tokenFor({ grant_type: 'refresh_token', refresh_token: refreshed.json.refresh_token, client_id: clientId })).json.error, 'invalid_grant', 'revoked is revoked');
+
   // A key stuck in a loop is slowed down, and others are not.
   const busy = (await api('POST', '/api/agent-keys', { name: 'busy', folders: ['docs'] })).json.token;
   const statuses = [];

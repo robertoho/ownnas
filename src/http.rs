@@ -319,6 +319,15 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/users/password", post(admin_set_password))
         .route("/api/users/admin", post(set_user_admin))
         .route("/api/users/remove", post(remove_managed_user))
+        .route("/.well-known/oauth-protected-resource", get(oauth_resource_metadata).options(oauth_preflight))
+        .route("/.well-known/oauth-protected-resource/mcp", get(oauth_resource_metadata).options(oauth_preflight))
+        .route("/.well-known/oauth-authorization-server", get(oauth_server_metadata).options(oauth_preflight))
+        .route("/.well-known/oauth-authorization-server/mcp", get(oauth_server_metadata).options(oauth_preflight))
+        .route("/oauth/register", post(oauth_register).options(oauth_preflight))
+        .route("/oauth/authorize", get(oauth_authorize))
+        .route("/oauth/token", post(oauth_token).options(oauth_preflight))
+        .route("/api/oauth/client", get(oauth_client_info))
+        .route("/api/oauth/approve", post(oauth_approve))
         .route("/mcp", post(crate::mcp::handle).get(crate::mcp::not_offered).delete(crate::mcp::not_offered).layer(DefaultBodyLimit::max(crate::mcp::MAX_REQUEST)))
         .route("/api/agent-keys", get(list_agent_keys).post(create_agent_key))
         .route("/api/agent-keys/revoke", post(revoke_agent_key))
@@ -5430,6 +5439,160 @@ async fn list_drives(State(state): State<std::sync::Arc<AppState>>, headers: Hea
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not list the drives"))?;
     Ok(Json(json!({ "drives": drives })))
+}
+
+// ---- Signing MCP clients in with OAuth (oauth.rs) ----
+
+/// This server's address as the client sees it (behind a proxy, as the proxy says).
+pub(crate) fn public_origin(state: &AppState, headers: &HeaderMap) -> String {
+    let header_text = |name: &str| headers.get(name).and_then(|value| value.to_str().ok()).map(|value| value.split(',').next().unwrap_or_default().trim().to_string()).filter(|value| !value.is_empty());
+    let scheme = header_text("x-forwarded-proto").unwrap_or_else(|| if state.https { "https".into() } else { "http".into() });
+    let host = header_text("x-forwarded-host").or_else(|| header_text("host")).unwrap_or_else(|| "localhost".into());
+    format!("{scheme}://{host}")
+}
+
+/// Anyone may read these (MCP clients run in browsers too); nothing here uses cookies.
+fn open_cors(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, header::HeaderValue::from_static("*"));
+    headers.insert(header::ACCESS_CONTROL_ALLOW_METHODS, header::HeaderValue::from_static("GET, POST, OPTIONS"));
+    headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, header::HeaderValue::from_static("content-type, authorization, mcp-protocol-version"));
+    response
+}
+
+async fn oauth_preflight() -> Response {
+    open_cors(StatusCode::NO_CONTENT.into_response())
+}
+
+/// RFC 9728: where /mcp's tokens come from.
+async fn oauth_resource_metadata(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Response {
+    let origin = public_origin(&state, &headers);
+    open_cors(Json(json!({
+        "resource": format!("{origin}/mcp"),
+        "authorization_servers": [origin],
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": ["mcp"],
+        "resource_name": "OwnNAS",
+    })).into_response())
+}
+
+/// RFC 8414: how to register, approve and get tokens.
+async fn oauth_server_metadata(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Response {
+    let origin = public_origin(&state, &headers);
+    open_cors(Json(json!({
+        "issuer": origin,
+        "authorization_endpoint": format!("{origin}/oauth/authorize"),
+        "token_endpoint": format!("{origin}/oauth/token"),
+        "registration_endpoint": format!("{origin}/oauth/register"),
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+        "scopes_supported": ["mcp"],
+    })).into_response())
+}
+
+/// RFC 7591: a client registers itself (no account needed: approving needs an administrator).
+async fn oauth_register(State(state): State<std::sync::Arc<AppState>>, Json(body): Json<crate::oauth::Registration>) -> Response {
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let now = chrono::Utc::now().timestamp();
+    let answer = match crate::oauth::register(&conn, &body, now) {
+        Ok(client) => (StatusCode::CREATED, Json(json!({
+            "client_id": client.client_id,
+            "client_name": client.client_name,
+            "redirect_uris": client.redirect_uris,
+            "client_id_issued_at": now,
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+        }))).into_response(),
+        Err(why) => (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid_client_metadata", "error_description": why }))).into_response(),
+    };
+    open_cors(answer)
+}
+
+/// Checks the request, then lets the web app ask an administrator (#oauth?…).
+async fn oauth_authorize(State(state): State<std::sync::Arc<AppState>>, Query(request): Query<crate::oauth::Request>, uri: axum::http::Uri) -> Response {
+    let checked = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::oauth::check_request(&conn, &request)
+    };
+    match checked {
+        Ok(_) => (StatusCode::FOUND, [(header::LOCATION, format!("/#oauth?{}", uri.query().unwrap_or_default()))]).into_response(),
+        Err(why) => (StatusCode::BAD_REQUEST, [(header::CONTENT_TYPE, "text/plain; charset=utf-8")], format!("This connection request cannot be used: {why}.")).into_response(),
+    }
+}
+
+/// The client asking, for the approval screen.
+async fn oauth_client_info(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, Query(request): Query<crate::oauth::Request>) -> Result<impl IntoResponse, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let client = crate::oauth::check_request(&conn, &request).map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
+    let back_to = request.redirect_uri.split("://").nth(1).and_then(|rest| rest.split(['/', '?']).next()).unwrap_or_default().to_string();
+    Ok(Json(json!({ "name": client.client_name, "backTo": back_to })))
+}
+
+#[derive(Deserialize)]
+struct OAuthApproveBody {
+    #[serde(flatten)]
+    request: crate::oauth::Request,
+    #[serde(default)]
+    deny: bool,
+    #[serde(default)]
+    folders: Vec<String>,
+    #[serde(default = "read_level")]
+    level: String,
+    #[serde(default)]
+    approve: bool,
+}
+
+fn with_params(base: &str, pairs: &[(&str, &str)]) -> String {
+    let encode = |text: &str| text.bytes().map(|byte| if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) { (byte as char).to_string() } else { format!("%{byte:02X}") }).collect::<String>();
+    let query: Vec<String> = pairs.iter().filter(|(_, value)| !value.is_empty()).map(|(name, value)| format!("{name}={}", encode(value))).collect();
+    format!("{base}{}{}", if base.contains('?') { "&" } else { "?" }, query.join("&"))
+}
+
+/// The administrator's answer: a key for the client and a code for it, or a refusal; either
+/// way, where to send the browser back.
+async fn oauth_approve(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, Json(body): Json<OAuthApproveBody>) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let origin = public_origin(&state, &headers);
+    let mut conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let client = crate::oauth::check_request(&conn, &body.request).map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
+    if body.deny {
+        drop(conn);
+        record(&state, &user, "oauth-deny", &client.client_name);
+        return Ok(Json(json!({ "redirect": with_params(&body.request.redirect_uri, &[("error", "access_denied"), ("state", &body.request.state), ("iss", &origin)]) })));
+    }
+    let now = chrono::Utc::now().timestamp();
+    let (key_id, token) = crate::agent_keys::create(&mut conn, &state.root, user.id, &crate::oauth::key_name(&client), &body.level, body.approve, &body.folders, None, now)
+        .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    let code = crate::oauth::approve(&conn, &body.request, key_id, &token, now).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    drop(conn);
+    record(&state, &user, "oauth-approve", &client.client_name);
+    Ok(Json(json!({ "redirect": with_params(&body.request.redirect_uri, &[("code", &code), ("state", &body.request.state), ("iss", &origin)]) })))
+}
+
+/// RFC 6749 §4.1.3 and §6: a code, or a refresh token, for an access token.
+async fn oauth_token(State(state): State<std::sync::Arc<AppState>>, axum::Form(form): axum::Form<std::collections::HashMap<String, String>>) -> Response {
+    let field = |name: &str| form.get(name).map(String::as_str).unwrap_or_default();
+    let now = chrono::Utc::now().timestamp();
+    let outcome = {
+        let mut conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        match field("grant_type") {
+            "authorization_code" => crate::oauth::exchange(&conn, field("code"), field("client_id"), field("redirect_uri"), field("code_verifier"), now),
+            "refresh_token" => crate::oauth::refresh(&mut conn, field("refresh_token"), field("client_id"), now),
+            _ => Err("unsupported_grant_type"),
+        }
+    };
+    let answer = match outcome {
+        Ok(tokens) => (StatusCode::OK, [(header::CACHE_CONTROL, "no-store")], Json(json!(tokens))).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, [(header::CACHE_CONTROL, "no-store")], Json(json!({ "error": error }))).into_response(),
+    };
+    open_cors(answer)
 }
 
 // ---- Tidy up a folder (cleanup.rs) ----

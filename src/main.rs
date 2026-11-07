@@ -38,6 +38,7 @@ mod mcp_photos;
 mod mcp_write;
 mod mcp_notes;
 mod notes;
+mod oauth;
 mod drives;
 mod cleanup;
 mod near_dupes;

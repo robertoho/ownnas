@@ -318,6 +318,15 @@ Put OwnNAS behind HTTPS and pass `--secure-cookie` if you terminate TLS with a r
 
 Right-click a folder, or the empty space inside one, and choose **Sort into folders…** to move its files into sub-folders by a pattern: by date (`{YYYY}/{MM}`, `{YYYY}-{MM}`, `{YYYY}/{MM}/{DD}`, or with the month's name, `{MMMM}`), by kind (Pictures, Videos, Music, Documents…), by extension, by first letter, or your own mix ("Photos {YYYY}"). The date is when a photo or video was taken (from the file's own data), or otherwise when the file last changed; it can also be when it was changed or created. You can include the files in the folders inside it. The dialog shows what will move before anything does, nothing is overwritten, hidden files stay, and **Undo** puts everything back and removes the folders it made.
 
+## Tidying up
+
+- **Find duplicates…** (in a folder's menu, or the toolbar): files with exactly the same contents.
+- **Find photos that look alike…**: burst shots, resized or re-saved copies and small edits, grouped by how they look; the largest of each group is kept and the others are ticked to go to the Trash.
+- **Rename by pattern…** (select files): by date and time (`2024-03-09 14.32.00`), a number (`Trip 001`), the folder's name, find and replace, or upper, lower and title case, with a preview and Undo.
+- **Tidy up…**: the largest files, folders left empty, photos whose date is wrong while their name says when they were taken (`IMG-20260928-WA0006`, fixed with a click), and comparing a folder with another (a backup, a copy).
+- **Convert to… JPEG** works for HEIC, HEIF and AVIF photos too, keeping their details, through `sips` on a Mac or `heif-convert` (or `ffmpeg`) elsewhere.
+- The preview of a photo or video shows its **Photo details**: when and where it was taken, the camera and lens, the exposure, and every EXIF field.
+
 ## Notes
 
 **Notes** (the notes icon at the top) shows quick notes and checklists as cards, like Google Keep, but each note is a plain Markdown file in one library folder (`Notes` unless an administrator picks another with the folder button). So notes open in Obsidian or any editor, sync with the desktop client, keep their earlier versions, and go to the Trash like any other file.
@@ -327,6 +336,8 @@ Right-click a folder, or the empty space inside one, and choose **Sort into fold
 - Link notes with `[[Note name]]`: each note shows which notes link to it. **Archive** moves a note into `Archive/`, and **Today** opens the day's note in `Daily/` (made from `Templates/Daily.md` when there is one, with `{{date}}` filled in).
 - Clicking a card opens it in the Markdown editor. Typing `[[` suggests notes to link to, and a picture pasted or dropped in is saved in `attachments/` next to the note. Renaming a note updates the links to it.
 - Sub-folders of the notes folder are notebooks: choose one to see its notes, and new notes go there.
+- **Reminders:** set one from a note's menu (kept as `remind:` in its front matter); when it is due the note goes to the top, and OwnNAS shows a notification while it is open. **Earlier versions…** is in the menu too.
+- **From the phone:** install the web app (Add to Home screen), then share text or a link from any app to OwnNAS to make a note of it; long-press its icon for New note.
 - Right-click a card (or long-press it, or use its ⋯ button) for everything else: open or edit, pin, colour, labels, move to another notebook, rename, make a copy, copy a `[[link]]` to it, show it in its folder, archive, or move it to the Trash.
 
 ## AI agents (MCP)
@@ -337,7 +348,9 @@ AI agents such as Claude reach the library over MCP at `https://<server>/mcp` wi
 - **Read and organise:** everything above, plus tagging, making folders, renaming, moving, moving to the Trash, and arranging albums. Nothing is ever deleted for good, protected files are left alone, and a key's own folders cannot be renamed, moved or put in the Trash.
 - **Read, organise and write:** everything above, plus making text files, changing a passage in one, adding rows to CSV and TSV files, and copying. Before a file changes, what it held is kept in its history.
 
-Every change an organising key makes can be undone from **Settings → Agents → Changes**, one at a time or everything since the start of the day. With **Ask me before each change** (the default for new organising and writing keys), changes wait there until you approve or decline them, and the status bar tells administrators when some are waiting. A key that doesn't ask first still asks after 500 changes in a day, and each key can make at most 300 requests a minute. Files are also offered as MCP resources (`ownnas:///path`), with a few ready-made prompts. Keys whose folders hold the notes folder can list and read notes; writing keys can also make notes, add to them and tick their items. **Limits & tools…** on a key chooses its tools one by one, folders it may only read, and its own limits; **Usage** shows what it did over 30 days, and a key refused again and again is flagged in the status bar.
+Every change an organising key makes can be undone from **Settings → Agents → Changes**, one at a time or everything since the start of the day. With **Ask me before each change** (the default for new organising and writing keys), changes wait there until you approve or decline them, and the status bar tells administrators when some are waiting. A key that doesn't ask first still asks after 500 changes in a day, and each key can make at most 300 requests a minute. **Connecting Claude without a key:** add OwnNAS as a custom connector with the address `https://<server>/mcp`. Claude registers itself and sends you to OwnNAS, where an administrator chooses the folders and what it may do (and whether it asks first), then allows or refuses it. The connection is an agent key like any other ("Claude (connected)"). Claude on the web connects from Anthropic's servers, so the server must then be reachable from the internet over HTTPS; on a server only reachable over a VPN, use a key with a client on your own computer, such as Claude Desktop or Claude Code.
+
+Files are also offered as MCP resources (`ownnas:///path`), with a few ready-made prompts. Keys whose folders hold the notes folder can list and read notes; writing keys can also make notes, add to them and tick their items. **Limits & tools…** on a key chooses its tools one by one, folders it may only read, and its own limits; **Usage** shows what it did over 30 days, and a key refused again and again is flagged in the status bar.
 
 Hidden files and the Trash are never visible to a key. Albums and people show only when they have photos in the key's folders. Every call, refused ones included, is in the key's activity log. The plans for MCP are in [todo/mcp.md](todo/mcp.md).
 
@@ -345,7 +358,7 @@ Hidden files and the Trash are never visible to a key. Albums and people show on
 
 **Settings → Backup** (administrators) backs up the library and OwnNAS's own data with [restic](https://restic.net), which needs to be installed (`brew install restic`, `sudo apt install restic`, or `winget install restic.restic`; 0.17 or newer). The data includes the database with users, albums, tags, and settings, and the file history. Thumbnails and caches are left out, because OwnNAS can make them again.
 
-- **Where:** a folder on another drive, an S3-compatible bucket (AWS, Backblaze B2, Cloudflare R2, Wasabi, MinIO…), or another computer over SFTP, signed in with this computer's SSH key. The page shows the key, or makes one.
+- **Where:** a folder on another drive (the drives plugged in are listed: click one to put the backup on it, and use Back up now whenever you like), an S3-compatible bucket (AWS, Backblaze B2, Cloudflare R2, Wasabi, MinIO…), or another computer over SFTP, signed in with this computer's SSH key. The page shows the key, or makes one.
 - **Encrypted:** OwnNAS makes up a password for the backup and shows it once. Write it down somewhere else: without it the backup cannot be restored, also by you. Settings → Backup shows it again after you enter your account password.
 - **When:** every day or every week at a time you choose, or only when you click Back up now. A backup missed while the computer was off runs when it is back. A failed one is tried again an hour later, up to three times. After the first backup, only what changed is sent.
 - **How long:** one snapshot a day for 7 days, one a week for 4 weeks, and one a month for 12 months by default. Older ones are removed after each backup.

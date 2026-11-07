@@ -44,6 +44,7 @@ pub mod mcp_photos;
 pub mod mcp_write;
 pub mod mcp_notes;
 pub mod notes;
+pub mod oauth;
 pub mod drives;
 pub mod cleanup;
 pub mod near_dupes;

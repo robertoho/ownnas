@@ -43,8 +43,8 @@ Legend: `[x]` done · `[~]` partly · `[ ]` to do
   after a minute (hashes read so far are kept, so asking again goes faster). Copies outside
   the key's folders are left out, and groups left with one copy with them.
 - [x] `read_text` for images: returns the text already read by OCR, when there is some.
-- [~] Results as `structuredContent` (MCP 2025-06-18) alongside the text. Still to do:
-  `outputSchema` per tool.
+- [x] Results as `structuredContent` (MCP 2025-06-18) alongside the text, and an
+  `outputSchema` for the main reading tools.
 - [x] Files as MCP resources: `resources/list` (the files at the top of the key's folders),
   `resources/templates/list` (`ownnas:///{+path}`) and `resources/read` (text, or a large
   picture for photos). Reads are in the agent log.
@@ -91,8 +91,9 @@ restores that version. A file or copy the agent made goes to the Trash on Undo.
 - [x] `edit_text`: replaces an exact passage that must appear exactly once, in UTF-8 text files.
 - [x] `append_rows` for spreadsheets (xlsx, any sheet: rows after the last one, numbers as
   numbers) and `add_paragraphs` for Word (docx), OpenDocument (odt), text and Markdown, done on
-  the server (`office_edit.rs`) by rewriting only the one XML part that changes. Still to do:
-  replacing a passage inside docx/odt (text is split across formatting runs).
+  the server (`office_edit.rs`) by rewriting only the one XML part that changes. `edit_text`
+  also replaces passages in docx (across formatting runs, within a paragraph) and odt (within
+  one stretch of text).
 - [x] `upload_file` from base64, up to 25 MB a call; a name taken gets a number, or
   `replace: true`.
 - [x] `sort_into_folders` (organise level): a folder's files into sub-folders by a pattern
@@ -119,4 +120,15 @@ restores that version. A file or copy the agent made goes to the Trash on Undo.
   refusals in red), calls by tool (allowed, refused, failed) and changes by state.
 - [x] Keys refused 20 times or more in the last hour are flagged: in the status bar ("Agent key
   “x” refused 25 times") and on the key's card, with a pointer to its Activity and Revoke.
-- [ ] OAuth sign-in for MCP clients that support it, instead of pasting keys.
+- [x] OAuth sign-in (MCP authorization spec): metadata (RFC 9728 and 8414), registration
+  (RFC 7591), an approval screen in the web app (folders, level, ask first), codes with PKCE
+  (S256 only) traded once within 10 minutes, and refreshing, which turns the key's secret over.
+  Each connection is an ordinary agent key ("Claude (connected)"), so the log, limits, undo and
+  revoking apply. Redirects: https, http on localhost, or an app's own address.
+
+## Also done
+
+- [x] `rename_many` (organise level): rename by pattern, find and replace, or case, with
+  `dry_run` and undo as one change.
+- [x] Dates from file names (`IMG-20260928-WA0006`) for `sort_into_folders` and `rename_many`
+  (`date: "name"`).

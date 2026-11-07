@@ -28,8 +28,11 @@ lock them in: the files are the notes.
 - [x] Labels are the existing OwnNAS tags, and `#hashtags` written in the text count too.
 - [x] Pictures pasted or dropped into a note are saved in `Notes/attachments/` and linked as
   `![](attachments/…)`.
-- [ ] On the phone: the share sheet ("Share to OwnNAS → Note"), and an Android quick tile or
-  shortcut for a new note.
+- [x] On the phone: the web app is a share target (text and links shared from other apps open
+  as a new note), and long-pressing its icon offers New note. Still to do: sharing pictures
+  and files (needs a service worker for POST), and the native Android app.
+- [x] Reminders (`remind:` in the front matter): set from the menu, due notes on top, and a
+  notification while OwnNAS is open. Earlier versions from the menu.
 
 ## Obsidian-like (write and connect)
 
