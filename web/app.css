@@ -3879,6 +3879,16 @@ body.is-notes .app > .explorer-status-bar { display: none; }
 .notes-swatch-none { background: linear-gradient(135deg, transparent 45%, var(--muted) 45% 55%, transparent 55%), var(--panel-deep); }
 .notes-color-menu { position: absolute; left: 0.5rem; bottom: 2.4rem; z-index: 5; padding: 0.4rem; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); box-shadow: var(--shadow); max-width: 13rem; }
 .notes-empty { max-width: 34rem; margin: 2rem auto; text-align: center; }
+.notes-menu { position: fixed; z-index: 1000; min-width: 13rem; max-width: 18rem; max-height: calc(100vh - 16px); overflow: auto; padding: 0.3rem; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); box-shadow: var(--shadow); display: grid; gap: 1px; }
+.notes-menu button[role="menuitem"] { display: block; width: 100%; min-height: 0; padding: 0.38rem 0.6rem; border: 0; border-radius: 6px; background: transparent; box-shadow: none; text-align: left; font-size: 0.88rem; color: var(--text); }
+.notes-menu button[role="menuitem"]:hover, .notes-menu button[role="menuitem"]:focus-visible { background: color-mix(in srgb, var(--text) 10%, transparent); outline: none; }
+.notes-menu button.danger { color: var(--danger); }
+.notes-menu hr { width: 100%; margin: 0.2rem 0; border: 0; border-top: 1px solid var(--line); }
+.notes-menu-title { padding: 0.3rem 0.6rem 0.4rem; font-weight: 600; font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.notes-menu-group { padding: 0.2rem 0.6rem 0.35rem; }
+.notes-menu-group button[role="menuitem"] { padding-left: 0.4rem; }
+.notes-menu-label { display: block; margin-bottom: 0.25rem; font-size: 0.75rem; color: var(--muted); }
+.note-more-btn { margin-left: auto; }
 .note-color-red { --note: #e5534b; } .note-color-orange { --note: #f0883e; } .note-color-yellow { --note: #e3b341; }
 .note-color-green { --note: #57ab5a; } .note-color-teal { --note: #39c5bb; } .note-color-blue { --note: #539bf5; }
 .note-color-purple { --note: #986ee2; } .note-color-pink { --note: #e275ad; } .note-color-brown { --note: #a8805a; } .note-color-gray { --note: #8b949e; }

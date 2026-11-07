@@ -227,6 +227,47 @@ try {
   await click(`[...document.querySelectorAll('#notes-view .notes-capture button')].find((b) => b.textContent === 'Add')`);
   await fileHas('Notes/Work/work idea.md', /^work idea\n$/);
 
+  // The context menu: every tool for a note, at the pointer.
+  const menuFor = async (name) => {
+    await js(`(() => { const card = ${cardOf(name)}; const box = card.getBoundingClientRect(); card.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: box.left + 20, clientY: box.top + 20 })); return true; })()`);
+    await until(`document.querySelector('.notes-menu')`, `the menu for ${name}`);
+  };
+  const menuItem = (label) => `[...document.querySelectorAll('.notes-menu button')].find((b) => b.textContent === ${JSON.stringify(label)})`;
+  await until(`${cardOf('Plan')}`, 'Plan in Work');
+  await menuFor('Plan');
+  const items = await js(`[...document.querySelectorAll('.notes-menu [role=menuitem]')].map((b) => b.textContent)`);
+  assert.equal(await js(`document.getElementById('notes-view').textContent.includes('null')`), false, 'no stray null');
+  for (const label of ['Open', 'Edit', 'Pin', 'Labels…', 'No notebook', 'Rename…', 'Make a copy', 'Copy link', 'Show in folder', 'Archive', 'Move to the Trash']) assert.ok(items.includes(label), `${label} in ${items}`);
+  if (process.env.NOTES_MENU_SHOT) {
+    const { result } = await send('Page.captureScreenshot', { format: 'png' });
+    fs.writeFileSync(process.env.NOTES_MENU_SHOT, Buffer.from(result.data, 'base64'));
+  }
+  await click(menuItem('No notebook'));
+  await fileHas('Notes/Plan.md', /ship it/);
+  await click(`[...document.querySelectorAll('#notes-view .notes-notebooks button')].find((b) => b.textContent === 'All notes')`);
+  await until(`${cardOf('Plan')}`, 'Plan in all notes');
+  await menuFor('Plan');
+  await click(menuItem('Rename…'));
+  await until(`document.getElementById('text-dialog').open`, 'the rename question');
+  await js(`document.getElementById('text-input').value = 'Project plan'; document.getElementById('text-ok').click(); true`);
+  await fileHas('Notes/Project plan.md', /ship it/);
+  assert.equal(exists('Notes/Plan.md'), false);
+  await until(`${cardOf('Plan')}`, 'the renamed note');
+  await menuFor('Plan');
+  await click(menuItem('Make a copy'));
+  for (let i = 0; i < 50 && fs.readdirSync(path.join(library, 'Notes')).filter((name) => name.startsWith('Project plan')).length < 2; i++) await new Promise((done) => setTimeout(done, 100));
+  assert.equal(fs.readdirSync(path.join(library, 'Notes')).filter((name) => name.startsWith('Project plan')).length, 2, 'a copy');
+  await menuFor('Plan');
+  await click(`document.querySelector('.notes-menu button[title="Green"]')`);
+  // Two cards are called Plan now (the copy has the same heading): one of them turns green.
+  let green = [];
+  for (let i = 0; i < 50 && !green.length; i++) {
+    green = fs.readdirSync(path.join(library, 'Notes')).filter((name) => name.startsWith('Project plan') && read(`Notes/${name}`).startsWith('---\ncolor: green\n---\n'));
+    if (!green.length) await new Promise((done) => setTimeout(done, 100));
+  }
+  assert.equal(green.length, 1, 'one of them is green');
+  assert.equal(await js(`!document.querySelector('.notes-menu')`), true, 'the menu closes');
+
   assert.deepEqual(problems, [], 'no errors in the page');
   console.log('ok: notes');
 } catch (err) {

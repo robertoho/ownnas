@@ -267,7 +267,8 @@ export function mountNotes(host, ctx) {
       heading ? el("h3", { class: "notes-section" }, heading) : null,
       el("div", { class: "notes-grid" }, notes.map((note) => card(note, linked.get(note.path) || []))),
     ] : [];
-    grid.replaceChildren(...section(pinned.length ? "Pinned" : "", pinned), ...section(pinned.length ? "Others" : "", others));
+    // replaceChildren would print a null as text.
+    grid.replaceChildren(...[...section(pinned.length ? "Pinned" : "", pinned), ...section(pinned.length ? "Others" : "", others)].filter(Boolean));
   }
 
   async function change(url, json, done) {
@@ -302,6 +303,115 @@ export function mountNotes(host, ctx) {
     document.addEventListener("pointerdown", away, true);
   }
 
+  function closeNoteMenu() {
+    document.querySelector(".notes-menu")?.remove();
+  }
+
+  /// Everything that can be done with a note, at the pointer (right-click, long press, or the
+  /// card's ⋯ button and the menu key).
+  function noteMenu(note, x, y) {
+    closeNoteMenu();
+    const write = ctx.canWrite();
+    const stem = stemOf(note.path);
+    const parent = note.path.slice(0, note.path.lastIndexOf("/"));
+    const item = (label, run, extra = "") => el("button", { type: "button", role: "menuitem", class: extra, onclick: () => { closeNoteMenu(); run(); } }, label);
+    const allNotebooks = [...new Set(data.notes.filter((other) => !other.archived).map(notebookOf).filter(Boolean)), ...made].filter((name, index, all) => all.indexOf(name) === index).sort((a, b) => a.localeCompare(b));
+    const here = notebookOf(note);
+    const moveTo = async (name) => {
+      try {
+        await ctx.api("/api/move", { method: "POST", json: { path: note.path, dest: name ? `${data.folder}/${name}` : data.folder } });
+        ctx.toast(name ? `Moved to ${name}` : "Moved out of its notebook");
+        await load();
+      } catch (err) {
+        ctx.toast(err.message, true);
+      }
+    };
+    const menu = el("div", { class: "notes-menu", role: "menu", "aria-label": note.title },
+      el("div", { class: "notes-menu-title" }, note.title),
+      item("Open", () => ctx.openNote(note.path, false)),
+      write ? item("Edit", () => ctx.openNote(note.path, true)) : null,
+      write && !note.archived ? item(note.pinned ? "Unpin" : "Pin", () => change("/api/notes/meta", { path: note.path, pinned: !note.pinned })) : null,
+      write ? el("div", { class: "notes-menu-group", role: "group", "aria-label": "Colour" },
+        el("span", { class: "notes-menu-label" }, "Colour"),
+        el("div", { class: "notes-palette" }, ["", ...Object.keys(COLOR_NAMES)].map((name) => el("button", {
+          type: "button",
+          class: `notes-swatch${name ? ` note-color-${name}` : " notes-swatch-none"}${(note.color || "") === name ? " is-chosen" : ""}`,
+          title: name ? COLOR_NAMES[name] : "No colour",
+          "aria-label": name ? COLOR_NAMES[name] : "No colour",
+          onclick: () => { closeNoteMenu(); change("/api/notes/meta", { path: note.path, color: name }); },
+        })))) : null,
+      write ? item("Labels…", () => ctx.tag([note.path]).then(() => load())) : null,
+      write && !note.archived && (allNotebooks.length || here) ? el("div", { class: "notes-menu-group", role: "group", "aria-label": "Move to notebook" },
+        el("span", { class: "notes-menu-label" }, "Move to notebook"),
+        here ? item("No notebook", () => moveTo("")) : null,
+        allNotebooks.filter((name) => name !== here).map((name) => item(`📓 ${name}`, () => moveTo(name)))) : null,
+      el("hr"),
+      write ? item("Rename…", async () => {
+        const name = await ctx.askText("Rename note", "Name", stem, "Rename");
+        if (!name || !name.trim() || name.trim() === stem) return;
+        try {
+          await ctx.api("/api/rename", { method: "POST", json: { path: note.path, name: `${name.trim().replace(/\.md$/i, "")}.md` } });
+          ctx.toast("Renamed; links to it were updated");
+          await load();
+        } catch (err) {
+          ctx.toast(err.message, true);
+        }
+      }) : null,
+      write ? item("Make a copy", async () => {
+        try {
+          await ctx.api("/api/copy", { method: "POST", json: { path: note.path, dest: parent } });
+          ctx.toast("Copy made");
+          await load();
+        } catch (err) {
+          ctx.toast(err.message, true);
+        }
+      }) : null,
+      item("Copy link", async () => {
+        try {
+          await navigator.clipboard.writeText(`[[${note.title}]]`);
+          ctx.toast(`Copied [[${note.title}]]: paste it into another note to link to this one`);
+        } catch {
+          ctx.toast("Could not copy", true);
+        }
+      }),
+      item("Show in folder", () => ctx.showInFolder(note.path)),
+      write ? el("hr") : null,
+      write ? item(note.archived ? "Unarchive" : "Archive", () => change("/api/notes/archive", { path: note.path, archived: !note.archived }, note.archived ? "Back in your notes" : "Archived")) : null,
+      write ? item("Move to the Trash", async () => {
+        try {
+          await ctx.api(`/api/entry?path=${encodeURIComponent(note.path)}`, { method: "DELETE" });
+          ctx.toast("Moved to the Trash");
+          await load();
+        } catch (err) {
+          ctx.toast(err.message, true);
+        }
+      }, "danger") : null);
+    document.body.append(menu);
+    const box = menu.getBoundingClientRect();
+    menu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - box.width - 8))}px`;
+    menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - box.height - 8))}px`;
+    menu.querySelector("button")?.focus();
+    const away = (event) => {
+      if (event.type === "keydown" && event.key !== "Escape") return;
+      if (event.type === "pointerdown" && menu.contains(event.target)) return;
+      closeNoteMenu();
+      document.removeEventListener("pointerdown", away, true);
+      document.removeEventListener("keydown", away, true);
+      window.removeEventListener("scroll", away, true);
+    };
+    document.addEventListener("pointerdown", away, true);
+    document.addEventListener("keydown", away, true);
+    window.addEventListener("scroll", away, true);
+    menu.addEventListener("keydown", (event) => {
+      const buttons = [...menu.querySelectorAll("button")];
+      const at = buttons.indexOf(document.activeElement);
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        buttons[(at + (event.key === "ArrowDown" ? 1 : -1) + buttons.length) % buttons.length]?.focus();
+      }
+    });
+  }
+
   function card(note, linkedFrom) {
     const write = ctx.canWrite();
     const items = note.items.slice(0, MOST_ITEMS).map((item) => {
@@ -324,12 +434,11 @@ export function mountNotes(host, ctx) {
       note.itemCount ? el("p", { class: "muted note-more" }, `${note.doneCount} of ${note.itemCount} done`) : null,
       labelsOf(note).length ? el("div", { class: "note-labels" }, labelsOf(note).map((name) => el("span", { class: "tag-chip mini" }, `#${name}`))) : null,
       linkedFrom.length ? el("p", { class: "muted note-backlinks", title: linkedFrom.map((from) => from.title).join(", ") }, `↩ Linked from ${linkedFrom.map((from) => from.title).slice(0, 3).join(", ")}${linkedFrom.length > 3 ? ` and ${linkedFrom.length - 3} more` : ""}`) : null,
-      write ? el("div", { class: "note-actions" },
-        action("Colour", "🎨", (event) => colorMenu(note, event.currentTarget)),
-        action("Labels", "🏷", () => ctx.tag([note.path]).then(() => load())),
-        action(note.archived ? "Unarchive" : "Archive", note.archived ? "⤴" : "🗄", () => change("/api/notes/archive", { path: note.path, archived: !note.archived }, note.archived ? "Back in your notes" : "Archived")),
-        action("Show in folder", "📁", () => ctx.showInFolder(note.path)),
-        action("Move to the Trash", "🗑", async () => {
+      el("div", { class: "note-actions" },
+        write ? action("Colour", "🎨", (event) => colorMenu(note, event.currentTarget)) : null,
+        write ? action("Labels", "🏷", () => ctx.tag([note.path]).then(() => load())) : null,
+        write ? action(note.archived ? "Unarchive" : "Archive", note.archived ? "⤴" : "🗄", () => change("/api/notes/archive", { path: note.path, archived: !note.archived }, note.archived ? "Back in your notes" : "Archived")) : null,
+        write ? action("Move to the Trash", "🗑", async () => {
           try {
             await ctx.api(`/api/entry?path=${encodeURIComponent(note.path)}`, { method: "DELETE" });
             ctx.toast("Moved to the Trash");
@@ -337,11 +446,24 @@ export function mountNotes(host, ctx) {
           } catch (err) {
             ctx.toast(err.message, true);
           }
-        }, "danger")) : null);
+        }, "danger") : null,
+        action("More", "⋯", (event) => {
+          const box = event.currentTarget.getBoundingClientRect();
+          noteMenu(note, box.left, box.bottom + 4);
+        }, "note-more-btn")));
+    node.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      noteMenu(note, event.clientX, event.clientY);
+    });
     const open = () => ctx.openNote(note.path, false);
     node.addEventListener("click", open);
     node.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && event.target === node) open();
+      if (event.target === node && (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10"))) {
+        event.preventDefault();
+        const box = node.getBoundingClientRect();
+        noteMenu(note, box.left + 16, box.top + 16);
+      }
     });
     return node;
   }

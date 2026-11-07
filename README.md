@@ -327,6 +327,7 @@ Right-click a folder, or the empty space inside one, and choose **Sort into fold
 - Link notes with `[[Note name]]`: each note shows which notes link to it. **Archive** moves a note into `Archive/`, and **Today** opens the day's note in `Daily/` (made from `Templates/Daily.md` when there is one, with `{{date}}` filled in).
 - Clicking a card opens it in the Markdown editor. Typing `[[` suggests notes to link to, and a picture pasted or dropped in is saved in `attachments/` next to the note. Renaming a note updates the links to it.
 - Sub-folders of the notes folder are notebooks: choose one to see its notes, and new notes go there.
+- Right-click a card (or long-press it, or use its ⋯ button) for everything else: open or edit, pin, colour, labels, move to another notebook, rename, make a copy, copy a `[[link]]` to it, show it in its folder, archive, or move it to the Trash.
 
 ## AI agents (MCP)
 
