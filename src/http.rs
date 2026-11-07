@@ -38,6 +38,7 @@ const MOTION_THUMBS_JS: &str = include_str!("../web/motion-thumbs.js");
 const PHOTO_UPLOAD_JS: &str = include_str!("../web/photo-upload.js");
 const THEME_JS: &str = include_str!("../web/theme.js");
 const GALLERY_JS: &str = include_str!("../web/gallery.js");
+const NOTES_JS: &str = include_str!("../web/notes.js");
 const VIEWERS_JS: &str = include_str!("../web/viewers.js");
 const APP_JS: &str = include_str!("../web/app.js");
 const MODEL_VIEWER_JS: &str = include_str!("../web/model-viewer.js");
@@ -258,6 +259,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/assets/photo-upload.js", get(photo_upload_javascript))
         .route("/assets/theme.js", get(theme_javascript))
         .route("/assets/gallery.js", get(gallery_javascript))
+        .route("/assets/notes.js", get(notes_javascript))
         .route("/assets/viewers.js", get(viewers_javascript))
         .route("/assets/vendor/three/addons/{*file}", get(three_addon))
         .route("/assets/docx-editor.css", get(docx_editor_css))
@@ -321,6 +323,15 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/agent-keys", get(list_agent_keys).post(create_agent_key))
         .route("/api/agent-keys/revoke", post(revoke_agent_key))
         .route("/api/agent-keys/log", get(agent_key_log))
+        .route("/api/agent-keys/approval", post(set_agent_key_approval))
+        .route("/api/agent-keys/settings", post(set_agent_key_settings))
+        .route("/api/agent-keys/tools", get(agent_key_tools))
+        .route("/api/agent-keys/usage", get(agent_key_usage))
+        .route("/api/agent-keys/attention", get(agent_key_attention))
+        .route("/api/agent-keys/changes", get(agent_key_changes))
+        .route("/api/agent-keys/changes/decide", post(decide_agent_change))
+        .route("/api/agent-keys/changes/undo", post(undo_agent_change))
+        .route("/api/agent-keys/changes/undo-since", post(undo_agent_changes_since))
         .route("/api/list", get(list))
         .route("/api/meta", get(meta))
         .route("/api/raw", get(raw))
@@ -458,6 +469,16 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/albums", get(get_album).post(create_album).patch(update_album).delete(delete_album))
         .route("/api/albums/tree", get(album_tree))
         .route("/api/workspaces", get(list_workspaces).post(create_workspace).patch(update_workspace).delete(delete_workspace))
+        .route("/api/workspaces/items", post(workspace_items).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
+        .route("/api/workspaces/membership", post(workspace_membership).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
+        .route("/api/workspaces/folders", post(workspace_folders_change))
+        .route("/api/notes", get(list_notes).post(create_note))
+        .route("/api/notes/tick", post(tick_note))
+        .route("/api/notes/meta", post(note_meta))
+        .route("/api/notes/archive", post(archive_note))
+        .route("/api/notes/daily", post(daily_note))
+        .route("/api/notes/folder", post(set_notes_folder))
+        .route("/api/workspaces/folder-membership", post(workspace_folder_membership))
         .route("/api/albums/items", post(album_items).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
         .route("/api/tags/bulk", post(bulk_tags))
         .route("/api/comments", post(add_comment).delete(remove_comment))
@@ -1101,6 +1122,10 @@ async fn theme_javascript() -> impl IntoResponse {
 
 async fn gallery_javascript() -> impl IntoResponse {
     app_module_javascript(GALLERY_JS)
+}
+
+async fn notes_javascript() -> impl IntoResponse {
+    app_module_javascript(NOTES_JS)
 }
 
 async fn viewers_javascript() -> impl IntoResponse {
@@ -1812,17 +1837,15 @@ struct WorkspaceQuery {
 }
 
 impl WorkspaceQuery {
-    /// The workspace, checked to exist.
+    /// The workspace, checked to exist (or `UNSORTED`, the photos in no workspace).
     fn check(&self, conn: &rusqlite::Connection) -> Result<Option<i64>, ApiError> {
-        Ok(crate::workspaces::check(conn, self.workspace)?)
+        Ok(crate::workspaces::check_view(conn, self.workspace)?)
     }
 
-    /// The workspace's folders, for filtering in memory (`None`: every photo).
-    fn folders(&self, conn: &rusqlite::Connection) -> Result<Option<Vec<String>>, ApiError> {
-        match self.check(conn)? {
-            Some(id) => Ok(Some(crate::workspaces::folders(conn, id)?)),
-            None => Ok(None),
-        }
+    /// Who is in the workspace, for filtering in memory.
+    fn members(&self, conn: &rusqlite::Connection) -> Result<crate::workspaces::Members, ApiError> {
+        let workspace = self.check(conn)?;
+        Ok(crate::workspaces::members(conn, workspace)?)
     }
 }
 
@@ -2080,6 +2103,12 @@ async fn forget_faces(State(state): State<std::sync::Arc<AppState>>, headers: He
     Ok(Json(json!({ "ok": true })))
 }
 
+/// Whether smart search can answer now (for `/mcp`).
+#[cfg(ownnas_ml)]
+pub(crate) fn smart_search_on(state: &AppState) -> bool {
+    ml_feature_on(state, crate::ml::Feature::Search) && state.models.ready(crate::ml::Feature::Search)
+}
+
 #[cfg(ownnas_ml)]
 fn search_ready(state: &AppState) -> Result<(), ApiError> {
     if !ml_feature_on(state, crate::ml::Feature::Search) || !state.models.ready(crate::ml::Feature::Search) {
@@ -2130,7 +2159,7 @@ async fn gallery_search(
         if text.is_empty() {
             return Ok(Json(json!({ "items": [] })));
         }
-        let folders = scope.folders(&state.db.lock().unwrap_or_else(|err| err.into_inner()))?;
+        let members = scope.members(&state.db.lock().unwrap_or_else(|err| err.into_inner()))?;
         let worker = state.clone();
         let found = tokio::task::spawn_blocking(move || -> Result<Vec<(String, f32)>, String> {
             let vector = worker.models.describe_text(&text)?;
@@ -2139,7 +2168,7 @@ async fn gallery_search(
                 let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
                 worker.media.descriptions.get(&conn)?
             };
-            let keep = |path: &str| folders.as_deref().is_none_or(|folders| crate::workspaces::contains(folders, path));
+            let keep = |path: &str| members.has(path);
             Ok(crate::smart::matching_text_where(&descriptions, &vector, &neutral, 300, &keep))
         })
         .await
@@ -2176,7 +2205,7 @@ async fn gallery_similar(
             None if body.is_empty() => return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose a photo, or drop one in")),
             None => None,
         };
-        let folders = scope.folders(&state.db.lock().unwrap_or_else(|err| err.into_inner()))?;
+        let members = scope.members(&state.db.lock().unwrap_or_else(|err| err.into_inner()))?;
         let worker = state.clone();
         let skip = sample.as_ref().map(|target| target.rel.clone());
         let found = tokio::task::spawn_blocking(move || -> Result<Vec<(String, f32)>, String> {
@@ -2210,7 +2239,7 @@ async fn gallery_similar(
                 let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
                 worker.media.descriptions.get(&conn)?
             };
-            let keep = |path: &str| skip.as_deref() != Some(path) && folders.as_deref().is_none_or(|folders| crate::workspaces::contains(folders, path));
+            let keep = |path: &str| skip.as_deref() != Some(path) && members.has(path);
             let found = crate::smart::nearest_where(&descriptions, &vector, 200, &keep);
             Ok(found.into_iter().filter(|(_, score)| *score >= 0.6).collect())
         })
@@ -3092,6 +3121,11 @@ async fn update_album(
         if body.set_workspace {
             let workspace = crate::workspaces::check(&conn, body.workspace_id)?;
             crate::albums::set_workspace(&conn, body.id, workspace)?;
+            // Its photos come along, so the album shows them in its new workspace's Photos too.
+            if let Some(workspace) = workspace {
+                let paths = crate::albums::subtree_paths(&conn, body.id)?;
+                crate::workspaces::change_items(&conn, &[workspace], &paths, true, &user.username)?;
+            }
         }
         crate::albums::get(&conn, body.id)?
     };
@@ -3150,19 +3184,427 @@ async fn album_items(
             paths.push(path);
         }
     }
-    let (changed, album) = {
+    let (changed, album, picked) = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
         let changed = crate::albums::change_items(&conn, body.album_id, &paths, add, &user.username)?;
-        (changed, crate::albums::get(&conn, body.album_id)?)
+        // An album's photos show in its workspace too, even those stored outside its folders.
+        let picked = match crate::albums::workspace_id(&conn, body.album_id)? {
+            Some(workspace) if add => crate::workspaces::change_items(&conn, &[workspace], &paths, true, &user.username)?,
+            _ => 0,
+        };
+        (changed, crate::albums::get(&conn, body.album_id)?, picked)
     };
     record(&state, &user, if add { "album-add" } else { "album-remove" }, &format!("{} ({changed})", album.name));
-    Ok(Json(json!({ "changed": changed, "album": album })))
+    Ok(Json(json!({ "changed": changed, "album": album, "pickedIntoWorkspace": picked })))
 }
 
 async fn list_workspaces(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     let conn = own_connection(&state)?;
-    Ok(Json(json!({ "workspaces": crate::workspaces::list(&conn)? })))
+    let workspaces = crate::workspaces::list(&conn)?;
+    // Worth counting only once there are workspaces to sort photos into.
+    let unsorted = if workspaces.is_empty() { 0 } else { crate::workspaces::unsorted_count(&conn)? };
+    Ok(Json(json!({ "workspaces": workspaces, "unsorted": unsorted })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceItemsBody {
+    workspace_ids: Vec<i64>,
+    paths: Vec<String>,
+    /// "add" (the default) picks them into the workspaces; "remove" takes them out.
+    action: Option<String>,
+}
+
+/// Picks photos and videos into workspaces one by one, wherever they are stored (or takes them
+/// out). Nothing moves; it changes only where the Gallery shows them.
+async fn workspace_items(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<WorkspaceItemsBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let add = body.action.as_deref() != Some("remove");
+    if body.workspace_ids.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose a workspace"));
+    }
+    let mut paths = Vec::with_capacity(body.paths.len());
+    for raw in &body.paths {
+        let path = raw.trim().trim_start_matches('/').to_string();
+        if add {
+            let target = files::resolve(&state.root, &path)?;
+            if !target.full.is_file() || !matches!(files::kind_of(&target.rel), "image" | "video" | "svg") {
+                return Err(ApiError::new(StatusCode::BAD_REQUEST, "Only photos and videos can be shown in workspaces"));
+            }
+            if files::is_under_trash(&target.rel) {
+                return Err(ApiError::new(StatusCode::BAD_REQUEST, "Photos in the Trash cannot be shown in a workspace"));
+            }
+            paths.push(target.rel);
+        } else {
+            paths.push(path);
+        }
+    }
+    let (changed, workspaces) = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        let changed = crate::workspaces::change_items(&conn, &body.workspace_ids, &paths, add, &user.username)?;
+        (changed, crate::workspaces::list(&conn)?)
+    };
+    let names: Vec<&str> = workspaces.iter().filter(|space| body.workspace_ids.contains(&space.id)).map(|space| space.name.as_str()).collect();
+    record(&state, &user, if add { "workspace-add" } else { "workspace-remove" }, &format!("{} ({changed})", names.join(", ")));
+    Ok(Json(json!({ "changed": changed, "workspaces": workspaces })))
+}
+
+#[derive(Deserialize)]
+struct WorkspaceMembershipBody {
+    paths: Vec<String>,
+}
+
+/// Where some photos stand in each workspace, for the Show in workspace dialog.
+async fn workspace_membership(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<WorkspaceMembershipBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    require_user(&state, &headers)?;
+    if body.paths.len() > crate::workspaces::MAX_ITEMS_PER_CHANGE {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, format!("Choose up to {} photos at a time", crate::workspaces::MAX_ITEMS_PER_CHANGE)));
+    }
+    let paths: Vec<String> = body.paths.iter().map(|path| path.trim().trim_start_matches('/').to_string()).collect();
+    let conn = own_connection(&state)?;
+    Ok(Json(json!({ "workspaces": crate::workspaces::membership(&conn, &paths)?, "total": paths.len() })))
+}
+
+// ---- Notes: Markdown files in one folder, shown as cards (see notes.rs) ----
+
+/// The library folder that holds the notes.
+pub(crate) fn notes_folder(state: &AppState) -> String {
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    db::get_setting(&conn, crate::notes::SETTING).ok().flatten().filter(|folder| !folder.trim().is_empty()).unwrap_or_else(|| crate::notes::DEFAULT_FOLDER.to_string())
+}
+
+/// The notes folder on disk, made when it is not there yet (with the folders above it).
+fn notes_dir(state: &AppState, make: bool) -> Result<(String, std::path::PathBuf), ApiError> {
+    let folder = notes_folder(state);
+    if make {
+        let mut at = String::new();
+        for part in folder.split('/').filter(|part| !part.is_empty()) {
+            let inside = at.clone();
+            match files::make_dir(&state.root, &inside, part) {
+                Ok(()) | Err(files::FileError::AlreadyExists) => {}
+                Err(err) => return Err(ApiError::from(err)),
+            }
+            at = if at.is_empty() { part.to_string() } else { format!("{at}/{part}") };
+        }
+    }
+    let found = files::resolve(&state.root, &folder)?;
+    Ok((found.rel, found.full))
+}
+
+/// A note's place: a Markdown file inside the notes folder.
+fn note_at(state: &AppState, path: &str) -> Result<files::Resolved, ApiError> {
+    let (folder, _) = notes_dir(state, false)?;
+    let found = files::resolve(&state.root, path.trim().trim_start_matches('/'))?;
+    let inside = found.rel.strip_prefix(&folder).is_some_and(|rest| rest.starts_with('/'));
+    if !inside || !found.rel.to_ascii_lowercase().ends_with(".md") || !found.full.is_file() {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "That note is no longer there"));
+    }
+    Ok(found)
+}
+
+fn read_note_text(full: &std::path::Path) -> Result<String, ApiError> {
+    std::fs::read_to_string(full).map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "That note is not text OwnNAS can change"))
+}
+
+/// Saves a note's new text, keeping what it held in its history.
+async fn save_note(state: &AppState, user: &User, rel: String, text: String) -> Result<(), ApiError> {
+    let root = state.root.clone();
+    let keep = keeper(state, user, "edit");
+    tokio::task::spawn_blocking(move || {
+        keep_at(&root, &rel, &keep);
+        files::write_text_file(&root, &rel, &text)
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not save the note"))?
+    .map_err(ApiError::from)
+}
+
+async fn list_notes(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let folder = notes_folder(&state);
+    let found = files::resolve(&state.root, &folder).ok().filter(|found| found.full.is_dir());
+    let Some(found) = found else {
+        return Ok(Json(json!({ "folder": folder, "exists": false, "notes": [], "colors": crate::notes::COLORS })));
+    };
+    let (rel, full) = (found.rel.clone(), found.full.clone());
+    let notes = tokio::task::spawn_blocking(move || crate::notes::list(&full, &rel))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the notes"))?;
+    let paths: Vec<String> = notes.iter().map(|note| note.path.clone()).collect();
+    let tags = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        db::tags_for_paths(&conn, &paths).unwrap_or_default()
+    };
+    let notes: Vec<serde_json::Value> = notes
+        .into_iter()
+        .map(|note| {
+            let tags = tags.get(&note.path).cloned().unwrap_or_default();
+            let mut value = json!(note);
+            value["tags"] = json!(tags);
+            value
+        })
+        .collect();
+    Ok(Json(json!({ "folder": found.rel, "exists": true, "notes": notes, "colors": crate::notes::COLORS })))
+}
+
+#[derive(Deserialize)]
+struct NewNoteBody {
+    text: String,
+    color: Option<String>,
+}
+
+async fn create_note(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<NewNoteBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    if body.text.trim().is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Write something first"));
+    }
+    if body.text.len() > 1024 * 1024 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "That note is too long (1 MB at most)"));
+    }
+    let (folder, full) = notes_dir(&state, true)?;
+    let now = chrono::Local::now().format("%Y-%m-%d %H.%M").to_string();
+    let name = crate::notes::name_for(&body.text, &now);
+    let mut text = body.text.replace("\r\n", "\n");
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    if let Some(color) = body.color.as_deref().filter(|color| crate::notes::COLORS.contains(color)) {
+        text = crate::notes::set_matter(&text, &[("color", Some(color))]);
+    }
+    let created = tokio::task::spawn_blocking(move || -> Result<String, ApiError> {
+        let target = crate::notes::free_path(&full, &name);
+        let file_name = target.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default();
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&target).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not save the note"))?;
+        file.write_all(text.as_bytes()).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not save the note"))?;
+        Ok(format!("{folder}/{file_name}"))
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not save the note"))??;
+    invalidate_sizes(&state, &parent_rel_path(&created));
+    record(&state, &user, "note-create", &created);
+    Ok(Json(json!({ "path": created })))
+}
+
+#[derive(Deserialize)]
+struct TickBody {
+    path: String,
+    line: usize,
+    text: String,
+    done: bool,
+}
+
+/// Ticks a checklist item on a note's card (or clears it).
+async fn tick_note(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<TickBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let found = note_at(&state, &body.path)?;
+    let text = read_note_text(&found.full)?;
+    let ticked = crate::notes::tick(&text, body.line, &body.text, body.done).map_err(|why| ApiError::new(StatusCode::CONFLICT, why))?;
+    save_note(&state, &user, found.rel.clone(), ticked).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct NoteMetaBody {
+    path: String,
+    /// A colour from `notes::COLORS`, or "" for none. Left out: unchanged.
+    color: Option<String>,
+    pinned: Option<bool>,
+}
+
+/// A note's colour and pin, kept in its front matter.
+async fn note_meta(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<NoteMetaBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let found = note_at(&state, &body.path)?;
+    let text = read_note_text(&found.full)?;
+    let mut changes: Vec<(&str, Option<&str>)> = Vec::new();
+    if let Some(color) = body.color.as_deref() {
+        if !color.is_empty() && !crate::notes::COLORS.contains(&color) {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose one of the note colours"));
+        }
+        changes.push(("color", (!color.is_empty()).then_some(color)));
+    }
+    if let Some(pinned) = body.pinned {
+        changes.push(("pinned", pinned.then_some("true")));
+    }
+    let changed = crate::notes::set_matter(&text, &changes);
+    if changed != text {
+        save_note(&state, &user, found.rel.clone(), changed).await?;
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct ArchiveNoteBody {
+    path: String,
+    archived: bool,
+}
+
+/// Moves a note into the notes folder's Archive, or back to the top of the notes folder.
+async fn archive_note(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<ArchiveNoteBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let found = note_at(&state, &body.path)?;
+    let (folder, _) = notes_dir(&state, false)?;
+    let archive = format!("{folder}/{}", crate::notes::ARCHIVE);
+    if body.archived {
+        match files::make_dir(&state.root, &folder, crate::notes::ARCHIVE) {
+            Ok(()) | Err(files::FileError::AlreadyExists) => {}
+            Err(err) => return Err(ApiError::from(err)),
+        }
+    }
+    let dest = if body.archived { archive } else { folder };
+    let (root, from, into) = (state.root.clone(), found.rel.clone(), dest.clone());
+    let moved = tokio::task::spawn_blocking(move || files::move_entry(&root, &from, &into))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not move the note"))?
+        .map_err(ApiError::from)?;
+    rewrite_meta(&state, &found.rel, &moved);
+    record(&state, &user, if body.archived { "note-archive" } else { "note-unarchive" }, &moved);
+    Ok(Json(json!({ "path": moved })))
+}
+
+/// Today's daily note (`Daily/2026-11-07.md`), made from `Templates/Daily.md` when there is
+/// one ({{date}} becomes the day).
+async fn daily_note(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let (folder, full) = notes_dir(&state, true)?;
+    match files::make_dir(&state.root, &folder, crate::notes::DAILY) {
+        Ok(()) | Err(files::FileError::AlreadyExists) => {}
+        Err(err) => return Err(ApiError::from(err)),
+    }
+    let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let rel = format!("{folder}/{}/{day}.md", crate::notes::DAILY);
+    let target = full.join(crate::notes::DAILY).join(format!("{day}.md"));
+    if !target.exists() {
+        let template = std::fs::read_to_string(full.join(crate::notes::TEMPLATES).join("Daily.md")).ok();
+        let text = template.map_or_else(|| format!("# {day}\n\n"), |template| template.replace("{{date}}", &day));
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().write(true).create_new(true).open(&target) {
+            file.write_all(text.as_bytes()).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not make the daily note"))?;
+            record(&state, &user, "note-create", &rel);
+        }
+    }
+    Ok(Json(json!({ "path": rel })))
+}
+
+#[derive(Deserialize)]
+struct NotesFolderBody {
+    folder: String,
+}
+
+/// Where the notes are kept (administrators).
+async fn set_notes_folder(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<NotesFolderBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let folder = body.folder.trim().trim_matches('/').to_string();
+    let found = files::resolve(&state.root, &folder)?;
+    if found.rel.is_empty() || !found.full.is_dir() || files::is_under_trash(&found.rel) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose a folder inside the library"));
+    }
+    {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        db::set_setting(&conn, crate::notes::SETTING, Some(&found.rel)).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    }
+    record(&state, &user, "notes-folder", &found.rel);
+    Ok(Json(json!({ "folder": found.rel })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceFoldersBody {
+    workspace_ids: Vec<i64>,
+    folders: Vec<String>,
+    action: Option<String>,
+}
+
+/// Shows everything in some folders (now and later) in workspaces, or stops, from the folders'
+/// side. The same as editing each workspace's folders, so only administrators can.
+async fn workspace_folders_change(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<WorkspaceFoldersBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    if body.workspace_ids.is_empty() || body.folders.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose a workspace and a folder"));
+    }
+    let add = body.action.as_deref() != Some("remove");
+    let folders = if add {
+        workspace_folders(&state, &body.folders)?
+    } else {
+        body.folders.iter().map(|folder| folder.trim().trim_matches('/').to_string()).collect()
+    };
+    let (changed, workspaces) = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        let changed = crate::workspaces::change_folders(&conn, &body.workspace_ids, &folders, add)?;
+        (changed, crate::workspaces::list(&conn)?)
+    };
+    let names: Vec<&str> = workspaces.iter().filter(|space| body.workspace_ids.contains(&space.id)).map(|space| space.name.as_str()).collect();
+    record(&state, &user, if add { "workspace-folder-add" } else { "workspace-folder-remove" }, &format!("{} → {}", folders.join(", "), names.join(", ")));
+    Ok(Json(json!({ "changed": changed, "workspaces": workspaces })))
+}
+
+#[derive(Deserialize)]
+struct WorkspaceFolderMembershipBody {
+    folders: Vec<String>,
+}
+
+/// Where some folders stand in each workspace, for the folders' Show in workspace dialog.
+async fn workspace_folder_membership(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<WorkspaceFolderMembershipBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    require_user(&state, &headers)?;
+    let folders: Vec<String> = body.folders.iter().take(1000).map(|folder| folder.trim().trim_matches('/').to_string()).collect();
+    let conn = own_connection(&state)?;
+    Ok(Json(json!({ "workspaces": crate::workspaces::folder_membership(&conn, &folders)?, "total": folders.len() })))
 }
 
 #[derive(Deserialize)]
@@ -4185,9 +4627,10 @@ async fn gallery_upload_check(
     let answer = tokio::task::spawn_blocking(move || {
         let state = worker;
         let sha256 = body.sha256.to_ascii_lowercase();
-        let folders = {
+        let members = {
             let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-            body.workspace.and_then(|id| crate::workspaces::folders(&conn, id).ok()).unwrap_or_default()
+            let workspace = body.workspace.filter(|id| *id != crate::workspaces::UNSORTED);
+            crate::workspaces::members(&conn, workspace).unwrap_or(crate::workspaces::Members::Every)
         };
         let mut copies: Vec<String> = Vec::new();
         if let Some(folder) = body.folder.as_deref().map(|folder| folder.trim_matches('/')).filter(|folder| !folder.is_empty()) {
@@ -4200,7 +4643,7 @@ async fn gallery_upload_check(
             }
         }
         // The copy to mention: one in this workspace, when there is one.
-        let inside = copies.iter().find(|path| crate::workspaces::contains(&folders, path)).cloned();
+        let inside = copies.iter().find(|path| members.has(path)).cloned();
         let in_workspace = inside.is_some();
         let copy = inside.or_else(|| copies.first().cloned());
         let resized = if copy.is_none() { find_resized_copy(&state, &sha256) } else { None };
@@ -7273,7 +7716,7 @@ async fn database_compact(State(state): State<std::sync::Arc<AppState>>, headers
 }
 
 /// A connection for work that may take a while, so it does not hold up the shared one.
-fn own_connection(state: &AppState) -> Result<rusqlite::Connection, ApiError> {
+pub(crate) fn own_connection(state: &AppState) -> Result<rusqlite::Connection, ApiError> {
     db::connect(&state.db_path).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not open the database"))
 }
 
@@ -7468,7 +7911,7 @@ fn record(state: &AppState, user: &User, action: &str, detail: &str) {
     let _ = db::log_event(&conn, Some(user.id), &user.username, action, detail);
 }
 
-fn rewrite_meta(state: &AppState, from: &str, to: &str) {
+pub(crate) fn rewrite_meta(state: &AppState, from: &str, to: &str) {
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     let _ = db::rewrite_path_meta(&conn, from, to);
     state.media.descriptions.invalidate();
@@ -7503,7 +7946,7 @@ fn delete_meta(state: &AppState, path: &str) {
     state.media.descriptions.invalidate();
 }
 
-fn invalidate_sizes(state: &AppState, path: &str) {
+pub(crate) fn invalidate_sizes(state: &AppState, path: &str) {
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     let _ = db::invalidate_folder_sizes(&conn, path);
 }
@@ -8513,6 +8956,8 @@ struct AgentKeyBody {
     level: String,
     folders: Vec<String>,
     expires_at: Option<i64>,
+    #[serde(default)]
+    approve: bool,
 }
 
 fn read_level() -> String {
@@ -8535,7 +8980,204 @@ async fn list_agent_keys(State(state): State<std::sync::Arc<AppState>>, headers:
     require_admin(&user)?;
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     let keys = crate::agent_keys::list(&conn).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
-    Ok(Json(json!({ "keys": keys })))
+    let pending = crate::agent_keys::changes(&conn, None, Some("pending"), 1000).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let mut waiting: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    for change in &pending {
+        *waiting.entry(change.key_id).or_default() += 1;
+    }
+    Ok(Json(json!({ "keys": keys, "pending": waiting })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentKeySettingsBody {
+    id: i64,
+    /// Leave out (or null) for every tool the key's level allows.
+    tools: Option<Vec<String>>,
+    calls_per_minute: Option<u32>,
+    daily_changes: Option<i64>,
+    #[serde(default)]
+    read_only: Vec<String>,
+}
+
+/// A key's tools, limits, and folders it may only read.
+async fn set_agent_key_settings(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AgentKeySettingsBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let known = crate::mcp::catalog();
+    if let Some(tools) = &body.tools {
+        let names: Vec<&str> = ["read", "organise", "write"].iter().flat_map(|level| known[level].as_array().into_iter().flatten()).filter_map(|tool| tool["name"].as_str()).collect();
+        if let Some(stray) = tools.iter().find(|tool| !names.contains(&tool.as_str())) {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, format!("There is no tool called {stray}")));
+        }
+    }
+    let settings = crate::agent_keys::KeySettings { tools: body.tools, calls_per_minute: body.calls_per_minute, daily_changes: body.daily_changes, read_only: body.read_only };
+    let changed = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::agent_keys::set_settings(&conn, body.id, &settings).map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?
+    };
+    if !changed {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "That key is no longer there"));
+    }
+    record(&state, &user, "agent-key-settings", &body.id.to_string());
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Refused this many times in the last hour, a key is shown as worth a look.
+const AGENT_REFUSALS_ALERT: i64 = 20;
+
+#[derive(Deserialize)]
+struct AgentUsageQuery {
+    id: i64,
+    days: Option<i64>,
+}
+
+/// What a key did over the last days (30 unless asked).
+async fn agent_key_usage(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AgentUsageQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let since = chrono::Utc::now().timestamp() - query.days.unwrap_or(30).clamp(1, 365) * 86_400;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let usage = crate::agent_keys::usage(&conn, query.id, since).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(Json(usage))
+}
+
+/// What needs an administrator: changes waiting for approval, and keys refused again and again
+/// in the last hour (looking for a way out of their folders, or lost).
+async fn agent_key_attention(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let pending: i64 = conn.query_row("SELECT count(*) FROM agent_changes WHERE status = 'pending'", [], |row| row.get(0)).unwrap_or(0);
+    let probing = crate::agent_keys::refused_since(&conn, chrono::Utc::now().timestamp() - 3600, AGENT_REFUSALS_ALERT).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let probing: Vec<serde_json::Value> = probing.into_iter().map(|(id, name, refused)| json!({ "id": id, "name": name, "refused": refused })).collect();
+    Ok(Json(json!({ "pending": pending, "probing": probing })))
+}
+
+/// Every tool by the level that brings it, to choose a key's tools.
+async fn agent_key_tools(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    Ok(Json(json!({ "tools": crate::mcp::catalog(), "defaults": { "callsPerMinute": crate::agent_keys::CALLS_PER_MINUTE, "dailyChanges": crate::agent_keys::DAILY_CHANGES } })))
+}
+
+#[derive(Deserialize)]
+struct AgentApprovalBody {
+    id: i64,
+    approve: bool,
+}
+
+/// Whether an organising key's changes wait for approval from now on.
+async fn set_agent_key_approval(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AgentApprovalBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let changed = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::agent_keys::set_approve(&conn, body.id, body.approve).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?
+    };
+    if !changed {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Only keys that can organise have changes to approve"));
+    }
+    record(&state, &user, "agent-key-approval", &format!("{} {}", body.id, if body.approve { "on" } else { "off" }));
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct AgentChangesQuery {
+    id: Option<i64>,
+    status: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn agent_key_changes(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AgentChangesQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let changes = crate::agent_keys::changes(&conn, query.id, query.status.as_deref().filter(|status| !status.is_empty()), query.limit.unwrap_or(200))
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(Json(json!({ "changes": changes })))
+}
+
+#[derive(Deserialize)]
+struct AgentDecisionBody {
+    id: i64,
+    approve: bool,
+}
+
+/// Carries out a change an agent asked for, or declines it.
+async fn decide_agent_change(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AgentDecisionBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let change = crate::mcp_organise::decide(&state, body.id, body.approve, &user.username).await.map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    Ok(Json(json!({ "change": change })))
+}
+
+async fn undo_agent_change(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AgentKeyId>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    require_write(&state)?;
+    let change = crate::mcp_organise::undo(&state, body.id, &user.username).await.map_err(|err| ApiError::new(StatusCode::CONFLICT, err))?;
+    Ok(Json(json!({ "change": change })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UndoSinceBody {
+    key_id: i64,
+    since: i64,
+}
+
+/// Undoes everything a key changed since a time, newest first. Ones that cannot be undone any
+/// more are skipped and named.
+async fn undo_agent_changes_since(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<UndoSinceBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    require_write(&state)?;
+    let made = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::agent_keys::changes(&conn, Some(body.key_id), Some("done"), 1000).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?
+    };
+    let (mut undone, mut skipped) = (0, Vec::new());
+    for change in made.into_iter().filter(|change| change.at >= body.since && change.can_undo) {
+        match crate::mcp_organise::undo(&state, change.id, &user.username).await {
+            Ok(_) => undone += 1,
+            Err(why) => skipped.push(json!({ "id": change.id, "change": change.summary, "why": why })),
+        }
+    }
+    Ok(Json(json!({ "undone": undone, "skipped": skipped })))
 }
 
 /// Makes a key. The answer is the only time its secret is shown.
@@ -8548,7 +9190,7 @@ async fn create_agent_key(
     let (user, _) = require_user(&state, &headers)?;
     require_admin(&user)?;
     let mut conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-    let (id, token) = crate::agent_keys::create(&mut conn, &state.root, user.id, &body.name, &body.level, &body.folders, body.expires_at, chrono::Utc::now().timestamp())
+    let (id, token) = crate::agent_keys::create(&mut conn, &state.root, user.id, &body.name, &body.level, body.approve, &body.folders, body.expires_at, chrono::Utc::now().timestamp())
         .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
     drop(conn);
     record(&state, &user, "agent-key-create", body.name.trim());

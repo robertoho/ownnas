@@ -24,11 +24,14 @@ await write('docs/deep/notes.md', 'deep notes about zebra habits\n');
 await write('docs/.env', 'API_KEY=zebra-secret\n');
 await write('docs/long.txt', 'é'.repeat(2000));
 await write('docs/binary.dat', Buffer.from([1, 2, 0, 3]));
+await write('docs/table.csv', 'name,amount\n"Smith, Ann",12.5\n"say ""hi""",3\n');
 await write('docs2/other.txt', 'zebra in the neighbouring folder\n');
 await write('secret/private.txt', 'zebra private words\n');
 await fs.writeFile(path.join(tmp, 'outside.txt'), 'zebra outside the library\n');
 // One white pixel.
-await write('docs/dot.png', Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==', 'base64'));
+const DOT = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==', 'base64');
+await write('docs/dot.png', DOT);
+await write('secret/hidden-album.png', DOT);
 await fs.symlink(path.join(library, 'secret'), path.join(library, 'docs/link-to-secret'));
 await fs.symlink(path.join(library, 'secret/private.txt'), path.join(library, 'docs/link-to-private.txt'));
 await fs.symlink(path.join(tmp, 'outside.txt'), path.join(library, 'docs/link-outside.txt'));
@@ -166,7 +169,7 @@ try {
   assert.equal((await fetch(`${base}/mcp`, { headers: { authorization: `Bearer ${key}` } })).status, 405);
   const init = await mcp(key, 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } });
   assert.equal(init.json.result.protocolVersion, '2025-06-18');
-  assert.deepEqual(init.json.result.capabilities, { tools: {} });
+  assert.deepEqual(init.json.result.capabilities, { tools: {}, prompts: {}, resources: {} });
   assert.match(init.json.result.instructions, /"docs"/);
   const newer = await mcp(key, 'initialize', { protocolVersion: '2099-01-01', capabilities: {}, clientInfo: { name: 'test', version: '1' } });
   assert.notEqual(newer.json.result.protocolVersion, '2099-01-01');
@@ -178,7 +181,9 @@ try {
   assert.equal(notJson.status, 400);
   assert.equal((await mcp(key, 'tools/call', { name: 'run_shell', arguments: {} })).json.error.code, -32602);
   const tools = (await mcp(key, 'tools/list')).json.result.tools;
-  assert.deepEqual(tools.map((t) => t.name).sort(), ['get_info', 'get_thumbnail', 'list_folder', 'read_text', 'search']);
+  const READING = ['album_photos', 'find_duplicates', 'folder_usage', 'get_info', 'get_thumbnail', 'list_albums', 'list_folder', 'list_notes', 'list_people', 'list_versions', 'person_photos', 'photo_search',
+    'photos_taken', 'read_note', 'read_table', 'read_text', 'read_version', 'recent_files', 'search', 'similar_photos'];
+  assert.deepEqual(tools.map((t) => t.name).sort(), READING, 'a read key sees no organising tools');
   assert.ok(tools.every((t) => t.annotations.readOnlyHint === true && t.inputSchema.type === 'object'));
 
   // Listing.
@@ -186,7 +191,7 @@ try {
   assert.deepEqual(start.entries.map((e) => e.path), ['docs']);
   const docs = data(await tool(key, 'list_folder', { path: 'docs' }));
   const names = docs.entries.map((e) => e.name).sort();
-  assert.deepEqual(names, ['binary.dat', 'deep', 'dot.png', 'long.txt', 'plan.txt']);
+  assert.deepEqual(names, ['binary.dat', 'deep', 'dot.png', 'long.txt', 'plan.txt', 'table.csv']);
   assert.equal(docs.more, false);
   const page = data(await tool(key, 'list_folder', { path: 'docs', limit: 2, offset: 1 }));
   assert.equal(page.entries.length, 2);
@@ -196,12 +201,19 @@ try {
   const escapes = ['secret', 'secret/private.txt', 'docs2', 'docs2/other.txt', 'docs/../secret/private.txt', '../outside.txt', 'docs/../../outside.txt',
     'docs/link-to-secret', 'docs/link-to-secret/private.txt', 'docs/link-to-private.txt', 'docs/link-outside.txt', 'docs/.env', '.ownnas-trash', 'docs/missing.txt',
     tmp + '/outside.txt', 'docs\\..\\secret\\private.txt'];
-  for (const name of ['read_text', 'get_info', 'get_thumbnail', 'list_folder']) {
+  for (const name of ['read_text', 'get_info', 'get_thumbnail', 'list_folder', 'read_table', 'list_versions', 'similar_photos']) {
     for (const target of escapes) await refused(key, name, { path: target });
   }
   await refused(key, 'search', { query: 'zebra', path: 'secret' });
   await refused(key, 'search', { query: 'zebra', path: 'docs/link-to-secret' });
   await refused(key, 'read_text', { path: '' });
+
+  // So many refusals in an hour: administrators are told, and the usage shows where.
+  const attention = (await api('GET', '/api/agent-keys/attention')).json;
+  assert.ok(attention.probing.some((entry) => entry.id === made.json.id && entry.refused >= 20), JSON.stringify(attention));
+  const keyUsage = (await api('GET', `/api/agent-keys/usage?id=${made.json.id}`)).json;
+  assert.ok(keyUsage.tools.find((row) => row.tool === 'read_text').outcomes.refused >= 16, JSON.stringify(keyUsage.tools));
+  assert.ok(keyUsage.days.at(-1).refused >= 20);
 
   // Search stays inside: by name, by word, and by tag.
   const tagged = async (rel) => assert.equal((await api('POST', '/api/tags', { path: rel, tag: 'zebra' })).status, 200);
@@ -252,6 +264,110 @@ try {
   assert.match(picture.mimeType, /^image\//);
   assert.ok(Buffer.from(picture.data, 'base64').length > 10);
 
+  // Tables, history, large pictures, photo details.
+  const table = data(await tool(key, 'read_table', { path: 'docs/table.csv' }));
+  assert.deepEqual(table.rows, [['name', 'amount'], ['Smith, Ann', '12.5'], ['say "hi"', '3']]);
+  assert.deepEqual(table.sheets, [{ name: 'table', rows: 3, columns: 2 }]);
+  const tablePage = data(await tool(key, 'read_table', { path: 'docs/table.csv', offset: 1, limit: 1 }));
+  assert.deepEqual(tablePage.rows, [['Smith, Ann', '12.5']]);
+  assert.equal(tablePage.more, true);
+  assert.equal((await tool(key, 'read_table', { path: 'docs/table.csv', sheet: 'nope' })).isError, true);
+  assert.equal((await tool(key, 'read_table', { path: 'docs/binary.dat' })).isError, true);
+  assert.deepEqual(data(await tool(key, 'list_versions', { path: 'docs/plan.txt' })).versions, []);
+  await refused(key, 'read_version', { path: 'docs/plan.txt', version: 1 });
+  const large = (await tool(key, 'get_thumbnail', { path: 'docs/dot.png', size: 'large' })).content[0];
+  assert.equal(large.mimeType, 'image/jpeg');
+  assert.ok(data(await tool(key, 'get_info', { path: 'docs/dot.png' })).details, 'photos come with their details');
+  const searchPage = data(await tool(key, 'search', { query: 'zebra', offset: 1, limit: 1 }));
+  assert.ok(searchPage.hits.length <= 1);
+
+  // Answers come as data too.
+  assert.equal((await tool(key, 'get_info', { path: 'docs/plan.txt' })).structuredContent.path, 'docs/plan.txt');
+
+  // Prompts, and files as resources.
+  const promptNames = (await mcp(key, 'prompts/list')).json.result.prompts.map((p) => p.name);
+  assert.deepEqual(promptNames.sort(), ['find_documents', 'photo_story', 'summarise_folder'], 'tidying is for organising keys');
+  const prompt = (await mcp(key, 'prompts/get', { name: 'summarise_folder', arguments: { folder: 'docs' } })).json.result;
+  assert.match(prompt.messages[0].content.text, /"docs"/);
+  assert.equal((await mcp(key, 'prompts/get', { name: 'tidy_folder', arguments: { folder: 'docs' } })).json.error.code, -32602);
+  const resources = (await mcp(key, 'resources/list')).json.result.resources;
+  assert.ok(resources.some((r) => r.uri === 'ownnas:///docs/plan.txt'), JSON.stringify(resources));
+  assert.equal(resources.some((r) => /env|link|secret/.test(r.uri)), false, JSON.stringify(resources));
+  const resource = (await mcp(key, 'resources/read', { uri: 'ownnas:///docs/plan.txt' })).json.result.contents[0];
+  assert.equal(resource.text, 'the launch plan: zebra crossing\n');
+  assert.equal((await mcp(key, 'resources/read', { uri: 'ownnas:///docs/dot.png' })).json.result.contents[0].mimeType, 'image/jpeg');
+  for (const uri of ['ownnas:///secret/private.txt', 'ownnas:///docs/link-to-private.txt', 'ownnas:///docs/.env', 'ownnas:///docs/%2E%2E/secret/private.txt', 'file:///etc/passwd']) {
+    const answer = (await mcp(key, 'resources/read', { uri })).json;
+    assert.ok(answer.error, uri);
+    assert.equal(JSON.stringify(answer).includes('private words'), false);
+  }
+  assert.ok((await mcp(key, 'resources/templates/list')).json.result.resourceTemplates.length === 1);
+
+  // What changed lately, and what takes up the space: only inside, never hidden files.
+  let recent = { files: [] };
+  for (let i = 0; i < 50 && !recent.files.length; i++) {
+    const answer = await tool(key, 'recent_files');
+    if (!answer.isError) recent = data(answer);
+    if (!recent.files.length) await sleep(200);
+  }
+  const recentPaths = recent.files.map((f) => f.path);
+  assert.ok(recentPaths.includes('docs/plan.txt'), JSON.stringify(recentPaths));
+  assert.ok(recentPaths.every((p) => p.startsWith('docs/') && !p.includes('.env') && !p.includes('link-')), JSON.stringify(recentPaths));
+  assert.deepEqual(data(await tool(key, 'recent_files', { since: '2099-01-01' })).files, []);
+  await refused(key, 'recent_files', { path: 'secret' });
+  const usage = data(await tool(key, 'folder_usage', { path: 'docs' }));
+  assert.deepEqual(usage.folders.map((f) => f.path), ['docs/deep']);
+  assert.ok(usage.largestFiles.some((f) => f.path === 'docs/long.txt'));
+  assert.equal(usage.largestFiles.some((f) => f.path.includes('.env')), false);
+  assert.equal(usage.bytes, usage.largestFiles.reduce((sum, f) => sum + f.bytes, 0) + usage.folders.reduce((sum, f) => sum + f.bytes, 0), 'hidden files are not counted');
+  await refused(key, 'folder_usage', { path: 'secret' });
+
+  // Duplicates: only copies the key can see, and a copy elsewhere is not even hinted at.
+  await write('docs/deep/copy-a.txt', 'the very same words\n');
+  await write('docs/deep/copy-b.txt', 'the very same words\n');
+  await write('secret/copy-c.txt', 'the very same words\n');
+  let dupes = { groups: [] };
+  for (let i = 0; i < 50 && !dupes.groups.length; i++) {
+    const answer = await tool(key, 'find_duplicates', { path: 'docs' });
+    if (!answer.isError) dupes = data(answer);
+    if (!dupes.groups.length) await sleep(200);
+  }
+  assert.deepEqual(dupes.groups.map((g) => g.copies.map((c) => c.path).sort()), [['docs/deep/copy-a.txt', 'docs/deep/copy-b.txt']]);
+  assert.equal(dupes.wastedBytes, 20);
+  assert.equal(JSON.stringify(dupes).includes('secret'), false);
+  await refused(key, 'find_duplicates', { path: 'secret' });
+  await fs.rm(path.join(library, 'docs/deep/copy-a.txt'));
+  await fs.rm(path.join(library, 'docs/deep/copy-b.txt'));
+
+  // Albums only show with photos the key can see, and never name the others.
+  const album = async (name, paths) => {
+    const madeAlbum = await api('POST', '/api/albums', { name });
+    assert.equal(madeAlbum.status, 200, JSON.stringify(madeAlbum.json));
+    const id = madeAlbum.json.album.id;
+    const added = await api('POST', '/api/albums/items', { albumId: id, paths });
+    assert.equal(added.status, 200, JSON.stringify(added.json));
+    return id;
+  };
+  const shared = await album('Shared trip', ['docs/dot.png', 'secret/hidden-album.png']);
+  const hidden = await album('Private trip', ['secret/hidden-album.png']);
+  const albums = data(await tool(key, 'list_albums')).albums;
+  assert.deepEqual(albums.map((a) => [a.id, a.name, a.photos]), [[shared, 'Shared trip', 1]]);
+  assert.deepEqual(data(await tool(key, 'album_photos', { album: shared })).photos.map((p) => p.path), ['docs/dot.png']);
+  await refused(key, 'album_photos', { album: hidden });
+  await refused(key, 'album_photos', { album: 99999 });
+  assert.equal(JSON.stringify(await tool(key, 'list_albums')).includes('Private'), false);
+  assert.deepEqual(data(await tool(key, 'list_people')).people, []);
+  assert.equal((await tool(key, 'photos_taken', { from: '2000-01-01', to: '2099-12-31' })).isError, false);
+  assert.equal((await tool(key, 'photos_taken', { from: 'yesterday', to: '2099-12-31' })).isError, true);
+  await refused(key, 'photos_taken', { from: '2000-01-01', to: '2099-12-31', path: 'secret' });
+  const taken = data(await tool(key, 'photos_taken', { from: '2000-01-01', to: '2099-12-31' })).photos;
+  assert.ok(taken.every((p) => p.path.startsWith('docs/')), JSON.stringify(taken));
+
+  // A read key cannot change anything.
+  const readOnly = await tool(key, 'add_tags', { paths: ['docs/plan.txt'], tags: ['x'] });
+  assert.equal(readOnly.isError, true);
+  assert.match(readOnly.content[0].text, /can only read/);
+
   // The log has what happened, refusals too, and never a secret.
   const log = (await api('GET', '/api/agent-keys/log?limit=1000')).json.entries;
   assert.ok(log.some((entry) => entry.tool === 'read_text' && entry.path === 'secret/private.txt' && entry.outcome === 'refused'));
@@ -288,6 +404,237 @@ try {
   for (const [file, print] of Object.entries(before)) {
     if (file.includes('/secret/')) continue;
     assert.equal(after[file], print, `${file} changed`);
+  }
+  // Organising: a key that can tag, make folders, rename, move, and use the Trash and albums,
+  // only inside its folders.
+  await write('work/a.txt', 'a\n');
+  await write('work/keep.txt', 'keep\n');
+  await write('work/pic.png', DOT);
+  const organiser = await api('POST', '/api/agent-keys', { name: 'tidy', folders: ['work'], level: 'organise' });
+  assert.equal(organiser.status, 200, JSON.stringify(organiser.json));
+  const tidy = organiser.json.token;
+  const tidyTools = (await mcp(tidy, 'tools/list')).json.result.tools.map((t) => t.name);
+  for (const name of ['add_tags', 'remove_tags', 'create_folder', 'rename', 'move', 'move_to_trash', 'create_album', 'add_to_album', 'remove_from_album']) {
+    assert.ok(tidyTools.includes(name), name);
+  }
+  assert.match((await mcp(tidy, 'initialize', { protocolVersion: '2025-06-18', capabilities: {} })).json.result.instructions, /organise/);
+  const exists = async (rel) => fs.access(path.join(library, rel)).then(() => true, () => false);
+
+  // Tags: all or nothing when one path is out of bounds.
+  assert.equal(data(await tool(tidy, 'add_tags', { paths: ['work/a.txt'], tags: ['#todo', 'q3'] })).changed, 1);
+  assert.deepEqual(data(await tool(tidy, 'get_info', { path: 'work/a.txt' })).tags.sort(), ['q3', 'todo']);
+  await refused(tidy, 'add_tags', { paths: ['work/keep.txt', 'docs/plan.txt'], tags: ['x'] });
+  assert.deepEqual(data(await tool(tidy, 'get_info', { path: 'work/keep.txt' })).tags, []);
+  await tool(tidy, 'remove_tags', { paths: ['work/a.txt'], tags: ['q3'] });
+  assert.deepEqual(data(await tool(tidy, 'get_info', { path: 'work/a.txt' })).tags, ['todo']);
+
+  // Folders, renaming and moving.
+  assert.equal(data(await tool(tidy, 'create_folder', { path: 'work', name: 'sorted' })).path, 'work/sorted');
+  assert.equal((await tool(tidy, 'create_folder', { path: 'work', name: 'sorted' })).isError, true);
+  await refused(tidy, 'create_folder', { path: 'docs', name: 'planted' });
+  assert.equal(await exists('docs/planted'), false);
+  assert.equal(data(await tool(tidy, 'move', { path: 'work/a.txt', to: 'work/sorted' })).path, 'work/sorted/a.txt');
+  assert.ok(await exists('work/sorted/a.txt'));
+  assert.deepEqual(data(await tool(tidy, 'get_info', { path: 'work/sorted/a.txt' })).tags, ['todo'], 'tags follow a move');
+  await refused(tidy, 'move', { path: 'work/keep.txt', to: 'docs' });
+  await refused(tidy, 'move', { path: 'docs/plan.txt', to: 'work' });
+  await refused(tidy, 'move', { path: 'work/keep.txt', to: '.ownnas-trash' });
+  assert.equal((await tool(tidy, 'move', { path: 'work/sorted', to: 'work/sorted' })).isError, true);
+  assert.equal(data(await tool(tidy, 'rename', { path: 'work/sorted/a.txt', name: 'b.txt' })).path, 'work/sorted/b.txt');
+  assert.equal((await tool(tidy, 'rename', { path: 'work/sorted/b.txt', name: '../escape.txt' })).isError, true);
+  assert.equal((await tool(tidy, 'rename', { path: 'work', name: 'renamed' })).isError, true, "a key's own folder stays");
+  assert.equal((await tool(tidy, 'move_to_trash', { path: 'work' })).isError, true);
+
+  // The Trash, but never protected files.
+  assert.equal((await tool(tidy, 'move_to_trash', { path: 'work/sorted/b.txt' })).isError, false);
+  assert.equal(await exists('work/sorted/b.txt'), false);
+  assert.ok((await fs.readdir(path.join(library, '.ownnas-trash'), { recursive: true })).some((name) => name.endsWith('b.txt')), 'it is in the Trash');
+  assert.equal((await api('POST', '/api/protect', { paths: ['work/keep.txt'], protect: true })).status, 200);
+  const kept = await tool(tidy, 'move_to_trash', { path: 'work/keep.txt' });
+  assert.equal(kept.isError, true);
+  assert.match(kept.content[0].text, /protected/);
+  assert.ok(await exists('work/keep.txt'));
+  await refused(tidy, 'move_to_trash', { path: 'docs/table.csv' });
+
+  // Albums: its own, or ones with its photos; never the others.
+  const tidyAlbum = data(await tool(tidy, 'create_album', { name: 'Work pictures' })).album;
+  assert.equal(data(await tool(tidy, 'add_to_album', { album: tidyAlbum, paths: ['work/pic.png'] })).changed, 1);
+  assert.deepEqual(data(await tool(tidy, 'album_photos', { album: tidyAlbum })).photos.map((p) => p.path), ['work/pic.png']);
+  await refused(tidy, 'add_to_album', { album: tidyAlbum, paths: ['docs/dot.png'] });
+  await refused(tidy, 'add_to_album', { album: shared, paths: ['work/pic.png'] });
+  assert.equal((await tool(tidy, 'add_to_album', { album: tidyAlbum, paths: ['work/keep.txt'] })).isError, true, 'only photos and videos');
+  assert.equal(data(await tool(tidy, 'remove_from_album', { album: tidyAlbum, paths: ['work/pic.png'] })).changed, 1);
+
+  // Every change is in the agent log.
+  const tidyLog = (await api('GET', `/api/agent-keys/log?id=${organiser.json.id}&limit=1000`)).json.entries;
+  assert.ok(tidyLog.some((entry) => entry.tool === 'move' && entry.outcome === 'ok' && entry.detail.includes('work/sorted')), JSON.stringify(tidyLog.slice(0, 5)));
+  assert.ok(tidyLog.some((entry) => entry.tool === 'move' && entry.outcome === 'refused'));
+  // Undo: everything the key did today, newest first, back to how it was.
+  const tidyChanges = (await api('GET', `/api/agent-keys/changes?id=${organiser.json.id}`)).json.changes;
+  assert.ok(tidyChanges.length >= 9, JSON.stringify(tidyChanges.map((c) => c.summary)));
+  assert.ok(tidyChanges.every((c) => c.status === 'done'), 'refused and failed calls are not changes');
+  assert.ok(tidyChanges.some((c) => c.summary === 'Move work/a.txt into work/sorted' && c.canUndo));
+  const undid = await api('POST', '/api/agent-keys/changes/undo-since', { keyId: organiser.json.id, since: 0 });
+  assert.equal(undid.status, 200, JSON.stringify(undid.json));
+  assert.deepEqual(undid.json.skipped, [], JSON.stringify(undid.json.skipped));
+  assert.ok(await exists('work/a.txt'), 'moved, renamed and trashed, and back where it started');
+  assert.equal(await exists('work/sorted'), false, 'the folder it made is gone again');
+  assert.deepEqual(data(await tool(tidy, 'get_info', { path: 'work/a.txt' })).tags, [], 'its tags are gone');
+  assert.equal((await api('GET', `/api/albums?id=${tidyAlbum}`)).status >= 400, true, 'the album it made is gone');
+  const again = await api('POST', '/api/agent-keys/changes/undo', { id: tidyChanges[0].id });
+  assert.equal(again.status, 409, 'an undone change cannot be undone twice');
+
+  // Approval mode: changes wait for a person, and are checked again when carried out.
+  const careful = (await api('POST', '/api/agent-keys', { name: 'careful', folders: ['work'], level: 'organise', approve: true })).json;
+  const asked = data(await tool(careful.token, 'create_folder', { path: 'work', name: 'inbox' }));
+  assert.equal(asked.status, 'pending');
+  assert.equal(await exists('work/inbox'), false, 'nothing happens before approval');
+  await refused(careful.token, 'create_folder', { path: 'docs', name: 'inbox' });
+  const renameAsk = data(await tool(careful.token, 'rename', { path: 'work/a.txt', name: 'z.txt' }));
+  assert.equal((await api('GET', '/api/agent-keys')).json.pending[careful.id], 2);
+  assert.deepEqual(data(await tool(careful.token, 'pending_changes', { status: 'pending' })).changes.map((c) => c.status), ['pending', 'pending']);
+  const approved = await api('POST', '/api/agent-keys/changes/decide', { id: asked.request, approve: true });
+  assert.equal(approved.status, 200, JSON.stringify(approved.json));
+  assert.equal(approved.json.change.status, 'done');
+  assert.ok(await exists('work/inbox'));
+  assert.equal((await api('POST', '/api/agent-keys/changes/decide', { id: asked.request, approve: true })).status, 400, 'decided once');
+  assert.equal((await api('POST', '/api/agent-keys/changes/decide', { id: renameAsk.request, approve: false })).json.change.status, 'declined');
+  assert.ok(await exists('work/a.txt'), 'a declined change is not made');
+  const late = data(await tool(careful.token, 'move_to_trash', { path: 'work/a.txt' }));
+  assert.equal((await api('POST', '/api/agent-keys/approval', { id: careful.id, approve: false })).status, 200);
+  assert.equal(data(await tool(careful.token, 'create_folder', { path: 'work', name: 'direct' })).path, 'work/direct', 'without asking now');
+  assert.equal((await api('POST', '/api/agent-keys/revoke', { id: careful.id })).status, 200);
+  const afterRevoke = (await api('POST', '/api/agent-keys/changes/decide', { id: late.request, approve: true })).json.change;
+  assert.equal(afterRevoke.status, 'declined');
+  assert.match(afterRevoke.result, /revoked/);
+  assert.ok(await exists('work/a.txt'), 'a revoked key changes nothing, even approved');
+  assert.equal((await api('POST', '/api/agent-keys/approval', { id: made.json.id, approve: true })).status, 400, 'read keys have nothing to approve');
+
+  // Writing: new files, passages, rows and copies, each kept in the history and undone.
+  await write('notes/plan.md', '# Plan\n\nStep one.\nStep two.\n');
+  await write('notes/sheet.csv', 'name,amount\nAnn,1\n');
+  const writerKey = (await api('POST', '/api/agent-keys', { name: 'writer', folders: ['notes'], level: 'write' })).json;
+  const writer = writerKey.token;
+  const writeTools = (await mcp(writer, 'tools/list')).json.result.tools.map((t) => t.name);
+  for (const name of ['write_file', 'edit_text', 'append_rows', 'copy', 'move', 'add_tags']) assert.ok(writeTools.includes(name), name);
+  assert.equal(tidyTools.includes('write_file'), false, 'organise keys cannot write');
+  assert.match((await tool(tidy, 'write_file', { path: 'work/x.txt', text: 'x' })).content[0].text, /cannot write/);
+  const read = async (rel) => fs.readFile(path.join(library, rel), 'utf8');
+
+  assert.equal(data(await tool(writer, 'write_file', { path: 'notes/summary.md', text: '# Summary\n' })).path, 'notes/summary.md');
+  assert.equal(await read('notes/summary.md'), '# Summary\n');
+  assert.match((await tool(writer, 'write_file', { path: 'notes/summary.md', text: 'again' })).content[0].text, /replace: true/);
+  assert.equal(data(await tool(writer, 'write_file', { path: 'notes/summary.md', text: 'replaced\n', replace: true })).replaced, true);
+  await refused(writer, 'write_file', { path: 'docs/planted.txt', text: 'x' });
+  await refused(writer, 'write_file', { path: 'notes/../docs/planted.txt', text: 'x' });
+  assert.equal((await tool(writer, 'write_file', { path: 'notes/.env', text: 'x' })).isError, true);
+  assert.equal((await tool(writer, 'write_file', { path: 'notes/missing/x.txt', text: 'x' })).isError, true);
+  assert.equal(await exists('docs/planted.txt'), false);
+
+  assert.equal((await tool(writer, 'edit_text', { path: 'notes/plan.md', find: 'Step', replace: 'Stage' })).isError, true, 'twice in the file');
+  assert.equal((await tool(writer, 'edit_text', { path: 'notes/plan.md', find: 'Step three', replace: 'x' })).isError, true, 'not in the file');
+  await tool(writer, 'edit_text', { path: 'notes/plan.md', find: 'Step two.', replace: 'Step two, done.' });
+  assert.equal(await read('notes/plan.md'), '# Plan\n\nStep one.\nStep two, done.\n');
+  await tool(writer, 'edit_text', { path: 'notes/plan.md', find: 'Step one.', replace: 'Step one, done.' });
+  await refused(writer, 'edit_text', { path: 'docs/plan.txt', find: 'zebra', replace: 'horse' });
+  assert.equal((await tool(writer, 'edit_text', { path: 'notes/../docs/dot.png', find: 'P', replace: 'Q' })).isError, true);
+
+  assert.equal(data(await tool(writer, 'append_rows', { path: 'notes/sheet.csv', rows: [['Bob, Jr.', 2], ['Cy', null]] })).added, 2);
+  assert.equal(await read('notes/sheet.csv'), 'name,amount\nAnn,1\n"Bob, Jr.",2\nCy,\n');
+  assert.equal((await tool(writer, 'append_rows', { path: 'notes/plan.md', rows: [['x']] })).isError, true);
+  const copied = data(await tool(writer, 'copy', { path: 'notes/plan.md', to: 'notes' })).path;
+  assert.notEqual(copied, 'notes/plan.md');
+  assert.ok(await exists(copied));
+  await refused(writer, 'copy', { path: 'notes/plan.md', to: 'docs' });
+  await refused(writer, 'copy', { path: 'docs/plan.txt', to: 'notes' });
+  assert.ok(data(await tool(writer, 'list_versions', { path: 'notes/plan.md' })).versions.length >= 2, 'each change kept a version');
+
+  // Undo it all, newest first: the files are as they were, and the new ones are in the Trash.
+  const undoneWrites = await api('POST', '/api/agent-keys/changes/undo-since', { keyId: writerKey.id, since: 0 });
+  assert.deepEqual(undoneWrites.json.skipped, [], JSON.stringify(undoneWrites.json));
+  assert.equal(await read('notes/plan.md'), '# Plan\n\nStep one.\nStep two.\n');
+  assert.equal(await read('notes/sheet.csv'), 'name,amount\nAnn,1\n');
+  assert.equal(await exists('notes/summary.md'), false);
+  assert.equal(await exists(copied), false);
+
+  // Writing can wait for approval too.
+  const askingWriter = (await api('POST', '/api/agent-keys', { name: 'asking writer', folders: ['notes'], level: 'write', approve: true })).json;
+  const askedWrite = data(await tool(askingWriter.token, 'write_file', { path: 'notes/new.md', text: 'hello\n' }));
+  assert.equal(askedWrite.status, 'pending');
+  assert.equal(await exists('notes/new.md'), false);
+  await refused(askingWriter.token, 'write_file', { path: 'docs/new.md', text: 'x' });
+  assert.equal((await api('POST', '/api/agent-keys/changes/decide', { id: askedWrite.request, approve: true })).json.change.status, 'done');
+  assert.equal(await read('notes/new.md'), 'hello\n');
+
+  // Notes: read and written only when the notes folder is the key's.
+  await write('Journal/Groceries.md', '# Groceries\n\n- [ ] milk\n- [ ] eggs\n');
+  await write('Journal/Pancakes.md', 'Needs things from [[Groceries]]. #cooking\n');
+  assert.equal((await api('POST', '/api/notes/folder', { folder: 'Journal' })).status, 200, 'the notes folder is a setting');
+  const docsOnly = (await api('POST', '/api/agent-keys', { name: 'docs only', folders: ['docs'] })).json.token;
+  assert.match((await tool(docsOnly, 'list_notes')).content[0].text, /cannot use/, 'not a folder of the docs key');
+  const noteKey = (await api('POST', '/api/agent-keys', { name: 'notes', folders: ['Journal'], level: 'write' })).json;
+  const noter = noteKey.token;
+  const listedNotes = data(await tool(noter, 'list_notes')).notes;
+  assert.deepEqual(listedNotes.map((n) => n.title).sort(), ['Groceries', 'Pancakes']);
+  assert.deepEqual(listedNotes.find((n) => n.title === 'Groceries').items, [{ text: 'milk', done: false }, { text: 'eggs', done: false }]);
+  assert.deepEqual(data(await tool(noter, 'list_notes', { label: 'cooking' })).notes.map((n) => n.title), ['Pancakes']);
+  const groceries = data(await tool(noter, 'read_note', { path: 'Journal/Groceries.md' }));
+  assert.deepEqual(groceries.linkedFrom, [{ path: 'Journal/Pancakes.md', title: 'Pancakes' }]);
+  assert.equal(data(await tool(noter, 'tick_item', { path: 'Journal/Groceries.md', item: 'MILK' })).done, true);
+  assert.equal(await fs.readFile(path.join(library, 'Journal/Groceries.md'), 'utf8'), '# Groceries\n\n- [x] milk\n- [ ] eggs\n');
+  assert.equal((await tool(noter, 'tick_item', { path: 'Journal/Groceries.md', item: 'milk' })).isError, true, 'ticked already');
+  await tool(noter, 'append_to_note', { path: 'Journal/Groceries.md', text: '- [ ] butter' });
+  assert.equal(await fs.readFile(path.join(library, 'Journal/Groceries.md'), 'utf8'), '# Groceries\n\n- [x] milk\n- [ ] eggs\n- [ ] butter\n');
+  const madeNote = data(await tool(noter, 'create_note', { title: 'Trip: Rome', text: 'Ideas #travel', checklist: ['tickets', 'hotel'] })).path;
+  assert.equal(madeNote, 'Journal/Trip Rome.md');
+  assert.equal(await fs.readFile(path.join(library, madeNote), 'utf8'), '# Trip: Rome\n\nIdeas #travel\n- [ ] tickets\n- [ ] hotel\n');
+  const undoneNotes = await api('POST', '/api/agent-keys/changes/undo-since', { keyId: noteKey.id, since: 0 });
+  assert.deepEqual(undoneNotes.json.skipped, []);
+  assert.equal(await fs.readFile(path.join(library, 'Journal/Groceries.md'), 'utf8'), '# Groceries\n\n- [ ] milk\n- [ ] eggs\n');
+  assert.equal(await exists(madeNote), false);
+
+  // Per key: its own tools, folders it may only read, and its own limits.
+  await fs.mkdir(path.join(library, 'notes/inbox'), { recursive: true });
+  const limitedKey = (await api('POST', '/api/agent-keys', { name: 'limited', folders: ['notes', 'notes/inbox'], level: 'write' })).json;
+  const limited = limitedKey.token;
+  const setLimits = (body) => api('POST', '/api/agent-keys/settings', { id: limitedKey.id, ...body });
+  assert.equal((await setLimits({ readOnly: ['notes'] })).status, 200);
+  assert.match((await tool(limited, 'write_file', { path: 'notes/x.md', text: 'x' })).content[0].text, /read-only/);
+  assert.equal(await exists('notes/x.md'), false);
+  assert.equal(data(await tool(limited, 'write_file', { path: 'notes/inbox/x.md', text: 'x' })).path, 'notes/inbox/x.md', 'a folder of its own inside a read-only one');
+  assert.match((await tool(limited, 'move', { path: 'notes/inbox/x.md', to: 'notes' })).content[0].text, /read-only/);
+  assert.match((await tool(limited, 'add_tags', { paths: ['notes/plan.md'], tags: ['x'] })).content[0].text, /read-only/);
+  assert.equal(data(await tool(limited, 'read_text', { path: 'notes/plan.md' })).path, 'notes/plan.md', 'reading is still fine');
+  assert.equal((await setLimits({ readOnly: ['docs'] })).status, 400, 'only its own folders');
+  assert.equal((await setLimits({ tools: ['run_shell'] })).status, 400);
+  assert.equal((await setLimits({ tools: [] })).status, 400);
+  assert.equal((await setLimits({ tools: ['list_folder', 'read_text', 'write_file'], readOnly: ['notes'] })).status, 200);
+  assert.deepEqual((await mcp(limited, 'tools/list')).json.result.tools.map((t) => t.name).sort(), ['list_folder', 'read_text', 'write_file']);
+  assert.match((await tool(limited, 'search', { query: 'plan' })).content[0].text, /not given that tool/);
+  assert.equal((await api('GET', '/api/agent-keys')).json.keys.find((k) => k.id === limitedKey.id).readOnly[0], 'notes');
+  assert.equal((await setLimits({ dailyChanges: 1 })).status, 200);
+  assert.equal(data(await tool(limited, 'write_file', { path: 'notes/inbox/y.md', text: 'y' })).status, 'pending', 'one change today already');
+  assert.match(data(await tool(limited, 'write_file', { path: 'notes/inbox/z.md', text: 'z' })).why, /1 changes today/);
+  assert.equal((await setLimits({ callsPerMinute: 3 })).status, 200);
+  const quick = [];
+  for (let i = 0; i < 4; i++) quick.push((await mcp(limited, 'ping')).status);
+  assert.equal(quick.at(-1), 429, JSON.stringify(quick));
+
+  // A key stuck in a loop is slowed down, and others are not.
+  const busy = (await api('POST', '/api/agent-keys', { name: 'busy', folders: ['docs'] })).json.token;
+  const statuses = [];
+  for (let i = 0; i < 301; i++) statuses.push((await mcp(busy, 'ping')).status);
+  assert.deepEqual([...new Set(statuses.slice(0, 300))], [200]);
+  const slowed = await mcp(busy, 'ping');
+  assert.equal(slowed.status, 429);
+  assert.ok(Number(slowed.headers.get('retry-after')) > 0);
+  assert.equal((await mcp(writer, 'ping')).status, 200, 'other keys go on');
+
+  // And nothing outside its folder changed.
+  const afterTidy = await fingerprints(library);
+  for (const [file, print] of Object.entries(before)) {
+    if (file.includes('/secret/')) continue;
+    assert.equal(afterTidy[file], print, `${file} changed`);
   }
   console.log('ok: MCP endpoint and agent keys');
 } catch (err) {

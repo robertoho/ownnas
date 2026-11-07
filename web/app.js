@@ -1386,6 +1386,7 @@ function openSelectionMenu(x, y, pasteInto) {
       buttons.push(`<button type="button" data-menu="uploadsLog">Recent uploads…</button>`);
     }
     if (write && customizableFolder({ path: state.path, dir: true, kind: 'folder' })) buttons.push('<button type="button" data-menu="folderAppearance">Customize folder…</button>');
+    if (state.me && state.me.admin && state.workspaceCount && state.path && !inTrash) buttons.push(`<button type="button" data-menu="showFolderInWorkspace">Show this folder in workspace…</button>`);
     buttons.push(`<button type="button" data-menu="downloadZip">Download folder zip</button>`);
     buttons.push(`<button type="button" data-menu="search">Search…</button>`);
     buttons.push(`<button type="button" data-menu="library">Library</button>`);
@@ -1480,6 +1481,10 @@ function openSelectionMenu(x, y, pasteInto) {
     }
     if (write && !allInTrash && entries.every((entry) => !entry.dir && ["image", "video", "svg"].includes(entry.kind))) {
       buttons.push(`<button type="button" data-menu="addToAlbum">Add to album…</button>`);
+      if (state.workspaceCount) buttons.push(`<button type="button" data-menu="showInWorkspace">Show in workspace…</button>`);
+    }
+    if (state.me && state.me.admin && state.workspaceCount && !allInTrash && entries.length && entries.every((entry) => entry.dir)) {
+      buttons.push(`<button type="button" data-menu="showFolderInWorkspace" title="Every photo and video in it, including ones added later">Show in workspace…</button>`);
     }
     if (write && entries.length && !allInTrash) {
       buttons.push(`<button type="button" data-menu="rename">Rename</button>`);
@@ -1510,6 +1515,8 @@ function closePreview(force = false) {
   setPreviewFullscreen(false);
   $("preview").hidden = true;
   state.current = null;
+  // A note may have changed in the editor.
+  if (notesOpen()) notesApi?.refresh();
   $("preview-body").innerHTML = "";
   $("preview-path").hidden = true;
   $("preview-path").textContent = "";
@@ -2315,6 +2322,7 @@ async function gallery() {
     galleryApi = galleryModule.mountGallery($("gallery"), {
       api,
       toast,
+      workspacesChanged: (count) => { state.workspaceCount = count; },
       askText,
       askConfirm,
       canWrite: () => !!(state.me && !state.me.readonly),
@@ -2338,8 +2346,54 @@ async function gallery() {
   return galleryApi;
 }
 
-/// Shows what the address names: the Gallery (#gallery…) or a folder (#/path).
+let notesModule = null;
+let notesApi = null;
+
+function notesOpen() {
+  return document.body.classList.contains("is-notes");
+}
+
+/// Loads Notes on first use.
+async function notes() {
+  if (!notesApi) {
+    notesModule = notesModule || await import("/assets/notes.js");
+    notesApi = notesModule.mountNotes($("notes-view"), {
+      api,
+      toast,
+      canWrite: () => !!(state.me && !state.me.readonly),
+      isAdmin: () => !!(state.me && state.me.admin),
+      pickFolder: (options) => pickFolder(options),
+      tag: (paths) => bulkTagEntries(paths.map((path) => ({ path, name: path.split("/").pop(), dir: false, size: 0, modified: 0, kind: "text" }))),
+      showInFolder: (path) => openFileByPath(path).catch((err) => toast(err.message, true)),
+      openFolder: (path) => { location.hash = `#/${path.split("/").map(encodeURIComponent).join("/")}`; },
+      openNote: async (path, edit) => {
+        await openEntry({ path, name: path.split("/").pop(), dir: false, size: 0, modified: 0, kind: "text" });
+        if (edit) document.querySelector('#preview [data-editor="mode"][data-mode="edit"]')?.click();
+      },
+    });
+  }
+  return notesApi;
+}
+
+/// Shows what the address names: the Gallery (#gallery…), Notes (#notes…), or a folder (#/path).
 async function route() {
+  if (location.hash.startsWith("#notes")) {
+    if (galleryOpen()) {
+      document.body.classList.remove("is-gallery");
+      galleryApi?.hide();
+    }
+    const api = await notes();
+    closeMenu();
+    state.selected = new Set();
+    document.body.classList.add("is-notes");
+    $("crumbs").innerHTML = `<button type="button" data-go="">${esc(state.me.rootName || "Library")}</button><span class="muted">/</span><button type="button" aria-current="page">Notes</button>`;
+    api.show(location.hash);
+    return;
+  }
+  if (notesOpen()) {
+    document.body.classList.remove("is-notes");
+    notesApi?.hide();
+  }
   if (location.hash.startsWith("#gallery")) {
     const api = await gallery();
     closeMenu();
@@ -5399,6 +5453,11 @@ function syncControls() {
   $("hidden-toggle").checked = state.hidden;
 }
 
+/// Whether there are Gallery workspaces, so the files' menu offers Show in workspace.
+function refreshWorkspaceCount() {
+  api("/api/workspaces").then((data) => { state.workspaceCount = data.workspaces.length; }).catch(() => {});
+}
+
 async function boot() {
   try {
     state.me = await api("/api/me", { allow401: true });
@@ -5416,12 +5475,17 @@ async function boot() {
     // The server checks once a day; looking every few hours is enough to notice.
     if (!updateStatusTimer) updateStatusTimer = setInterval(pollUpdateNotice, 3 * 60 * 60 * 1000);
   }
+  if (state.me.admin) {
+    pollAgentChanges();
+    if (!agentChangesTimer) agentChangesTimer = setInterval(pollAgentChanges, 60_000);
+  }
   syncControls();
   // Music from before a reload comes back paused, where it was.
   let savedMusic = null;
   try { savedMusic = localStorage.getItem("ownnas-music"); } catch {}
   if (savedMusic) music().then((player) => player.restore()).catch(() => {});
   refreshSmartStatus().then(syncSimilarButton);
+  refreshWorkspaceCount();
   pollHealthAlerts().catch(() => {});
   if (!healthTimer) healthTimer = setInterval(() => pollHealthAlerts().catch(() => {}), 10 * 60 * 1000);
   pollTrashReminder();
@@ -5628,6 +5692,29 @@ function showUpdatePill(update) {
 
 $("update-pill-open").addEventListener("click", () => openSettings("updates"));
 
+// ---- Changes AI agents asked for, waiting for an administrator to approve them ----
+
+let agentChangesTimer = null;
+
+async function pollAgentChanges() {
+  if (!state.me?.admin) return;
+  try {
+    const { pending, probing } = await api("/api/agent-keys/attention");
+    const notes = [];
+    if (pending) notes.push(pending === 1 ? "1 agent change waiting" : `${pending} agent changes waiting`);
+    if (probing.length === 1) notes.push(`Agent key “${probing[0].name}” refused ${probing[0].refused} times`);
+    else if (probing.length) notes.push(`${probing.length} agent keys refused often`);
+    $("agent-pill").hidden = !notes.length;
+    $("agent-pill-text").textContent = notes.join(" · ");
+  } catch {}
+}
+
+$("agent-pill-open").addEventListener("click", () => {
+  openSettings("agents");
+  // Seen: it comes back with the next check while changes are still waiting.
+  $("agent-pill").hidden = true;
+});
+
 // ---- A reminder when the Trash has held things a long time (they stay until it is emptied) ----
 
 const TRASH_SNOOZE_KEY = "ownnas-trash-snooze";
@@ -5743,6 +5830,10 @@ $("crumbs").addEventListener("click", (event) => {
   const button = event.target.closest("[data-go]");
   if (!button) return;
   go(button.dataset.go).catch((err) => toast(err.message, true));
+});
+
+$("notes-btn").addEventListener("click", () => {
+  location.hash = "#notes";
 });
 
 $("gallery-btn").addEventListener("click", () => {
@@ -6041,6 +6132,11 @@ function runMenuAction(button, entries, pasteInto) {
     playMusic(action, entries).catch((err) => toast(err.message, true));
   }
   if (action === "addToAlbum") gallery().then((api) => api.pickAlbum(entries.map((entry) => entry.path))).catch((err) => toast(err.message, true));
+  if (action === "showInWorkspace") gallery().then((api) => api.showInWorkspaces(entries.map((entry) => entry.path))).catch((err) => toast(err.message, true));
+  if (action === "showFolderInWorkspace") {
+    const folders = entries.length ? entries.map((entry) => entry.path) : [state.path];
+    gallery().then((api) => api.showFoldersInWorkspaces(folders)).catch((err) => toast(err.message, true));
+  }
   if (action === "bookmark") $("bookmark-btn").click();
   if (action === "usage") $("usage-btn").click();
   if (action === "reindex") reindexFolder(one && one.dir ? one.path : state.path).catch((err) => toast(err.message, true));

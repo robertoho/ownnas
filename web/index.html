@@ -71,6 +71,12 @@
               <circle cx="11.25" cy="10.75" r="1.75" fill="none" stroke="currentColor" stroke-width="1.35"/>
             </svg>
           </button>
+          <button id="notes-btn" class="icon-btn" type="button" title="Notes: quick notes and checklists" aria-label="Notes">
+            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+              <path d="M3.25 1.75h7l2.5 2.5v10h-9.5z" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/>
+              <path d="M5.5 6.5h5M5.5 9h5M5.5 11.5h3" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/>
+            </svg>
+          </button>
           <button id="gallery-btn" class="icon-btn" type="button" title="Gallery: photos, albums, and tags" aria-label="Gallery">
             <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
               <rect x="1.75" y="2.75" width="12.5" height="10.5" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.35"/>
@@ -274,6 +280,7 @@
       <p id="empty" class="empty" hidden></p>
     </main>
     <section id="gallery" class="gallery" aria-label="Gallery" hidden></section>
+    <section id="notes-view" class="notes-view" aria-label="Notes" hidden></section>
     <div id="music-bar" class="music-bar" role="region" aria-label="Music player" hidden></div>
     <footer class="explorer-status-bar" aria-label="File browser status and tile size">
       <div class="status-summary" role="status" aria-live="polite" aria-atomic="true">
@@ -290,6 +297,9 @@
           <button id="trash-pill-open" type="button" title="Open the Trash"><span id="trash-pill-text"></span><span id="trash-pill-short"></span></button>
           <button id="trash-pill-empty" type="button" title="Permanently delete what has been in the Trash for over a month">Empty those</button>
           <button id="trash-pill-later" type="button" class="update-pill-later" title="Remind me in two weeks" aria-label="Remind me in two weeks">✕</button>
+        </span>
+        <span id="agent-pill" class="update-pill" hidden>
+          <button id="agent-pill-open" type="button" title="Open Settings → AI agents"><span class="update-dot" aria-hidden="true"></span><span id="agent-pill-text"></span></button>
         </span>
         <button id="storage-meter" class="storage-meter" type="button" hidden aria-label="Disk space">
           <span class="storage-bar" aria-hidden="true"><span class="storage-bar-library"></span><span class="storage-bar-other"></span></span>

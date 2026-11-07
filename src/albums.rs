@@ -100,7 +100,8 @@ pub fn create(conn: &Connection, parent: Option<i64>, name: &str, workspace: Opt
             }
             workspace_of(conn, parent)?
         }
-        None => workspace,
+        // Seen from the photos in no workspace yet, a new album is in no workspace either.
+        None => workspace.filter(|id| *id != crate::workspaces::UNSORTED),
     };
     check_sibling_name(conn, parent, workspace, &name, None)?;
     let now = now_secs();
@@ -268,10 +269,11 @@ pub fn get(conn: &Connection, id: i64) -> Result<Album> {
 }
 
 /// The albums directly inside `parent`, or the top-level albums of `workspace` (of every
-/// workspace for `None`).
+/// workspace for `None`; those in no workspace for `UNSORTED`).
 pub fn children(conn: &Connection, parent: Option<i64>, workspace: Option<i64>) -> Result<Vec<Album>> {
     match (parent, workspace) {
         (Some(parent), _) => album_rows(conn, "a.parent_id = ?1", Some(parent)),
+        (None, Some(crate::workspaces::UNSORTED)) => album_rows(conn, "a.parent_id IS NULL AND a.workspace_id IS NULL AND ?1 IS NULL", None),
         (None, Some(workspace)) => album_rows(conn, "a.parent_id IS NULL AND a.workspace_id = ?1", Some(workspace)),
         (None, None) => album_rows(conn, "a.parent_id IS NULL AND ?1 IS NULL", None),
     }
@@ -280,9 +282,25 @@ pub fn children(conn: &Connection, parent: Option<i64>, workspace: Option<i64>) 
 /// Every album of a workspace (of every one for `None`), for pickers that show the whole tree.
 pub fn all(conn: &Connection, workspace: Option<i64>) -> Result<Vec<Album>> {
     match workspace {
+        Some(crate::workspaces::UNSORTED) => album_rows(conn, "a.workspace_id IS NULL AND ?1 IS NULL", None),
         Some(workspace) => album_rows(conn, "a.workspace_id = ?1", Some(workspace)),
         None => album_rows(conn, "?1 IS NULL", None),
     }
+}
+
+/// Every photo in an album and in the albums inside it.
+pub fn subtree_paths(conn: &Connection, id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!(
+        "WITH RECURSIVE inside(id) AS (SELECT ?1 UNION ALL SELECT a.id FROM albums a JOIN inside ON a.parent_id = inside.id)
+         SELECT DISTINCT path FROM album_items WHERE album_id IN (SELECT id FROM inside) AND {NOT_IN_TRASH}"
+    ))?;
+    let rows = stmt.query_map([id], |row| row.get(0))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// The workspace an album is in (none for an album in no workspace).
+pub fn workspace_id(conn: &Connection, id: i64) -> Result<Option<i64>> {
+    workspace_of(conn, id)
 }
 
 /// The album and the albums above it, from the top.

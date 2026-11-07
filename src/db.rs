@@ -670,6 +670,24 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             outcome TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS agent_key_log_key ON agent_key_log(key_id, id);
+        -- Changes asked for by organising agent keys: waiting for approval, made (with how to undo
+        -- them), declined, failed, or undone.
+        CREATE TABLE IF NOT EXISTS agent_changes (
+            id INTEGER PRIMARY KEY,
+            key_id INTEGER NOT NULL,
+            key_name TEXT NOT NULL,
+            at INTEGER NOT NULL,
+            tool TEXT NOT NULL,
+            arguments TEXT NOT NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL,
+            undo TEXT,
+            result TEXT NOT NULL DEFAULT '',
+            decided_by TEXT NOT NULL DEFAULT '',
+            decided_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS agent_changes_key ON agent_changes(key_id, id);
+        CREATE INDEX IF NOT EXISTS agent_changes_status ON agent_changes(status);
         CREATE TABLE IF NOT EXISTS protected_paths (
             path TEXT PRIMARY KEY,
             contents INTEGER NOT NULL DEFAULT 0,
@@ -777,6 +795,15 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             PRIMARY KEY (workspace_id, folder)
         );
         CREATE INDEX IF NOT EXISTS workspace_folders_folder ON workspace_folders(folder);
+        -- Photos and videos picked into a workspace one by one, wherever they are stored.
+        CREATE TABLE IF NOT EXISTS workspace_items (
+            workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+            path TEXT NOT NULL,
+            added_at INTEGER NOT NULL,
+            added_by TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (workspace_id, path)
+        );
+        CREATE INDEX IF NOT EXISTS workspace_items_path ON workspace_items(path);
         ",
     )
     .map_err(|_| "Could not create the database schema".to_string())?;
@@ -794,6 +821,24 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     if !has_motion {
         conn.execute("ALTER TABLE media_index ADD COLUMN motion INTEGER", [])
             .map_err(|_| "Could not update the photo index".to_string())?;
+    }
+    let has_key_limits: bool = conn.prepare("SELECT 1 FROM pragma_table_info('agent_keys') WHERE name = 'tools'").and_then(|mut stmt| stmt.exists([])).unwrap_or(false);
+    if !has_key_limits {
+        // Per key: the tools it may use (all its level allows when empty), its own limits, and
+        // folders it may only read.
+        conn.execute_batch(
+            "ALTER TABLE agent_keys ADD COLUMN tools TEXT;
+             ALTER TABLE agent_keys ADD COLUMN calls_per_minute INTEGER;
+             ALTER TABLE agent_keys ADD COLUMN daily_changes INTEGER;
+             ALTER TABLE agent_key_folders ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0;",
+        )
+        .map_err(|_| "Could not update the agent keys".to_string())?;
+    }
+    let has_approve: bool = conn.prepare("SELECT 1 FROM pragma_table_info('agent_keys') WHERE name = 'approve'").and_then(|mut stmt| stmt.exists([])).unwrap_or(false);
+    if !has_approve {
+        // Organising keys can wait for a person to approve each change.
+        conn.execute("ALTER TABLE agent_keys ADD COLUMN approve INTEGER NOT NULL DEFAULT 0", [])
+            .map_err(|_| "Could not update the agent keys".to_string())?;
     }
     let has_workspace: bool = conn.prepare("SELECT 1 FROM pragma_table_info('albums') WHERE name = 'workspace_id'").and_then(|mut stmt| stmt.exists([])).unwrap_or(false);
     if !has_workspace {
@@ -1607,7 +1652,7 @@ pub fn rewrite_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), 
         );
     }
     // Albums keep the photos they hold, wherever they move (into the Trash and back too).
-    for (table, column) in [("album_items", "path"), ("albums", "cover_path"), ("media_index", "path"), ("timeline_hidden", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path"), ("file_hashes", "path"), ("content_text", "path"), ("file_versions", "path"), ("workspace_folders", "folder")] {
+    for (table, column) in [("album_items", "path"), ("albums", "cover_path"), ("media_index", "path"), ("timeline_hidden", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path"), ("file_hashes", "path"), ("content_text", "path"), ("file_versions", "path"), ("workspace_folders", "folder"), ("workspace_items", "path")] {
         conn.execute(
             &format!(
                 "UPDATE OR REPLACE {table} SET {column} = CASE WHEN {column} = ?1 THEN ?2 ELSE ?2 || substr({column}, length(?1) + 1) END
@@ -1916,7 +1961,7 @@ pub fn delete_path_meta(conn: &Connection, path: &str) -> Result<(), String> {
         params![path],
     )
     .map_err(|_| "Could not remove recent files".to_string())?;
-    for (table, column) in [("album_items", "path"), ("media_index", "path"), ("timeline_hidden", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path"), ("file_hashes", "path"), ("content_text", "path"), ("file_versions", "path"), ("workspace_folders", "folder")] {
+    for (table, column) in [("album_items", "path"), ("media_index", "path"), ("timeline_hidden", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path"), ("file_hashes", "path"), ("content_text", "path"), ("file_versions", "path"), ("workspace_folders", "folder"), ("workspace_items", "path")] {
         conn.execute(
             &format!("DELETE FROM {table} WHERE {column} = ?1 OR ({column} >= ?1 || '/' AND {column} < ?1 || '0')"),
             params![path],

@@ -65,6 +65,16 @@ pub enum View {
     Picture { entry: String, pdf: bool, note: String },
 }
 
+/// The sheets of a spreadsheet or data file, to read as cells (`/mcp`).
+pub fn sheets(path: &Path) -> Result<Vec<Sheet>, String> {
+    let extension = path.extension().map(|ext| ext.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let found = if extension == "xlsx" { spreadsheet(path)? } else { view(path)? };
+    match found {
+        View::Sheets { sheets } => Ok(sheets),
+        _ => Err("That file has no sheets of cells".into()),
+    }
+}
+
 pub fn view(path: &Path) -> Result<View, String> {
     let size = std::fs::metadata(path).map_err(|_| "Could not read the file".to_string())?.len();
     if path.is_dir() {

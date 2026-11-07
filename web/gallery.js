@@ -55,6 +55,8 @@ function dayLabel(day) {
 
 const SIZE_KEY = "ownnas-gallery-size";
 const WORKSPACE_KEY = "ownnas-gallery-workspace";
+/// Not a workspace: the photos in no workspace yet, to sort them (real ids start at 1).
+const UNSORTED = 0;
 const VIEW_KEY = "ownnas-gallery-view";
 const GAP = 4; // between photos, as in the CSS
 
@@ -114,8 +116,9 @@ export function mountGallery(root, ctx) {
   let cardAlbums = new Map(); // id -> the albums shown as cards
   let menu = null;
   let placesMap = null; // the Places map, while it shows
-  let workspace = null; // the workspace shown (its id), or null for every photo
-  let workspaces = []; // every workspace: {id, name, folders, photos}
+  let workspace = null; // the workspace shown (its id), UNSORTED, or null for every photo
+  let workspaces = []; // every workspace: {id, name, folders, photos, picked}
+  let unsortedCount = 0; // photos in no workspace yet
   let workspacesLoaded = null; // a promise, while the list loads
 
   /// Gallery requests carry the workspace shown, so the server sends only its photos and albums.
@@ -126,8 +129,9 @@ export function mountGallery(root, ctx) {
   }
 
   /// The address of the Gallery in the workspace shown: every link keeps it.
-  const home = () => `#gallery/${workspace === null ? "all" : `w${workspace}`}`;
+  const home = () => `#gallery/${workspace === null ? "all" : workspace === UNSORTED ? "none" : `w${workspace}`}`;
   const workspaceName = (id) => (workspaces.find((entry) => entry.id === id) || {}).name || "";
+  const UNSORTED_NAME = "Not in any workspace";
 
   const tabs = el("nav", { class: "gallery-tabs", "aria-label": "Gallery sections" });
   for (const [tab, label] of [["photos", "Photos"], ["albums", "Albums"], ["people", "People"], ["places", "Places"], ["tags", "Tags"]]) {
@@ -456,6 +460,8 @@ export function mountGallery(root, ctx) {
     selectionBar.replaceChildren(...[
       el("strong", {}, `${number(selected.size)} selected`),
       write && present.length ? button("Add to album…", () => pickAlbum(present)) : null,
+      write && present.length && workspaces.length ? button("Show in workspace…", () => showInWorkspaces(present)) : null,
+      write && pickedHere(picked).length ? button(`Remove from “${workspaceName(workspace)}”`, () => removeFromWorkspace(pickedHere(picked))) : null,
       write && present.length ? button("Tag…", () => ctx.tag(present)) : null,
       write && present.length && present.every(resizable) ? button("Resize…", () => ctx.resize(present)) : null,
       write && ctx.canConvertVideos() && present.length && picked.every((item) => item.kind === "video") ? button("Convert video…", () => ctx.convertVideos(present, "format")) : null,
@@ -624,8 +630,9 @@ export function mountGallery(root, ctx) {
       const space = workspaces.find((entry) => entry.id === workspace);
       body.replaceChildren(el("p", { class: "muted gallery-message" }, data.status.scanning
         ? "Looking for photos in the library…"
-        : space && !space.folders.length ? `“${space.name}” has no folders yet.${ctx.isAdmin() ? " Choose its folders with Edit workspace, in the workspace menu." : ""}`
-        : space ? `No photos or videos in “${space.name}” yet: it shows those in ${space.folders.map((folder) => `“${folder}”`).join(", ")}.`
+        : workspace === UNSORTED ? "Every photo and video is in a workspace."
+        : space && !space.folders.length ? `Nothing in “${space.name}” yet. Pick photos for it anywhere: select them under All photos (or ${UNSORTED_NAME}) and choose Show in workspace.${ctx.isAdmin() ? " Or give it whole folders with Edit workspace, in the workspace menu." : ""}`
+        : space ? `No photos or videos in “${space.name}” yet: it shows those in ${space.folders.map((folder) => `“${folder}”`).join(", ")}, and those picked into it with Show in workspace.`
         : "No photos or videos yet. Photos anywhere in the library show up here, newest first."));
       scheduleScrubber();
       return;
@@ -825,6 +832,7 @@ export function mountGallery(root, ctx) {
     // In a workspace, count its photos rather than the whole library's.
     const space = workspaces.find((entry) => entry.id === workspace);
     if (space) info = { ...info, total: space.photos };
+    else if (workspace === UNSORTED) info = { ...info, total: unsortedCount };
     if (info.scanning) {
       status.textContent = `Looking for photos… ${number(info.seen)} found`;
       const mine = generation;
@@ -863,6 +871,7 @@ export function mountGallery(root, ctx) {
       await loadWorkspaces();
       const space = workspaces.find((entry) => entry.id === workspace);
       module.openPhotoUpload({
+        // Seen from the photos in no workspace, uploads go where the files say, as under All.
         workspace: space ? space.id : null,
         name: space ? space.name : "",
         folders: space ? space.folders : [],
@@ -989,7 +998,8 @@ export function mountGallery(root, ctx) {
       if (stale(mine)) return;
       current = data.album;
       // An album opened from elsewhere (a link in the files) shows in its own workspace.
-      if (current && workspace !== null && current.workspaceId !== workspace) {
+      // (Seen from the photos in no workspace, the albums in no workspace are its own.)
+      if (current && workspace !== null && (current.workspaceId ?? UNSORTED) !== workspace) {
         setWorkspace(current.workspaceId ?? null);
         history.replaceState(null, "", `${home()}/albums/${current.id}`);
         paintWorkspace();
@@ -1176,6 +1186,12 @@ export function mountGallery(root, ctx) {
     openMenu(event.clientX, event.clientY, one ? nameOf(one.path) : `${number(picked.length)} photos`, [
       one && !one.missing && { label: "Open", icon: "open", run: () => ctx.openPreview(one, ordered().filter((entry) => !entry.missing)) },
       write && paths.length && { label: "Add to album…", icon: "addToAlbum", run: () => pickAlbum(paths) },
+      write && paths.length && workspaces.length && { label: "Show in workspace…", icon: "workspace", run: () => showInWorkspaces(paths) },
+      write && pickedHere(picked).length && {
+        label: `Remove from “${workspaceName(workspace)}”`,
+        icon: "removeFromAlbum",
+        run: () => removeFromWorkspace(pickedHere(picked)),
+      },
       write && paths.length && { label: "Tag…", icon: "bulkTag", run: () => ctx.tag(paths) },
       write && paths.length && paths.every(resizable) && { label: "Resize…", icon: "resize", run: () => ctx.resize(paths) },
       write && ctx.canConvertVideos() && present.length && present.every((entry) => entry.kind === "video") && { label: "Convert video…", icon: "convertVideo", run: () => ctx.convertVideos(paths, "format") },
@@ -1266,6 +1282,7 @@ export function mountGallery(root, ctx) {
     openMenu(event.clientX, event.clientY, `${label} · ${plural(list.length, "photo")}`, [
       { label: "Select this day", icon: "check", run: () => { for (const path of paths) selected.add(path); paintSelection(); } },
       write && { label: "Add this day to album…", icon: "addToAlbum", run: () => pickAlbum(paths) },
+      write && workspaces.length && { label: "Show this day in workspace…", icon: "workspace", run: () => showInWorkspaces(paths) },
       write && { label: "Tag this day…", icon: "bulkTag", run: () => ctx.tag(paths) },
       { label: "Download this day", icon: "download", run: () => ctx.download(paths) },
       write && { label: "Hide this day from Photos", icon: "hide", run: () => setHidden(paths, true) },
@@ -1449,7 +1466,9 @@ export function mountGallery(root, ctx) {
     try {
       const data = await api("/api/albums/items", { method: "POST", json: { albumId: id, paths } });
       const already = paths.length - data.changed;
-      ctx.toast(`Added ${plural(data.changed, "photo")} to “${data.album.name}”${already ? ` (${number(already)} already there)` : ""}`);
+      const space = data.pickedIntoWorkspace && data.album.workspaceId ? workspaceName(data.album.workspaceId) : "";
+      ctx.toast(`Added ${plural(data.changed, "photo")} to “${data.album.name}”${already ? ` (${number(already)} already there)` : ""}${space ? `, and ${number(data.pickedIntoWorkspace)} to the workspace “${space}”` : ""}`);
+      if (space) loadWorkspaces();
       clearSelection();
       if (route.tab === "albums") showAlbums(route.id);
     } catch (err) {
@@ -1878,10 +1897,14 @@ export function mountGallery(root, ctx) {
 
   async function loadWorkspaces() {
     try {
-      workspaces = (await ctx.api("/api/workspaces")).workspaces;
+      const data = await ctx.api("/api/workspaces");
+      workspaces = data.workspaces;
+      unsortedCount = data.unsorted || 0;
     } catch {
       workspaces = [];
+      unsortedCount = 0;
     }
+    ctx.workspacesChanged?.(workspaces.length);
   }
 
   function storedWorkspace() {
@@ -1904,17 +1927,193 @@ export function mountGallery(root, ctx) {
     }
   }
 
+  /// Whether a path is in a workspace's folders (photos picked into it are not known here).
   function inWorkspace(id, path) {
     const space = workspaces.find((entry) => entry.id === id);
     return !!space && space.folders.some((folder) => path === folder || path.startsWith(`${folder}/`));
+  }
+
+  /// Of these photos, the ones picked into the workspace shown (outside its folders), which
+  /// can be taken out of it. (An album shows its photos whatever their workspace.)
+  function pickedHere(items) {
+    if (workspace === null || workspace === UNSORTED || current) return [];
+    return items.filter((item) => !inWorkspace(workspace, item.path)).map((item) => item.path);
+  }
+
+  async function removeFromWorkspace(paths) {
+    const name = workspaceName(workspace);
+    try {
+      const data = await ctx.api("/api/workspaces/items", { method: "POST", json: { workspaceIds: [workspace], paths, action: "remove" } });
+      ctx.toast(`Took ${plural(data.changed, "photo")} out of “${name}”. They stay in the library.`);
+      afterWorkspaceChange(data);
+    } catch (err) {
+      ctx.toast(err.message, true);
+    }
+  }
+
+  function afterWorkspaceChange(data) {
+    workspaces = data.workspaces;
+    clearSelection();
+    // What the Gallery shows may have changed under it; the files have not.
+    loadWorkspaces().then(() => {
+      if (!root.hidden && workspace !== null) show(location.hash);
+      else paintWorkspace();
+    });
+  }
+
+  /// A dialog to show everything in some folders in workspaces, now and later (photos added to
+  /// the folders afterwards too), or to stop. The same as each workspace's folders setting.
+  async function showFoldersInWorkspaces(folders) {
+    if (!folders.length) return;
+    await loadWorkspaces();
+    if (!workspaces.length) {
+      ctx.toast(ctx.isAdmin() ? "No workspaces yet: create one in the Gallery's workspace menu" : "No workspaces yet", true);
+      return;
+    }
+    let standing;
+    try {
+      standing = await ctx.api("/api/workspaces/folder-membership", { method: "POST", json: { folders } });
+    } catch (err) {
+      ctx.toast(err.message, true);
+      return;
+    }
+    const total = folders.length;
+    const rows = workspaces.map((space) => {
+      const where = standing.workspaces.find((entry) => entry.id === space.id) || { direct: 0, through: 0, via: null, inner: 0 };
+      const inside = where.direct + where.through;
+      const box = el("input", { type: "checkbox" });
+      box.checked = inside === total;
+      box.indeterminate = (inside > 0 && inside < total) || (inside === 0 && where.inner > 0);
+      // In through a folder above: it can only go by taking that folder out.
+      box.disabled = where.through === total;
+      const note = where.through === total ? `Through “${where.via}”`
+        : where.through > 0 ? `${number(where.through)} through “${where.via}”`
+        : inside && inside < total ? `${number(inside)} of ${number(total)}`
+        : !inside && where.inner ? "Some folders inside it"
+        : "";
+      return { space, where, box, start: { checked: box.checked, indeterminate: box.indeterminate }, node: el("label", { class: "workspace-pick" },
+        box,
+        el("span", { class: "workspace-pick-name" }, space.name),
+        note ? el("span", { class: "muted workspace-pick-note" }, note) : null) };
+    });
+    const save = el("button", { type: "button", class: "primary" }, "Save");
+    const dialog = el("dialog", { class: "workspace-editor workspace-picker" },
+      el("h3", {}, total === 1 ? `Show everything in ${nameOf(folders[0])} in…` : `Show everything in ${plural(total, "folder")} in…`),
+      el("p", { class: "muted" }, "Each workspace you tick shows every photo and video in it, including ones added later and in folders inside it. Nothing is moved or copied."),
+      el("div", { class: "workspace-picks" }, ...rows.map((row) => row.node)),
+      el("div", { class: "dialog-actions" }, el("span", { class: "spacer" }), el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"), save));
+    dialog.addEventListener("close", () => dialog.remove());
+    save.addEventListener("click", async () => {
+      const changed = (row) => row.box.checked !== row.start.checked || row.box.indeterminate !== row.start.indeterminate;
+      const add = rows.filter((row) => changed(row) && row.box.checked && !row.box.indeterminate).map((row) => row.space.id);
+      const remove = rows.filter((row) => changed(row) && !row.box.checked && !row.box.indeterminate && row.where.direct).map((row) => row.space.id);
+      save.disabled = true;
+      try {
+        let data = null;
+        if (add.length) data = await ctx.api("/api/workspaces/folders", { method: "POST", json: { workspaceIds: add, folders } });
+        if (remove.length) data = await ctx.api("/api/workspaces/folders", { method: "POST", json: { workspaceIds: remove, folders, action: "remove" } });
+        dialog.close();
+        if (!data) return;
+        const names = (ids) => ids.map((id) => `“${workspaceName(id)}”`).join(", ");
+        ctx.toast([
+          add.length && `Everything in ${total === 1 ? "it" : "them"} shows in ${names(add)}`,
+          remove.length && `No longer shown in ${names(remove)}`,
+        ].filter(Boolean).join(". "));
+        afterWorkspaceChange(data);
+      } catch (err) {
+        ctx.toast(err.message, true);
+      } finally {
+        save.disabled = false;
+      }
+    });
+    document.body.append(dialog);
+    dialog.showModal();
+    rows.find((row) => !row.box.disabled)?.box.focus();
+  }
+
+  /// A dialog to show photos in workspaces (one or more), or take them out, without moving them.
+  async function showInWorkspaces(paths) {
+    if (!paths.length) return;
+    await loadWorkspaces();
+    if (!workspaces.length) {
+      ctx.toast(ctx.isAdmin() ? "No workspaces yet: create one in the Gallery's workspace menu" : "No workspaces yet", true);
+      return;
+    }
+    let standing;
+    try {
+      standing = await ctx.api("/api/workspaces/membership", { method: "POST", json: { paths } });
+    } catch (err) {
+      ctx.toast(err.message, true);
+      return;
+    }
+    const total = paths.length;
+    const rows = workspaces.map((space) => {
+      const where = standing.workspaces.find((entry) => entry.id === space.id) || { inside: 0, picked: 0 };
+      const byFolder = where.inside - where.picked;
+      const box = el("input", { type: "checkbox" });
+      box.checked = where.inside === total;
+      box.indeterminate = where.inside > 0 && where.inside < total;
+      // In through its folders: nothing to pick, and it can't be taken out here.
+      box.disabled = byFolder === total;
+      const note = byFolder === total ? (total === 1 ? "In its folders" : "All in its folders")
+        : byFolder > 0 ? `${number(byFolder)} in its folders`
+        : where.inside && where.inside < total ? `${number(where.inside)} of ${number(total)} in it`
+        : "";
+      return { space, where, box, start: { checked: box.checked, indeterminate: box.indeterminate }, node: el("label", { class: "workspace-pick" },
+        box,
+        el("span", { class: "workspace-pick-name" }, space.name),
+        note ? el("span", { class: "muted workspace-pick-note" }, note) : null) };
+    });
+    const save = el("button", { type: "button", class: "primary" }, "Save");
+    const dialog = el("dialog", { class: "workspace-editor workspace-picker" },
+      el("h3", {}, total === 1 ? `Show ${nameOf(paths[0])} in…` : `Show ${plural(total, "photo")} in…`),
+      el("p", { class: "muted" }, "Each workspace you tick shows them, wherever they are stored. Nothing is moved or copied."),
+      el("div", { class: "workspace-picks" }, ...rows.map((row) => row.node)),
+      el("div", { class: "dialog-actions" }, el("span", { class: "spacer" }), el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"), save));
+    dialog.addEventListener("close", () => dialog.remove());
+    save.addEventListener("click", async () => {
+      // Ticked: pick them in (those already there stay). Cleared: take out the ones picked in.
+      const changed = (row) => row.box.checked !== row.start.checked || row.box.indeterminate !== row.start.indeterminate;
+      const add = rows.filter((row) => changed(row) && row.box.checked && !row.box.indeterminate).map((row) => row.space.id);
+      const remove = rows.filter((row) => changed(row) && !row.box.checked && !row.box.indeterminate && row.where.picked).map((row) => row.space.id);
+      save.disabled = true;
+      try {
+        let added = 0;
+        let removed = 0;
+        let data = null;
+        if (add.length) {
+          data = await ctx.api("/api/workspaces/items", { method: "POST", json: { workspaceIds: add, paths } });
+          added = data.changed;
+        }
+        if (remove.length) {
+          data = await ctx.api("/api/workspaces/items", { method: "POST", json: { workspaceIds: remove, paths, action: "remove" } });
+          removed = data.changed;
+        }
+        dialog.close();
+        if (!data) return;
+        const names = (ids) => ids.map((id) => `“${workspaceName(id)}”`).join(", ");
+        ctx.toast([
+          add.length && `Showing them in ${names(add)}${added ? "" : " (they were there already)"}`,
+          remove.length && `Took ${plural(removed, "photo")} out of ${names(remove)}`,
+        ].filter(Boolean).join(". "));
+        afterWorkspaceChange(data);
+      } catch (err) {
+        ctx.toast(err.message, true);
+      } finally {
+        save.disabled = false;
+      }
+    });
+    document.body.append(dialog);
+    dialog.showModal();
+    rows.find((row) => !row.box.disabled)?.box.focus();
   }
 
   /// The switcher's label, and the tabs' links in the workspace shown.
   function paintWorkspace() {
     const space = workspaces.find((entry) => entry.id === workspace);
     switcher.hidden = !workspaces.length && !ctx.isAdmin();
-    switcher.textContent = space ? space.name : "All photos";
-    switcher.classList.toggle("is-all", !space);
+    switcher.textContent = space ? space.name : workspace === UNSORTED ? UNSORTED_NAME : "All photos";
+    switcher.classList.toggle("is-all", !space && workspace !== UNSORTED);
     for (const link of tabs.children) link.setAttribute("href", `${home()}${link.dataset.tab === "photos" ? "" : `/${link.dataset.tab}`}`);
   }
 
@@ -1923,11 +2122,12 @@ export function mountGallery(root, ctx) {
     const space = workspaces.find((entry) => entry.id === workspace);
     const go = (id) => {
       const tab = ["albums", "people", "places", "tags"].includes(route.tab) ? `/${route.tab}` : route.tab === "person" ? "/people" : "";
-      location.hash = `#gallery/${id === null ? "all" : `w${id}`}${tab}`;
+      location.hash = `#gallery/${id === null ? "all" : id === UNSORTED ? "none" : `w${id}`}${tab}`;
     };
     openMenu(x, y, "Workspace", [
       { label: "All photos", icon: workspace === null ? "check" : "workspace", run: () => go(null) },
       ...workspaces.map((entry) => ({ label: `${entry.name} · ${number(entry.photos)}`, icon: entry.id === workspace ? "check" : "workspace", run: () => go(entry.id) })),
+      workspaces.length && { label: `${UNSORTED_NAME} · ${number(unsortedCount)}`, icon: workspace === UNSORTED ? "check" : "hide", run: () => go(UNSORTED) },
       admin && "-",
       admin && { label: "New workspace…", icon: "newWorkspace", run: () => editWorkspace(null) },
       admin && space && { label: `Edit “${space.name}”…`, icon: "rename", run: () => editWorkspace(space) },
@@ -1947,7 +2147,8 @@ export function mountGallery(root, ctx) {
       el("h3", {}, space ? `Edit “${space.name}”` : "New workspace"),
       el("label", {}, el("span", {}, "Name"), name),
       el("div", {}, el("span", { class: "workspace-label" }, "Folders"),
-        el("p", { class: "muted" }, "The workspace shows the photos and videos in these folders and the folders inside them. Nothing is moved or copied.")),
+        el("p", { class: "muted" }, "The workspace shows every photo and video in these folders and the folders inside them. To show only some photos of a folder, leave it out and pick them instead: select them in the Gallery and choose Show in workspace. Nothing is moved or copied."),
+        space && space.picked ? el("p", { class: "muted" }, `Also ${plural(space.picked, "photo")} picked into it one by one.`) : null),
       list,
       el("div", { class: "dialog-actions" }, add, el("span", { class: "spacer" }), el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"), save));
 
@@ -1955,7 +2156,7 @@ export function mountGallery(root, ctx) {
       list.replaceChildren(...folders.map((folder) => el("div", { class: "workspace-folder" },
         el("span", { title: folder }, folder),
         el("button", { type: "button", class: "workspace-folder-remove", "aria-label": `Remove “${folder}”`, title: "Remove", onclick: () => { folders = folders.filter((entry) => entry !== folder); render(); } }, "×"))));
-      if (!folders.length) list.append(el("p", { class: "muted" }, "No folders yet. Add the folders whose photos belong here."));
+      if (!folders.length) list.append(el("p", { class: "muted" }, "No folders. Add folders whose photos all belong here, or leave it empty and pick photos one by one."));
     }
 
     add.addEventListener("click", async () => {
@@ -2019,6 +2220,7 @@ export function mountGallery(root, ctx) {
     let parts = hash.replace(/^#?gallery\/?/, "").split("/").filter(Boolean).map(decodeURIComponent);
     let scope;
     if (parts[0] === "all") scope = null;
+    else if (parts[0] === "none") scope = UNSORTED;
     else if (/^w\d+$/.test(parts[0] || "")) scope = Number(parts[0].slice(1));
     if (scope !== undefined) parts = parts.slice(1);
     return { ...parseRoute(parts), scope };
@@ -2056,9 +2258,9 @@ export function mountGallery(root, ctx) {
       // "Find similar photos" from the files: look where the photo is.
       if (route.tab === "similar" && route.path && scope !== null && !inWorkspace(scope, route.path)) scope = null;
     }
-    if (scope !== null && !workspaces.some((entry) => entry.id === scope)) scope = null;
+    if (scope === UNSORTED ? !workspaces.length : scope !== null && !workspaces.some((entry) => entry.id === scope)) scope = null;
     setWorkspace(scope);
-    const canonical = `${home()}${hash.replace(/^#?gallery(\/(all|w\d+))?/, "")}`;
+    const canonical = `${home()}${hash.replace(/^#?gallery(\/(all|none|w\d+))?/, "")}`;
     if (location.hash !== canonical) history.replaceState(null, "", canonical);
     paintWorkspace();
     current = null;
@@ -2141,6 +2343,8 @@ export function mountGallery(root, ctx) {
     show,
     hide,
     pickAlbum,
+    showInWorkspaces,
+    showFoldersInWorkspaces,
     handleKey,
     uploadPhotos,
     /// The album the page shows, so changes elsewhere can refresh it.

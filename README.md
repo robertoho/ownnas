@@ -122,6 +122,26 @@ ownnas-sync setup ~/OwnNAS --server https://nas.example:8787 --username alice --
 ownnas-sync run ~/OwnNAS --watch
 ```
 
+To sync only some server folders, each into a local folder of its own, link more after
+`setup`. `add` reuses the sign-in, so it doesn't ask for the password:
+
+```bash
+ownnas-sync folders                     # the server's folders, and which ones sync here
+ownnas-sync folders Photos              # look inside one
+ownnas-sync add ~/Pictures/NAS --remote Photos/2024
+ownnas-sync add ~/Work --remote Documents/Work
+ownnas-sync list                        # each local folder and the server folder it syncs with
+ownnas-sync run --watch                 # with no folder, syncs every linked folder
+ownnas-sync remove ~/Work               # stop syncing; files stay on both sides
+```
+
+Folders you don't link stay on the server only. A link is refused when its local folder is
+inside another linked folder (or holds one), or when its server folder is inside another
+linked server folder (or holds one), so the same files never sync twice. `add --create`
+makes a server folder that doesn't exist yet. With more than one server, pick it with
+`--server`. The list of linked folders is in `~/.config/ownnas/sync-folders.json`
+(`%APPDATA%\OwnNAS` on Windows).
+
 `setup` signs in once and stores a token in `~/OwnNAS/.ownnas-sync/config.json`; the
 password is not saved. Pass `--ca-cert ca.crt` when the server uses a certificate from
 `ownnas tls generate`. `run` syncs once; `--watch` syncs again every 30 seconds
@@ -201,6 +221,18 @@ permission, asks a question, or finishes. **Edited** lists the files the agent c
   (`~/.config/opencode/plugins/ownnas.js`) for step-by-step status. They report only from
   inside OwnNAS terminals, through a per-terminal token to a listener on `127.0.0.1`, and do
   nothing elsewhere. **Remove** takes them out again.
+
+## Linux installer
+
+`ownnas-VERSION-linux-x86_64.run` installs the server and the clients and runs OwnNAS as a systemd service. It asks for the folder to share, the user to run as, the data folder (default `/var/lib/ownnas`) and the first account:
+
+```bash
+sudo sh ownnas-0.9.5-linux-x86_64.run
+sudo sh ownnas-0.9.5-linux-x86_64.run --root /srv/media --user alice --yes   # without questions
+sudo sh ownnas-0.9.5-linux-x86_64.run --uninstall                            # keeps data and library
+```
+
+Running a newer one upgrades in place, keeps the settings in `/etc/ownnas/ownnas.env`, and keeps the old binary as `/opt/ownnas/ownnas.previous`. It needs glibc 2.38 or newer (Ubuntu 24.04, Debian 13, Fedora 39). Build it with `python3 scripts/package-installer.py VERSION x86_64-unknown-linux-gnu` after the release build.
 
 ## Run in the background
 
@@ -282,6 +314,27 @@ Thumbnails are small JPEGs (PNG for pictures with transparency) kept in the data
 
 Put OwnNAS behind HTTPS and pass `--secure-cookie` if you terminate TLS with a reverse proxy. The login is the application boundary; the VPN is the network boundary.
 
+## Notes
+
+**Notes** (the notes icon at the top) shows quick notes and checklists as cards, like Google Keep, but each note is a plain Markdown file in one library folder (`Notes` unless an administrator picks another with the folder button). So notes open in Obsidian or any editor, sync with the desktop client, keep their earlier versions, and go to the Trash like any other file.
+
+- **Take a note…** saves on Add (or Ctrl/⌘+Enter); **List** turns each line into a checklist item. The file is named after the first line.
+- Tick checklist items on the card itself. Colour and pin a note (kept in its front matter as `color:` and `pinned:`), label it with OwnNAS tags or `#hashtags`, and search or filter by label.
+- Link notes with `[[Note name]]`: each note shows which notes link to it. **Archive** moves a note into `Archive/`, and **Today** opens the day's note in `Daily/` (made from `Templates/Daily.md` when there is one, with `{{date}}` filled in).
+- Clicking a card opens it in the Markdown editor.
+
+## AI agents (MCP)
+
+AI agents such as Claude reach the library over MCP at `https://<server>/mcp` with an agent key. An administrator makes keys in **Settings → Agents**, choosing which folders each one can use and what it can do there:
+
+- **Read:** list folders and search them; read text, documents and PDFs (and the text read from photos); read spreadsheets and CSV files as cells; look at photos (large enough to read a photographed page); see a file's details and earlier versions; see what changed lately and what takes up space; and find photos by what they show, by similar look, by date, by album, or by the people in them.
+- **Read and organise:** everything above, plus tagging, making folders, renaming, moving, moving to the Trash, and arranging albums. Nothing is ever deleted for good, protected files are left alone, and a key's own folders cannot be renamed, moved or put in the Trash.
+- **Read, organise and write:** everything above, plus making text files, changing a passage in one, adding rows to CSV and TSV files, and copying. Before a file changes, what it held is kept in its history.
+
+Every change an organising key makes can be undone from **Settings → Agents → Changes**, one at a time or everything since the start of the day. With **Ask me before each change** (the default for new organising and writing keys), changes wait there until you approve or decline them, and the status bar tells administrators when some are waiting. A key that doesn't ask first still asks after 500 changes in a day, and each key can make at most 300 requests a minute. Files are also offered as MCP resources (`ownnas:///path`), with a few ready-made prompts. Keys whose folders hold the notes folder can list and read notes; writing keys can also make notes, add to them and tick their items. **Limits & tools…** on a key chooses its tools one by one, folders it may only read, and its own limits; **Usage** shows what it did over 30 days, and a key refused again and again is flagged in the status bar.
+
+Hidden files and the Trash are never visible to a key. Albums and people show only when they have photos in the key's folders. Every call, refused ones included, is in the key's activity log. The plans for MCP are in [todo/mcp.md](todo/mcp.md).
+
 ## Backups
 
 **Settings → Backup** (administrators) backs up the library and OwnNAS's own data with [restic](https://restic.net), which needs to be installed (`brew install restic`, `sudo apt install restic`, or `winget install restic.restic`; 0.17 or newer). The data includes the database with users, albums, tags, and settings, and the file history. Thumbnails and caches are left out, because OwnNAS can make them again.
@@ -311,7 +364,11 @@ OwnNAS also includes embedded ODT and XLSX editors. Open an `.odt` or `.xlsx` fi
 
 The **Gallery** (the picture button at the top, or #gallery) shows every photo and video in the library by the day it was taken, newest first, with albums and tags. Albums are virtual: they list photos wherever they are, without moving, copying, or changing them, and albums can hold other albums, like folders. Add photos from the Gallery (select them, then Add to album…), from the file browser (right-click → Add to album…), or from the preview. Two optional smart features run entirely on the server (Settings → Gallery switches them on and downloads their models once): **search by what photos show** — type words like “dog on the beach” in the Gallery’s search box, or drop a picture on it or choose Find similar photos to see photos that look alike (CLIP ViT-B/32, about 155 MB) — and **faces and people**, which finds faces, groups them into people you can name, merge (Same person as…), hide, or correct (Not this person), in a People tab (YuNet and SFace from the OpenCV model zoo, about 39 MB). Face data stays in OwnNAS’s database and can be deleted from Settings at any time. Both work through the library at the indexing speed you choose; not available in the Android build. Photos you would rather not see in the timeline can be hidden from it (right-click → Hide from Photos); they stay in their folders, albums, and tags, and Hidden in the Photos header lists them to bring back. Albums and tags are shared by everyone on the server, and they keep up when files are moved, renamed, or put in the Trash through OwnNAS. The timeline comes from an index OwnNAS keeps in its own database (dates from the photos' EXIF, or the file date); it is refreshed at start, every 30 minutes, and with Rescan (Settings → Gallery sets how hard this may work the computer: Slow, Medium, the default, or Fast), and it skips hidden folders, the Trash, and Apple Photos libraries.
 
-**Workspaces** keep groups of photos apart in the Gallery — Family, Work, Customer 1, and so on. A workspace is a name and some library folders; the switcher at the top left of the Gallery shows one workspace at a time (or All photos), and Photos, Albums, People, Places, Tags, search, Find similar photos, and On this day then show only the photos and videos in its folders. Each album belongs to one workspace (or to none, shown only under All photos), and can be moved to another with Move to workspace…. Administrators create, edit, and delete workspaces from the switcher's menu; deleting one keeps its albums and never touches photos or folders. The Gallery remembers the workspace last shown, and its address names it (`#gallery/w3/albums`, `#gallery/all`).
+**Workspaces** keep groups of photos apart in the Gallery — Family, Work, Customer 1, and so on. A workspace is a name, some library folders, and photos and videos picked into it one by one; the switcher at the top left of the Gallery shows one workspace at a time (or All photos), and Photos, Albums, People, Places, Tags, search, Find similar photos, and On this day then show only the photos and videos in its folders and those picked into it.
+
+To show everything in a folder in one or more workspaces, including photos added to it later, administrators can also start from the folder: right-click it in Files (or the empty space inside it) and choose **Show in workspace…**, then tick the workspaces. It's the same as adding the folder in each workspace's settings. A folder already shown through a folder above it is ticked and greyed out, with that folder named.
+
+To show only some photos of a folder (a phone's camera roll, say), don't add the folder: select the photos anywhere in the Gallery (or in the files) and choose **Show in workspace…**, then tick one or more workspaces. A photo can show in Work and Private at once, and nothing moves. **Remove from “Work”** takes picked photos out of the workspace shown (photos there through its folders stay). Picks follow their files when they are moved or renamed through OwnNAS. Photos added to an album also show in the album's workspace, and an album moved to another workspace takes its photos along. **Not in any workspace**, in the switcher, shows the photos still to sort: in no workspace's folders and picked into none. Uploading to a workspace with no folders asks for a folder and then picks the uploads into the workspace. Each album belongs to one workspace (or to none, shown only under All photos), and can be moved to another with Move to workspace…. Administrators create, edit, and delete workspaces from the switcher's menu; deleting one keeps its albums and never touches photos or folders. The Gallery remembers the workspace last shown, and its address names it (`#gallery/w3/albums`, `#gallery/all`).
 
 SQLite databases (`.db`, `.sqlite`, `.sqlite3`, `.db3`) open in a read-only viewer: pick a table or view to page through its rows (sorted by any column and filtered by text in any column), see its columns, `CREATE` statement, and indexes, or run your own `SELECT` queries (up to 1,000 rows, stopped after 10 seconds). The database is opened read-only, so the viewer never changes or locks it for the program that uses it; long text and blobs can be opened or downloaded whole.
 ## Native HTTPS with your own certificates

@@ -67,6 +67,13 @@ pub fn keep(conn: &Connection, store: &Path, full: &Path, rel: &str, by: &str, r
     let _ = try_keep(conn, store, full, rel, by, reason, crate::db::now_secs());
 }
 
+/// Keeps a file as a version before an agent changes it, every time (not once per session of
+/// edits, so each change can be undone on its own). The version's id, or `None` for an empty
+/// file, which has nothing to keep.
+pub fn keep_for_agent(conn: &Connection, store: &Path, full: &Path, rel: &str, by: &str) -> Result<Option<i64>, String> {
+    try_keep(conn, store, full, rel, by, "agent", crate::db::now_secs())
+}
+
 fn try_keep(conn: &Connection, store: &Path, full: &Path, rel: &str, by: &str, reason: &str, now: i64) -> Result<Option<i64>, String> {
     let Ok(meta) = std::fs::metadata(full) else { return Ok(None) };
     if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_FILE || rel.is_empty() {
@@ -75,7 +82,7 @@ fn try_keep(conn: &Connection, store: &Path, full: &Path, rel: &str, by: &str, r
     let modified = meta.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs() as i64);
     // Saved again within a session of edits (by the same person): the version from before it
     // started stands for the whole session. A restore always keeps what it replaces.
-    if reason != "restore" {
+    if reason != "restore" && reason != "agent" {
         let recent: Option<i64> = conn
             .query_row(
                 "SELECT saved_at FROM file_versions WHERE path = ?1 AND by = ?2 AND reason = ?3 ORDER BY saved_at DESC LIMIT 1",

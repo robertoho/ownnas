@@ -167,13 +167,15 @@ export function openPhotoUpload({ workspace, name, folders, api, toast, pickFold
     const select = el("select", { "aria-label": "Folder", onchange: () => { folder = select.value; } }, ...folders.map((path) => el("option", { value: path }, path)));
     whereText.textContent = "Into";
     where.append(select);
-  } else if (workspace !== null && !folders.length) {
-    whereText.textContent = `“${name}” has no folders yet, so there is nowhere to put photos. Add a folder to the workspace first.`;
-    choose.disabled = true;
-  } else if (workspace !== null) {
+  } else if (workspace !== null && folders.length) {
     whereText.textContent = `Into ${folder}`;
   } else {
-    const paint = () => { whereText.textContent = folder === null ? "Choose a folder for them first." : `Into ${folder || "the top of the library"}`; };
+    // A workspace with no folders of its own: they go in a folder chosen here, and are picked
+    // into the workspace once they arrive.
+    const paint = () => {
+      whereText.textContent = folder === null ? "Choose a folder for them first." : `Into ${folder || "the top of the library"}`;
+      if (workspace !== null && folder !== null) whereText.textContent += `, shown in ${name}`;
+    };
     paint();
     choose.disabled = true;
     where.append(el("button", { type: "button", class: "photo-upload-folder", onclick: async () => {
@@ -213,10 +215,10 @@ export function openPhotoUpload({ workspace, name, folders, api, toast, pickFold
     const set = (text, kind = "") => {
       note.textContent = text;
       node.className = `photo-upload-row${kind ? ` is-${kind}` : ""}`;
-      node.querySelector("button")?.remove();
+      for (const button of node.querySelectorAll("button")) button.remove();
     };
+    // Choices for this row, beside any already offered (setting its text clears them).
     const offer = (label, run) => {
-      node.querySelector("button")?.remove();
       node.append(el("button", { type: "button", onclick: run }, label));
     };
     return { file, node, set, offer };
@@ -235,6 +237,22 @@ export function openPhotoUpload({ workspace, name, folders, api, toast, pickFold
     counts.uploaded += 1;
     uploadedAny = true;
     item.set(`Uploaded to ${path}`, "uploaded");
+    // Outside the workspace's folders, it shows there only once picked into it.
+    if (workspace !== null && !inFolders(path)) {
+      try {
+        await pickInto(path);
+      } catch (err) {
+        item.set(`Uploaded to ${path}, but not shown in ${name}: ${err.message}`, "failed");
+      }
+    }
+  }
+
+  function inFolders(path) {
+    return folders.some((inside) => path === inside || path.startsWith(`${inside}/`));
+  }
+
+  function pickInto(path) {
+    return api("/api/workspaces/items", { method: "POST", json: { workspaceIds: [workspace], paths: [path] } });
   }
 
   function reportDuplicate(item, text, sha256, kind = "duplicate") {
@@ -280,6 +298,18 @@ export function openPhotoUpload({ workspace, name, folders, api, toast, pickFold
         if (found.copy) {
           const whereItIs = workspace === null || found.inWorkspace ? "Already here" : "Already in the library, outside this workspace";
           reportDuplicate(item, `${whereItIs}: ${found.copy}`, sha256);
+          // The copy there can show here without a second one being sent.
+          if (workspace !== null && !found.inWorkspace) {
+            item.offer(`Show it in ${name}`, async () => {
+              try {
+                await pickInto(found.copy);
+                uploadedAny = true;
+                item.set(`Shown in ${name}: ${found.copy}`, "uploaded");
+              } catch (err) {
+                toast(err.message, true);
+              }
+            });
+          }
           return;
         }
         if (found.resized) {
@@ -353,9 +383,9 @@ export function openPhotoUpload({ workspace, name, folders, api, toast, pickFold
   dialog.showModal();
   if (files.length) {
     if (workspace !== null && folders.length === 1) start(files);
-    else if (workspace === null || folders.length) {
+    else {
       startDropped.hidden = false;
-      startDropped.disabled = workspace === null;
+      startDropped.disabled = folder === null;
     }
   }
 }
