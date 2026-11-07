@@ -401,6 +401,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/hash", get(file_hash))
         .route("/api/duplicates", get(find_duplicates))
         .route("/api/near-duplicates", get(find_near_duplicates))
+        .route("/api/drives", get(list_drives))
         .route("/api/cleanup/large", get(cleanup_large))
         .route("/api/cleanup/empty", get(cleanup_empty))
         .route("/api/cleanup/dates", get(cleanup_dates).post(cleanup_fix_dates))
@@ -3651,6 +3652,8 @@ struct NoteMetaBody {
     /// A colour from `notes::COLORS`, or "" for none. Left out: unchanged.
     color: Option<String>,
     pinned: Option<bool>,
+    /// "2026-11-08 09:00" (or with a T), or "" for no reminder. Left out: unchanged.
+    remind: Option<String>,
 }
 
 /// A note's colour and pin, kept in its front matter.
@@ -3673,6 +3676,14 @@ async fn note_meta(
     }
     if let Some(pinned) = body.pinned {
         changes.push(("pinned", pinned.then_some("true")));
+    }
+    let remind = match body.remind.as_deref().map(str::trim) {
+        Some("") => Some(None),
+        Some(text) => Some(Some(crate::notes::reminder_time(text).ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Give the reminder as a date and time"))?)),
+        None => None,
+    };
+    if let Some(remind) = &remind {
+        changes.push(("remind", remind.as_deref()));
     }
     let changed = crate::notes::set_matter(&text, &changes);
     if changed != text {
@@ -5408,6 +5419,17 @@ pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
         }
     }
     Ok(out)
+}
+
+/// The drives mounted on this computer, to choose one for backups (administrators).
+async fn list_drives(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let library = state.root.canonicalize().unwrap_or_else(|_| state.root.clone());
+    let drives = tokio::task::spawn_blocking(move || crate::drives::list(&library))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not list the drives"))?;
+    Ok(Json(json!({ "drives": drives })))
 }
 
 // ---- Tidy up a folder (cleanup.rs) ----

@@ -186,6 +186,9 @@ try {
     'photos_taken', 'read_note', 'read_table', 'read_text', 'read_version', 'recent_files', 'search', 'similar_photos'];
   assert.deepEqual(tools.map((t) => t.name).sort(), READING, 'a read key sees no organising tools');
   assert.ok(tools.every((t) => t.annotations.readOnlyHint === true && t.inputSchema.type === 'object'));
+  // Reading tools say what they answer, and their answers come as that data too.
+  assert.equal(tools.find((t) => t.name === 'get_info').outputSchema.type, 'object');
+  assert.ok(tools.filter((t) => t.outputSchema).length >= 15, 'the main reading tools have output schemas');
 
   // Listing.
   const start = data(await tool(key, 'list_folder'));
@@ -585,6 +588,8 @@ try {
   assert.equal(data(await tool(writer, 'add_paragraphs', { path: 'notes/report.docx', paragraphs: ['Added by the agent'] })).added, 1);
   const reportText = (await tool(writer, 'read_text', { path: 'notes/report.docx' })).content[1].text;
   assert.match(reportText, /First paragraph[\s\S]*Added by the agent/);
+  await tool(writer, 'edit_text', { path: 'notes/report.docx', find: 'First paragraph', replace: 'Opening paragraph' });
+  assert.match((await tool(writer, 'read_text', { path: 'notes/report.docx' })).content[1].text, /Opening paragraph/);
   assert.equal(data(await tool(writer, 'append_rows', { path: 'notes/costs.xlsx', rows: [['Paper', 12.5]] })).added, 1);
   assert.deepEqual(data(await tool(writer, 'read_table', { path: 'notes/costs.xlsx' })).rows, [['Item', 'Cost'], ['Paper', '12.5']]);
   assert.equal((await tool(writer, 'append_rows', { path: 'notes/costs.xlsx', sheet: 'Nope', rows: [['x']] })).isError, true);

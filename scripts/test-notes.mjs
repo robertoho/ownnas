@@ -268,6 +268,25 @@ try {
   assert.equal(green.length, 1, 'one of them is green');
   assert.equal(await js(`!document.querySelector('.notes-menu')`), true, 'the menu closes');
 
+  // A reminder from the menu: in the front matter, and due ones on top.
+  await menuFor('Recipes');
+  assert.ok(await js(`!!${menuItem('Earlier versions…')}`), 'earlier versions in the menu');
+  await click(menuItem('Remind me…'));
+  await until(`document.querySelector('dialog.notes-remind')`, 'the reminder dialog');
+  await js(`(() => { document.querySelector('dialog.notes-remind input').value = '2020-01-02T08:30'; [...document.querySelectorAll('dialog.notes-remind button')].find((b) => b.textContent === 'Remind me').click(); return true; })()`);
+  await fileHas('Notes/Recipes.md', /^---\nremind: 2020-01-02 08:30\n---\n/);
+  await until(`${cardOf('Recipes')}?.classList.contains('is-due')`, 'a due reminder');
+  assert.equal(await js(`document.querySelector('#notes-view .notes-section')?.textContent`), 'Reminders');
+  assert.match(await js(`${cardOf('Recipes')}.querySelector('.note-reminder').textContent`), /⏰/);
+
+  // Shared from another app (the web app's share target): a new note, filled in.
+  await send('Page.navigate', { url: `${base}?share_title=An%20article&share_text=Worth%20reading&share_url=https%3A%2F%2Fexample.com%2Fa` });
+  await until(`document.querySelector('#notes-view .notes-capture-title')?.value === 'An article'`, 'the shared note');
+  assert.equal(await js(`document.querySelector('#notes-view .notes-capture-body').value`), 'Worth reading\nhttps://example.com/a');
+  assert.equal(await js(`location.search + location.hash`), '#notes/new');
+  await click(`[...document.querySelectorAll('#notes-view .notes-capture button')].find((b) => b.textContent === 'Add')`);
+  await fileHas('Notes/An article.md', /^# An article\n\nWorth reading\nhttps:\/\/example\.com\/a\n$/);
+
   assert.deepEqual(problems, [], 'no errors in the page');
   console.log('ok: notes');
 } catch (err) {

@@ -270,7 +270,43 @@ fn tools(key: &AgentKey) -> Value {
         all.extend(crate::mcp_write::tools());
     }
     all.retain(|tool| tool["name"].as_str().is_some_and(|name| key.may_use(name)));
+    for tool in &mut all {
+        if let Some(schema) = tool["name"].as_str().and_then(output_schema) {
+            tool["outputSchema"] = schema;
+        }
+    }
     Value::Array(all)
+}
+
+/// What a reading tool answers, as JSON Schema (MCP 2025-06-18): the `structuredContent` of its
+/// result. Only the main fields are named; answers may hold more.
+fn output_schema(name: &str) -> Option<Value> {
+    let string = json!({ "type": "string" });
+    // Numbers may be missing (null) for some entries, such as a folder's size.
+    let integer = json!({ "type": ["integer", "null"] });
+    let boolean = json!({ "type": "boolean" });
+    let strings = json!({ "type": "array", "items": { "type": "string" } });
+    let object = |properties: Value| json!({ "type": "object", "properties": properties });
+    let list_of = |properties: Value| json!({ "type": "array", "items": { "type": "object", "properties": properties } });
+    let photo = json!({ "path": string, "kind": string, "taken": { "type": ["string", "null"] }, "width": { "type": ["integer", "null"] }, "height": { "type": ["integer", "null"] }, "size": { "type": ["integer", "null"] } });
+    let photos = object(json!({ "photos": list_of(photo), "more": boolean }));
+    Some(match name {
+        "list_folder" => object(json!({ "path": string, "more": boolean, "entries": list_of(json!({ "name": string, "path": string, "dir": boolean, "kind": string, "size": integer, "modified": integer, "tags": strings })) })),
+        "search" => object(json!({ "more": boolean, "hits": list_of(json!({ "path": string })) })),
+        "read_text" | "read_version" => object(json!({ "path": string, "offset": integer, "nextOffset": { "type": ["integer", "null"] }, "totalBytes": integer })),
+        "get_info" => object(json!({ "name": string, "path": string, "dir": boolean, "kind": string, "size": { "type": ["integer", "null"] }, "modified": { "type": ["integer", "null"] }, "tags": strings, "protected": boolean })),
+        "read_table" => object(json!({ "path": string, "sheet": string, "firstRow": integer, "more": boolean, "rows": { "type": "array", "items": strings }, "sheets": list_of(json!({ "name": string, "rows": integer, "columns": integer })) })),
+        "list_versions" => object(json!({ "path": string, "versions": list_of(json!({ "version": integer, "replaced": string, "size": integer, "by": string, "reason": string })) })),
+        "photo_search" | "similar_photos" | "photos_taken" | "album_photos" | "person_photos" => photos,
+        "list_albums" => object(json!({ "albums": list_of(json!({ "id": integer, "name": string, "photos": integer })) })),
+        "list_people" => object(json!({ "people": list_of(json!({ "id": integer, "name": { "type": ["string", "null"] }, "photos": integer })) })),
+        "recent_files" => object(json!({ "more": boolean, "files": list_of(json!({ "path": string, "size": integer, "kind": string, "modified": string })) })),
+        "folder_usage" => object(json!({ "path": string, "bytes": integer, "files": integer, "folders": list_of(json!({ "path": string, "bytes": integer, "files": integer })), "largestFiles": list_of(json!({ "path": string, "bytes": integer })) })),
+        "find_duplicates" => object(json!({ "path": string, "wastedBytes": integer, "more": boolean, "groups": list_of(json!({ "size": integer, "copies": list_of(json!({ "path": string, "modified": string })) })) })),
+        "list_notes" => object(json!({ "notes": list_of(json!({ "path": string, "title": string, "start": string, "labels": strings, "pinned": boolean, "archived": boolean })) })),
+        "read_note" => object(json!({ "path": string, "title": string, "links": strings, "linkedFrom": list_of(json!({ "path": string, "title": string })) })),
+        _ => return None,
+    })
 }
 
 /// Every tool by the level that brings it, for choosing a key's tools in Settings.

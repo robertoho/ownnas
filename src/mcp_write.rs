@@ -38,7 +38,7 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "edit_text",
             "title": "Change a passage",
-            "description": "Replaces one exact passage of a text file with new text. The passage must appear exactly once: include enough around it to make it unique. What the file held is kept in its history.",
+            "description": "Replaces one exact passage of a text file, or of a Word (docx) or OpenDocument (odt) document, with new text. The passage must appear exactly once: include enough around it to make it unique (in a document, within one paragraph). What the file held is kept in its history.",
             "inputSchema": { "type": "object", "required": ["path", "find", "replace"], "properties": {
                 "path": path("The text file."),
                 "find": { "type": "string", "description": "The exact text to replace, as it is in the file." },
@@ -235,6 +235,15 @@ async fn edit_text(state: &Arc<AppState>, key: &AgentKey, path: &str, find: &str
         return failed("Give the exact passage to replace.");
     }
     let Some(replace) = replace else { return failed("Give the new text (an empty one takes the passage out).") };
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".docx") || lower.ends_with(".odt") {
+        let (found, bytes) = binary_file(state, key, path).await?;
+        let (find, replace, word) = (find.to_string(), replace.to_string(), lower.ends_with(".docx"));
+        let changed = blocking(move || if word { crate::office_edit::docx_replace(&bytes, &find, &replace) } else { crate::office_edit::odt_replace(&bytes, &find, &replace) }.map_err(Stop::Failed)).await?;
+        let version = overwrite_bytes(state, key, &found, changed).await?;
+        after_write(state, key, "agent-edit", &found.rel);
+        return done(json!({ "path": found.rel, "changed": true }), json!({ "kind": "version", "path": found.rel, "version": version }));
+    }
     let (found, text) = text_file(state, key, path).await?;
     let times = text.matches(find).count();
     if times == 0 {

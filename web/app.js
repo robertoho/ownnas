@@ -2381,6 +2381,7 @@ async function notes() {
       pickFolder: (options) => pickFolder(options),
       tag: (paths) => bulkTagEntries(paths.map((path) => ({ path, name: path.split("/").pop(), dir: false, size: 0, modified: 0, kind: "text" }))),
       showInFolder: (path) => openFileByPath(path).catch((err) => toast(err.message, true)),
+      openVersions: (path) => openVersions(path).catch((err) => toast(err.message, true)),
       openFolder: (path) => { location.hash = `#/${path.split("/").map(encodeURIComponent).join("/")}`; },
       openNote: async (path, edit) => {
         await openEntry({ path, name: path.split("/").pop(), dir: false, size: 0, modified: 0, kind: "text" });
@@ -5645,6 +5646,9 @@ async function boot() {
     // The server checks once a day; looking every few hours is enough to notice.
     if (!updateStatusTimer) updateStatusTimer = setInterval(pollUpdateNotice, 3 * 60 * 60 * 1000);
   }
+  takeShare();
+  pollReminders();
+  if (!reminderTimer) reminderTimer = setInterval(pollReminders, 60_000);
   if (state.me.admin) {
     pollAgentChanges();
     if (!agentChangesTimer) agentChangesTimer = setInterval(pollAgentChanges, 60_000);
@@ -5865,6 +5869,43 @@ $("update-pill-open").addEventListener("click", () => openSettings("updates"));
 // ---- Changes AI agents asked for, waiting for an administrator to approve them ----
 
 let agentChangesTimer = null;
+let reminderTimer = null;
+
+/// Something shared to OwnNAS from another app (the web app is a share target): a new note
+/// with it, in Notes.
+function takeShare() {
+  const params = new URLSearchParams(location.search);
+  if (!["share_title", "share_text", "share_url"].some((name) => params.has(name))) return;
+  const title = (params.get("share_title") || "").trim();
+  const text = [params.get("share_text"), params.get("share_url")].map((part) => (part || "").trim()).filter(Boolean).filter((part, index, all) => all.indexOf(part) === index).join("\n");
+  history.replaceState(null, "", "/#notes/new");
+  route().then(() => notes()).then((api) => api.prefill({ title, text })).catch((err) => toast(err.message, true));
+}
+
+/// Notes whose reminder is due, as notifications (once each), while OwnNAS is open.
+async function pollReminders() {
+  if (!state.me || !("Notification" in window) || Notification.permission !== "granted") return;
+  let shown = {};
+  try { shown = JSON.parse(localStorage.getItem("ownnas-reminded") || "{}"); } catch { /* none yet */ }
+  try {
+    const { notes: all } = await api("/api/notes");
+    const now = new Date();
+    for (const note of all || []) {
+      if (!note.remind || note.archived || new Date(note.remind.replace(" ", "T")) > now) continue;
+      const key = `${note.path}|${note.remind}`;
+      if (shown[key]) continue;
+      shown[key] = Date.now();
+      const notice = new Notification(note.title, { body: note.excerpt || note.items.map((item) => item.text).join(", "), tag: key });
+      notice.onclick = () => {
+        window.focus();
+        openEntry({ path: note.path, name: note.path.split("/").pop(), dir: false, size: 0, modified: 0, kind: "text" }).catch(() => {});
+      };
+    }
+    // Only the last 500 are remembered.
+    const kept = Object.entries(shown).sort((a, b) => b[1] - a[1]).slice(0, 500);
+    localStorage.setItem("ownnas-reminded", JSON.stringify(Object.fromEntries(kept)));
+  } catch { /* tried again in a minute */ }
+}
 
 async function pollAgentChanges() {
   if (!state.me?.admin) return;

@@ -221,11 +221,47 @@ function renderForm() {
     user: el("input", { autocomplete: "off", spellcheck: "false", value: d.user }),
     remotePath: el("input", { autocomplete: "off", spellcheck: "false", value: d.kind === "sftp" ? d.path : "", placeholder: "/srv/backups/ownnas" }),
   };
+  /// The drives plugged in now: one click puts a backup folder on it.
+  const drivesBox = () => {
+    const box = el("div", { class: "backup-drives" }, el("p", { class: "muted" }, "Looking for drives…"));
+    const size = (bytes) => {
+      const units = ["B", "KB", "MB", "GB", "TB"];
+      let value = bytes;
+      let unit = 0;
+      while (value >= 1000 && unit < units.length - 1) { value /= 1000; unit += 1; }
+      return `${value >= 10 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
+    };
+    const paint = async () => {
+      try {
+        const { drives } = await ctx.api("/api/drives");
+        box.replaceChildren(
+          el("div", { class: "backup-drives-head" },
+            el("span", { class: "muted" }, drives.length ? "Drives plugged in:" : "No other drives are plugged in. Plug one in and look again."),
+            el("button", { type: "button", class: "backup-drives-refresh", onclick: () => { box.replaceChildren(el("p", { class: "muted" }, "Looking for drives…")); paint(); } }, "Look again")),
+          ...drives.map((drive) => el("button", {
+            type: "button",
+            class: `backup-drive${drive.holdsLibrary ? " holds-library" : ""}`,
+            title: drive.path,
+            onclick: () => {
+              inputs.path.value = `${drive.path.replace(/[\\/]+$/, "")}${drive.path.includes("\\") ? "\\" : "/"}OwnNAS backup`;
+              inputs.path.focus();
+            },
+          },
+          el("strong", {}, `${drive.removable ? "💾" : "🗄"} ${drive.name}`),
+          el("span", { class: "muted" }, `${size(drive.available)} free of ${size(drive.total)}${drive.filesystem ? ` · ${drive.filesystem}` : ""}`),
+          drive.holdsLibrary ? el("span", { class: "backup-drive-warning" }, "The library is on this drive") : null)));
+      } catch (err) {
+        box.replaceChildren(el("p", { class: "muted" }, err.message));
+      }
+    };
+    paint();
+    return box;
+  };
   const showKind = () => {
     for (const button of kindPicker.children) button.setAttribute("aria-checked", button.dataset.kind === kind ? "true" : "false");
     pane.replaceChildren();
     if (kind === "local") {
-      pane.append(field("Folder", inputs.path, "The full path of a folder on a drive this computer can write to, such as a USB disk. Keep it on a different drive from the library."));
+      pane.append(field("Folder", inputs.path, "The full path of a folder on a drive this computer can write to, such as a USB disk. Keep it on a different drive from the library."), drivesBox());
     } else if (kind === "s3") {
       pane.append(
         field("Endpoint", inputs.endpoint, "AWS: s3.amazonaws.com. Backblaze B2: s3.<region>.backblazeb2.com. Cloudflare R2: <account>.r2.cloudflarestorage.com. MinIO and others: https://host:port."),

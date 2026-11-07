@@ -3813,6 +3813,12 @@ button.linkish {
 body.is-gallery .app > .toolbar,
 body.is-gallery .app > .explorer-content,
 body.is-gallery .app > .explorer-status-bar { display: none; }
+/* ---- Drives for backups (nas-backup.js) ---- */
+.backup-drives { display: grid; gap: 0.35rem; margin: 0.5rem 0 0.25rem; }
+.backup-drives-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; font-size: 0.85rem; }
+.backup-drives-refresh { min-height: 0; padding: 0.15rem 0.6rem; font-size: 0.8rem; }
+.backup-drive { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 0.1rem 0.75rem; text-align: left; padding: 0.45rem 0.7rem; }
+.backup-drive .backup-drive-warning { grid-column: 1 / -1; color: var(--danger); font-size: 0.8rem; }
 /* ---- Photo details (EXIF) under the preview ---- */
 .preview-exif { border-top: 1px solid var(--line); }
 .exif-summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.8rem; }
@@ -3927,6 +3933,10 @@ body.is-notes .app > .explorer-status-bar { display: none; }
 .notes-menu-group button[role="menuitem"] { padding-left: 0.4rem; }
 .notes-menu-label { display: block; margin-bottom: 0.25rem; font-size: 0.75rem; color: var(--muted); }
 .note-more-btn { margin-left: auto; }
+.note-reminder { display: inline-block; min-height: 0; margin: 0 0 0.35rem; padding: 0.1rem 0.5rem; border-radius: 999px; border: 1px solid var(--line); background: transparent; box-shadow: none; font-size: 0.78rem; color: var(--muted); }
+.note-reminder.is-due { border-color: var(--accent); color: var(--text); font-weight: 600; }
+.note-card.is-due { border-color: var(--accent); }
+.notes-remind input[type="datetime-local"] { width: 100%; }
 .note-color-red { --note: #e5534b; } .note-color-orange { --note: #f0883e; } .note-color-yellow { --note: #e3b341; }
 .note-color-green { --note: #57ab5a; } .note-color-teal { --note: #39c5bb; } .note-color-blue { --note: #539bf5; }
 .note-color-purple { --note: #986ee2; } .note-color-pink { --note: #e275ad; } .note-color-brown { --note: #a8805a; } .note-color-gray { --note: #8b949e; }

@@ -37,6 +37,25 @@ function plain(text) {
 
 const stemOf = (path) => path.split("/").pop().replace(/\.(md|markdown)$/i, "");
 
+/// A reminder "2026-11-08 09:00" (this computer's time) as a Date.
+const reminderDate = (text) => new Date(text.replace(" ", "T"));
+const isDue = (note) => !!note.remind && reminderDate(note.remind) <= new Date();
+
+/// "Today 09:00", "Tomorrow 18:30", or the date.
+function reminderText(text) {
+  const when = reminderDate(text);
+  const day = new Date(when);
+  day.setHours(0, 0, 0, 0);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const days = Math.round((day - today) / 86400000);
+  const time = when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (days === 0) return `Today ${time}`;
+  if (days === 1) return `Tomorrow ${time}`;
+  if (days === -1) return `Yesterday ${time}`;
+  return `${when.toLocaleDateString([], { day: "numeric", month: "short", year: day.getFullYear() === today.getFullYear() ? undefined : "numeric" })} ${time}`;
+}
+
 export function mountNotes(host, ctx) {
   let data = null;
   let query = "";
@@ -261,14 +280,16 @@ export function mountNotes(host, ctx) {
       grid.replaceChildren(el("p", { class: "notes-empty muted" }, archived ? "Nothing archived here." : "No notes match."));
       return;
     }
-    const pinned = archived ? [] : shown.filter((note) => note.pinned);
-    const others = archived ? shown : shown.filter((note) => !note.pinned);
+    const due = archived ? [] : shown.filter(isDue).sort((a, b) => a.remind.localeCompare(b.remind));
+    const pinned = archived ? [] : shown.filter((note) => note.pinned && !isDue(note));
+    const others = archived ? shown : shown.filter((note) => !note.pinned && !isDue(note));
     const section = (heading, notes) => notes.length ? [
       heading ? el("h3", { class: "notes-section" }, heading) : null,
       el("div", { class: "notes-grid" }, notes.map((note) => card(note, linked.get(note.path) || []))),
     ] : [];
     // replaceChildren would print a null as text.
-    grid.replaceChildren(...[...section(pinned.length ? "Pinned" : "", pinned), ...section(pinned.length ? "Others" : "", others)].filter(Boolean));
+    const headed = pinned.length || due.length;
+    grid.replaceChildren(...[...section("Reminders", due), ...section(pinned.length ? "Pinned" : "", pinned), ...section(headed ? "Others" : "", others)].filter(Boolean));
   }
 
   async function change(url, json, done) {
@@ -301,6 +322,35 @@ export function mountNotes(host, ctx) {
       }
     };
     document.addEventListener("pointerdown", away, true);
+  }
+
+  /// Asks when to be reminded of a note (or to stop).
+  function reminderDialog(note) {
+    const local = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}T${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    tomorrow.setHours(9, 0, 0, 0);
+    const input = el("input", { type: "datetime-local", value: note.remind ? note.remind.replace(" ", "T") : local(tomorrow), "aria-label": "When" });
+    const save = el("button", { type: "button", class: "primary" }, "Remind me");
+    const remove = note.remind ? el("button", { type: "button", class: "danger" }, "No reminder") : null;
+    const dialog = el("dialog", { class: "workspace-editor notes-remind" },
+      el("h3", {}, `Remind me of “${note.title}”`),
+      el("p", { class: "muted" }, "It shows at the top of Notes when it is time, and as a notification while OwnNAS is open."),
+      input,
+      el("div", { class: "dialog-actions" }, remove, el("span", { class: "spacer" }), el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"), save));
+    const set = async (remind) => {
+      dialog.close();
+      await change("/api/notes/meta", { path: note.path, remind }, remind ? `Reminder set for ${reminderText(remind.replace("T", " "))}` : "Reminder removed");
+      if (remind && "Notification" in window && Notification.permission === "default") {
+        try { await Notification.requestPermission(); } catch { /* the reminder still shows in Notes */ }
+      }
+    };
+    save.addEventListener("click", () => input.value && set(input.value));
+    remove?.addEventListener("click", () => set(""));
+    dialog.addEventListener("close", () => dialog.remove());
+    document.body.append(dialog);
+    dialog.showModal();
+    input.focus();
   }
 
   function closeNoteMenu() {
@@ -341,6 +391,7 @@ export function mountNotes(host, ctx) {
           onclick: () => { closeNoteMenu(); change("/api/notes/meta", { path: note.path, color: name }); },
         })))) : null,
       write ? item("Labels…", () => ctx.tag([note.path]).then(() => load())) : null,
+      write ? item(note.remind ? `Reminder: ${reminderText(note.remind)}…` : "Remind me…", () => reminderDialog(note)) : null,
       write && !note.archived && (allNotebooks.length || here) ? el("div", { class: "notes-menu-group", role: "group", "aria-label": "Move to notebook" },
         el("span", { class: "notes-menu-label" }, "Move to notebook"),
         here ? item("No notebook", () => moveTo("")) : null,
@@ -375,6 +426,7 @@ export function mountNotes(host, ctx) {
         }
       }),
       item("Show in folder", () => ctx.showInFolder(note.path)),
+      item("Earlier versions…", () => ctx.openVersions(note.path)),
       write ? el("hr") : null,
       write ? item(note.archived ? "Unarchive" : "Archive", () => change("/api/notes/archive", { path: note.path, archived: !note.archived }, note.archived ? "Back in your notes" : "Archived")) : null,
       write ? item("Move to the Trash", async () => {
@@ -425,9 +477,10 @@ export function mountNotes(host, ctx) {
       type: "button", class: `notes-icon-btn ${extra}`, title: label, "aria-label": label,
       onclick: (event) => { event.stopPropagation(); run(event); },
     }, symbol);
-    const node = el("article", { class: `note-card${note.color ? ` note-color-${note.color}` : ""}${note.pinned ? " is-pinned" : ""}`, tabindex: "0", "data-path": note.path, title: note.path },
+    const node = el("article", { class: `note-card${note.color ? ` note-color-${note.color}` : ""}${note.pinned ? " is-pinned" : ""}${isDue(note) ? " is-due" : ""}`, tabindex: "0", "data-path": note.path, title: note.path },
       write && !note.archived ? action(note.pinned ? "Unpin" : "Pin", "📌", () => change("/api/notes/meta", { path: note.path, pinned: !note.pinned }), "note-pin") : null,
       el("h4", { class: "note-title" }, note.title),
+      note.remind ? el("button", { type: "button", class: `note-reminder${isDue(note) ? " is-due" : ""}`, title: "Change the reminder", onclick: (event) => { event.stopPropagation(); if (write) reminderDialog(note); } }, `⏰ ${reminderText(note.remind)}`) : null,
       note.excerpt ? el("p", { class: "note-excerpt" }, plain(note.excerpt)) : null,
       items.length ? el("ul", { class: "note-items" }, items) : null,
       more > 0 ? el("p", { class: "muted note-more" }, `+ ${more} more item${more === 1 ? "" : "s"}`) : null,
@@ -473,8 +526,17 @@ export function mountNotes(host, ctx) {
   });
 
   return {
+    /// Opens the capture box with something shared from another app.
+    prefill({ title: sharedTitle = "", text = "" }) {
+      openCapture();
+      title.value = sharedTitle;
+      body.value = text;
+      body.rows = Math.min(14, Math.max(2, text.split("\n").length));
+      body.focus();
+    },
     show(hash) {
       archived = hash.startsWith("#notes/archive");
+      if (hash.startsWith("#notes/new")) setTimeout(() => body.focus());
       host.hidden = false;
       paint();
       load().catch((err) => ctx.toast(err.message, true));

@@ -45,6 +45,8 @@ pub struct Note {
     pub color: Option<String>,
     pub pinned: bool,
     pub archived: bool,
+    /// When to be reminded, "2026-11-08 09:00" (this computer's time), from `remind:`.
+    pub remind: Option<String>,
     /// `#hashtags` in the text (OwnNAS tags are added by the caller).
     pub hashtags: Vec<String>,
     /// `[[wiki links]]`: the names linked to.
@@ -169,6 +171,7 @@ pub fn read_note(path: &str, stem: &str, text: &str, modified: i64, size: u64, a
     let excerpt: String = excerpt.trim_end().chars().take(EXCERPT).collect();
     let color = matter_value(&matter, "color").map(str::to_ascii_lowercase).filter(|color| COLORS.contains(&color.as_str()));
     let pinned = matter_value(&matter, "pinned").is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "yes");
+    let remind = matter_value(&matter, "remind").and_then(reminder_time);
     Note {
         path: path.to_string(),
         title: title.unwrap_or_else(|| stem.to_string()),
@@ -179,6 +182,7 @@ pub fn read_note(path: &str, stem: &str, text: &str, modified: i64, size: u64, a
         color,
         pinned,
         archived,
+        remind,
         hashtags: hashtags(body),
         links: links(body),
         modified,
@@ -248,6 +252,16 @@ pub fn free_path(dir: &Path, name: &str) -> PathBuf {
         n += 1;
     }
     candidate
+}
+
+/// A reminder's time as "YYYY-MM-DD HH:MM", from that or "YYYY-MM-DDTHH:MM" (what a browser's
+/// date and time field gives), or a day alone (9:00 then).
+pub fn reminder_time(text: &str) -> Option<String> {
+    let text = text.trim().replace('T', " ");
+    let (day, time) = text.split_once(' ').unwrap_or((&text, "09:00"));
+    let date = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").ok()?;
+    let time = chrono::NaiveTime::parse_from_str(time.get(..5).unwrap_or(time), "%H:%M").ok()?;
+    Some(format!("{} {}", date.format("%Y-%m-%d"), time.format("%H:%M")))
 }
 
 /// The text with one checklist line ticked or not. `expected` is the item's text as shown, so a
@@ -402,6 +416,16 @@ mod tests {
         );
         assert_eq!(relink("no links here", "Groceries", "Shopping"), None);
         assert_eq!(relink("[[broken", "broken", "x"), None);
+    }
+
+    #[test]
+    fn reminders_read_in_several_ways() {
+        assert_eq!(reminder_time("2026-11-08 09:30").as_deref(), Some("2026-11-08 09:30"));
+        assert_eq!(reminder_time("2026-11-08T18:05").as_deref(), Some("2026-11-08 18:05"));
+        assert_eq!(reminder_time("2026-11-08").as_deref(), Some("2026-11-08 09:00"));
+        assert_eq!(reminder_time("tomorrow"), None);
+        let note = read_note("Notes/x.md", "x", "---\nremind: 2026-11-08T07:00\n---\nCall Ann\n", 0, 0, false);
+        assert_eq!(note.remind.as_deref(), Some("2026-11-08 07:00"));
     }
 
     #[test]

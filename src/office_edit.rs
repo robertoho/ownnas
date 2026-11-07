@@ -70,6 +70,105 @@ pub fn odt_add_paragraphs(bytes: &[u8], paragraphs: &[String]) -> Result<Vec<u8>
     })
 }
 
+fn xml_unescape(text: &str) -> String {
+    text.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+}
+
+/// The text pieces of a Word paragraph: where each `<w:t>`'s text is in the XML, and the text.
+fn word_pieces(xml: &str, from: usize, to: usize) -> Vec<(usize, usize, String)> {
+    let mut pieces = Vec::new();
+    let mut at = from;
+    while let Some(found) = xml[at..to].find("<w:t") {
+        let open = at + found;
+        // <w:t>, <w:t xml:space="preserve">, but not <w:tab/> or <w:tbl>.
+        let after = xml.as_bytes().get(open + 4).copied();
+        let Some(close_tag) = xml[open..to].find('>').map(|end| open + end) else { break };
+        if !matches!(after, Some(b'>') | Some(b' ')) || xml.as_bytes()[close_tag - 1] == b'/' {
+            at = close_tag + 1;
+            continue;
+        }
+        let Some(end) = xml[close_tag..to].find("</w:t>").map(|end| close_tag + end) else { break };
+        pieces.push((close_tag + 1, end, xml_unescape(&xml[close_tag + 1..end])));
+        at = end + 6;
+    }
+    pieces
+}
+
+/// A passage of a Word document replaced, even when it runs across differently formatted
+/// parts of a paragraph (the new text takes the formatting where the passage starts). It must
+/// be in the document exactly once, and inside one paragraph.
+pub fn docx_replace(bytes: &[u8], find: &str, replace: &str) -> Result<Vec<u8>, String> {
+    if find.is_empty() {
+        return Err("Give the passage to replace".into());
+    }
+    rewrite_part(bytes, "word/document.xml", |xml| {
+        let mut found: Option<(Vec<(usize, usize, String)>, usize)> = None;
+        let mut count = 0;
+        let mut at = 0;
+        while let Some(start) = xml[at..].find("<w:p").map(|start| at + start) {
+            let after = xml.as_bytes().get(start + 4).copied();
+            let Some(end) = xml[start..].find("</w:p>").map(|end| start + end) else { break };
+            if !matches!(after, Some(b'>') | Some(b' ')) {
+                at = start + 4;
+                continue;
+            }
+            let pieces = word_pieces(xml, start, end);
+            let text: String = pieces.iter().map(|(_, _, text)| text.as_str()).collect();
+            let matches: Vec<usize> = text.match_indices(find).map(|(index, _)| index).collect();
+            count += matches.len();
+            if let (Some(&first), None) = (matches.first(), found.as_ref()) {
+                found = Some((pieces, first));
+            }
+            at = end + 6;
+        }
+        match count {
+            0 => return Err("That passage is not in the document (or it runs across two paragraphs)".into()),
+            1 => {}
+            n => return Err(format!("That passage is in the document {n} times: include more of the text around it")),
+        }
+        let (pieces, start) = found.ok_or("That passage is not in the document")?;
+        let end = start + find.len();
+        // Which pieces the passage covers, and the new text of each.
+        let mut offset = 0;
+        let mut edits: Vec<(usize, usize, String)> = Vec::new();
+        let mut placed = false;
+        for (from, to, text) in &pieces {
+            let (piece_start, piece_end) = (offset, offset + text.len());
+            offset = piece_end;
+            if piece_end <= start || piece_start >= end {
+                continue;
+            }
+            let keep_before = &text[..start.saturating_sub(piece_start).min(text.len())];
+            let keep_after = &text[end.saturating_sub(piece_start).min(text.len())..];
+            let middle = if placed { "" } else { replace };
+            placed = true;
+            edits.push((*from, *to, format!("{keep_before}{middle}{keep_after}")));
+        }
+        let mut out = xml.to_string();
+        for (from, to, text) in edits.into_iter().rev() {
+            out.replace_range(from..to, &xml_text(&text));
+        }
+        // Spaces at the edges of a run only stay with xml:space="preserve".
+        Ok(out.replace("<w:t>", "<w:t xml:space=\"preserve\">"))
+    })
+}
+
+/// A passage of an OpenDocument text replaced: it must be in the document exactly once, and
+/// within one stretch of text (not across formatting).
+pub fn odt_replace(bytes: &[u8], find: &str, replace: &str) -> Result<Vec<u8>, String> {
+    if find.is_empty() {
+        return Err("Give the passage to replace".into());
+    }
+    rewrite_part(bytes, "content.xml", |xml| {
+        let escaped = xml_text(find);
+        match xml.matches(&escaped).count() {
+            0 => Err("That passage is not in the document as one stretch of text: give a shorter one, without formatting changes inside".into()),
+            1 => Ok(xml.replacen(&escaped, &xml_text(replace), 1)),
+            n => Err(format!("That passage is in the document {n} times: include more of the text around it")),
+        }
+    })
+}
+
 /// A column number (from 0) as letters: 0 is A, 26 is AA.
 fn column(mut index: usize) -> String {
     let mut letters = Vec::new();
@@ -208,6 +307,21 @@ mod tests {
         );
         assert_eq!(part(&changed, "word/media/a.png"), "picture", "the rest is as it was");
         assert!(docx_add_paragraphs(b"not a zip", &["x".into()]).is_err());
+    }
+
+    #[test]
+    fn word_passages_are_replaced_across_runs() {
+        let doc = zipped(&[("word/document.xml", "<w:document><w:body><w:p><w:r><w:t>Pay </w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t xml:space=\"preserve\">100 EUR</w:t></w:r><w:r><w:t> by Friday &amp; on time.</w:t></w:r></w:p><w:p><w:r><w:t>Other</w:t></w:r></w:p></w:body></w:document>")]);
+        let changed = docx_replace(&doc, "100 EUR by Friday", "120 EUR by Monday").unwrap();
+        let xml = part(&changed, "word/document.xml");
+        assert!(xml.contains("<w:t xml:space=\"preserve\">Pay </w:t>"), "{xml}");
+        assert!(xml.contains("<w:b/></w:rPr><w:t xml:space=\"preserve\">120 EUR by Monday</w:t>"), "{xml}");
+        assert!(xml.contains("<w:t xml:space=\"preserve\"> &amp; on time.</w:t>"), "{xml}");
+        assert!(docx_replace(&doc, "Friday & on", "x").is_ok(), "entities are read as text");
+        assert!(docx_replace(&doc, "nowhere", "x").is_err());
+        assert!(docx_replace(&doc, "e", "x").unwrap_err().contains("times"));
+        let odt = zipped(&[("content.xml", "<office:text><text:p>Hello Bob &amp; Ann</text:p></office:text>")]);
+        assert!(part(&odt_replace(&odt, "Bob & Ann", "everyone").unwrap(), "content.xml").contains("<text:p>Hello everyone</text:p>"));
     }
 
     #[test]
