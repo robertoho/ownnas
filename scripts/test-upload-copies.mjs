@@ -1,6 +1,6 @@
-// Web uploads: photos and videos the library already has (same contents, anywhere outside the
-// Trash) are found before they are sent, and skipped or sent as the person chooses; other files
-// upload as usual. In headless Chrome against a throwaway server (CHROME overrides its path;
+// Web uploads: files the library already has (same contents, anywhere outside the Trash) are
+// found before they are sent, and skipped or sent as the person chooses: photos and videos of
+// any size, other files from 100 KB (small ones are often the same on purpose) upload as usual. In headless Chrome against a throwaway server (CHROME overrides its path;
 // OWNNAS_TARGET the target directory).
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -25,6 +25,9 @@ fs.writeFileSync(path.join(library, 'Photos/beach.jpg'), beach);
 fs.writeFileSync(path.join(library, 'Photos/clip.mp4'), clip);
 fs.writeFileSync(path.join(library, '.ownnas-trash/old.jpg'), trashed);
 fs.writeFileSync(path.join(library, 'notes.txt'), 'the same notes');
+const report = randomBytes(200 * 1024);
+fs.mkdirSync(path.join(library, 'Docs'));
+fs.writeFileSync(path.join(library, 'Docs/report.pdf'), report);
 const write = (name, data) => { fs.writeFileSync(path.join(local, name), data); return path.join(local, name); };
 // The same photo and video under other names; one only in the Trash; a new one of the same size
 // as the photo; and a text file the library has too (not a photo, so not looked at).
@@ -33,6 +36,7 @@ const clipCopy = write('clip-copy.mp4', clip);
 const trashedCopy = write('trashed-copy.jpg', trashed);
 const sameSize = write('same-size.jpg', Buffer.concat([JPEG, randomBytes(3000)]));
 const notesCopy = write('notes-copy.txt', 'the same notes');
+const reportCopy = write('report-copy.pdf', report);
 const PASSWORD = randomBytes(12).toString('hex');
 const freePort = () => new Promise((done) => {
   const probe = net.createServer().listen(0, '127.0.0.1', () => {
@@ -110,19 +114,19 @@ try {
   await open();
   await until(`!!document.getElementById('upload-btn') && !document.getElementById('upload-btn').hidden`, 'the app');
   // The library is indexed (by size) once the server knows the photo's size.
-  await until(`fetch('/api/upload/same-size', { method: 'POST', headers: { 'content-type': 'application/json', 'x-ownnas': '1' }, body: JSON.stringify({ sizes: [${beach.length}, ${clip.length}] }) }).then((r) => r.json()).then((a) => a.sizes.length === 2)`, 'the library index');
+  await until(`fetch('/api/upload/same-size', { method: 'POST', headers: { 'content-type': 'application/json', 'x-ownnas': '1' }, body: JSON.stringify({ sizes: [${beach.length}, ${clip.length}, ${report.length}] }) }).then((r) => r.json()).then((a) => a.sizes.length === 3)`, 'the library index');
   const dialogOpen = `document.getElementById('media-copies-dialog').open`;
 
-  // Skip: the photo and video already there stay out; everything else goes.
-  await pick(beachCopy, clipCopy, trashedCopy, sameSize, notesCopy);
+  // Skip: the photo, video and document already there stay out; everything else goes.
+  await pick(beachCopy, clipCopy, trashedCopy, sameSize, notesCopy, reportCopy);
   await until(dialogOpen, 'the copies dialog');
   const rows = await js(`[...document.querySelectorAll('#media-copies-list li')].map((li) => [...li.children].map((part) => part.textContent).join(' ')).sort()`);
-  assert.deepEqual(rows, ['beach-copy.jpg already in Photos/beach.jpg', 'clip-copy.mp4 already in Photos/clip.mp4']);
-  assert.match(await js(`document.getElementById('media-copies-copy').textContent`), /^2 photos and videos are already on the server.*The other files upload as usual[.]$/);
+  assert.deepEqual(rows, ['beach-copy.jpg already in Photos/beach.jpg', 'clip-copy.mp4 already in Photos/clip.mp4', 'report-copy.pdf already in Docs/report.pdf']);
+  assert.match(await js(`document.getElementById('media-copies-copy').textContent`), /^3 files are already on the server.*The other files upload as usual[.]$/);
   await js(`document.querySelector('#media-copies-dialog button[value="skip"]').click()`);
   for (let i = 0; i < 100 && !(there('trashed-copy.jpg') && there('same-size.jpg') && there('notes-copy.txt')); i++) await sleep(100);
   assert.ok(there('trashed-copy.jpg') && there('same-size.jpg') && there('notes-copy.txt'), 'the others were uploaded');
-  assert.ok(!there('beach-copy.jpg') && !there('clip-copy.mp4'), 'the copies were skipped');
+  assert.ok(!there('beach-copy.jpg') && !there('clip-copy.mp4') && !there('report-copy.pdf'), 'the copies were skipped');
 
   // Upload anyway sends it; Cancel sends nothing.
   await pick(clipCopy);
@@ -132,7 +136,7 @@ try {
   assert.ok(!there('clip-copy.mp4'), 'nothing sent after Cancel');
   await pick(beachCopy);
   await until(dialogOpen, 'the copies dialog once more');
-  assert.equal(await js(`document.getElementById('media-copies-copy').textContent`), '1 photo or video is already on the server, with exactly the same contents.');
+  assert.equal(await js(`document.getElementById('media-copies-copy').textContent`), '1 file is already on the server, with exactly the same contents.');
   await js(`document.querySelector('#media-copies-dialog button[value="upload"]').click()`);
   for (let i = 0; i < 100 && !there('beach-copy.jpg'); i++) await sleep(100);
   assert.ok(there('beach-copy.jpg'), 'sent anyway');

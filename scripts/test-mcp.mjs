@@ -8,6 +8,7 @@ import fs from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { zipSync, strToU8 } from '../web/vendor/three/addons/libs/fflate.module.js';
 
 const repo = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 const binary = path.join(process.env.OWNNAS_TARGET || path.join(repo, 'target/debug'), 'ownnas');
@@ -484,6 +485,18 @@ try {
   const again = await api('POST', '/api/agent-keys/changes/undo', { id: tidyChanges[0].id });
   assert.equal(again.status, 409, 'an undone change cannot be undone twice');
 
+  // Sorting a folder into sub-folders: a dry run, the real thing, and undoing it.
+  const dry = data(await tool(tidy, 'sort_into_folders', { path: 'work', pattern: '{type}', dry_run: true }));
+  assert.deepEqual(Object.keys(dry.folders).sort(), ['work/Documents', 'work/Pictures']);
+  assert.ok(await exists('work/a.txt'), 'a dry run moves nothing');
+  await refused(tidy, 'sort_into_folders', { path: 'docs', pattern: '{type}' });
+  assert.equal((await tool(tidy, 'sort_into_folders', { path: 'work', pattern: 'no tokens' })).isError, true);
+  assert.equal(data(await tool(tidy, 'sort_into_folders', { path: 'work', pattern: '{type}' })).moved, 3);
+  assert.ok(await exists('work/Documents/a.txt') && await exists('work/Pictures/pic.png') && !(await exists('work/a.txt')));
+  const sortChange = (await api('GET', `/api/agent-keys/changes?id=${organiser.json.id}&status=done`)).json.changes.find((c) => c.tool === 'sort_into_folders');
+  assert.equal((await api('POST', '/api/agent-keys/changes/undo', { id: sortChange.id })).status, 200);
+  assert.ok(await exists('work/a.txt') && await exists('work/pic.png') && !(await exists('work/Documents')), 'all back, and its folders gone');
+
   // Approval mode: changes wait for a person, and are checked again when carried out.
   const careful = (await api('POST', '/api/agent-keys', { name: 'careful', folders: ['work'], level: 'organise', approve: true })).json;
   const asked = data(await tool(careful.token, 'create_folder', { path: 'work', name: 'inbox' }));
@@ -542,6 +555,38 @@ try {
   assert.equal(data(await tool(writer, 'append_rows', { path: 'notes/sheet.csv', rows: [['Bob, Jr.', 2], ['Cy', null]] })).added, 2);
   assert.equal(await read('notes/sheet.csv'), 'name,amount\nAnn,1\n"Bob, Jr.",2\nCy,\n');
   assert.equal((await tool(writer, 'append_rows', { path: 'notes/plan.md', rows: [['x']] })).isError, true);
+  // Office files: paragraphs at the end of a Word document, rows after a sheet's last row.
+  const docx = Buffer.from(zipSync({
+    '[Content_Types].xml': strToU8('<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>'),
+    'word/document.xml': strToU8('<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>First paragraph</w:t></w:r></w:p><w:sectPr/></w:body></w:document>'),
+  }));
+  const SHEET_NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+  const REL_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+  const xlsx = Buffer.from(zipSync({
+    '[Content_Types].xml': strToU8('<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'),
+    '_rels/.rels': strToU8(`<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${REL_NS}/officeDocument" Target="xl/workbook.xml"/></Relationships>`),
+    'xl/workbook.xml': strToU8(`<?xml version="1.0"?><workbook xmlns="${SHEET_NS}" xmlns:r="${REL_NS}"><sheets><sheet name="Costs" sheetId="1" r:id="rId1"/></sheets></workbook>`),
+    'xl/_rels/workbook.xml.rels': strToU8(`<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${REL_NS}/worksheet" Target="worksheets/sheet1.xml"/></Relationships>`),
+    'xl/worksheets/sheet1.xml': strToU8(`<?xml version="1.0"?><worksheet xmlns="${SHEET_NS}"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Item</t></is></c><c r="B1" t="inlineStr"><is><t>Cost</t></is></c></row></sheetData></worksheet>`),
+  }));
+  await write('notes/report.docx', docx);
+  await write('notes/costs.xlsx', xlsx);
+  assert.equal(data(await tool(writer, 'add_paragraphs', { path: 'notes/report.docx', paragraphs: ['Added by the agent'] })).added, 1);
+  const reportText = (await tool(writer, 'read_text', { path: 'notes/report.docx' })).content[1].text;
+  assert.match(reportText, /First paragraph[\s\S]*Added by the agent/);
+  assert.equal(data(await tool(writer, 'append_rows', { path: 'notes/costs.xlsx', rows: [['Paper', 12.5]] })).added, 1);
+  assert.deepEqual(data(await tool(writer, 'read_table', { path: 'notes/costs.xlsx' })).rows, [['Item', 'Cost'], ['Paper', '12.5']]);
+  assert.equal((await tool(writer, 'append_rows', { path: 'notes/costs.xlsx', sheet: 'Nope', rows: [['x']] })).isError, true);
+  assert.equal((await tool(writer, 'add_paragraphs', { path: 'notes/sheet.csv', paragraphs: ['x'] })).isError, true);
+
+  // Any file, from base64; a name already taken gets a number.
+  assert.equal(data(await tool(writer, 'upload_file', { path: 'notes', name: 'dot.png', base64: DOT.toString('base64') })).path, 'notes/dot.png');
+  assert.ok((await fs.readFile(path.join(library, 'notes/dot.png'))).equals(DOT));
+  assert.equal(data(await tool(writer, 'upload_file', { path: 'notes', name: 'dot.png', base64: DOT.toString('base64') })).path, 'notes/dot 2.png');
+  await refused(writer, 'upload_file', { path: 'docs', name: 'x.png', base64: DOT.toString('base64') });
+  assert.equal((await tool(writer, 'upload_file', { path: 'notes', name: '.hidden', base64: 'eA==' })).isError, true);
+  assert.equal((await tool(writer, 'upload_file', { path: 'notes', name: 'x.bin', base64: '***' })).isError, true);
+
   const copied = data(await tool(writer, 'copy', { path: 'notes/plan.md', to: 'notes' })).path;
   assert.notEqual(copied, 'notes/plan.md');
   assert.ok(await exists(copied));
@@ -554,7 +599,10 @@ try {
   assert.deepEqual(undoneWrites.json.skipped, [], JSON.stringify(undoneWrites.json));
   assert.equal(await read('notes/plan.md'), '# Plan\n\nStep one.\nStep two.\n');
   assert.equal(await read('notes/sheet.csv'), 'name,amount\nAnn,1\n');
+  assert.ok((await fs.readFile(path.join(library, 'notes/report.docx'))).equals(docx), 'the Word document is as it was');
+  assert.ok((await fs.readFile(path.join(library, 'notes/costs.xlsx'))).equals(xlsx), 'the spreadsheet is as it was');
   assert.equal(await exists('notes/summary.md'), false);
+  assert.equal(await exists('notes/dot.png'), false, 'uploads go to the Trash on undo');
   assert.equal(await exists(copied), false);
 
   // Writing can wait for approval too.

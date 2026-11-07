@@ -314,6 +314,10 @@ Thumbnails are small JPEGs (PNG for pictures with transparency) kept in the data
 
 Put OwnNAS behind HTTPS and pass `--secure-cookie` if you terminate TLS with a reverse proxy. The login is the application boundary; the VPN is the network boundary.
 
+## Sort into folders
+
+Right-click a folder, or the empty space inside one, and choose **Sort into folders…** to move its files into sub-folders by a pattern: by date (`{YYYY}/{MM}`, `{YYYY}-{MM}`, `{YYYY}/{MM}/{DD}`, or with the month's name, `{MMMM}`), by kind (Pictures, Videos, Music, Documents…), by extension, by first letter, or your own mix ("Photos {YYYY}"). The date is when a photo or video was taken (from the file's own data), or otherwise when the file last changed; it can also be when it was changed or created. You can include the files in the folders inside it. The dialog shows what will move before anything does, nothing is overwritten, hidden files stay, and **Undo** puts everything back and removes the folders it made.
+
 ## Notes
 
 **Notes** (the notes icon at the top) shows quick notes and checklists as cards, like Google Keep, but each note is a plain Markdown file in one library folder (`Notes` unless an administrator picks another with the folder button). So notes open in Obsidian or any editor, sync with the desktop client, keep their earlier versions, and go to the Trash like any other file.
@@ -321,7 +325,8 @@ Put OwnNAS behind HTTPS and pass `--secure-cookie` if you terminate TLS with a r
 - **Take a note…** saves on Add (or Ctrl/⌘+Enter); **List** turns each line into a checklist item. The file is named after the first line.
 - Tick checklist items on the card itself. Colour and pin a note (kept in its front matter as `color:` and `pinned:`), label it with OwnNAS tags or `#hashtags`, and search or filter by label.
 - Link notes with `[[Note name]]`: each note shows which notes link to it. **Archive** moves a note into `Archive/`, and **Today** opens the day's note in `Daily/` (made from `Templates/Daily.md` when there is one, with `{{date}}` filled in).
-- Clicking a card opens it in the Markdown editor.
+- Clicking a card opens it in the Markdown editor. Typing `[[` suggests notes to link to, and a picture pasted or dropped in is saved in `attachments/` next to the note. Renaming a note updates the links to it.
+- Sub-folders of the notes folder are notebooks: choose one to see its notes, and new notes go there.
 
 ## AI agents (MCP)
 

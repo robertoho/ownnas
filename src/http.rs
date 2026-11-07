@@ -472,6 +472,8 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/workspaces/items", post(workspace_items).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
         .route("/api/workspaces/membership", post(workspace_membership).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
         .route("/api/workspaces/folders", post(workspace_folders_change))
+        .route("/api/sort-folder", post(sort_folder).layer(DefaultBodyLimit::max(1024 * 1024)))
+        .route("/api/sort-folder/undo", post(sort_folder_undo).layer(DefaultBodyLimit::max(32 * 1024 * 1024)))
         .route("/api/notes", get(list_notes).post(create_note))
         .route("/api/notes/tick", post(tick_note))
         .route("/api/notes/meta", post(note_meta))
@@ -3277,12 +3279,148 @@ async fn workspace_membership(
     Ok(Json(json!({ "workspaces": crate::workspaces::membership(&conn, &paths)?, "total": paths.len() })))
 }
 
+// ---- Sorting a folder's files into sub-folders by date, kind, extension… (sort_folder.rs) ----
+
+/// The dates photos and videos under `folder` were taken, as their own clock says (sorting uses
+/// the file's own date for the others).
+pub(crate) fn taken_dates(state: &AppState, folder: &str) -> std::collections::HashMap<String, i64> {
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let Ok(mut stmt) = conn.prepare("SELECT path, taken_at FROM media_index WHERE date_source = 'exif' AND (?1 = '' OR (path >= ?1 || '/' AND path < ?1 || '0'))") else {
+        return Default::default();
+    };
+    let rows = stmt.query_map([folder], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)));
+    rows.map(|rows| rows.filter_map(Result::ok).collect()).unwrap_or_default()
+}
+
+#[derive(Deserialize)]
+struct SortFolderBody {
+    path: String,
+    pattern: String,
+    /// "taken" (photos' and videos' date taken, else modified), "modified" or "created".
+    date: Option<String>,
+    #[serde(default)]
+    recursive: bool,
+    /// Month names for {MMMM}, in the person's language.
+    #[serde(default)]
+    months: Vec<String>,
+    /// Carry it out; otherwise only say what would happen.
+    #[serde(default)]
+    apply: bool,
+}
+
+/// How a folder's files would be sorted into sub-folders, or sorting them.
+async fn sort_folder(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<SortFolderBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    if body.apply {
+        require_write(&state)?;
+    }
+    crate::sort_folder::check_pattern(&body.pattern).map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    let from = match body.date.as_deref() {
+        Some("modified") => crate::sort_folder::DateFrom::Modified,
+        Some("created") => crate::sort_folder::DateFrom::Created,
+        _ => crate::sort_folder::DateFrom::Taken,
+    };
+    let folder = files::resolve(&state.root, &rel_of(&Some(body.path.clone())))?.rel;
+    if files::is_under_trash(&folder) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Things in the Trash are not sorted"));
+    }
+    let taken = taken_dates(&state, &folder);
+    let months: Vec<String> = body.months.iter().take(12).map(|name| name.chars().take(30).collect()).collect();
+    let (root, base, pattern, recursive, apply) = (state.root.clone(), folder.clone(), body.pattern.clone(), body.recursive, body.apply);
+    let outcome = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, files::FileError> {
+        let plan = crate::sort_folder::plan(&root, &base, &pattern, from, recursive, &months, &taken)?;
+        if !apply {
+            let shown: Vec<_> = plan.moves.iter().take(300).collect();
+            return Ok(json!({ "moves": shown, "total": plan.moves.len(), "folders": plan.folders, "inPlace": plan.in_place, "lookedAt": plan.looked_at, "truncated": plan.truncated }));
+        }
+        let (made, failed) = crate::sort_folder::apply(&root, &plan.moves);
+        let failed: Vec<_> = failed.into_iter().map(|(path, why)| json!({ "path": path, "why": why })).collect();
+        Ok(json!({ "made": made, "failed": failed, "folders": plan.folders.len() }))
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not sort the folder"))?
+    .map_err(ApiError::from)?;
+    if body.apply {
+        for item in outcome["made"].as_array().into_iter().flatten() {
+            if let (Some(from), Some(to)) = (item["from"].as_str(), item["to"].as_str()) {
+                rewrite_meta(&state, from, to);
+            }
+        }
+        invalidate_sizes(&state, &folder);
+        let count = outcome["made"].as_array().map_or(0, Vec::len);
+        record(&state, &user, "sort-folder", &format!("{} by {}: {count} file(s)", if folder.is_empty() { "/" } else { &folder }, body.pattern));
+    }
+    Ok(Json(outcome))
+}
+
+#[derive(Deserialize)]
+struct SortUndoBody {
+    moves: Vec<crate::sort_folder::Move>,
+}
+
+/// Puts back what a sort moved (the moves it answered with); folders it left empty go.
+async fn sort_folder_undo(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<SortUndoBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let root = state.root.clone();
+    let moves = body.moves.clone();
+    let (back, failed) = tokio::task::spawn_blocking(move || crate::sort_folder::undo(&root, &moves))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not undo the sort"))?;
+    let failed_paths: std::collections::HashSet<&str> = failed.iter().map(|(path, _)| path.as_str()).collect();
+    for item in &body.moves {
+        if !failed_paths.contains(item.to.as_str()) {
+            rewrite_meta(&state, &item.to, &item.from);
+            invalidate_sizes(&state, &parent_rel_path(&item.from));
+        }
+    }
+    record(&state, &user, "sort-folder-undo", &format!("{back} file(s)"));
+    let failed: Vec<_> = failed.into_iter().map(|(path, why)| json!({ "path": path, "why": why })).collect();
+    Ok(Json(json!({ "back": back, "failed": failed })))
+}
+
 // ---- Notes: Markdown files in one folder, shown as cards (see notes.rs) ----
 
 /// The library folder that holds the notes.
 pub(crate) fn notes_folder(state: &AppState) -> String {
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     db::get_setting(&conn, crate::notes::SETTING).ok().flatten().filter(|folder| !folder.trim().is_empty()).unwrap_or_else(|| crate::notes::DEFAULT_FOLDER.to_string())
+}
+
+/// After a note was renamed, the [[links]] to it in the other notes follow (each changed note
+/// keeps its earlier version).
+pub(crate) async fn relink_notes(state: &AppState, by: &str, from: &str, to: &str) {
+    let stem = |path: &str| -> Option<String> {
+        let name = path.rsplit('/').next()?;
+        let (stem, extension) = name.rsplit_once('.')?;
+        matches!(extension.to_ascii_lowercase().as_str(), "md" | "markdown").then(|| stem.to_string())
+    };
+    let (Some(old), Some(new)) = (stem(from), stem(to)) else { return };
+    let folder = notes_folder(state);
+    if !to.strip_prefix(&folder).is_some_and(|rest| rest.starts_with('/')) {
+        return;
+    }
+    let Ok(found) = files::resolve(&state.root, &folder) else { return };
+    let (db_path, store, by) = (state.db_path.clone(), state.versions.clone(), by.to_string());
+    let _ = tokio::task::spawn_blocking(move || {
+        let keep = |full: &std::path::Path, rel: &str| {
+            if let Ok(conn) = db::connect(&db_path) {
+                crate::versions::keep(&conn, &store, full, rel, &by, "edit");
+            }
+        };
+        crate::notes::relink_folder(&found.full, &found.rel, &old, &new, &keep)
+    })
+    .await;
 }
 
 /// The notes folder on disk, made when it is not there yet (with the folders above it).
@@ -3363,6 +3501,8 @@ async fn list_notes(State(state): State<std::sync::Arc<AppState>>, headers: Head
 struct NewNoteBody {
     text: String,
     color: Option<String>,
+    /// A sub-folder of the notes folder to make it in (made when not there yet).
+    notebook: Option<String>,
 }
 
 async fn create_note(
@@ -3379,7 +3519,18 @@ async fn create_note(
     if body.text.len() > 1024 * 1024 {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "That note is too long (1 MB at most)"));
     }
-    let (folder, full) = notes_dir(&state, true)?;
+    let (mut folder, mut full) = notes_dir(&state, true)?;
+    if let Some(notebook) = body.notebook.as_deref().map(str::trim).filter(|notebook| !notebook.is_empty()) {
+        if notebook.contains('/') || notebook.starts_with('.') || notebook == crate::notes::ATTACHMENTS || notebook == crate::notes::TEMPLATES {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "That cannot be a notebook"));
+        }
+        match files::make_dir(&state.root, &folder, notebook) {
+            Ok(()) | Err(files::FileError::AlreadyExists) => {}
+            Err(err) => return Err(ApiError::from(err)),
+        }
+        full = files::resolve(&state.root, &format!("{folder}/{notebook}"))?.full;
+        folder = format!("{folder}/{notebook}");
+    }
     let now = chrono::Local::now().format("%Y-%m-%d %H.%M").to_string();
     let name = crate::notes::name_for(&body.text, &now);
     let mut text = body.text.replace("\r\n", "\n");
@@ -5165,7 +5316,7 @@ async fn pdf_rotate(
     Ok(Json(json!({ "ok": true, "path": created })))
 }
 
-fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
+pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let clean: Vec<u8> = input
         .bytes()
@@ -5319,6 +5470,7 @@ async fn rename(
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not rename the item"))?
         .map_err(ApiError::from)?;
     rewrite_meta(&state, &from, &to);
+    relink_notes(&state, &user.username, &from, &to).await;
     record(&state, &user, "rename", &label);
     Ok(Json(json!({ "ok": true, "path": to })))
 }

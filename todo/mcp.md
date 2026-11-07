@@ -89,9 +89,14 @@ restores that version. A file or copy the agent made goes to the Trash on Undo.
 - [x] `append_rows` to CSV and TSV (keeping the file's separator, semicolons included, and its
   line endings).
 - [x] `edit_text`: replaces an exact passage that must appear exactly once, in UTF-8 text files.
-- [ ] `edit_text` and `append_rows` for documents and spreadsheets (DOCX, ODT, XLSX), through
-  the editors' code.
-- [ ] `upload` from base64, with a size limit per key.
+- [x] `append_rows` for spreadsheets (xlsx, any sheet: rows after the last one, numbers as
+  numbers) and `add_paragraphs` for Word (docx), OpenDocument (odt), text and Markdown, done on
+  the server (`office_edit.rs`) by rewriting only the one XML part that changes. Still to do:
+  replacing a passage inside docx/odt (text is split across formatting runs).
+- [x] `upload_file` from base64, up to 25 MB a call; a name taken gets a number, or
+  `replace: true`.
+- [x] `sort_into_folders` (organise level): a folder's files into sub-folders by a pattern
+  (`{YYYY}/{MM}`, `{type}`, `{ext}`…), with `dry_run`, undone as one change.
 - [x] `copy`.
 
 ## Notes

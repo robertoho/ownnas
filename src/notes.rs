@@ -296,6 +296,57 @@ pub fn set_matter(text: &str, changes: &[(&str, Option<&str>)]) -> String {
     format!("---\n{}\n---\n{body}", lines.join("\n"))
 }
 
+/// The text with `[[old]]` links (also `[[old|shown]]` and `[[old#part]]`, in any case) pointing
+/// to `new`; `None` when there are none.
+pub fn relink(text: &str, old: &str, new: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut changed = false;
+    while let Some(start) = rest.find("[[") {
+        out.push_str(&rest[..start + 2]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("]]") else {
+            rest = after;
+            break;
+        };
+        let inner = &after[..end];
+        let cut = inner.find(['|', '#']).unwrap_or(inner.len());
+        if !inner.contains('\n') && inner[..cut].trim().eq_ignore_ascii_case(old.trim()) {
+            out.push_str(new);
+            out.push_str(&inner[cut..]);
+            changed = true;
+        } else {
+            out.push_str(inner);
+        }
+        out.push_str("]]");
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    changed.then_some(out)
+}
+
+/// After a note was renamed from `old` to `new` (file names without `.md`): points the links in
+/// the notes of `folder` (on disk `full`) to the new name. `keep` is called with each note's
+/// place and library path before it is changed (to keep a version). The notes changed.
+pub fn relink_folder(full: &Path, folder: &str, old: &str, new: &str, keep: &dyn Fn(&Path, &str)) -> Vec<String> {
+    if old.eq_ignore_ascii_case(new) {
+        return Vec::new();
+    }
+    let mut changed = Vec::new();
+    for note in list(full, folder) {
+        let Some(inside) = note.path.strip_prefix(folder).map(|rest| rest.trim_start_matches('/')) else { continue };
+        let place = full.join(inside);
+        let Ok(text) = std::fs::read_to_string(&place) else { continue };
+        if let Some(relinked) = relink(&text, old, new) {
+            keep(&place, &note.path);
+            if std::fs::write(&place, relinked).is_ok() {
+                changed.push(note.path);
+            }
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +391,17 @@ mod tests {
         let none = set_matter(&set, &[("color", None)]);
         assert!(none.starts_with("# Groceries"), "{none}");
         assert_eq!(set_matter("plain\n", &[("pinned", Some("true"))]), "---\npinned: true\n---\nplain\n");
+    }
+
+    #[test]
+    fn links_follow_a_rename() {
+        let text = "See [[groceries]], [[Groceries|the list]] and [[Groceries#Weekend]], not [[Groceries old]] or [[Other]].";
+        assert_eq!(
+            relink(text, "Groceries", "Shopping").as_deref(),
+            Some("See [[Shopping]], [[Shopping|the list]] and [[Shopping#Weekend]], not [[Groceries old]] or [[Other]].")
+        );
+        assert_eq!(relink("no links here", "Groceries", "Shopping"), None);
+        assert_eq!(relink("[[broken", "broken", "x"), None);
     }
 
     #[test]

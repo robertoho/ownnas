@@ -38,6 +38,8 @@ mod mcp_photos;
 mod mcp_write;
 mod mcp_notes;
 mod notes;
+mod office_edit;
+mod sort_folder;
 mod music;
 mod nas_backup;
 mod map_tiles;

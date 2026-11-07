@@ -26,7 +26,7 @@ lock them in: the files are the notes.
   `pinned: true`), which Obsidian shows as properties and otherwise ignores. Archive moves the
   file to `Notes/Archive/`.
 - [x] Labels are the existing OwnNAS tags, and `#hashtags` written in the text count too.
-- [ ] Pictures pasted or dropped into a note are saved in `Notes/attachments/` and linked as
+- [x] Pictures pasted or dropped into a note are saved in `Notes/attachments/` and linked as
   `![](attachments/…)`.
 - [ ] On the phone: the share sheet ("Share to OwnNAS → Note"), and an Android quick tile or
   shortcut for a new note.
@@ -34,13 +34,13 @@ lock them in: the files are the notes.
 ## Obsidian-like (write and connect)
 
 - [x] Open a card in a full editor with live preview, using the existing Markdown editor.
-- [~] `[[Wiki links]]` between notes, completed as you type, with **Backlinks** ("linked from")
+- [x] `[[Wiki links]]` between notes, completed as you type, with **Backlinks** ("linked from")
   under each note. Renaming a note updates the links to it (it's in our hands, since moves go
   through OwnNAS).
 - [x] Daily notes: one click opens `Notes/Daily/2026-11-07.md`, made from a template if there
   is one.
 - [x] Templates in `Notes/Templates/`.
-- [ ] Sub-folders work as notebooks in a side list; everything else is search and tags.
+- [x] Sub-folders work as notebooks (a row of filters above the cards); everything else is search and tags.
 - [ ] Later: a graph of links, and `![[embeds]]`.
 
 ## Under the hood
@@ -74,7 +74,11 @@ come second; the phone share sheet third.
   editor, daily notes with a template, choosing the notes folder (admins, the folder button),
   and backlinks ("Linked from …") from `[[links]]`. Tested in `scripts/test-notes.mjs` (headless
   Chrome) and `notes.rs` unit tests. Agents: see todo/mcp.md.
-- Next: link completion while typing `[[`, updating links when a note is renamed, pasting
-  pictures into `attachments/`, a side list of notebooks (sub-folders), an index in SQLite if
-  folders with thousands of notes get slow (today the folder is read on each visit), and the
-  phone share sheet.
+- Second round, done: the Markdown preview hides front matter, shows checklists as boxes,
+  pictures from the library and clickable `[[links]]` (a link to a note that is not there yet
+  offers to make it); typing `[[` in the editor suggests notes; pictures pasted or dropped into
+  the editor are saved in `attachments/` next to the note and linked; renaming a note (in Files
+  or by an agent, and undoing that) rewrites the links to it in the other notes, keeping their
+  versions; notebooks (sub-folders) filter the cards, and new notes go into the one shown.
+- Next: the phone share sheet, an index in SQLite if folders with thousands of notes get slow
+  (today the folder is read on each visit), `![[embeds]]`, and a graph of links.

@@ -1387,6 +1387,7 @@ function openSelectionMenu(x, y, pasteInto) {
     }
     if (write && customizableFolder({ path: state.path, dir: true, kind: 'folder' })) buttons.push('<button type="button" data-menu="folderAppearance">Customize folder…</button>');
     if (state.me && state.me.admin && state.workspaceCount && state.path && !inTrash) buttons.push(`<button type="button" data-menu="showFolderInWorkspace">Show this folder in workspace…</button>`);
+    if (write && !inTrash) buttons.push(`<button type="button" data-menu="sortFolder" title="Into sub-folders by date, kind, extension…">Sort into folders…</button>`);
     buttons.push(`<button type="button" data-menu="downloadZip">Download folder zip</button>`);
     buttons.push(`<button type="button" data-menu="search">Search…</button>`);
     buttons.push(`<button type="button" data-menu="library">Library</button>`);
@@ -1482,6 +1483,9 @@ function openSelectionMenu(x, y, pasteInto) {
     if (write && !allInTrash && entries.every((entry) => !entry.dir && ["image", "video", "svg"].includes(entry.kind))) {
       buttons.push(`<button type="button" data-menu="addToAlbum">Add to album…</button>`);
       if (state.workspaceCount) buttons.push(`<button type="button" data-menu="showInWorkspace">Show in workspace…</button>`);
+    }
+    if (write && one && one.dir && !allInTrash) {
+      buttons.push(`<button type="button" data-menu="sortFolder" title="Into sub-folders by date, kind, extension…">Sort into folders…</button>`);
     }
     if (state.me && state.me.admin && state.workspaceCount && !allInTrash && entries.length && entries.every((entry) => entry.dir)) {
       buttons.push(`<button type="button" data-menu="showFolderInWorkspace" title="Every photo and video in it, including ones added later">Show in workspace…</button>`);
@@ -2360,6 +2364,7 @@ async function notes() {
     notesApi = notesModule.mountNotes($("notes-view"), {
       api,
       toast,
+      askText,
       canWrite: () => !!(state.me && !state.me.readonly),
       isAdmin: () => !!(state.me && state.me.admin),
       pickFolder: (options) => pickFolder(options),
@@ -3405,7 +3410,7 @@ function paintTextEditor(body = $("preview-body")) {
     try { pretty = JSON.stringify(JSON.parse(pretty), null, 2); } catch { /* keep */ }
     main = `<pre class="text-code">${esc(pretty)}</pre>`;
   } else if (ed.format === "markdown") {
-    main = `<div class="md-preview">${renderMarkdown(ed.content)}</div>`;
+    main = `<div class="md-preview">${renderMarkdown(ed.content, parentPath(state.current?.path || ""))}</div>`;
   } else if (ed.format === "ini") {
     main = `<pre class="text-code ini-preview">${renderIni(ed.content)}</pre>`;
   } else {
@@ -3624,10 +3629,16 @@ function renderIni(content) {
   }).join("\n");
 }
 
-function renderMarkdown(source) {
+/// `base` is the library folder the Markdown file is in, for its pictures (`![](attachments/a.png)`).
+function renderMarkdown(source, base = "") {
   const lines = source.replace(/\r\n/g, "\n").split("\n");
   const out = [];
   let i = 0;
+  // Front matter (colour, pinned, properties) is for apps, not for reading.
+  if (lines[0] === "---") {
+    const end = lines.indexOf("---", 1);
+    if (end > 0) i = end + 1;
+  }
   let inCode = false;
   let code = [];
   let list = null;
@@ -3643,7 +3654,14 @@ function renderMarkdown(source) {
     html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
     html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
     html = html.replace(/(^|[^*\w])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+    // Pictures in the library, relative to the file (only the library's: the page loads nothing else).
+    html = html.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (whole, alt, src) => {
+      const target = markdownPath(base, unescapeHtml(src));
+      return target === null ? whole : `<img class="md-image" src="/api/raw?path=${encodeURIComponent(target)}" alt="${alt}" loading="lazy">`;
+    });
     html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    // [[Note]], [[Note|shown as]], [[Note#part]]: opens that note.
+    html = html.replace(/\[\[([^\]|#\n]+)(?:#[^\]|\n]*)?(?:\|([^\]\n]+))?\]\]/g, (_, target, shown) => `<a href="#" class="md-wikilink" data-wiki="${target.trim()}">${(shown || target).trim()}</a>`);
     return html;
   }
 
@@ -3699,7 +3717,10 @@ function renderMarkdown(source) {
         list = "ul";
         out.push("<ul>");
       }
-      out.push(`<li>${inlineMd(unordered[1])}</li>`);
+      const task = unordered[1].match(/^\[( |x|X)\]\s+(.*)$/);
+      out.push(task
+        ? `<li class="md-task"><input type="checkbox" disabled${task[1] === " " ? "" : " checked"}> ${inlineMd(task[2])}</li>`
+        : `<li>${inlineMd(unordered[1])}</li>`);
       i += 1;
       continue;
     }
@@ -3721,6 +3742,26 @@ function renderMarkdown(source) {
   if (inCode) out.push(`<pre class="text-code"><code>${esc(code.join("\n"))}</code></pre>`);
   closeList();
   return out.join("") || "<p class=\"muted\">Empty file</p>";
+}
+
+/// The library path a Markdown link points to, from the file's folder; null for one outside.
+function markdownPath(base, src) {
+  if (/^[a-z][a-z0-9+.-]*:/i.test(src) || src.startsWith("//")) return null;
+  let decoded = src;
+  try { decoded = decodeURIComponent(src); } catch { /* keep */ }
+  const parts = decoded.startsWith("/") ? [] : (base ? base.split("/") : []);
+  for (const part of decoded.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (!parts.length) return null;
+      parts.pop();
+    } else parts.push(part);
+  }
+  return parts.join("/");
+}
+
+function unescapeHtml(text) {
+  return text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&");
 }
 
 function renderTable(content, separator) {
@@ -4311,7 +4352,9 @@ function renderJobsPanel(show) {
     list.innerHTML = "";
     return;
   }
-  list.innerHTML = items.map((job) => {
+  // Each item is replaced only when it changed: rebuilding the whole list on every progress tick
+  // replaced the buttons under the pointer, so a click on Dismiss (or Retry) could get lost.
+  const rendered = items.map((job) => {
     const pct = job.percent;
     const barClass = pct == null ? "status-bar indeterminate" : "status-bar";
     const width = pct == null ? "" : ` data-css="width:${Math.max(0, Math.min(100, Math.round(pct)))}%"`;
@@ -4335,7 +4378,24 @@ function renderJobsPanel(show) {
       ${lines}
       ${actions}
     </li>`;
-  }).join("");
+  });
+  const keep = new Set(items.map((job) => job.id));
+  for (const node of [...list.children]) {
+    if (!keep.has(node.dataset.job)) node.remove();
+  }
+  items.forEach((job, index) => {
+    const html = rendered[index];
+    let node = [...list.children].find((child) => child.dataset.job === job.id);
+    if (!node || node.dataset.html !== html) {
+      const holder = document.createElement("template");
+      holder.innerHTML = html.trim();
+      const fresh = holder.content.firstElementChild;
+      fresh.dataset.html = html;
+      if (node) node.replaceWith(fresh);
+      node = fresh;
+    }
+    if (list.children[index] !== node) list.insertBefore(node, list.children[index] || null);
+  });
   panel.hidden = !show || jobState.hidden;
 }
 
@@ -4639,6 +4699,30 @@ async function pasteClipboard(dest) {
   else toast("Already in this folder");
 }
 
+const NAME_BYTES = 200;
+
+/// A file or folder name the server can store: tabs and line breaks (long e-mail subjects are
+/// folded with them) become spaces, other control characters go, : and \ become -, and a name
+/// may not end with a dot or space nor be longer than 200 bytes (the extension is kept).
+function safeUploadPart(part) {
+  let name = part.replace(/[\t\r\n]+/g, " ").replace(/[\u0000-\u001f\u007f]/g, "").replace(/[:\\]/g, "-").replace(/ {2,}/g, " ");
+  name = name.replace(/[ .]+$/, "").trim();
+  const bytes = (text) => new TextEncoder().encode(text).length;
+  if (bytes(name) > NAME_BYTES) {
+    const dot = name.lastIndexOf(".");
+    const extension = dot > 0 && name.length - dot <= 10 ? name.slice(dot) : "";
+    let stem = name.slice(0, name.length - extension.length);
+    while (stem && bytes(stem + extension) > NAME_BYTES) stem = [...stem].slice(0, -1).join("");
+    name = stem.replace(/[ .]+$/, "") + extension;
+  }
+  return name === "." || name === ".." || !name ? "unnamed" : name;
+}
+
+/// A path to upload to, each part made safe (see safeUploadPart).
+function safeUploadPath(path) {
+  return path.split("/").filter((part) => part !== "").map(safeUploadPart).join("/");
+}
+
 function uploadFiles(fileList, names, destination = state.path) {
   const files = [...fileList].map((file, index) => ({
     file,
@@ -4683,12 +4767,17 @@ function askUploadConflict(item, info) {
   });
 }
 
-/// The photos and videos among `files` that the library already has (same contents, anywhere
-/// outside the Trash), by their index, with where. Only files with the size of something in the
-/// library are read and hashed, so a batch of new photos costs one question to the server.
-async function findMediaCopies(files, progress, stopped) {
+/// Smaller files are often the same on purpose (templates, licences, settings, empty markers),
+/// so only photos and videos are looked for at any size.
+const COPY_CHECK_LEAST = 100 * 1024;
+
+/// The files among `files` that the library already has (same contents, anywhere outside the
+/// Trash), by their index, with where: photos and videos of any size, other files from 100 KB.
+/// Only files with the size of something in the library are read and hashed, so a batch of new
+/// files costs one question to the server.
+async function findCopies(files, progress, stopped) {
   const module = await import("/assets/photo-upload.js");
-  const media = files.map((item, index) => ({ item, index })).filter(({ item }) => item.file.size > 0 && module.MEDIA.test(item.name));
+  const media = files.map((item, index) => ({ item, index })).filter(({ item }) => item.file.size > 0 && (module.MEDIA.test(item.name) || item.file.size >= COPY_CHECK_LEAST));
   const copies = new Map();
   if (!media.length) return copies;
   const sizes = [...new Set(media.map(({ item }) => item.file.size))];
@@ -4716,11 +4805,11 @@ async function findMediaCopies(files, progress, stopped) {
   return copies;
 }
 
-/// Asks what to do with photos and videos the library has already: "skip", "upload", or null to cancel.
-function askMediaCopies(files, copies) {
+/// Asks what to do with files the library has already: "skip", "upload", or null to cancel.
+function askCopies(files, copies) {
   const count = copies.size;
-  const media = count === 1 ? "photo or video is" : "photos and videos are";
-  $("media-copies-copy").textContent = `${count} ${media} already on the server, with exactly the same contents.${files.length > count ? " The other files upload as usual." : ""}`;
+  const what = count === 1 ? "file is" : "files are";
+  $("media-copies-copy").textContent = `${count} ${what} already on the server, with exactly the same contents.${files.length > count ? " The other files upload as usual." : ""}`;
   const rows = [...copies].slice(0, 200).map(([index, path]) => {
     const row = document.createElement("li");
     const name = document.createElement("span");
@@ -4755,16 +4844,38 @@ function choiceFits(choice, info) {
   return choice === "keep" || choice === "ignore";
 }
 
+/// The server takes this many names a request (it refuses lists over 5000).
+const UPLOAD_CHECK_CHUNK = 1000;
+
+/// What is already in the destination under each name, asked a part at a time, so a folder of
+/// any size can be uploaded.
+async function uploadStatuses(destination, names) {
+  const byName = new Map();
+  for (let start = 0; start < names.length; start += UPLOAD_CHECK_CHUNK) {
+    const plan = await api("/api/upload/conflicts", {
+      method: "POST",
+      json: { path: destination, names: names.slice(start, start + UPLOAD_CHECK_CHUNK) },
+    });
+    for (const item of plan.items || []) byName.set(item.name, item);
+  }
+  return byName;
+}
+
 async function sendUploads(files, destination = state.path) {
+  // Names the server cannot store are adjusted first, so checks, logs and uploads agree.
+  let adjusted = 0;
+  files = files.map((item) => {
+    const safe = safeUploadPath(item.name);
+    if (safe === item.name) return item;
+    adjusted += 1;
+    return { ...item, name: safe };
+  });
+  if (adjusted) toast(`${adjusted} ${adjusted === 1 ? "name had" : "names had"} characters the server can't store (such as tabs or line breaks), so ${adjusted === 1 ? "it was" : "they were"} adjusted`);
   const batch = startUploadLog(files, destination);
   let byName = new Map();
   let planError = null;
   try {
-    const plan = await api("/api/upload/conflicts", {
-      method: "POST",
-      json: { path: destination, names: files.map((item) => item.name) },
-    });
-    byName = new Map((plan.items || []).map((item) => [item.name, item]));
+    byName = await uploadStatuses(destination, files.map((item) => item.name));
   } catch (err) {
     planError = err;
   }
@@ -4823,15 +4934,15 @@ async function sendUploads(files, destination = state.path) {
     loadedBefore += item.file.size;
     settle(index, "skipped", details);
   };
-  // Photos and videos the library already has (anywhere), skipped when the person says so.
+  // Files the library already has (anywhere), skipped when the person says so.
   const copyOf = new Map();
   let cancelled = null;
   try {
     if (!planError) {
       let copies = new Map();
       try {
-        copies = await findMediaCopies(files, (done, total, name) => upsertJob("transfer", {
-          title: "Looking for photos and videos already on the server…",
+        copies = await findCopies(files, (done, total, name) => upsertJob("transfer", {
+          title: "Looking for files already on the server…",
           detail: name,
           stats: `${done + 1} of ${total}`,
           percent: (done / total) * 100,
@@ -4845,7 +4956,7 @@ async function sendUploads(files, destination = state.path) {
       if (uploadAbort) throw cancelledError();
       if (copies.size) {
         hideStatus();
-        const answer = await askMediaCopies(files, copies);
+        const answer = await askCopies(files, copies);
         if (!answer) throw cancelledError();
         if (answer === "skip") for (const [index, path] of copies) copyOf.set(index, path);
       }
@@ -5097,7 +5208,7 @@ function showUploadReport({ batch, files, failures, destination, stopped }) {
     actions: [
       { label: "Retry failed", run: () => retryUploads(batch.id, destination) },
       { label: "Check uploads", run: () => openUploadLog() },
-      { label: "Close", run: () => { uploadRetries.delete(batch.id); removeJob(id); } },
+      { label: "Dismiss", run: () => { uploadRetries.delete(batch.id); removeJob(id); } },
     ],
   });
   openJobsPanel();
@@ -5347,11 +5458,7 @@ function folderPasteRoots(transfer) {
 }
 
 async function statusForUploadNames(destination, names) {
-  const plan = await api("/api/upload/conflicts", {
-    method: "POST",
-    json: { path: destination, names },
-  });
-  return new Map((plan.items || []).map((item) => [item.name, item]));
+  return uploadStatuses(destination, names);
 }
 
 function askFolderPasteConflict(name, existing) {
@@ -5422,14 +5529,15 @@ async function pasteExternalTransfer(transfer, destination) {
     const mapped = rootNames.get(root);
     return mapped ? `${mapped}${slash < 0 ? "" : path.slice(slash)}` : path;
   };
-  const directories = new Set(roots.map((root) => rootNames.get(root) || root));
-  for (const path of transfer.directories) directories.add(rewrite(path));
+  const directories = new Set(roots.map((root) => safeUploadPath(rootNames.get(root) || root)));
+  for (const path of transfer.directories) directories.add(safeUploadPath(rewrite(path)));
   const mappedFiles = transfer.files.map((item) => ({ file: item.file, name: rewrite(item.name) }));
   if (directories.size) {
-    await api("/api/upload/directories", {
-      method: "POST",
-      json: { path: destination, names: [...directories].sort((a, b) => a.split("/").length - b.split("/").length) },
-    });
+    // Shallowest first, so each part only makes folders inside ones already made.
+    const ordered = [...directories].sort((a, b) => a.split("/").length - b.split("/").length);
+    for (let start = 0; start < ordered.length; start += UPLOAD_CHECK_CHUNK) {
+      await api("/api/upload/directories", { method: "POST", json: { path: destination, names: ordered.slice(start, start + UPLOAD_CHECK_CHUNK) } });
+    }
   }
   const result = mappedFiles.length
     ? await uploadFiles(mappedFiles.map((item) => item.file), mappedFiles.map((item) => item.name), destination)
@@ -6133,6 +6241,7 @@ function runMenuAction(button, entries, pasteInto) {
   }
   if (action === "addToAlbum") gallery().then((api) => api.pickAlbum(entries.map((entry) => entry.path))).catch((err) => toast(err.message, true));
   if (action === "showInWorkspace") gallery().then((api) => api.showInWorkspaces(entries.map((entry) => entry.path))).catch((err) => toast(err.message, true));
+  if (action === "sortFolder") openSortDialog(one && one.dir ? one.path : state.path);
   if (action === "showFolderInWorkspace") {
     const folders = entries.length ? entries.map((entry) => entry.path) : [state.path];
     gallery().then((api) => api.showFoldersInWorkspaces(folders)).catch((err) => toast(err.message, true));
@@ -6246,7 +6355,324 @@ $("preview-body").addEventListener("input", (event) => {
   if (!state.editor || state.editor.mode !== "edit") return;
   if (!event.target.closest("[data-editor-input], [data-csv-editor]")) return;
   markEditorDirty();
+  const area = event.target.closest("[data-editor-input]");
+  if (area) updateLinkMenu(area).catch(() => closeLinkMenu());
 });
+
+// ---- Sort into folders: a folder's files into sub-folders by date, kind, extension… ----
+
+const SORT_PATTERNS = [
+  ["{YYYY}/{MM}", "Year / month (2024/03)"],
+  ["{YYYY}-{MM}", "Year-month (2024-03)"],
+  ["{YYYY}/{MM}/{DD}", "Year / month / day (2024/03/09)"],
+  ["{YYYY}", "Year (2024)"],
+  ["{YYYY}/{MM} {MMMM}", "Year / month with its name (2024/03 March)"],
+  ["{type}", "Kind (Pictures, Videos, Music, Documents…)"],
+  ["{ext}", "Extension (jpg, pdf…)"],
+  ["{first}", "First letter (A, B…)"],
+  ["", "My own pattern…"],
+];
+
+function monthNames() {
+  return Array.from({ length: 12 }, (_, month) => {
+    const name = new Date(2024, month, 1).toLocaleString(undefined, { month: "long" });
+    return name.charAt(0).toUpperCase() + name.slice(1);
+  });
+}
+
+function openSortDialog(folder) {
+  const shown = folder ? folder.split("/").pop() : (state.me?.rootName || "Library");
+  const dialog = document.createElement("dialog");
+  dialog.className = "sort-dialog";
+  dialog.innerHTML = `<form method="dialog">
+    <h3>Sort “${esc(shown)}” into folders</h3>
+    <p class="muted">Moves its files into sub-folders by the pattern. Nothing is overwritten, and you can undo it afterwards.</p>
+    <label>Into folders by
+      <select data-sort="preset">${SORT_PATTERNS.map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join("")}</select>
+    </label>
+    <label>Pattern
+      <input type="text" data-sort="pattern" value="{YYYY}/{MM}" spellcheck="false" autocomplete="off">
+      <span class="muted sort-help">{YYYY} year, {MM} month, {DD} day, {MMMM} or {MMM} the month's name, {type} kind, {ext} extension, {first} first letter, / for a folder inside a folder. Other words stay as they are: “Photos {YYYY}”.</span>
+    </label>
+    <label data-sort="date-row">Date
+      <select data-sort="date">
+        <option value="taken">Date taken for photos and videos, otherwise last changed</option>
+        <option value="modified">Last changed</option>
+        <option value="created">Created</option>
+      </select>
+    </label>
+    <label class="sort-check"><input type="checkbox" data-sort="recursive"> Also the files in the folders inside it</label>
+    <div class="sort-preview" data-sort="preview" aria-live="polite"><p class="muted">Looking…</p></div>
+    <div class="dialog-actions">
+      <span class="spacer"></span>
+      <button value="cancel" type="submit">Cancel</button>
+      <button type="button" class="primary" data-sort="apply" disabled>Sort</button>
+    </div>
+  </form>`;
+  document.body.append(dialog);
+  const field = (name) => dialog.querySelector(`[data-sort="${name}"]`);
+  const months = monthNames();
+  let asked = 0;
+  let last = null;
+  const settings = () => ({ path: folder, pattern: field("pattern").value.trim(), date: field("date").value, recursive: field("recursive").checked, months });
+  const preview = async () => {
+    const mine = ++asked;
+    const wanted = settings();
+    field("date-row").hidden = !/\{(YYYY|MM|DD|MMMM|MMM)\}/.test(wanted.pattern);
+    field("apply").disabled = true;
+    try {
+      const plan = await api("/api/sort-folder", { method: "POST", json: wanted });
+      if (mine !== asked) return;
+      last = plan;
+      const folders = Object.entries(plan.folders);
+      const name = (path) => (folder && path.startsWith(`${folder}/`) ? path.slice(folder.length + 1) : path);
+      field("preview").innerHTML = plan.total
+        ? `<p><strong>${plan.total} file${plan.total === 1 ? "" : "s"}</strong> into ${folders.length} folder${folders.length === 1 ? "" : "s"}${plan.inPlace ? `, ${plan.inPlace} already in place` : ""}${plan.truncated ? " (only the first 50000 files were looked at)" : ""}.</p>
+          <ul class="sort-folders">${folders.slice(0, 40).map(([path, count]) => `<li><span>📁 ${esc(name(path))}</span><span class="muted">${count}</span></li>`).join("")}${folders.length > 40 ? `<li class="muted">and ${folders.length - 40} more</li>` : ""}</ul>
+          <p class="muted sort-sample">${plan.moves.slice(0, 5).map((move) => `${esc(move.from.split("/").pop())} → ${esc(name(move.to))}/`).join("<br>")}</p>`
+        : `<p class="muted">${plan.lookedAt ? `Nothing to move: ${plan.inPlace === plan.lookedAt ? "every file is in place already" : "no file fits"}.` : "There are no files to sort here."}</p>`;
+      field("apply").textContent = plan.total ? `Sort ${plan.total} file${plan.total === 1 ? "" : "s"}` : "Sort";
+      field("apply").disabled = !plan.total;
+    } catch (err) {
+      if (mine !== asked) return;
+      last = null;
+      field("apply").textContent = "Sort";
+      field("preview").innerHTML = `<p class="sort-problem">${esc(err.message)}</p>`;
+    }
+  };
+  let timer = null;
+  const later = () => { clearTimeout(timer); timer = setTimeout(preview, 250); };
+  field("preset").addEventListener("change", () => {
+    if (field("preset").value) field("pattern").value = field("preset").value;
+    else field("pattern").focus();
+    preview();
+  });
+  field("pattern").addEventListener("input", () => {
+    field("preset").value = SORT_PATTERNS.some(([value]) => value === field("pattern").value.trim()) ? field("pattern").value.trim() : "";
+    later();
+  });
+  for (const name of ["date", "recursive"]) field(name).addEventListener("change", preview);
+  field("apply").addEventListener("click", async () => {
+    if (!last?.total) return;
+    field("apply").disabled = true;
+    field("apply").textContent = "Sorting…";
+    try {
+      const done = await api("/api/sort-folder", { method: "POST", json: { ...settings(), apply: true } });
+      dialog.close();
+      const id = `sort-${Date.now()}`;
+      upsertJob(id, {
+        title: `Sorted ${done.made.length} file${done.made.length === 1 ? "" : "s"} into ${done.folders} folder${done.folders === 1 ? "" : "s"}`,
+        detail: done.failed.length ? `${done.failed.length} could not be moved` : shown,
+        percent: 100,
+        problem: done.failed.length > 0,
+        lines: done.failed.slice(0, 8).map((item) => `${item.path}: ${item.why}`),
+        actions: [
+          { label: "Undo", run: async () => {
+            try {
+              const back = await api("/api/sort-folder/undo", { method: "POST", json: { moves: done.made } });
+              removeJob(id);
+              toast(back.failed.length ? `Put ${back.back} back; ${back.failed.length} could not be` : `Put ${back.back} file${back.back === 1 ? "" : "s"} back`, back.failed.length > 0);
+              await load(state.path);
+            } catch (err) {
+              toast(err.message, true);
+            }
+          } },
+          { label: "Dismiss", run: () => removeJob(id) },
+        ],
+      });
+      openJobsPanel();
+      await load(state.path);
+    } catch (err) {
+      toast(err.message, true);
+      field("apply").disabled = false;
+      field("apply").textContent = "Sort";
+    }
+  });
+  dialog.addEventListener("close", () => dialog.remove());
+  dialog.showModal();
+  preview();
+}
+
+// ---- Notes in the Markdown editor: [[links]], their completion, and pasted pictures ----
+
+/// The notes by name, for [[links]]; asked again after a minute, or after a note is made.
+let noteNames = { at: 0, notes: [] };
+async function notesByName() {
+  if (Date.now() - noteNames.at > 60_000) {
+    const data = await api("/api/notes");
+    noteNames = { at: Date.now(), notes: data.notes || [] };
+  }
+  return noteNames.notes;
+}
+
+const noteStem = (path) => path.split("/").pop().replace(/\.(md|markdown)$/i, "");
+
+function findNoteNamed(notes, name) {
+  const wanted = name.trim().toLowerCase();
+  return notes.find((note) => note.title.toLowerCase() === wanted) || notes.find((note) => noteStem(note.path).toLowerCase() === wanted);
+}
+
+/// Opens the note a [[link]] names, or offers to make it when there is none yet.
+async function openWikiLink(name) {
+  let note = findNoteNamed(await notesByName(), name);
+  if (!note) {
+    noteNames.at = 0;
+    note = findNoteNamed(await notesByName(), name);
+  }
+  let path = note?.path;
+  if (!path) {
+    if (!(state.me && !state.me.readonly)) {
+      toast(`There is no note called “${name}”`, true);
+      return;
+    }
+    if (!(await askConfirm(`There is no note called “${name}” yet. Make it?`, "Make it"))) return;
+    path = (await api("/api/notes", { method: "POST", json: { text: `# ${name}\n\n` } })).path;
+    noteNames.at = 0;
+  }
+  await openEntry({ path, name: path.split("/").pop(), dir: false, size: 0, modified: 0, kind: "text" });
+}
+
+$("preview-body").addEventListener("click", (event) => {
+  const link = event.target.closest("[data-wiki]");
+  if (!link) return;
+  event.preventDefault();
+  openWikiLink(link.dataset.wiki).catch((err) => toast(err.message, true));
+});
+
+let linkMenu = null;
+
+function closeLinkMenu() {
+  linkMenu?.node.remove();
+  linkMenu = null;
+}
+
+/// Where the caret is in a textarea, on the page: a copy of its text up to the caret, laid out
+/// the same way, measured.
+function caretPoint(area) {
+  const mirror = document.createElement("div");
+  const style = getComputedStyle(area);
+  for (const name of ["boxSizing", "width", "paddingTop", "paddingRight", "paddingBottom", "paddingLeft", "borderTopWidth", "borderLeftWidth", "fontFamily", "fontSize", "fontWeight", "lineHeight", "letterSpacing", "tabSize", "wordSpacing"]) {
+    mirror.style[name] = style[name];
+  }
+  mirror.style.position = "absolute";
+  mirror.style.visibility = "hidden";
+  mirror.style.whiteSpace = "pre-wrap";
+  mirror.style.overflowWrap = "break-word";
+  mirror.textContent = area.value.slice(0, area.selectionStart);
+  const mark = document.createElement("span");
+  mark.textContent = "\u200b";
+  mirror.append(mark);
+  document.body.append(mirror);
+  const box = area.getBoundingClientRect();
+  const point = { x: box.left + mark.offsetLeft - area.scrollLeft, y: box.top + mark.offsetTop - area.scrollTop + (parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.3 || 18) };
+  mirror.remove();
+  return point;
+}
+
+/// Suggests notes while a [[link]] is being typed.
+async function updateLinkMenu(area) {
+  if (state.editor?.format !== "markdown") return closeLinkMenu();
+  const before = area.value.slice(0, area.selectionStart);
+  const typing = before.match(/\[\[([^\]\n|#]*)$/);
+  if (!typing) return closeLinkMenu();
+  const query = typing[1].toLowerCase();
+  const own = state.current?.path;
+  const matches = (await notesByName()).filter((note) => note.path !== own && note.title.toLowerCase().includes(query)).slice(0, 8);
+  if (!matches.length) return closeLinkMenu();
+  closeLinkMenu();
+  const node = document.createElement("ul");
+  node.className = "link-menu";
+  node.setAttribute("role", "listbox");
+  matches.forEach((note, index) => {
+    const item = document.createElement("li");
+    item.setAttribute("role", "option");
+    item.textContent = note.title;
+    item.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+      pickLink(area, index);
+    });
+    node.append(item);
+  });
+  document.body.append(node);
+  const point = caretPoint(area);
+  node.style.left = `${Math.min(point.x, window.innerWidth - 260)}px`;
+  node.style.top = `${Math.min(point.y + 4, window.innerHeight - 40)}px`;
+  linkMenu = { node, matches, index: 0, start: area.selectionStart - typing[1].length };
+  paintLinkMenu();
+}
+
+function paintLinkMenu() {
+  [...linkMenu.node.children].forEach((item, index) => item.setAttribute("aria-selected", String(index === linkMenu.index)));
+}
+
+function pickLink(area, index) {
+  const note = linkMenu.matches[index];
+  const { start } = linkMenu;
+  closeLinkMenu();
+  const after = area.value.slice(area.selectionStart);
+  const closing = after.startsWith("]]") ? "" : "]]";
+  area.setRangeText(`${note.title}${closing}`, start, area.selectionStart, "end");
+  if (!closing) area.setSelectionRange(area.selectionStart + 2, area.selectionStart + 2);
+  area.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+$("preview-body").addEventListener("keydown", (event) => {
+  if (!linkMenu || !event.target.closest("[data-editor-input]")) return;
+  const area = event.target.closest("[data-editor-input]");
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    const step = event.key === "ArrowDown" ? 1 : -1;
+    linkMenu.index = (linkMenu.index + step + linkMenu.matches.length) % linkMenu.matches.length;
+    paintLinkMenu();
+  } else if (event.key === "Enter" || event.key === "Tab") {
+    event.preventDefault();
+    pickLink(area, linkMenu.index);
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    closeLinkMenu();
+  }
+}, true);
+$("preview-body").addEventListener("focusout", () => setTimeout(closeLinkMenu, 150));
+
+/// Pictures pasted or dropped into a Markdown file are saved in `attachments/` next to it and
+/// linked where the caret is.
+async function attachPictures(area, pictures) {
+  const folder = parentPath(state.current.path);
+  try {
+    await api("/api/mkdir", { method: "POST", json: { path: folder, name: "attachments" } });
+  } catch { /* there already */ }
+  const destination = folder ? `${folder}/attachments` : "attachments";
+  const stamp = new Date().toISOString().slice(0, 19).replace("T", " ").replace(/:/g, ".");
+  const links = [];
+  for (const [index, picture] of pictures.entries()) {
+    const extension = (picture.type.split("/")[1] || "png").replace("jpeg", "jpg").replace(/[^a-z0-9]/gi, "");
+    const name = picture.name && picture.name !== "image.png" ? picture.name : `Pasted ${stamp}${pictures.length > 1 ? ` ${index + 1}` : ""}.${extension}`;
+    const body = new FormData();
+    body.append("file", picture, name);
+    const response = await fetch(`/api/upload?${new URLSearchParams({ path: destination, conflict: "keep" })}`, { method: "POST", headers: { "X-OwnNAS": "1" }, body });
+    const answer = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(answer.error || "Could not save the picture");
+    const saved = (answer.paths && answer.paths[0]) || `${destination}/${name}`;
+    links.push(`![](attachments/${encodeURI(saved.split("/").pop())})`);
+  }
+  area.setRangeText(links.join("\n"), area.selectionStart, area.selectionEnd, "end");
+  area.dispatchEvent(new Event("input", { bubbles: true }));
+  toast(pictures.length === 1 ? "Picture saved in attachments" : `${pictures.length} pictures saved in attachments`);
+}
+
+for (const kind of ["paste", "drop"]) {
+  $("preview-body").addEventListener(kind, (event) => {
+    const area = event.target.closest("[data-editor-input]");
+    if (!area || state.editor?.format !== "markdown" || !state.current) return;
+    const source = kind === "paste" ? event.clipboardData : event.dataTransfer;
+    const pictures = [...(source?.files || [])].filter((file) => file.type.startsWith("image/"));
+    if (!pictures.length) return;
+    event.preventDefault();
+    event.stopPropagation();
+    attachPictures(area, pictures).catch((err) => toast(err.message, true));
+  });
+}
 
 $("notes-ack").addEventListener("click", async () => {
   if (!state.current) return;

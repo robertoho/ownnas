@@ -98,6 +98,19 @@ pub fn tools() -> Vec<Value> {
             "annotations": same_again,
         }),
         json!({
+            "name": "sort_into_folders",
+            "title": "Sort a folder into sub-folders",
+            "description": "Moves the files of a folder into sub-folders by a pattern: {YYYY} year, {MM} month, {DD} day, {MMMM} month name, {type} kind (Pictures, Videos, Music, Documents, Archives, Other), {ext} extension, {first} first letter; / makes a folder inside a folder. For example {YYYY}/{MM} or {YYYY}-{MM}. With dry_run it only says what would move. Can be undone.",
+            "inputSchema": { "type": "object", "required": ["path", "pattern"], "properties": {
+                "path": path("The folder to sort."),
+                "pattern": { "type": "string", "description": "Where each file goes, such as {YYYY}/{MM}." },
+                "date": { "type": "string", "enum": ["taken", "modified", "created"], "description": "Which date: taken (photos and videos, else last changed; the default), modified or created." },
+                "recursive": { "type": "boolean", "description": "Also the files in the folders inside it." },
+                "dry_run": { "type": "boolean", "description": "Only say what would move." },
+            } },
+            "annotations": changes,
+        }),
+        json!({
             "name": "pending_changes",
             "title": "Changes waiting for approval",
             "description": "Lists this key's latest changes and what became of them: waiting for the user to approve, made, declined, failed, or undone by the user.",
@@ -153,6 +166,9 @@ pub(crate) async fn call(state: &Arc<AppState>, key: &AgentKey, name: &str, args
     if state.readonly {
         return Some(failed("This OwnNAS server is read-only."));
     }
+    if name == "sort_into_folders" && args.raw().get("dry_run").and_then(Value::as_bool).unwrap_or(false) {
+        return Some(sort_plan(state, key, args).await.map(|plan| as_text(&plan)));
+    }
     let summary = summarize(name, args);
     if key.approve {
         return Some(ask(state, key, name, args, &summary, None).await);
@@ -185,6 +201,7 @@ async fn run(state: &Arc<AppState>, key: &AgentKey, name: &str, args: &Args<'_>)
         "create_album" => create_album(state, key, &args.text("name"), args.integer("parent")).await,
         "add_to_album" => album_items(state, key, args, true).await,
         "remove_from_album" => album_items(state, key, args, false).await,
+        "sort_into_folders" => sort_into_folders(state, key, args).await,
         other if mcp_write::has(other) && key.can_write() => mcp_write::run(state, key, other, args).await,
         _ => failed("Unknown tool"),
     }
@@ -196,9 +213,10 @@ fn targets(name: &str, args: &Args<'_>) -> Vec<(String, Option<String>)> {
     match name {
         "add_tags" | "remove_tags" => args.texts("paths").into_iter().map(|path| (path, None)).collect(),
         "create_folder" => vec![(args.path(), Some(args.text("name")))],
-        "rename" | "move_to_trash" | "edit_text" | "append_rows" | "append_to_note" | "tick_item" => vec![(args.path(), None)],
+        "rename" | "move_to_trash" | "edit_text" | "append_rows" | "add_paragraphs" | "append_to_note" | "tick_item" | "sort_into_folders" => vec![(args.path(), None)],
         "move" => vec![(args.path(), None), (args.text("to"), None)],
         "copy" => vec![(args.text("to"), None)],
+        "upload_file" => vec![(args.path(), Some(args.text("name")))],
         "write_file" => {
             let path = args.path();
             let (parent, file) = path.rsplit_once('/').unwrap_or(("", &path));
@@ -252,10 +270,13 @@ fn summarize(name: &str, args: &Args<'_>) -> String {
         "create_album" => format!("Make album {}", args.text("name")),
         "add_to_album" => format!("Add {items} to {album}"),
         "remove_from_album" => format!("Take {items} out of {album}"),
+        "sort_into_folders" => format!("Sort {} into folders by {}", args.path(), args.text("pattern")),
         "write_file" => format!("{} {}", if args.raw().get("replace").and_then(Value::as_bool).unwrap_or(false) { "Write (replacing)" } else { "Write" }, args.path()),
         "edit_text" => format!("Change a passage in {}", args.path()),
         "append_rows" => format!("Add {} row(s) to {}", args.raw().get("rows").and_then(Value::as_array).map_or(0, Vec::len), args.path()),
         "copy" => format!("Copy {} into {}", args.path(), args.text("to")),
+        "add_paragraphs" => format!("Add {} paragraph(s) to {}", args.texts("paragraphs").len(), args.path()),
+        "upload_file" => format!("Upload {} into {}", args.text("name"), args.path()),
         "create_note" => format!("Make the note “{}”", if args.text("title").trim().is_empty() { args.text("text").lines().next().unwrap_or_default().chars().take(60).collect::<String>() } else { args.text("title") }),
         "append_to_note" => format!("Add to the note {}", args.path()),
         "tick_item" => format!("{} “{}” in {}", if args.raw().get("done").and_then(Value::as_bool).unwrap_or(true) { "Tick" } else { "Untick" }, args.text("item"), args.path()),
@@ -386,6 +407,7 @@ pub(crate) async fn undo(state: &Arc<AppState>, id: i64, by_user: &str) -> Resul
             let (back_from, back_to) = (to.clone(), from.clone());
             tokio::task::spawn_blocking(move || files::move_exact(&root, &back_from, &back_to)).await.map_err(|_| "Could not undo it".to_string())?.map_err(message)?;
             crate::http::rewrite_meta(state, &to, &from);
+            crate::http::relink_notes(state, by_user, &to, &from).await;
             crate::http::invalidate_sizes(state, &from);
             crate::http::invalidate_sizes(state, &to);
         }
@@ -424,6 +446,19 @@ pub(crate) async fn undo(state: &Arc<AppState>, id: i64, by_user: &str) -> Resul
                 }
             }
             crate::http::invalidate_sizes(state, path.rsplit_once('/').map_or("", |(parent, _)| parent));
+        }
+        "sorted" => {
+            let moves: Vec<crate::sort_folder::Move> = serde_json::from_value(how["moves"].clone()).unwrap_or_default();
+            let sorted = moves.clone();
+            let (back, failed) = tokio::task::spawn_blocking(move || crate::sort_folder::undo(&root, &sorted)).await.map_err(|_| "Could not undo it".to_string())?;
+            for item in &moves {
+                if !failed.iter().any(|(path, _)| path == &item.to) {
+                    crate::http::rewrite_meta(state, &item.to, &item.from);
+                }
+            }
+            if let Some((path, why)) = failed.first() {
+                return Err(format!("Put {back} back, but not {path}: {why}"));
+            }
         }
         "created" => {
             let path = text_of(&how, "path");
@@ -554,6 +589,7 @@ async fn rename(state: &Arc<AppState>, key: &AgentKey, path: &str, name: &str) -
     let (root, from, to_name) = (state.root.clone(), found.rel.clone(), name.trim().to_string());
     let to = blocking(move || files::rename_entry(&root, &from, &to_name).map_err(file_error)).await?;
     crate::http::rewrite_meta(state, &found.rel, &to);
+    crate::http::relink_notes(state, &by(key), &found.rel, &to).await;
     log(state, key, "rename", &format!("{} → {to}", found.rel));
     done(json!({ "path": to }), json!({ "kind": "moved", "from": found.rel, "to": to }))
 }
@@ -591,6 +627,49 @@ async fn trash(state: &Arc<AppState>, key: &AgentKey, path: &str) -> Result<Done
     crate::http::invalidate_sizes(state, &found.rel);
     log(state, key, "trash", &found.rel);
     done(json!({ "moved": found.rel, "note": "It is in the OwnNAS Trash, where the user can restore it." }), json!({ "kind": "trashed", "from": found.rel, "to": moved }))
+}
+
+/// Where sorting would move the files: the plan, checked against the key's folders.
+async fn sort_plan(state: &Arc<AppState>, key: &AgentKey, args: &Args<'_>) -> Result<Value, Stop> {
+    let found = allowed(state, key, &args.path()).await?;
+    if !found.full.is_dir() {
+        return failed("That is a file, not a folder.");
+    }
+    let pattern = args.text("pattern");
+    crate::sort_folder::check_pattern(&pattern).map_err(Stop::Failed)?;
+    let from = match args.text("date").as_str() {
+        "modified" => crate::sort_folder::DateFrom::Modified,
+        "created" => crate::sort_folder::DateFrom::Created,
+        _ => crate::sort_folder::DateFrom::Taken,
+    };
+    let recursive = args.raw().get("recursive").and_then(Value::as_bool).unwrap_or(false);
+    let taken = crate::http::taken_dates(state, &found.rel);
+    let (root, rel, folders) = (state.root.clone(), found.rel.clone(), key.folders.clone());
+    blocking(move || {
+        let months: Vec<String> = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"].map(String::from).to_vec();
+        let mut plan = crate::sort_folder::plan(&root, &rel, &pattern, from, recursive, &months, &taken).map_err(file_error)?;
+        // Links inside could lead elsewhere: only what the key may use moves.
+        plan.moves.retain(|item| agent_keys::check(&root, &folders, &item.from).is_some());
+        Ok(json!({ "path": rel, "moves": plan.moves, "folders": plan.folders, "inPlace": plan.in_place, "truncated": plan.truncated }))
+    })
+    .await
+}
+
+async fn sort_into_folders(state: &Arc<AppState>, key: &AgentKey, args: &Args<'_>) -> Result<Done, Stop> {
+    let plan = sort_plan(state, key, args).await?;
+    let moves: Vec<crate::sort_folder::Move> = serde_json::from_value(plan["moves"].clone()).unwrap_or_default();
+    if moves.is_empty() {
+        return failed("Nothing to move: every file is where the pattern puts it already.");
+    }
+    let root = state.root.clone();
+    let (made, failed_moves) = blocking(move || Ok(crate::sort_folder::apply(&root, &moves))).await?;
+    for item in &made {
+        crate::http::rewrite_meta(state, &item.from, &item.to);
+    }
+    crate::http::invalidate_sizes(state, plan["path"].as_str().unwrap_or_default());
+    log(state, key, "sort-folder", &format!("{} by {}: {} file(s)", plan["path"].as_str().unwrap_or_default(), args.text("pattern"), made.len()));
+    let failed_list: Vec<Value> = failed_moves.iter().map(|(path, why)| json!({ "path": path, "why": why })).collect();
+    done(json!({ "moved": made.len(), "folders": plan["folders"], "failed": failed_list }), json!({ "kind": "sorted", "moves": made }))
 }
 
 /// An album the key may change: one with photos in its folders, or an empty one (such as one

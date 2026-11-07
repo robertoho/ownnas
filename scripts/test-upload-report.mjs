@@ -147,6 +147,27 @@ try {
   assert.equal(onServer('bad.txt'), 'bad bad bad');
   await until(`document.body.innerText.includes('confirmed on the server')`, 'the confirmation');
 
+  // A name the server can't store (a tab, as folded e-mail subjects have) is adjusted, not refused.
+  await pick(write(local, 'tab\there: 19:47.txt', 'tabbed'));
+  for (let i = 0; i < 50 && !there('tab here- 19-47.txt'); i++) await sleep(100);
+  assert.equal(onServer('tab here- 19-47.txt'), 'tabbed');
+
+  // Dismiss works with a real click while another job keeps updating the panel (each update
+  // used to rebuild every button, so the click was lost between press and release).
+  fs.rmSync(path.join(library, 'bad.txt'));
+  await js(`window.dropBad = true`);
+  await pick(write(local, 'bad.txt', 'bad again'));
+  await until(`!!document.querySelector('.jobs-item.problem')`, 'the second report');
+  await js(`window.dropBad = false; window.ticker = setInterval(() => upsertJob('busy-test', { title: 'Busy', detail: String(Date.now()), percent: (Date.now() / 10) % 100 }), 20); true`);
+  await sleep(200);
+  const box = await js(`(() => { const button = [...document.querySelectorAll('.jobs-item.problem button')].find((b) => b.textContent === 'Dismiss'); const r = button.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()`);
+  await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: box.x, y: box.y });
+  await send('Input.dispatchMouseEvent', { type: 'mousePressed', x: box.x, y: box.y, button: 'left', clickCount: 1 });
+  await sleep(150);
+  await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: box.x, y: box.y, button: 'left', clickCount: 1 });
+  await until(`!document.querySelector('.jobs-item.problem')`, 'the report to be dismissed');
+  await js(`clearInterval(window.ticker); removeJob('busy-test'); true`);
+
   // Keep newer, with the same choice for the rest: replaces the older, skips the newer.
   write(library, 'older-here.txt', 'server, old', 5000);
   write(library, 'newer-here.txt', 'server, new', 100);

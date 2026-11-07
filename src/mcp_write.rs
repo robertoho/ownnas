@@ -16,6 +16,8 @@ use std::sync::Arc;
 
 /// The largest text an agent can write in one go, and the largest file it can change.
 const MOST_TEXT: usize = 5 * 1024 * 1024;
+/// The largest file an agent can upload in one call (base64 makes the request a third bigger).
+const MOST_UPLOAD: usize = 25 * 1024 * 1024;
 const MOST_ROWS: usize = 10_000;
 
 pub fn tools() -> Vec<Value> {
@@ -47,9 +49,10 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "append_rows",
             "title": "Add rows to a table",
-            "description": "Adds rows to the end of a CSV or TSV file, quoting cells as needed. What the file held is kept in its history.",
+            "description": "Adds rows after the last row of a CSV or TSV file, or of a sheet of a spreadsheet (xlsx). Numbers stay numbers. What the file held is kept in its history.",
             "inputSchema": { "type": "object", "required": ["path", "rows"], "properties": {
-                "path": path("The CSV or TSV file."),
+                "path": path("The CSV, TSV or xlsx file."),
+                "sheet": { "type": "string", "description": "For a spreadsheet: the sheet's name. Leave out for the first." },
                 "rows": { "type": "array", "maxItems": MOST_ROWS, "items": { "type": "array", "items": { "type": ["string", "number", "boolean", "null"] } }, "description": "The rows, each a list of cells." },
             } },
             "annotations": changes,
@@ -87,6 +90,28 @@ pub fn tools() -> Vec<Value> {
             "annotations": changes,
         }),
         json!({
+            "name": "add_paragraphs",
+            "title": "Add paragraphs",
+            "description": "Adds paragraphs at the end of a Word (docx) or OpenDocument (odt) document, or of a text or Markdown file. The document's look and everything else in it stay as they were; what it held is kept in its history.",
+            "inputSchema": { "type": "object", "required": ["path", "paragraphs"], "properties": {
+                "path": path("The document."),
+                "paragraphs": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 1000, "description": "The paragraphs, as plain text." },
+            } },
+            "annotations": changes,
+        }),
+        json!({
+            "name": "upload_file",
+            "title": "Upload a file",
+            "description": "Saves a file of any kind (a picture, PDF, spreadsheet…) from base64, up to 25 MB, in a folder. A name already taken gets a number added, unless replace is true; what a replaced file held is kept in its history.",
+            "inputSchema": { "type": "object", "required": ["path", "name", "base64"], "properties": {
+                "path": path("The folder to save it in."),
+                "name": { "type": "string", "description": "The file's name, with its extension." },
+                "base64": { "type": "string", "description": "The file's contents, base64-encoded." },
+                "replace": { "type": "boolean", "description": "Replace a file with that name." },
+            } },
+            "annotations": changes,
+        }),
+        json!({
             "name": "copy",
             "title": "Copy",
             "description": "Copies a file or folder into a folder. A name already taken there gets a number added. Returns the copy's path.",
@@ -108,7 +133,10 @@ pub(crate) async fn run(state: &Arc<AppState>, key: &AgentKey, name: &str, args:
     match name {
         "write_file" => write_file(state, key, &args.path(), &args.text("text"), args.raw().get("replace").and_then(Value::as_bool).unwrap_or(false)).await,
         "edit_text" => edit_text(state, key, &args.path(), &args.text("find"), replace_text.as_deref()).await,
+        "append_rows" if args.path().to_ascii_lowercase().ends_with(".xlsx") => append_sheet_rows(state, key, &args.path(), &args.text("sheet"), args.raw().get("rows")).await,
         "append_rows" => append_rows(state, key, &args.path(), args.raw().get("rows")).await,
+        "add_paragraphs" => add_paragraphs(state, key, &args.path(), &args.texts("paragraphs")).await,
+        "upload_file" => upload_file(state, key, &args.path(), &args.text("name"), &args.text("base64"), args.raw().get("replace").and_then(Value::as_bool).unwrap_or(false)).await,
         "copy" => copy(state, key, &args.path(), &args.text("to")).await,
         "create_note" => create_note(state, key, &args.text("title"), &args.text("text"), &args.texts("checklist")).await,
         "append_to_note" => append_to_note(state, key, &args.path(), &args.text("text")).await,
@@ -375,6 +403,126 @@ async fn tick_item(state: &Arc<AppState>, key: &AgentKey, path: &str, item: &str
     let version = overwrite(state, key, &found, ticked).await?;
     after_write(state, key, "agent-note", &found.rel);
     done(json!({ "path": found.rel, "item": target.text, "done": done_now }), json!({ "kind": "version", "path": found.rel, "version": version }))
+}
+
+/// A file the key may change, as bytes (for documents and spreadsheets).
+async fn binary_file(state: &Arc<AppState>, key: &AgentKey, path: &str) -> Result<(agent_keys::Allowed, Vec<u8>), Stop> {
+    let found = allowed(state, key, path).await?;
+    let full = found.full.clone();
+    let bytes = blocking(move || {
+        let size = std::fs::metadata(&full).map_err(|_| Stop::Refused)?.len();
+        if full.is_dir() {
+            return failed("That is a folder.");
+        }
+        if size > 50 * 1024 * 1024 {
+            return failed("That file is too large to change here.");
+        }
+        std::fs::read(&full).map_err(|_| Stop::Failed("Could not read that file.".to_string()))
+    })
+    .await?;
+    Ok((found, bytes))
+}
+
+async fn overwrite_bytes(state: &Arc<AppState>, key: &AgentKey, found: &agent_keys::Allowed, bytes: Vec<u8>) -> Result<Option<i64>, Stop> {
+    let version = keep(state, key, &found.full, &found.rel)?;
+    let full = found.full.clone();
+    blocking(move || std::fs::write(&full, bytes).map_err(|_| Stop::Failed("Could not write the file.".to_string()))).await?;
+    Ok(version)
+}
+
+async fn append_sheet_rows(state: &Arc<AppState>, key: &AgentKey, path: &str, sheet: &str, rows: Option<&Value>) -> Result<Done, Stop> {
+    let Some(rows) = rows.and_then(Value::as_array).filter(|rows| !rows.is_empty()) else {
+        return failed("Give at least one row, as a list of cells.");
+    };
+    if rows.len() > MOST_ROWS {
+        return failed(&format!("Give at most {MOST_ROWS} rows at a time."));
+    }
+    let rows: Vec<Vec<Value>> = rows.iter().map(|row| row.as_array().cloned().unwrap_or_default()).collect();
+    let (found, bytes) = binary_file(state, key, path).await?;
+    let sheet = sheet.to_string();
+    let count = rows.len();
+    let changed = blocking(move || crate::office_edit::xlsx_add_rows(&bytes, &sheet, &rows).map_err(Stop::Failed)).await?;
+    let version = overwrite_bytes(state, key, &found, changed).await?;
+    after_write(state, key, "agent-append", &found.rel);
+    done(json!({ "path": found.rel, "added": count }), json!({ "kind": "version", "path": found.rel, "version": version }))
+}
+
+async fn add_paragraphs(state: &Arc<AppState>, key: &AgentKey, path: &str, paragraphs: &[String]) -> Result<Done, Stop> {
+    let paragraphs: Vec<String> = paragraphs.iter().map(|text| text.trim_end().to_string()).collect();
+    if paragraphs.is_empty() || paragraphs.len() > 1000 {
+        return failed("Give between 1 and 1000 paragraphs.");
+    }
+    let extension = path.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
+    let (found, version) = match extension.as_str() {
+        "docx" | "odt" => {
+            let (found, bytes) = binary_file(state, key, path).await?;
+            let list = paragraphs.clone();
+            let changed = blocking(move || {
+                if extension == "docx" { crate::office_edit::docx_add_paragraphs(&bytes, &list) } else { crate::office_edit::odt_add_paragraphs(&bytes, &list) }.map_err(Stop::Failed)
+            })
+            .await?;
+            let version = overwrite_bytes(state, key, &found, changed).await?;
+            (found, version)
+        }
+        "txt" | "md" | "markdown" | "text" => {
+            let (found, mut body) = text_file(state, key, path).await?;
+            if !body.is_empty() && !body.ends_with('\n') {
+                body.push('\n');
+            }
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&paragraphs.join("\n\n"));
+            body.push('\n');
+            let version = overwrite(state, key, &found, body).await?;
+            (found, version)
+        }
+        _ => return failed("Paragraphs can be added to docx, odt, text and Markdown files."),
+    };
+    after_write(state, key, "agent-edit", &found.rel);
+    done(json!({ "path": found.rel, "added": paragraphs.len() }), json!({ "kind": "version", "path": found.rel, "version": version }))
+}
+
+async fn upload_file(state: &Arc<AppState>, key: &AgentKey, folder: &str, name: &str, encoded: &str, replace: bool) -> Result<Done, Stop> {
+    let name = name.trim();
+    if name.is_empty() || name.starts_with('.') || name.contains('/') || name.contains('\\') {
+        return failed("Give the file a name that does not start with a dot.");
+    }
+    if encoded.len() > MOST_UPLOAD / 3 * 4 + 8 {
+        return failed("That file is too large to upload here (25 MB at most).");
+    }
+    let compact: String = encoded.chars().filter(|c| !c.is_whitespace()).collect();
+    let bytes = crate::http::base64_decode(&compact).map_err(|()| Stop::Failed("That is not base64.".to_string()))?;
+    let place = allowed(state, key, folder).await?;
+    if !place.full.is_dir() {
+        return failed("Upload it into a folder.");
+    }
+    let rel = if place.rel.is_empty() { name.to_string() } else { format!("{}/{name}", place.rel) };
+    let target = place.full.join(name);
+    if replace && target.is_file() {
+        let found = allowed(state, key, &rel).await?;
+        let version = overwrite_bytes(state, key, &found, bytes).await?;
+        after_write(state, key, "agent-upload", &found.rel);
+        return done(json!({ "path": found.rel, "replaced": true }), json!({ "kind": "version", "path": found.rel, "version": version }));
+    }
+    let (dir, file_name) = (place.full.clone(), name.to_string());
+    let saved = blocking(move || {
+        // A name already taken gets a number: "report 2.pdf".
+        let (stem, extension) = file_name.rsplit_once('.').map_or((file_name.clone(), String::new()), |(stem, ext)| (stem.to_string(), format!(".{ext}")));
+        let mut candidate = dir.join(&file_name);
+        let mut n = 2;
+        while candidate.exists() || candidate.is_symlink() {
+            candidate = dir.join(format!("{stem} {n}{extension}"));
+            n += 1;
+        }
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate).map_err(|_| Stop::Failed("Could not save the file.".to_string()))?;
+        file.write_all(&bytes).map_err(|_| Stop::Failed("Could not save the file.".to_string()))?;
+        Ok(candidate.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default())
+    })
+    .await?;
+    let rel = if place.rel.is_empty() { saved } else { format!("{}/{saved}", place.rel) };
+    after_write(state, key, "agent-upload", &rel);
+    done(json!({ "path": rel, "replaced": false }), json!({ "kind": "created", "path": rel }))
 }
 
 #[cfg(test)]

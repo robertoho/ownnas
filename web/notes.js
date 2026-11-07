@@ -41,6 +41,7 @@ export function mountNotes(host, ctx) {
   let data = null;
   let query = "";
   let label = "";
+  let notebook = "";
   let archived = false;
   let listMode = false;
   let color = "";
@@ -60,9 +61,11 @@ export function mountNotes(host, ctx) {
   const archiveToggle = el("button", { type: "button", "aria-pressed": "false" }, "Archive");
   const folderButton = el("button", { type: "button", class: "notes-folder-btn", title: "Where the notes are kept" });
   const labels = el("div", { class: "notes-labels" });
+  const notebooks = el("div", { class: "notes-labels notes-notebooks", "aria-label": "Notebooks" });
   const grid = el("div", { class: "notes-body" });
   host.replaceChildren(
     el("div", { class: "notes-head" }, capture, el("div", { class: "notes-tools" }, search, today, archiveToggle, folderButton)),
+    notebooks,
     labels,
     grid,
   );
@@ -90,7 +93,7 @@ export function mountNotes(host, ctx) {
     color = "";
     listMode = false;
     listToggle.setAttribute("aria-pressed", "false");
-    body.placeholder = "Take a note…";
+    body.placeholder = notebook ? `Take a note in ${notebook}…` : "Take a note…";
     capture.className = "notes-capture";
     title.hidden = true;
     captureTools.hidden = true;
@@ -130,7 +133,7 @@ export function mountNotes(host, ctx) {
     const full = heading ? `# ${heading}\n\n${text}\n` : `${text}\n`;
     add.disabled = true;
     try {
-      await ctx.api("/api/notes", { method: "POST", json: { text: full, color: color || undefined } });
+      await ctx.api("/api/notes", { method: "POST", json: { text: full, color: color || undefined, notebook: notebook || undefined } });
       resetCapture();
       await load();
       body.focus();
@@ -164,6 +167,21 @@ export function mountNotes(host, ctx) {
     }
   });
 
+  /// Notebooks made here and still empty (the server lists notes, not folders).
+  const made = new Set();
+  async function newNotebook() {
+    const name = await ctx.askText("New notebook", "Name", "", "Make it");
+    if (!name || !name.trim()) return;
+    try {
+      await ctx.api("/api/mkdir", { method: "POST", json: { path: data.folder, name: name.trim() } });
+      made.add(name.trim());
+      notebook = name.trim();
+      paint();
+    } catch (err) {
+      ctx.toast(err.message, true);
+    }
+  }
+
   async function load() {
     const request = ctx.api("/api/notes");
     loading = request;
@@ -194,10 +212,17 @@ export function mountNotes(host, ctx) {
     return linked;
   }
 
+  /// The notebook a note is in: the sub-folder of the notes folder it is in, or "" at the top.
+  const notebookOf = (note) => {
+    const inside = note.path.slice(data.folder.length + 1).split("/");
+    return inside.length > 1 && !["Archive"].includes(inside[0]) ? inside[0] : "";
+  };
+
   const labelsOf = (note) => [...new Set([...note.tags, ...note.hashtags].map((tag) => tag.toLowerCase()))];
 
   function matches(note) {
     if (note.archived !== archived) return false;
+    if (notebook && notebookOf(note) !== notebook) return false;
     if (label && !labelsOf(note).includes(label)) return false;
     if (!query) return true;
     const words = [note.title, note.excerpt, ...note.items.map((item) => item.text), ...labelsOf(note), note.path].join("\n").toLowerCase();
@@ -209,6 +234,15 @@ export function mountNotes(host, ctx) {
     archiveToggle.textContent = archived ? "Back to notes" : "Archive";
     archiveToggle.setAttribute("aria-pressed", String(archived));
     folderButton.textContent = `📁 ${data.folder}`;
+    const allNotebooks = [...new Set(data.notes.filter((note) => !note.archived).map(notebookOf).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+    if (notebook && !allNotebooks.includes(notebook) && !made.has(notebook)) notebook = "";
+    const shownNotebooks = [...new Set([...allNotebooks, ...made])].sort((a, b) => a.localeCompare(b));
+    notebooks.replaceChildren(...(archived ? [] : [
+      el("button", { type: "button", class: `notes-label${notebook ? "" : " is-chosen"}`, onclick: () => { notebook = ""; paint(); } }, "All notes"),
+      ...shownNotebooks.map((name) => el("button", { type: "button", class: `notes-label${notebook === name ? " is-chosen" : ""}`, title: `Notes in ${data.folder}/${name}`, onclick: () => { notebook = notebook === name ? "" : name; paint(); } }, `📓 ${name}`)),
+      ctx.canWrite() ? el("button", { type: "button", class: "notes-label", title: "A notebook is a folder inside the notes folder", onclick: newNotebook }, "+ Notebook") : null,
+    ]));
+    body.placeholder = listMode ? "One item a line" : notebook ? `Take a note in ${notebook}…` : "Take a note…";
     const allLabels = [...new Set(data.notes.filter((note) => note.archived === archived).flatMap(labelsOf))].sort();
     if (label && !allLabels.includes(label)) label = "";
     labels.replaceChildren(...(allLabels.length ? [

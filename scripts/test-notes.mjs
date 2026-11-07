@@ -178,6 +178,54 @@ try {
   assert.equal(read(`Notes/Daily/${stamp}.md`), `# ${stamp}\n\n`);
   const { result: shot } = await send('Page.captureScreenshot', { format: 'png' });
   if (process.env.NOTES_SHOT) fs.writeFileSync(process.env.NOTES_SHOT, Buffer.from(shot.data, 'base64'));
+  await js(`document.getElementById('preview-close').click(), true`);
+
+  // A [[link]] in the preview opens the note it names.
+  await click(cardOf('Recipes'));
+  await until(`document.querySelector('#preview-body .md-wikilink[data-wiki="Groceries"]')`, 'the link in the preview');
+  await click(`document.querySelector('#preview-body .md-wikilink')`);
+  await until(`document.getElementById('preview-title').textContent === 'Groceries.md'`, 'the linked note');
+  assert.equal(await js(`document.querySelector('#preview-body .md-preview').textContent.includes('pinned')`), false, 'front matter is not shown');
+  assert.equal(await js(`document.querySelectorAll('#preview-body .md-task input[type=checkbox]').length`), 2, 'checklists show as boxes');
+
+  // Typing [[ suggests notes; a pasted picture lands in attachments, linked.
+  await click(`document.querySelector('#preview [data-editor="mode"][data-mode="edit"]')`);
+  await until(`document.querySelector('#preview-body [data-editor-input]')`, 'the editor');
+  await js(`(() => { const area = document.querySelector('#preview-body [data-editor-input]'); area.focus(); area.value += 'See [[Rec'; area.setSelectionRange(area.value.length, area.value.length); area.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+  await until(`[...document.querySelectorAll('.link-menu li')].some((li) => li.textContent === 'Recipes')`, 'the suggestions');
+  await js(`document.querySelector('#preview-body [data-editor-input]').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })), true`);
+  await until(`document.querySelector('#preview-body [data-editor-input]').value.endsWith('See [[Recipes]]')`, 'the link completed');
+  await js(`(() => {
+    const area = document.querySelector('#preview-body [data-editor-input]');
+    area.setRangeText('\\n', area.value.length, area.value.length, 'end');
+    const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='), (c) => c.charCodeAt(0));
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([png], 'image.png', { type: 'image/png' }));
+    area.dispatchEvent(new ClipboardEvent('paste', { clipboardData: transfer, bubbles: true, cancelable: true }));
+    return true;
+  })()`);
+  await until(`document.querySelector('#preview-body [data-editor-input]').value.includes('![](attachments/Pasted')`, 'the picture linked');
+  assert.equal(fs.readdirSync(path.join(library, 'Notes/attachments')).filter((name) => name.startsWith('Pasted')).length, 1);
+  await click(`document.querySelector('#preview [data-editor="save"]')`);
+  await fileHas('Notes/Groceries.md', /See \[\[Recipes\]\]\n!\[\]\(attachments\/Pasted/);
+  await click(`document.querySelector('#preview [data-editor="mode"][data-mode="view"]')`);
+  await until(`document.querySelector('#preview-body img.md-image')?.naturalWidth === 1`, 'the picture in the preview');
+
+  // Renaming a note takes the links to it along.
+  await js(`document.getElementById('preview-close').click(), true`);
+  assert.equal((await call('POST', '/api/rename', { path: 'Notes/Groceries.md', name: 'Shopping list.md' })).status, 200);
+  await fileHas('Notes/Recipes.md', /\[\[Shopping list\]\]/);
+
+  // Notebooks: the sub-folders, and new notes go into the one shown.
+  put('Notes/Work/Plan.md', '# Plan\n\nship it\n');
+  await send('Page.navigate', { url: `${base}?notebooks#notes` });
+  await until(`[...document.querySelectorAll('#notes-view .notes-notebooks button')].some((b) => b.textContent.includes('Work'))`, 'the Work notebook');
+  await click(`[...document.querySelectorAll('#notes-view .notes-notebooks button')].find((b) => b.textContent.includes('Work'))`);
+  await until(`document.querySelectorAll('#notes-view .note-card').length === 1`, 'only the Work notes');
+  assert.deepEqual(await cards(), ['Plan']);
+  await type('#notes-view .notes-capture-body', 'work idea');
+  await click(`[...document.querySelectorAll('#notes-view .notes-capture button')].find((b) => b.textContent === 'Add')`);
+  await fileHas('Notes/Work/work idea.md', /^work idea\n$/);
 
   assert.deepEqual(problems, [], 'no errors in the page');
   console.log('ok: notes');

@@ -44,6 +44,8 @@ pub mod mcp_photos;
 pub mod mcp_write;
 pub mod mcp_notes;
 pub mod notes;
+pub mod office_edit;
+pub mod sort_folder;
 pub mod music;
 pub mod nas_backup;
 pub mod map_tiles;

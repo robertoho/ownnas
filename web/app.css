@@ -3813,7 +3813,26 @@ button.linkish {
 body.is-gallery .app > .toolbar,
 body.is-gallery .app > .explorer-content,
 body.is-gallery .app > .explorer-status-bar { display: none; }
+/* ---- Sort into folders (app.js openSortDialog) ---- */
+.sort-dialog { width: min(34rem, calc(100vw - 2rem)); }
+.sort-dialog select, .sort-dialog input[type="text"] { width: 100%; }
+.sort-help { display: block; font-size: 0.78rem; line-height: 1.35; }
+.sort-dialog label.sort-check { display: flex; align-items: center; gap: 0.5rem; }
+.sort-dialog label.sort-check input { width: auto; margin: 0; }
+.sort-preview { max-height: 16rem; overflow: auto; padding: 0.5rem 0.75rem; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-deep); font-size: 0.88rem; }
+.sort-preview p { margin: 0.25rem 0; }
+.sort-folders { list-style: none; margin: 0.35rem 0; padding: 0; display: grid; gap: 0.1rem; }
+.sort-folders li { display: flex; justify-content: space-between; gap: 1rem; }
+.sort-sample { font-size: 0.8rem; overflow-wrap: anywhere; }
+.sort-problem { color: var(--danger); }
 /* ---- Notes (notes.js): cards over Markdown files ---- */
+.md-preview .md-image { display: block; max-width: 100%; max-height: 70vh; margin: 0.5rem 0; border-radius: 6px; }
+.md-preview .md-task { list-style: none; margin-left: -1.2rem; }
+.md-preview .md-task input { margin: 0 0.35rem 0 0; vertical-align: middle; }
+.md-preview .md-wikilink { text-decoration: underline dotted; }
+.link-menu { position: fixed; z-index: 1000; min-width: 12rem; max-width: 18rem; margin: 0; padding: 0.25rem; list-style: none; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); box-shadow: var(--shadow); font-size: 0.88rem; }
+.link-menu li { padding: 0.3rem 0.55rem; border-radius: 5px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.link-menu li[aria-selected="true"], .link-menu li:hover { background: var(--accent); color: var(--accent-ink); }
 body.is-notes .app > .toolbar,
 body.is-notes .app > .explorer-content,
 body.is-notes .app > .explorer-status-bar { display: none; }
