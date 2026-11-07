@@ -556,6 +556,13 @@ fn index_schema(conn: &Connection) -> Result<(), String> {
             sha256 TEXT NOT NULL,
             hashed_at INTEGER NOT NULL
         );
+        -- Difference hashes of photos, to find the ones that look alike (near_dupes.rs).
+        CREATE TABLE IF NOT EXISTS idx.photo_hashes (
+            path TEXT PRIMARY KEY,
+            size INTEGER NOT NULL,
+            mtime INTEGER NOT NULL,
+            dhash INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS idx.folder_sizes (
             path TEXT PRIMARY KEY,
             bytes INTEGER NOT NULL,

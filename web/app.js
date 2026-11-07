@@ -1399,6 +1399,8 @@ function openSelectionMenu(x, y, pasteInto) {
     buttons.push(`<button type="button" data-menu="usage">Folder size</button>`);
     buttons.push(`<button type="button" data-menu="reindex">Reindex this folder</button>`);
     buttons.push(`<button type="button" data-menu="duplicates">Find duplicates…</button>`);
+    buttons.push(`<button type="button" data-menu="nearDuplicates" title="Burst shots, resized or re-saved copies">Find photos that look alike…</button>`);
+    buttons.push(`<button type="button" data-menu="tidy" title="Largest files, empty folders, photo dates, comparing with another folder">Tidy up…</button>`);
     buttons.push(`<button type="button" data-menu="activity">Activity</button>`);
     buttons.push(`<button type="button" data-menu="toggleHidden">${state.hidden ? "Hide dotfiles" : "Show hidden files"}</button>`);
     if (state.me && state.me.terminal && !inTrash) {
@@ -1487,11 +1489,19 @@ function openSelectionMenu(x, y, pasteInto) {
     if (write && one && one.dir && !allInTrash) {
       buttons.push(`<button type="button" data-menu="sortFolder" title="Into sub-folders by date, kind, extension…">Sort into folders…</button>`);
     }
+    if (one && one.dir && !allInTrash) {
+      buttons.push(`<button type="button" data-menu="duplicates" title="Files with the same contents in it and its folders">Find duplicates in this folder…</button>`);
+      buttons.push(`<button type="button" data-menu="nearDuplicates" title="Burst shots, resized or re-saved copies">Find photos that look alike…</button>`);
+      buttons.push(`<button type="button" data-menu="tidy" title="Largest files, empty folders, photo dates, comparing with another folder">Tidy up…</button>`);
+    }
     if (state.me && state.me.admin && state.workspaceCount && !allInTrash && entries.length && entries.every((entry) => entry.dir)) {
       buttons.push(`<button type="button" data-menu="showFolderInWorkspace" title="Every photo and video in it, including ones added later">Show in workspace…</button>`);
     }
     if (write && entries.length && !allInTrash) {
       buttons.push(`<button type="button" data-menu="rename">Rename</button>`);
+    }
+    if (write && entries.length && !allInTrash && entries.every((entry) => !entry.dir)) {
+      buttons.push(`<button type="button" data-menu="renameMany" title="By date, numbers, find and replace, or case">Rename by pattern…</button>`);
     }
     if (write && entries.length && entries.every((entry) => !entry.dir && ["image", "video"].includes(entry.kind))) {
       buttons.push(`<button type="button" data-menu="deleteBlock" class="danger">Delete, never back up again…</button>`);
@@ -1519,6 +1529,7 @@ function closePreview(force = false) {
   setPreviewFullscreen(false);
   $("preview").hidden = true;
   state.current = null;
+  setupExif(null);
   // A note may have changed in the editor.
   if (notesOpen()) notesApi?.refresh();
   $("preview-body").innerHTML = "";
@@ -2603,6 +2614,56 @@ function libraryPath(path) {
   return `${root}/${path.split("/").map(specialFolderLabel).join("/")}`;
 }
 
+// ---- Photo details (EXIF) under the preview of a photo or video ----
+
+const PHOTO_NAME = /\.(jpe?g|png|gif|webp|avif|heic|heif|jxl|bmp|tiff?|dng|cr2|cr3|nef|arw|raf|orf|rw2|pef|srw|mp4|m4v|mov|webm|mkv|avi|3gp|mts|m2ts)$/i;
+let exifFor = null;
+
+function exifOpen() {
+  try { return localStorage.getItem("ownnas-exif-open") === "1"; } catch { return false; }
+}
+
+/// Shows (or hides) the photo details strip for what the preview shows; the details are read
+/// when it is opened.
+function setupExif(entry) {
+  const section = $("preview-exif");
+  const media = entry && !entry.dir && (["image", "video"].includes(entry.kind) || PHOTO_NAME.test(entry.name || entry.path || ""));
+  section.hidden = !media;
+  $("exif-details").replaceChildren();
+  $("exif-summary").textContent = "";
+  exifFor = media ? entry.path : null;
+  const open = media && exifOpen();
+  $("exif-toggle").setAttribute("aria-expanded", String(open));
+  $("exif-details").hidden = !open;
+  if (open) loadExif(entry.path).catch(() => {});
+}
+
+async function loadExif(path) {
+  const details = $("exif-details");
+  details.innerHTML = `<p class="muted">Reading…</p>`;
+  const data = await api(`/api/gallery/details?path=${encodeURIComponent(path)}`);
+  if (exifFor !== path) return;
+  const rows = (rows) => `<dl class="exif-rows">${rows.map((row) => `<dt>${esc(row.label)}</dt><dd>${esc(row.value)}</dd>`).join("")}</dl>`;
+  const place = data.location ? `<p class="exif-place">📍 <a href="https://www.openstreetmap.org/?mlat=${data.location.lat}&amp;mlon=${data.location.lon}#map=16/${data.location.lat}/${data.location.lon}" target="_blank" rel="noopener noreferrer">${data.location.lat.toFixed(5)}, ${data.location.lon.toFixed(5)}</a></p>` : "";
+  details.innerHTML = place + (data.sections || []).map((section) => {
+    const everything = /^All /.test(section.title);
+    return everything
+      ? `<details class="exif-section"><summary>${esc(section.title)} (${section.rows.length})</summary>${rows(section.rows)}</details>`
+      : `<section class="exif-section"><h4>${esc(section.title)}</h4>${rows(section.rows)}</section>`;
+  }).join("") || `<p class="muted">No details in this file.</p>`;
+  const camera = (data.sections || []).flatMap((section) => section.rows).find((row) => row.label === "Model");
+  const taken = (data.sections || []).flatMap((section) => section.rows).find((row) => row.label === "Taken");
+  $("exif-summary").textContent = [taken?.value, camera?.value].filter(Boolean).join(" · ");
+}
+
+$("exif-toggle").addEventListener("click", () => {
+  const open = $("exif-toggle").getAttribute("aria-expanded") !== "true";
+  $("exif-toggle").setAttribute("aria-expanded", String(open));
+  $("exif-details").hidden = !open;
+  try { localStorage.setItem("ownnas-exif-open", open ? "1" : "0"); } catch { /* fine */ }
+  if (open && exifFor) loadExif(exifFor).catch((err) => { $("exif-details").innerHTML = `<p class="muted">${esc(err.message)}</p>`; });
+});
+
 async function openEntry(entry) {
   if (!entry) return;
   if (entry.dir) {
@@ -2619,6 +2680,7 @@ async function openEntry(entry) {
   closeLibrary();
   state.current = entry;
   $("preview").hidden = false;
+  setupExif(entry);
   $("preview-title").textContent = entry.name;
   $("preview-path").hidden = false;
   $("preview-path").textContent = libraryPath(entry.path);
@@ -6242,6 +6304,9 @@ function runMenuAction(button, entries, pasteInto) {
   if (action === "addToAlbum") gallery().then((api) => api.pickAlbum(entries.map((entry) => entry.path))).catch((err) => toast(err.message, true));
   if (action === "showInWorkspace") gallery().then((api) => api.showInWorkspaces(entries.map((entry) => entry.path))).catch((err) => toast(err.message, true));
   if (action === "sortFolder") openSortDialog(one && one.dir ? one.path : state.path);
+  if (action === "renameMany") openRenameDialog(entries.map((entry) => entry.path));
+  if (action === "nearDuplicates") openNearDuplicates(one && one.dir ? one.path : state.path);
+  if (action === "tidy") openTidyDialog(one && one.dir ? one.path : state.path);
   if (action === "showFolderInWorkspace") {
     const folders = entries.length ? entries.map((entry) => entry.path) : [state.path];
     gallery().then((api) => api.showFoldersInWorkspaces(folders)).catch((err) => toast(err.message, true));
@@ -6249,7 +6314,7 @@ function runMenuAction(button, entries, pasteInto) {
   if (action === "bookmark") $("bookmark-btn").click();
   if (action === "usage") $("usage-btn").click();
   if (action === "reindex") reindexFolder(one && one.dir ? one.path : state.path).catch((err) => toast(err.message, true));
-  if (action === "duplicates") openDuplicatesFinder().catch((err) => toast(err.message, true));
+  if (action === "duplicates") openDuplicatesFinder(one && one.dir ? one.path : state.path).catch((err) => toast(err.message, true));
   if (action === "findSimilar" && one) findSimilar(one.path).catch((err) => toast(err.message, true));
   if (action === "versions" && one) openVersions(one.path).catch((err) => toast(err.message, true));
   if (action === "activity") $("activity-btn").click();
@@ -6397,6 +6462,7 @@ function openSortDialog(folder) {
     <label data-sort="date-row">Date
       <select data-sort="date">
         <option value="taken">Date taken for photos and videos, otherwise last changed</option>
+        <option value="name">From the file name (IMG-20260928-WA0006), otherwise date taken</option>
         <option value="modified">Last changed</option>
         <option value="created">Created</option>
       </select>
@@ -6486,6 +6552,363 @@ function openSortDialog(folder) {
       toast(err.message, true);
       field("apply").disabled = false;
       field("apply").textContent = "Sort";
+    }
+  });
+  dialog.addEventListener("close", () => dialog.remove());
+  dialog.showModal();
+  preview();
+}
+
+// ---- Tidy up a folder: largest files, empty folders, photo dates, comparing ----
+
+/// Calendar seconds (a date as written, no time zone) as "2024-03-09 14:32".
+const calendarText = (seconds) => new Date(seconds * 1000).toISOString().slice(0, 16).replace("T", " ");
+
+function openTidyDialog(folder) {
+  const shown = folder ? folder.split("/").pop() : (state.me?.rootName || "Library");
+  const write = state.me && !state.me.readonly;
+  const inside = (path) => (folder && path.startsWith(`${folder}/`) ? path.slice(folder.length + 1) : path);
+  const dialog = document.createElement("dialog");
+  dialog.className = "near-dialog tidy-dialog";
+  dialog.innerHTML = `<form method="dialog">
+    <h3>Tidy up “${esc(shown)}”</h3>
+    <div class="tidy-tabs" role="tablist">
+      <button type="button" role="tab" data-tab="large" aria-selected="true">Largest files</button>
+      <button type="button" role="tab" data-tab="empty" aria-selected="false">Empty folders</button>
+      <button type="button" role="tab" data-tab="dates" aria-selected="false">Photo dates</button>
+      <button type="button" role="tab" data-tab="compare" aria-selected="false">Compare</button>
+    </div>
+    <div class="tidy-body" data-tidy="body"></div>
+    <div class="dialog-actions">
+      <span class="spacer"></span>
+      <button value="cancel" type="submit">Close</button>
+      <button type="button" class="primary" data-tidy="act" hidden></button>
+    </div>
+  </form>`;
+  document.body.append(dialog);
+  const body = dialog.querySelector('[data-tidy="body"]');
+  const act = dialog.querySelector('[data-tidy="act"]');
+  let tab = "large";
+  let action = null;
+  const ticked = () => [...body.querySelectorAll("input[data-path]:checked")].map((box) => box.dataset.path);
+  const updateAct = (label) => {
+    const count = ticked().length;
+    act.hidden = !write || !action || !count;
+    act.textContent = label(count);
+  };
+  const checklist = (items, row, checked) => `<ul class="tidy-list">${items.map((item) => `<li><label><input type="checkbox" data-path="${esc(item.path)}"${checked ? " checked" : ""}>${row(item)}</label></li>`).join("")}</ul>`;
+  const trash = async (paths) => {
+    let moved = 0;
+    const problems = [];
+    for (const path of paths) {
+      try {
+        await api(`/api/entry?path=${encodeURIComponent(path)}`, { method: "DELETE" });
+        moved += 1;
+      } catch (err) {
+        problems.push(`${path.split("/").pop()}: ${err.message}`);
+      }
+    }
+    toast(problems.length ? `Moved ${moved} to the Trash; ${problems.length} could not be moved (${problems[0]})` : `Moved ${moved} to the Trash`, problems.length > 0);
+    load(state.path).catch(() => {});
+  };
+  const show = async (name) => {
+    tab = name;
+    action = null;
+    act.hidden = true;
+    for (const button of dialog.querySelectorAll("[data-tab]")) button.setAttribute("aria-selected", String(button.dataset.tab === name));
+    body.innerHTML = `<p class="muted">Looking…</p>`;
+    try {
+      if (name === "large") {
+        const { files } = await api(`/api/cleanup/large?path=${encodeURIComponent(folder)}&limit=100`);
+        if (tab !== name) return;
+        body.innerHTML = files.length
+          ? `<p class="muted">The ${files.length} largest files here and in the folders inside it. Tick the ones to move to the Trash.</p>${checklist(files, (file) => `<span class="tidy-name">${esc(inside(file.path))}</span><span class="muted">${formatSize(file.size, false)} · ${formatDate(file.modified)}</span>`, false)}`
+          : `<p class="muted">No files here.</p>`;
+        action = { label: (count) => `Move ${count} to the Trash`, run: async () => { await trash(ticked()); show("large"); } };
+      } else if (name === "empty") {
+        const { folders } = await api(`/api/cleanup/empty?path=${encodeURIComponent(folder)}`);
+        if (tab !== name) return;
+        body.innerHTML = folders.length
+          ? `<p class="muted">Folders with no files in them (or only files systems leave, such as .DS_Store).</p>${checklist(folders.map((path) => ({ path })), (item) => `<span class="tidy-name">📁 ${esc(inside(item.path))}</span>`, true)}`
+          : `<p class="muted">No empty folders here.</p>`;
+        action = { label: (count) => `Move ${count} to the Trash`, run: async () => { await trash(ticked()); show("empty"); } };
+      } else if (name === "dates") {
+        const { fixes } = await api(`/api/cleanup/dates?path=${encodeURIComponent(folder)}`);
+        if (tab !== name) return;
+        body.innerHTML = fixes.length
+          ? `<p class="muted">Photos and videos with no date taken inside, whose name says another day than the file's date (often the day they were copied). Fixing gives the file the date in its name, so it shows on that day in the Gallery.</p>${checklist(fixes, (fix) => `<span class="tidy-name">${esc(inside(fix.path))}</span><span class="muted">${calendarText(fix.now)} → <strong>${calendarText(fix.fromName)}</strong></span>`, true)}`
+          : `<p class="muted">No photo dates to fix here.</p>`;
+        action = { label: (count) => `Fix ${count} date${count === 1 ? "" : "s"}`, run: async () => {
+          const result = await api("/api/cleanup/dates", { method: "POST", json: { paths: ticked() } });
+          toast(result.failed.length ? `Fixed ${result.fixed}; ${result.failed.length} could not be (${result.failed[0].why})` : `Fixed ${result.fixed} date${result.fixed === 1 ? "" : "s"}`, result.failed.length > 0);
+          show("dates");
+        } };
+      } else {
+        body.innerHTML = `<p class="muted">What is only here, only in the other folder, or different in both (by name and size; reading the contents finds every difference but takes longer).</p>
+          <div class="tidy-compare">
+            <button type="button" data-tidy="pick">Choose the other folder…</button>
+            <label class="sort-check"><input type="checkbox" data-tidy="contents"> Compare the contents too</label>
+          </div>
+          <div data-tidy="result"></div>`;
+        body.querySelector('[data-tidy="pick"]').addEventListener("click", async () => {
+          const other = await pickFolder({ title: "Compare with", ok: "Compare" });
+          if (other === null || other === undefined) return;
+          const result = body.querySelector('[data-tidy="result"]');
+          result.innerHTML = `<p class="muted">Comparing “${esc(shown)}” with “${esc(other || "Library")}”…</p>`;
+          try {
+            const contents = body.querySelector('[data-tidy="contents"]').checked;
+            const found = await api(`/api/cleanup/compare?first=${encodeURIComponent(folder)}&second=${encodeURIComponent(other)}&contents=${contents}`);
+            const list = (title, items) => `<details class="exif-section"${items.length && items.length < 50 ? " open" : ""}><summary>${esc(title)} (${items.length})</summary><ul class="tidy-list tidy-plain">${items.slice(0, 500).map((path) => `<li>${esc(path)}</li>`).join("")}${items.length > 500 ? `<li class="muted">and ${items.length - 500} more</li>` : ""}</ul></details>`;
+            result.innerHTML = `<p><strong>${found.same}</strong> the same in both${found.truncated ? " (only the first 100000 files were compared)" : ""}.</p>`
+              + list(`Only in “${shown}”`, found.onlyInFirst) + list(`Only in “${other.split("/").pop() || "Library"}”`, found.onlyInSecond) + list("Different", found.different);
+          } catch (err) {
+            result.innerHTML = `<p class="sort-problem">${esc(err.message)}</p>`;
+          }
+        });
+      }
+      if (action) updateAct(action.label);
+    } catch (err) {
+      if (tab === name) body.innerHTML = `<p class="sort-problem">${esc(err.message)}</p>`;
+    }
+  };
+  dialog.querySelector(".tidy-tabs").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-tab]");
+    if (button) show(button.dataset.tab);
+  });
+  body.addEventListener("change", () => { if (action) updateAct(action.label); });
+  act.addEventListener("click", async () => {
+    if (!action) return;
+    act.disabled = true;
+    try {
+      await action.run();
+    } catch (err) {
+      toast(err.message, true);
+    } finally {
+      act.disabled = false;
+    }
+  });
+  dialog.addEventListener("close", () => dialog.remove());
+  dialog.showModal();
+  show("large");
+}
+
+// ---- Photos that look alike: bursts, resized or re-saved copies ----
+
+function openNearDuplicates(folder) {
+  const shown = folder ? folder.split("/").pop() : (state.me?.rootName || "Library");
+  const write = state.me && !state.me.readonly;
+  const dialog = document.createElement("dialog");
+  dialog.className = "near-dialog";
+  dialog.innerHTML = `<form method="dialog">
+    <h3>Photos that look alike in “${esc(shown)}”</h3>
+    <p class="muted">Burst shots, resized or re-saved copies, small edits. In each group the largest is kept; the others are ticked to go to the Trash, where they can be restored.</p>
+    <label class="near-strength">How alike
+      <select data-near="strength"><option value="strict">Almost the same</option><option value="normal" selected>Alike</option><option value="loose">Similar</option></select>
+    </label>
+    <p class="muted" data-near="status" aria-live="polite">Comparing… the first time, each photo is looked at once.</p>
+    <div class="near-groups" data-near="groups"></div>
+    <div class="dialog-actions">
+      <span class="spacer"></span>
+      <button value="cancel" type="submit">Close</button>
+      ${write ? `<button type="button" class="primary danger" data-near="trash" hidden>Move to the Trash</button>` : ""}
+    </div>
+  </form>`;
+  document.body.append(dialog);
+  const field = (name) => dialog.querySelector(`[data-near="${name}"]`);
+  let controller = null;
+  const count = () => {
+    const ticked = dialog.querySelectorAll(".near-photo input:checked").length;
+    if (field("trash")) {
+      field("trash").hidden = !ticked;
+      field("trash").textContent = `Move ${ticked} to the Trash`;
+    }
+  };
+  const look = async () => {
+    controller?.abort();
+    controller = new AbortController();
+    field("groups").replaceChildren();
+    field("status").textContent = "Comparing… the first time, each photo is looked at once.";
+    count();
+    try {
+      const report = await api(`/api/near-duplicates?path=${encodeURIComponent(folder)}&strength=${field("strength").value}`, { signal: controller.signal });
+      const extra = report.groups.reduce((sum, group) => sum + group.length - 1, 0);
+      field("status").textContent = report.groups.length
+        ? `${report.groups.length} group${report.groups.length === 1 ? "" : "s"} of photos that look alike, ${extra} that could go (${report.compared} photos compared${report.truncated ? ", only the first 40000" : ""}).`
+        : `No photos that look alike (${report.compared} compared).`;
+      field("groups").innerHTML = report.groups.map((group, groupIndex) => `<div class="near-group">${group.map((photo, index) => `
+        <label class="near-photo${index === 0 ? " is-best" : ""}" title="${esc(photo.path)}">
+          <img src="/api/thumb?path=${encodeURIComponent(photo.path)}" alt="" loading="lazy">
+          <span class="near-name">${esc(photo.path.split("/").pop())}</span>
+          <span class="muted near-meta">${photo.width ? `${photo.width}×${photo.height} · ` : ""}${formatSize(photo.size, false)}${index === 0 ? " · kept" : ""}</span>
+          ${write ? `<input type="checkbox" data-path="${esc(photo.path)}" data-group="${groupIndex}"${index === 0 ? "" : " checked"} aria-label="Move ${esc(photo.path.split("/").pop())} to the Trash">` : ""}
+        </label>`).join("")}</div>`).join("");
+      count();
+    } catch (err) {
+      if (!isCancelError(err) && err.name !== "AbortError") field("status").textContent = err.message;
+    }
+  };
+  field("groups").addEventListener("change", (event) => {
+    const box = event.target.closest("input[data-group]");
+    if (!box) return;
+    // A group always keeps one photo.
+    const group = [...dialog.querySelectorAll(`input[data-group="${box.dataset.group}"]`)];
+    if (group.every((other) => other.checked)) {
+      box.checked = false;
+      toast("Keep at least one photo of each group", true);
+    }
+    count();
+  });
+  field("strength").addEventListener("change", look);
+  field("trash")?.addEventListener("click", async () => {
+    const paths = [...dialog.querySelectorAll(".near-photo input:checked")].map((box) => box.dataset.path);
+    field("trash").disabled = true;
+    let moved = 0;
+    const problems = [];
+    for (const path of paths) {
+      try {
+        await api(`/api/entry?path=${encodeURIComponent(path)}`, { method: "DELETE" });
+        moved += 1;
+      } catch (err) {
+        problems.push(`${path.split("/").pop()}: ${err.message}`);
+      }
+    }
+    field("trash").disabled = false;
+    toast(problems.length ? `Moved ${moved} to the Trash; ${problems.length} could not be moved (${problems[0]})` : `Moved ${moved} photo${moved === 1 ? "" : "s"} to the Trash`, problems.length > 0);
+    await look();
+    load(state.path).catch(() => {});
+  });
+  dialog.addEventListener("close", () => {
+    controller?.abort();
+    dialog.remove();
+  });
+  dialog.showModal();
+  look();
+}
+
+// ---- Rename by pattern: many files at once ----
+
+const RENAME_PATTERNS = [
+  ["", "Keep the names (only find and replace, or case)"],
+  ["{YYYY}-{MM}-{DD} {hh}.{mm}.{ss}", "Date and time (2024-03-09 14.32.00)"],
+  ["{YYYY}-{MM}-{DD} {name}", "Date, then the name"],
+  ["{name} {n:3}", "The name and a number (photo 001)"],
+  ["{folder} {n:3}", "The folder's name and a number (Rome 001)"],
+  ["custom", "My own pattern…"],
+];
+
+/// Shows a finished change in the jobs panel, with Undo (moves put back) and Dismiss.
+function showUndoableJob(title, done, detail) {
+  const id = `undoable-${Date.now()}`;
+  upsertJob(id, {
+    title,
+    detail: done.failed.length ? `${done.failed.length} could not be done` : detail,
+    percent: 100,
+    problem: done.failed.length > 0,
+    lines: done.failed.slice(0, 8).map((item) => `${item.path}: ${item.why}`),
+    actions: [
+      { label: "Undo", run: async () => {
+        try {
+          const back = await api("/api/sort-folder/undo", { method: "POST", json: { moves: done.made } });
+          removeJob(id);
+          toast(back.failed.length ? `Put ${back.back} back; ${back.failed.length} could not be` : `Put ${back.back} back as ${back.back === 1 ? "it was" : "they were"}`, back.failed.length > 0);
+          await load(state.path);
+        } catch (err) {
+          toast(err.message, true);
+        }
+      } },
+      { label: "Dismiss", run: () => removeJob(id) },
+    ],
+  });
+  openJobsPanel();
+}
+
+function openRenameDialog(paths) {
+  const dialog = document.createElement("dialog");
+  dialog.className = "sort-dialog";
+  dialog.innerHTML = `<form method="dialog">
+    <h3>Rename ${paths.length === 1 ? `“${esc(paths[0].split("/").pop())}”` : `${paths.length} files`}</h3>
+    <p class="muted">The extensions stay. Names that would clash get a number. You can undo it afterwards.</p>
+    <label>New names
+      <select data-rename="preset">${RENAME_PATTERNS.map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`).join("")}</select>
+    </label>
+    <label data-rename="pattern-row">Pattern
+      <input type="text" data-rename="pattern" spellcheck="false" autocomplete="off">
+      <span class="muted sort-help">{name} the name now, {n} a number ({n:3} with three digits), {YYYY} {MM} {DD} {hh} {mm} {ss} the date and time, {folder} the folder's name.</span>
+    </label>
+    <div class="rename-row">
+      <label>Find <input type="text" data-rename="find" spellcheck="false" autocomplete="off"></label>
+      <label>Replace with <input type="text" data-rename="replace" spellcheck="false" autocomplete="off"></label>
+    </div>
+    <div class="rename-row">
+      <label>Letters
+        <select data-rename="case"><option value="">As they are</option><option value="lower">lower case</option><option value="upper">UPPER CASE</option><option value="title">Title Case</option></select>
+      </label>
+      <label data-rename="start-row">First number <input type="number" data-rename="start" value="1" min="0"></label>
+    </div>
+    <label data-rename="date-row">Date
+      <select data-rename="date">
+        <option value="taken">Date taken for photos and videos, otherwise last changed</option>
+        <option value="name">From the file name (IMG-20260928-WA0006), otherwise date taken</option>
+        <option value="modified">Last changed</option>
+        <option value="created">Created</option>
+      </select>
+    </label>
+    <div class="sort-preview" data-rename="preview" aria-live="polite"><p class="muted">Looking…</p></div>
+    <div class="dialog-actions">
+      <span class="spacer"></span>
+      <button value="cancel" type="submit">Cancel</button>
+      <button type="button" class="primary" data-rename="apply" disabled>Rename</button>
+    </div>
+  </form>`;
+  document.body.append(dialog);
+  const field = (name) => dialog.querySelector(`[data-rename="${name}"]`);
+  let asked = 0;
+  const rules = () => ({ paths, pattern: field("pattern").value, find: field("find").value, replace: field("replace").value, case: field("case").value, start: Number(field("start").value) || 0, date: field("date").value });
+  const preview = async () => {
+    const mine = ++asked;
+    const wanted = rules();
+    field("date-row").hidden = !/\{(YYYY|MM|DD|hh|mm|ss)\}/.test(wanted.pattern);
+    field("start-row").hidden = !/\{n(:\d+)?\}/.test(wanted.pattern);
+    field("apply").disabled = true;
+    try {
+      const plan = await api("/api/rename-many", { method: "POST", json: wanted });
+      if (mine !== asked) return;
+      field("preview").innerHTML = plan.total
+        ? `<p><strong>${plan.total} file${plan.total === 1 ? "" : "s"}</strong> get${plan.total === 1 ? "s" : ""} a new name${plan.unchanged ? `; ${plan.unchanged} stay${plan.unchanged === 1 ? "s" : ""} as ${plan.unchanged === 1 ? "it is" : "they are"}` : ""}.</p>
+          <ul class="sort-folders rename-list">${plan.renames.slice(0, 60).map((item) => `<li><span>${esc(item.from.split("/").pop())}</span><span>→ ${esc(item.to.split("/").pop())}</span></li>`).join("")}${plan.total > 60 ? `<li class="muted">and ${plan.total - 60} more</li>` : ""}</ul>`
+        : `<p class="muted">Every name stays as it is.</p>`;
+      field("apply").textContent = plan.total ? `Rename ${plan.total}` : "Rename";
+      field("apply").disabled = !plan.total;
+    } catch (err) {
+      if (mine !== asked) return;
+      field("apply").textContent = "Rename";
+      field("preview").innerHTML = `<p class="sort-problem">${esc(err.message)}</p>`;
+    }
+  };
+  let timer = null;
+  const later = () => { clearTimeout(timer); timer = setTimeout(preview, 250); };
+  field("preset").addEventListener("change", () => {
+    const value = field("preset").value;
+    if (value !== "custom") field("pattern").value = value;
+    field("pattern-row").hidden = value !== "custom" && value === "";
+    if (value === "custom") field("pattern").focus();
+    preview();
+  });
+  field("pattern-row").hidden = true;
+  for (const name of ["pattern", "find", "replace", "start"]) field(name).addEventListener("input", later);
+  for (const name of ["case", "date"]) field(name).addEventListener("change", preview);
+  field("apply").addEventListener("click", async () => {
+    field("apply").disabled = true;
+    field("apply").textContent = "Renaming…";
+    try {
+      const done = await api("/api/rename-many", { method: "POST", json: { ...rules(), apply: true } });
+      dialog.close();
+      showUndoableJob(`Renamed ${done.made.length} file${done.made.length === 1 ? "" : "s"}`, done, "");
+      await load(state.path);
+    } catch (err) {
+      toast(err.message, true);
+      field("apply").disabled = false;
+      field("apply").textContent = "Rename";
     }
   });
   dialog.addEventListener("close", () => dialog.remove());
@@ -8148,9 +8571,10 @@ $("versions-list").addEventListener("click", async (event) => {
 
 let duplicateGroups = [];
 
-async function openDuplicatesFinder() {
+/// `folder` is the one to look in (the one shown unless given).
+async function openDuplicatesFinder(folder = state.path) {
   const dialog = $("duplicates-dialog");
-  $("duplicates-status").textContent = "Scanning this folder and subfolders…";
+  $("duplicates-status").textContent = folder === state.path ? "Scanning this folder and subfolders…" : `Scanning “${folder.split("/").pop()}” and its subfolders…`;
   $("duplicates-results").innerHTML = "";
   $("duplicates-bar").hidden = true;
   $("duplicates-trash").hidden = true;
@@ -8166,7 +8590,7 @@ async function openDuplicatesFinder() {
     onCancel: () => controller.abort(),
   });
   try {
-    const data = await api(`/api/duplicates?path=${encodeURIComponent(state.path)}`, {
+    const data = await api(`/api/duplicates?path=${encodeURIComponent(folder)}`, {
       signal: controller.signal,
     });
     removeJob(id);

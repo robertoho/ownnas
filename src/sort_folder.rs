@@ -19,6 +19,8 @@ const TOKENS: [&str; 8] = ["{YYYY}", "{MM}", "{DD}", "{MMMM}", "{MMM}", "{type}"
 pub enum DateFrom {
     /// The date a photo or video was taken, or else when the file was last changed.
     Taken,
+    /// The date written in the file's name (IMG-20260928-WA0006.jpg), or else as `Taken`.
+    Name,
     Modified,
     Created,
 }
@@ -40,6 +42,62 @@ pub struct Plan {
     pub in_place: usize,
     pub looked_at: usize,
     pub truncated: bool,
+}
+
+/// The date (and time, when there is one) written in a file name, as calendar seconds:
+/// `IMG-20260928-WA0006`, `IMG_20260928_143205`, `PXL_20260928_143205123`,
+/// `Screenshot_2026-09-28-14-32-05`, `2026-09-28 14.32.05`, `signal-2026-09-28-143205`.
+/// Years from 1990 to 2100 only, so other numbers are not taken for dates.
+pub fn date_from_name(name: &str) -> Option<i64> {
+    let digits: Vec<(usize, char)> = name.char_indices().collect();
+    let bytes = name.as_bytes();
+    let number = |at: usize, len: usize| -> Option<u32> {
+        let part = name.get(at..at + len)?;
+        part.bytes().all(|b| b.is_ascii_digit()).then(|| part.parse().ok())?
+    };
+    let separator = |at: usize| bytes.get(at).is_some_and(|b| matches!(b, b'-' | b'_' | b'.' | b' '));
+    for &(start, c) in &digits {
+        if !c.is_ascii_digit() || (start > 0 && bytes[start - 1].is_ascii_digit()) {
+            continue;
+        }
+        // YYYYMMDD, or YYYY-MM-DD with one separator kind between.
+        let (year, month, day, mut end) = if let (Some(y), Some(m), Some(d)) = (number(start, 4), number(start + 4, 2), number(start + 6, 2)) {
+            (y, m, d, start + 8)
+        } else if let (Some(y), true, Some(m), true, Some(d)) = (number(start, 4), separator(start + 4), number(start + 5, 2), separator(start + 7), number(start + 8, 2)) {
+            (y, m, d, start + 10)
+        } else {
+            continue;
+        };
+        if bytes.get(end).is_some_and(u8::is_ascii_digit) && !(bytes.len() > end + 6 && end == start + 8) {
+            // A longer run of digits (a phone number, a counter) is not a date…
+            if end == start + 10 || !bytes[end..].iter().take(6).all(u8::is_ascii_digit) {
+                continue;
+            }
+        }
+        if !(1990..=2100).contains(&year) || !(1..=12).contains(&month) || day == 0 || day > 31 {
+            continue;
+        }
+        let date = chrono::NaiveDate::from_ymd_opt(year as i32, month, day)?;
+        // A time after it: HHMMSS or HH-MM-SS / HH.MM.SS, after a separator (or straight on).
+        let mut time = (0, 0, 0);
+        if separator(end) || bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            let at = if separator(end) { end + 1 } else { end };
+            if let (Some(h), Some(m), Some(sec)) = (number(at, 2), number(at + 2, 2), number(at + 4, 2)) {
+                time = (h, m, sec);
+                end = at + 6;
+            } else if let (Some(h), true, Some(m), true, Some(sec)) = (number(at, 2), separator(at + 2), number(at + 3, 2), separator(at + 5), number(at + 6, 2)) {
+                time = (h, m, sec);
+                end = at + 8;
+            }
+            if time.0 > 23 || time.1 > 59 || time.2 > 59 {
+                time = (0, 0, 0);
+            }
+        }
+        let _ = end;
+        let at = date.and_hms_opt(time.0, time.1, time.2)?;
+        return Some(at.and_utc().timestamp());
+    }
+    None
 }
 
 /// Year, month, day, from seconds as a calendar date (already in the right time zone).
@@ -160,6 +218,7 @@ pub fn plan(root: &Path, folder: &str, pattern: &str, from: DateFrom, recursive:
         let modified = seconds(meta.as_ref().map(std::fs::Metadata::modified));
         let when = match from {
             DateFrom::Taken => taken.get(&path).copied().or(modified),
+            DateFrom::Name => date_from_name(&name).or_else(|| taken.get(&path).copied()).or(modified),
             DateFrom::Modified => modified,
             DateFrom::Created => seconds(meta.as_ref().map(std::fs::Metadata::created)).or(modified),
         };
@@ -189,7 +248,7 @@ fn make_folders(root: &Path, rel: &str) -> Result<(), FileError> {
     Ok(())
 }
 
-fn why(err: FileError) -> String {
+pub(crate) fn why(err: FileError) -> String {
     match err {
         FileError::NotFound => "It is no longer there".into(),
         FileError::AlreadyExists => "Something with that name is in the way".into(),
@@ -276,6 +335,22 @@ mod tests {
         assert_eq!(target("{first}", "2024.txt", march, &months()).as_deref(), Some("#"));
         assert_eq!(target("Photos {YYYY}/{MM}", "a.jpg", march, &months()).as_deref(), Some("Photos 2024/03"));
         assert_eq!(target("{YYYY}//:{MM}", "a.jpg", march, &months()).as_deref(), Some("2024/-03"));
+    }
+
+    #[test]
+    fn dates_in_names() {
+        let at = |text: &str| date_from_name(text).map(|seconds| crate::photo_details::wall_clock(seconds));
+        assert_eq!(at("IMG-20260928-WA0006.jpg").as_deref(), Some("2026-09-28 00:00:00"));
+        assert_eq!(at("IMG_20260928_143205.jpg").as_deref(), Some("2026-09-28 14:32:05"));
+        assert_eq!(at("PXL_20260928_143205123.jpg").as_deref(), Some("2026-09-28 14:32:05"));
+        assert_eq!(at("Screenshot_2026-09-28-14-32-05.png").as_deref(), Some("2026-09-28 14:32:05"));
+        assert_eq!(at("2026-09-28 14.32.05.jpg").as_deref(), Some("2026-09-28 14:32:05"));
+        assert_eq!(at("signal-2026-09-28-143205.jpg").as_deref(), Some("2026-09-28 14:32:05"));
+        assert_eq!(at("VID-20190101-WA0001.mp4").as_deref(), Some("2019-01-01 00:00:00"));
+        assert_eq!(at("Scan 20231302.pdf"), None, "no 13th month");
+        assert_eq!(at("IMG_1234.jpg"), None);
+        assert_eq!(at("invoice 4412345678901.pdf"), None, "a long number is not a date");
+        assert_eq!(at("photo 18000101.jpg"), None, "too long ago");
     }
 
     #[test]

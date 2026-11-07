@@ -132,6 +132,74 @@ try {
   for (const rel of ['Inbox/a.txt', 'Inbox/b.pdf', 'Inbox/c.txt', 'Inbox/sub/d.txt']) assert.ok(exists(rel), rel);
   assert.equal(exists('Inbox/2023-05'), false, 'the folders it made are gone');
   assert.equal(exists('Inbox/2024-03'), false);
+  await js(`[...document.querySelectorAll('.jobs-item button')].find((b) => b.textContent === 'Dismiss')?.click(), true`);
+
+  // Rename by pattern: in the menu of files, with a preview, and undone.
+  await send('Page.navigate', { url: `${base}?again#/Inbox` });
+  await until(`document.querySelector('.card[data-path="Inbox/a.txt"]')`, 'the Inbox again');
+  await js(`(() => { const card = document.querySelector('.card[data-path="Inbox/a.txt"]'); const box = card.getBoundingClientRect(); card.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: box.left + 10, clientY: box.top + 10 })); return true; })()`);
+  await until(`document.querySelector('#menu:not([hidden]) [data-menu="renameMany"]')`, 'Rename by pattern… in the menu');
+  await js(`document.body.click(); openRenameDialog(['Inbox/c.txt', 'Inbox/a.txt', 'Inbox/b.pdf']); true`);
+  const renameText = () => js(`document.querySelector('dialog.sort-dialog [data-rename="preview"]').textContent`);
+  await until(`document.querySelector('dialog.sort-dialog [data-rename="preview"]')?.textContent.includes('Every name stays')`, 'nothing to rename yet');
+  await js(`(() => { const select = document.querySelector('dialog.sort-dialog [data-rename="preset"]'); select.value = '{name} {n:3}'; select.dispatchEvent(new Event('change')); return true; })()`);
+  await until(`document.querySelector('dialog.sort-dialog [data-rename="preview"]').textContent.includes('3 files')`, 'the preview');
+  assert.match(await renameText(), /c\.txt→ c 001\.txt/);
+  assert.match(await renameText(), /b\.pdf→ b 003\.pdf/);
+  await js(`(() => { const input = document.querySelector('dialog.sort-dialog [data-rename="find"]'); input.value = 'C '; input.dispatchEvent(new Event('input')); const other = document.querySelector('dialog.sort-dialog [data-rename="replace"]'); other.value = 'Copy '; other.dispatchEvent(new Event('input')); return true; })()`);
+  await until(`document.querySelector('dialog.sort-dialog [data-rename="preview"]').textContent.includes('Copy 001.txt')`, 'find and replace');
+  await until(`document.querySelector('dialog.sort-dialog [data-rename="apply"]').textContent === 'Rename 3' && !document.querySelector('dialog.sort-dialog [data-rename="apply"]').disabled`, 'the Rename button');
+  await js(`document.querySelector('dialog.sort-dialog [data-rename="apply"]').click(), true`);
+  for (let i = 0; i < 50 && !exists('Inbox/Copy 001.txt'); i++) await new Promise((done) => setTimeout(done, 100));
+  for (const rel of ['Inbox/Copy 001.txt', 'Inbox/a 002.txt', 'Inbox/b 003.pdf']) assert.ok(exists(rel), rel);
+  await until(`[...document.querySelectorAll('.jobs-item')].some((item) => item.textContent.includes('Renamed 3 files'))`, 'the result');
+  await js(`[...document.querySelectorAll('.jobs-item button')].find((b) => b.textContent === 'Undo').click(), true`);
+  for (let i = 0; i < 50 && !exists('Inbox/c.txt'); i++) await new Promise((done) => setTimeout(done, 100));
+  for (const rel of ['Inbox/a.txt', 'Inbox/b.pdf', 'Inbox/c.txt']) assert.ok(exists(rel), `${rel} back`);
+
+  // The date in the file's name (WhatsApp, phones), rather than when it was copied.
+  put('Inbox/IMG-20190704-WA0001.jpg', 'x', '2024-11-01T12:00:00');
+  await js(`openSortDialog('Inbox'); true`);
+  await until(`document.querySelector('dialog.sort-dialog [data-sort="preview"]')?.textContent.includes('into')`, 'the preview');
+  assert.match(await js(`document.querySelector('dialog.sort-dialog [data-sort="preview"]').textContent`), /2024\/11/);
+  await js(`(() => { const select = document.querySelector('dialog.sort-dialog [data-sort="date"]'); select.value = 'name'; select.dispatchEvent(new Event('change')); return true; })()`);
+  await until(`document.querySelector('dialog.sort-dialog [data-sort="preview"]').textContent.includes('2019/07')`, 'the date from the name');
+  await js(`document.querySelector('dialog.sort-dialog').close(); true`);
+
+  // Tidy up: the largest files, empty folders, dates from names, and comparing two folders.
+  fs.mkdirSync(path.join(library, 'Inbox/empty-one/inner'), { recursive: true });
+  put('Inbox/big.bin', Buffer.alloc(300 * 1024, 7), '2024-01-01T12:00:00');
+  put('Copy/a.txt', 'a', '2023-05-10T12:00:00');
+  put('Copy/extra.txt', 'e', '2023-05-10T12:00:00');
+  const tidyText = () => js(`document.querySelector('dialog.tidy-dialog [data-tidy="body"]').textContent`);
+  const tab = (name) => js(`document.querySelector('dialog.tidy-dialog [data-tab="${name}"]').click(), true`);
+  for (let i = 0; i < 60; i++) {
+    await js(`document.querySelector('dialog.tidy-dialog')?.close(); openTidyDialog('Inbox'); true`);
+    await until(`!document.querySelector('dialog.tidy-dialog [data-tidy="body"]').textContent.includes('Looking')`, 'the largest files');
+    if ((await tidyText()).includes('big.bin')) break;
+    await new Promise((done) => setTimeout(done, 300));
+  }
+  assert.match(await tidyText(), /big\.bin.*300 KB/);
+  await tab('empty');
+  await until(`document.querySelector('dialog.tidy-dialog [data-tidy="body"]').textContent.includes('empty-one')`, 'the empty folder');
+  assert.equal((await tidyText()).includes('inner'), false, 'only the outermost empty folder');
+  await js(`document.querySelector('dialog.tidy-dialog [data-tidy="act"]').click(), true`);
+  for (let i = 0; i < 50 && exists('Inbox/empty-one'); i++) await new Promise((done) => setTimeout(done, 100));
+  assert.equal(exists('Inbox/empty-one'), false, 'moved to the Trash');
+  for (let i = 0; i < 60; i++) {
+    await tab('dates');
+    await until(`!document.querySelector('dialog.tidy-dialog [data-tidy="body"]').textContent.includes('Looking')`, 'the dates');
+    if ((await tidyText()).includes('IMG-20190704-WA0001.jpg')) break;
+    await new Promise((done) => setTimeout(done, 300));
+  }
+  assert.match(await tidyText(), /IMG-20190704-WA0001\.jpg2024-11-01 12:00 → 2019-07-04 00:00/);
+  await js(`document.querySelector('dialog.tidy-dialog [data-tidy="act"]').click(), true`);
+  for (let i = 0; i < 50 && fs.statSync(path.join(library, 'Inbox/IMG-20190704-WA0001.jpg')).mtime.getFullYear() !== 2019; i++) await new Promise((done) => setTimeout(done, 100));
+  assert.equal(fs.statSync(path.join(library, 'Inbox/IMG-20190704-WA0001.jpg')).mtime.getFullYear(), 2019, 'the date from its name');
+  const compared = await js(`fetch('/api/cleanup/compare?first=Inbox&second=Copy&contents=true').then((r) => r.json())`);
+  assert.deepEqual(compared.onlyInSecond, ['extra.txt']);
+  assert.ok(compared.onlyInFirst.includes('b.pdf') && compared.same === 1, JSON.stringify(compared));
+  await js(`document.querySelector('dialog.tidy-dialog').close(); true`);
 
   assert.deepEqual(problems, [], 'no errors in the page');
   console.log('ok: sort into folders');

@@ -497,6 +497,17 @@ try {
   assert.equal((await api('POST', '/api/agent-keys/changes/undo', { id: sortChange.id })).status, 200);
   assert.ok(await exists('work/a.txt') && await exists('work/pic.png') && !(await exists('work/Documents')), 'all back, and its folders gone');
 
+  // Renaming many files: a dry run, the real thing, and undoing it.
+  const renameDry = data(await tool(tidy, 'rename_many', { paths: ['work/a.txt', 'work/pic.png'], pattern: 'item {n:2}', dry_run: true })).renames;
+  assert.deepEqual(renameDry.map((item) => item.to), ['work/item 01.txt', 'work/item 02.png']);
+  assert.ok(await exists('work/a.txt'));
+  await refused(tidy, 'rename_many', { paths: ['work/a.txt', 'docs/plan.txt'], pattern: 'x' });
+  assert.equal(data(await tool(tidy, 'rename_many', { paths: ['work/a.txt', 'work/pic.png'], pattern: 'item {n:2}' })).renamed.length, 2);
+  assert.ok(await exists('work/item 01.txt') && await exists('work/item 02.png'));
+  const renameChange = (await api('GET', `/api/agent-keys/changes?id=${organiser.json.id}&status=done`)).json.changes.find((c) => c.tool === 'rename_many');
+  assert.equal((await api('POST', '/api/agent-keys/changes/undo', { id: renameChange.id })).status, 200);
+  assert.ok(await exists('work/a.txt') && await exists('work/pic.png'), 'the old names are back');
+
   // Approval mode: changes wait for a person, and are checked again when carried out.
   const careful = (await api('POST', '/api/agent-keys', { name: 'careful', folders: ['work'], level: 'organise', approve: true })).json;
   const asked = data(await tool(careful.token, 'create_folder', { path: 'work', name: 'inbox' }));

@@ -2333,6 +2333,25 @@ pub fn convert_image(root: &Path, rel: &str, format: &str) -> Result<String, Fil
     if current_ext == ext || (current_ext == "jpeg" && ext == "jpg") || (current_ext == "tif" && ext == "tiff") {
         return Err(FileError::Rejected("That file is already in this format"));
     }
+    // HEIC, HEIF and AVIF to JPEG through the system's tool, which keeps the EXIF data.
+    if crate::thumbs::needs_converter(&current_ext) && ext == "jpg" {
+        let stem = Path::new(&name).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "image".to_string());
+        let parent = target.full.parent().ok_or(FileError::Forbidden)?;
+        let dest = unique_path(parent.join(format!("{stem}.jpg")));
+        let tmp = parent.join(format!(".ownnas-convert-{}-{}.jpg", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
+        let converted = crate::thumbs::convert_to_jpeg(&target.full, &tmp).and_then(|()| fs::rename(&tmp, &dest).map_err(|_| "Could not save the picture".to_string()));
+        if converted.is_err() {
+            let _ = fs::remove_file(&tmp);
+            return Err(FileError::Rejected("Could not convert this photo: install heif-convert (libheif) or ffmpeg"));
+        }
+        if let Ok(modified) = fs::metadata(&target.full).and_then(|meta| meta.modified()) {
+            // The copy keeps the photo's date.
+            let _ = fs::File::options().write(true).open(&dest).and_then(|file| file.set_modified(modified));
+        }
+        let dest_name = dest.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let parent_rel = target.rel.rsplit_once('/').map_or("", |(parent, _)| parent);
+        return Ok(if parent_rel.is_empty() { dest_name } else { format!("{parent_rel}/{dest_name}") });
+    }
     let meta = fs::metadata(&target.full).map_err(map_io)?;
     if meta.len() > 40 * 1024 * 1024 {
         return Err(FileError::Rejected("Image is too large to convert (40 MB max)"));

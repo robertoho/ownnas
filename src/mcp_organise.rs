@@ -104,9 +104,25 @@ pub fn tools() -> Vec<Value> {
             "inputSchema": { "type": "object", "required": ["path", "pattern"], "properties": {
                 "path": path("The folder to sort."),
                 "pattern": { "type": "string", "description": "Where each file goes, such as {YYYY}/{MM}." },
-                "date": { "type": "string", "enum": ["taken", "modified", "created"], "description": "Which date: taken (photos and videos, else last changed; the default), modified or created." },
+                "date": { "type": "string", "enum": ["taken", "name", "modified", "created"], "description": "Which date: taken (photos and videos, else last changed; the default), name (written in the file name, such as IMG-20260928-WA0006), modified or created." },
                 "recursive": { "type": "boolean", "description": "Also the files in the folders inside it." },
                 "dry_run": { "type": "boolean", "description": "Only say what would move." },
+            } },
+            "annotations": changes,
+        }),
+        json!({
+            "name": "rename_many",
+            "title": "Rename many files",
+            "description": "Renames files by a pattern ({name} the name now, {n} a number or {n:3} with three digits, {YYYY} {MM} {DD} {hh} {mm} {ss} the date taken or changed, {folder} the folder's name), by find and replace (any case), and/or by case (lower, upper, title). Extensions stay; clashes get a number. With dry_run it only says what would change. Can be undone.",
+            "inputSchema": { "type": "object", "required": ["paths"], "properties": {
+                "paths": paths,
+                "pattern": { "type": "string", "description": "The new name without the extension. Leave out to keep the names." },
+                "find": { "type": "string" },
+                "replace": { "type": "string" },
+                "case": { "type": "string", "enum": ["", "lower", "upper", "title"] },
+                "start": { "type": "integer", "description": "The first number for {n} (1 unless given)." },
+                "date": { "type": "string", "enum": ["taken", "name", "modified", "created"] },
+                "dry_run": { "type": "boolean", "description": "Only say what would change." },
             } },
             "annotations": changes,
         }),
@@ -169,6 +185,9 @@ pub(crate) async fn call(state: &Arc<AppState>, key: &AgentKey, name: &str, args
     if name == "sort_into_folders" && args.raw().get("dry_run").and_then(Value::as_bool).unwrap_or(false) {
         return Some(sort_plan(state, key, args).await.map(|plan| as_text(&plan)));
     }
+    if name == "rename_many" && args.raw().get("dry_run").and_then(Value::as_bool).unwrap_or(false) {
+        return Some(rename_plan(state, key, args).await.map(|plan| as_text(&json!({ "renames": plan }))));
+    }
     let summary = summarize(name, args);
     if key.approve {
         return Some(ask(state, key, name, args, &summary, None).await);
@@ -202,6 +221,7 @@ async fn run(state: &Arc<AppState>, key: &AgentKey, name: &str, args: &Args<'_>)
         "add_to_album" => album_items(state, key, args, true).await,
         "remove_from_album" => album_items(state, key, args, false).await,
         "sort_into_folders" => sort_into_folders(state, key, args).await,
+        "rename_many" => rename_many(state, key, args).await,
         other if mcp_write::has(other) && key.can_write() => mcp_write::run(state, key, other, args).await,
         _ => failed("Unknown tool"),
     }
@@ -211,7 +231,7 @@ async fn run(state: &Arc<AppState>, key: &AgentKey, name: &str, args: &Args<'_>)
 /// made inside it, if anything.
 fn targets(name: &str, args: &Args<'_>) -> Vec<(String, Option<String>)> {
     match name {
-        "add_tags" | "remove_tags" => args.texts("paths").into_iter().map(|path| (path, None)).collect(),
+        "add_tags" | "remove_tags" | "rename_many" => args.texts("paths").into_iter().map(|path| (path, None)).collect(),
         "create_folder" => vec![(args.path(), Some(args.text("name")))],
         "rename" | "move_to_trash" | "edit_text" | "append_rows" | "add_paragraphs" | "append_to_note" | "tick_item" | "sort_into_folders" => vec![(args.path(), None)],
         "move" => vec![(args.path(), None), (args.text("to"), None)],
@@ -271,6 +291,7 @@ fn summarize(name: &str, args: &Args<'_>) -> String {
         "add_to_album" => format!("Add {items} to {album}"),
         "remove_from_album" => format!("Take {items} out of {album}"),
         "sort_into_folders" => format!("Sort {} into folders by {}", args.path(), args.text("pattern")),
+        "rename_many" => format!("Rename {items}{}", if args.text("pattern").is_empty() { String::new() } else { format!(" to {}", args.text("pattern")) }),
         "write_file" => format!("{} {}", if args.raw().get("replace").and_then(Value::as_bool).unwrap_or(false) { "Write (replacing)" } else { "Write" }, args.path()),
         "edit_text" => format!("Change a passage in {}", args.path()),
         "append_rows" => format!("Add {} row(s) to {}", args.raw().get("rows").and_then(Value::as_array).map_or(0, Vec::len), args.path()),
@@ -640,6 +661,7 @@ async fn sort_plan(state: &Arc<AppState>, key: &AgentKey, args: &Args<'_>) -> Re
     let from = match args.text("date").as_str() {
         "modified" => crate::sort_folder::DateFrom::Modified,
         "created" => crate::sort_folder::DateFrom::Created,
+        "name" => crate::sort_folder::DateFrom::Name,
         _ => crate::sort_folder::DateFrom::Taken,
     };
     let recursive = args.raw().get("recursive").and_then(Value::as_bool).unwrap_or(false);
@@ -670,6 +692,44 @@ async fn sort_into_folders(state: &Arc<AppState>, key: &AgentKey, args: &Args<'_
     log(state, key, "sort-folder", &format!("{} by {}: {} file(s)", plan["path"].as_str().unwrap_or_default(), args.text("pattern"), made.len()));
     let failed_list: Vec<Value> = failed_moves.iter().map(|(path, why)| json!({ "path": path, "why": why })).collect();
     done(json!({ "moved": made.len(), "folders": plan["folders"], "failed": failed_list }), json!({ "kind": "sorted", "moves": made }))
+}
+
+/// What renaming would do, for paths the key may change.
+async fn rename_plan(state: &Arc<AppState>, key: &AgentKey, args: &Args<'_>) -> Result<Vec<crate::rename_many::Rename>, Stop> {
+    let paths = all_allowed(state, key, args).await?;
+    let rules = crate::rename_many::Rules {
+        pattern: args.text("pattern"),
+        find: args.text("find"),
+        replace: args.text("replace"),
+        case: args.text("case"),
+        start: args.integer("start").unwrap_or(1),
+    };
+    let from = match args.text("date").as_str() {
+        "modified" => crate::sort_folder::DateFrom::Modified,
+        "created" => crate::sort_folder::DateFrom::Created,
+        "name" => crate::sort_folder::DateFrom::Name,
+        _ => crate::sort_folder::DateFrom::Taken,
+    };
+    let taken = crate::http::taken_dates(state, "");
+    let root = state.root.clone();
+    blocking(move || crate::rename_many::plan(&root, &paths, &rules, from, &taken).map_err(file_error)).await
+}
+
+async fn rename_many(state: &Arc<AppState>, key: &AgentKey, args: &Args<'_>) -> Result<Done, Stop> {
+    let plan = rename_plan(state, key, args).await?;
+    if plan.is_empty() {
+        return failed("Nothing to rename: every name stays as it is.");
+    }
+    let root = state.root.clone();
+    let (made, failed_renames) = blocking(move || Ok(crate::rename_many::apply(&root, &plan))).await?;
+    for item in &made {
+        crate::http::rewrite_meta(state, &item.from, &item.to);
+        crate::http::relink_notes(state, &by(key), &item.from, &item.to).await;
+    }
+    log(state, key, "rename-many", &format!("{} file(s)", made.len()));
+    let failed_list: Vec<Value> = failed_renames.iter().map(|(path, why)| json!({ "path": path, "why": why })).collect();
+    let moves: Vec<Value> = made.iter().map(|item| json!({ "from": item.from, "to": item.to })).collect();
+    done(json!({ "renamed": made, "failed": failed_list }), json!({ "kind": "sorted", "moves": moves }))
 }
 
 /// An album the key may change: one with photos in its folders, or an empty one (such as one

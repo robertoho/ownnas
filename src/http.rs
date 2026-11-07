@@ -400,6 +400,11 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/usage", get(folder_usage))
         .route("/api/hash", get(file_hash))
         .route("/api/duplicates", get(find_duplicates))
+        .route("/api/near-duplicates", get(find_near_duplicates))
+        .route("/api/cleanup/large", get(cleanup_large))
+        .route("/api/cleanup/empty", get(cleanup_empty))
+        .route("/api/cleanup/dates", get(cleanup_dates).post(cleanup_fix_dates))
+        .route("/api/cleanup/compare", get(cleanup_compare))
         .route("/api/activity", get(activity))
         .route("/api/zip", get(zip_folder))
         .route("/api/download", post(download_selection))
@@ -473,6 +478,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/workspaces/membership", post(workspace_membership).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
         .route("/api/workspaces/folders", post(workspace_folders_change))
         .route("/api/sort-folder", post(sort_folder).layer(DefaultBodyLimit::max(1024 * 1024)))
+        .route("/api/rename-many", post(rename_many).layer(DefaultBodyLimit::max(16 * 1024 * 1024)))
         .route("/api/sort-folder/undo", post(sort_folder_undo).layer(DefaultBodyLimit::max(32 * 1024 * 1024)))
         .route("/api/notes", get(list_notes).post(create_note))
         .route("/api/notes/tick", post(tick_note))
@@ -3323,6 +3329,7 @@ async fn sort_folder(
     let from = match body.date.as_deref() {
         Some("modified") => crate::sort_folder::DateFrom::Modified,
         Some("created") => crate::sort_folder::DateFrom::Created,
+        Some("name") => crate::sort_folder::DateFrom::Name,
         _ => crate::sort_folder::DateFrom::Taken,
     };
     let folder = files::resolve(&state.root, &rel_of(&Some(body.path.clone())))?.rel;
@@ -3354,6 +3361,65 @@ async fn sort_folder(
         invalidate_sizes(&state, &folder);
         let count = outcome["made"].as_array().map_or(0, Vec::len);
         record(&state, &user, "sort-folder", &format!("{} by {}: {count} file(s)", if folder.is_empty() { "/" } else { &folder }, body.pattern));
+    }
+    Ok(Json(outcome))
+}
+
+#[derive(Deserialize)]
+struct RenameManyBody {
+    paths: Vec<String>,
+    #[serde(flatten)]
+    rules: crate::rename_many::Rules,
+    date: Option<String>,
+    #[serde(default)]
+    apply: bool,
+}
+
+/// What renaming many files by a pattern would do, or doing it. Undone with
+/// /api/sort-folder/undo, given the renames made.
+async fn rename_many(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<RenameManyBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    if body.apply {
+        require_write(&state)?;
+    }
+    if body.paths.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose some files"));
+    }
+    let from = match body.date.as_deref() {
+        Some("modified") => crate::sort_folder::DateFrom::Modified,
+        Some("created") => crate::sort_folder::DateFrom::Created,
+        Some("name") => crate::sort_folder::DateFrom::Name,
+        _ => crate::sort_folder::DateFrom::Taken,
+    };
+    let taken = taken_dates(&state, "");
+    let (root, paths, rules, apply) = (state.root.clone(), body.paths.clone(), body.rules.clone(), body.apply);
+    let outcome = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, files::FileError> {
+        let renames = crate::rename_many::plan(&root, &paths, &rules, from, &taken)?;
+        if !apply {
+            let shown: Vec<_> = renames.iter().take(500).collect();
+            return Ok(json!({ "renames": shown, "total": renames.len(), "unchanged": paths.len() - renames.len() }));
+        }
+        let (made, failed) = crate::rename_many::apply(&root, &renames);
+        let failed: Vec<_> = failed.into_iter().map(|(path, why)| json!({ "path": path, "why": why })).collect();
+        Ok(json!({ "made": made, "failed": failed }))
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not rename the files"))?
+    .map_err(ApiError::from)?;
+    if body.apply {
+        for item in outcome["made"].as_array().into_iter().flatten() {
+            if let (Some(from), Some(to)) = (item["from"].as_str(), item["to"].as_str()) {
+                rewrite_meta(&state, from, to);
+                relink_notes(&state, &user.username, from, to).await;
+            }
+        }
+        let count = outcome["made"].as_array().map_or(0, Vec::len);
+        record(&state, &user, "rename-many", &format!("{count} file(s)"));
     }
     Ok(Json(outcome))
 }
@@ -5342,6 +5408,145 @@ pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
         }
     }
     Ok(out)
+}
+
+// ---- Tidy up a folder (cleanup.rs) ----
+
+#[derive(Deserialize)]
+struct CleanupQuery {
+    path: Option<String>,
+    limit: Option<usize>,
+}
+
+fn index_ready(state: &AppState) -> Result<(), ApiError> {
+    if state.file_index.ready() {
+        Ok(())
+    } else {
+        Err(ApiError::new(StatusCode::CONFLICT, "OwnNAS is still reading the library for the first time. Try again in a few minutes."))
+    }
+}
+
+/// The largest files under a folder.
+async fn cleanup_large(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, Query(query): Query<CleanupQuery>) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    index_ready(&state)?;
+    let folder = files::resolve(&state.root, &rel_of(&query.path))?.rel;
+    let conn = own_connection(&state)?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    let found = tokio::task::spawn_blocking(move || crate::cleanup::large_files(&conn, &folder, limit))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not list the files"))?
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(Json(json!({ "files": found })))
+}
+
+/// The folders under a folder with nothing in them.
+async fn cleanup_empty(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, Query(query): Query<CleanupQuery>) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let (root, folder) = (state.root.clone(), rel_of(&query.path));
+    let found = tokio::task::spawn_blocking(move || crate::cleanup::empty_folders(&root, &folder))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not look for empty folders"))?
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "folders": found })))
+}
+
+/// Photos and videos whose date is wrong while their name says when they were taken.
+async fn cleanup_dates(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, Query(query): Query<CleanupQuery>) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    index_ready(&state)?;
+    let folder = files::resolve(&state.root, &rel_of(&query.path))?.rel;
+    let (conn, root) = (own_connection(&state)?, state.root.clone());
+    let fixes = tokio::task::spawn_blocking(move || crate::cleanup::date_fixes(&conn, &root, &folder))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the dates"))?
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(Json(json!({ "fixes": fixes })))
+}
+
+#[derive(Deserialize)]
+struct FixDatesBody {
+    paths: Vec<String>,
+}
+
+/// Gives files the date their names say (checked again, file by file).
+async fn cleanup_fix_dates(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, Json(body): Json<FixDatesBody>) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let root = state.root.clone();
+    let paths = body.paths;
+    let (fixed, failed) = tokio::task::spawn_blocking(move || {
+        let (mut fixed, mut failed) = (0usize, Vec::new());
+        for path in paths {
+            let name = path.rsplit('/').next().unwrap_or_default().to_string();
+            match crate::sort_folder::date_from_name(&name) {
+                Some(when) => match crate::cleanup::set_date(&root, &path, when) {
+                    Ok(()) => fixed += 1,
+                    Err(err) => failed.push(json!({ "path": path, "why": crate::sort_folder::why(err) })),
+                },
+                None => failed.push(json!({ "path": path, "why": "Its name has no date" })),
+            }
+        }
+        (fixed, failed)
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not change the dates"))?;
+    // The Gallery reads the new dates.
+    state.media.rescan_soon();
+    record(&state, &user, "fix-dates", &format!("{fixed} file(s)"));
+    Ok(Json(json!({ "fixed": fixed, "failed": failed })))
+}
+
+#[derive(Deserialize)]
+struct CompareQuery {
+    first: String,
+    second: String,
+    #[serde(default)]
+    contents: bool,
+}
+
+/// What differs between two folders.
+async fn cleanup_compare(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, Query(query): Query<CompareQuery>) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let root = state.root.clone();
+    let cancel = files::CancelFlag::new();
+    let _guard = CancelOnDrop(cancel.clone());
+    let found = tokio::task::spawn_blocking(move || crate::cleanup::compare(&root, &query.first, &query.second, query.contents, &cancel))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not compare the folders"))?
+        .map_err(ApiError::from)?;
+    Ok(Json(found))
+}
+
+#[derive(Deserialize)]
+struct NearDuplicatesQuery {
+    path: Option<String>,
+    /// "strict", "normal" or "loose".
+    strength: Option<String>,
+}
+
+/// Photos that look alike under a folder (bursts, resized or re-saved copies).
+async fn find_near_duplicates(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<NearDuplicatesQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    if !state.file_index.ready() {
+        return Err(ApiError::new(StatusCode::CONFLICT, "OwnNAS is still reading the library for the first time. Try again in a few minutes."));
+    }
+    let (root, thumbs) = (state.root.clone(), state.thumbs.clone());
+    let path = rel_of(&query.path);
+    let strength = query.strength.unwrap_or_default();
+    let cancel = files::CancelFlag::new();
+    let _guard = CancelOnDrop(cancel.clone());
+    let conn = own_connection(&state)?;
+    let report = tokio::task::spawn_blocking(move || crate::near_dupes::find(&conn, &root, &thumbs, &path, &strength, &cancel, &|_, _| {}))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not compare the photos"))?
+        .map_err(ApiError::from)?;
+    Ok(Json(report))
 }
 
 async fn find_duplicates(

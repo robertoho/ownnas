@@ -61,18 +61,25 @@ enum Converter {
 }
 
 fn converter() -> Option<Converter> {
-    static FOUND: OnceLock<Option<Converter>> = OnceLock::new();
-    *FOUND.get_or_init(|| {
-        if cfg!(target_os = "macos") && Path::new("/usr/bin/sips").is_file() {
-            Some(Converter::Sips)
-        } else if runs("heif-convert", &["--version"]) {
-            Some(Converter::HeifConvert)
-        } else if ffmpeg_available() {
-            Some(Converter::Ffmpeg)
-        } else {
-            None
-        }
-    })
+    // Found once, kept; not found, looked for again at most once a minute, so a tool installed
+    // while OwnNAS runs is used without a restart.
+    static FOUND: std::sync::Mutex<(Option<Converter>, Option<std::time::Instant>)> = std::sync::Mutex::new((None, None));
+    let mut found = FOUND.lock().unwrap_or_else(|err| err.into_inner());
+    if found.0.is_some() || found.1.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(60)) {
+        return found.0;
+    }
+    let detected = if cfg!(target_os = "macos") && Path::new("/usr/bin/sips").is_file() {
+        Some(Converter::Sips)
+    } else if crate::helper_tools::find("heif-convert").is_some() {
+        // On the PATH is enough: older versions answer --version with an error.
+        Some(Converter::HeifConvert)
+    } else if ffmpeg_available() {
+        Some(Converter::Ffmpeg)
+    } else {
+        None
+    };
+    *found = (detected, Some(std::time::Instant::now()));
+    detected
 }
 
 /// Photo formats the image library cannot decode, read through a converter instead.
@@ -275,6 +282,17 @@ pub fn decode_for_analysis(source: &Path, max: u32) -> Result<image::DynamicImag
     }
     let image = apply_orientation(decode(source)?, read_orientation(source));
     Ok(shrink(image, max))
+}
+
+/// A HEIC, HEIF or AVIF photo saved as a full-size JPEG at `dest`, through the system's tool
+/// (which keeps its EXIF data and turns it upright).
+pub fn convert_to_jpeg(source: &Path, dest: &Path) -> Result<(), String> {
+    match converter().ok_or("No tool to read this picture is installed (heif-convert, or ffmpeg)")? {
+        Converter::Sips => run(tool("/usr/bin/sips").args(["-s", "format", "jpeg", "-s", "formatOptions", "92"]).arg(source).arg("--out").arg(dest))?,
+        Converter::HeifConvert => run(tool("heif-convert").args(["-q", "92"]).arg(source).arg(dest))?,
+        Converter::Ffmpeg => run(tool("ffmpeg").args(["-y", "-hide_banner", "-loglevel", "error", "-i"]).arg(source).args(["-frames:v", "1", "-q:v", "2"]).arg(dest))?,
+    }
+    if dest.is_file() { Ok(()) } else { Err("The picture could not be converted".to_string()) }
 }
 
 /// Longest side of a converted photo shown in the preview.
