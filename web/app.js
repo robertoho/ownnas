@@ -2368,8 +2368,14 @@ function notesOpen() {
   return document.body.classList.contains("is-notes");
 }
 
-/// Loads Notes on first use.
-async function notes() {
+/// Loads Notes on first use (once, however many ask at the same time).
+let notesLoading = null;
+function notes() {
+  notesLoading = notesLoading || loadNotes().catch((err) => { notesLoading = null; throw err; });
+  return notesLoading;
+}
+
+async function loadNotes() {
   if (!notesApi) {
     notesModule = notesModule || await import("/assets/notes.js");
     notesApi = notesModule.mountNotes($("notes-view"), {

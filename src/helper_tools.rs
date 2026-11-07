@@ -81,10 +81,15 @@ pub fn check() -> Vec<HelperTool> {
             &["--version"],
             "Turns HEIC and AVIF photos into thumbnails and previews.",
             "ffmpeg is used for HEIC and AVIF photos if it is installed; otherwise they show no thumbnail.",
-            install("brew install libheif", "sudo apt install libheif-examples", "Not needed on Windows: install ffmpeg instead"),
+            install("brew install libheif", "sudo apt install libheif-examples libheif-plugin-libde265", "Not needed on Windows: install ffmpeg instead"),
         );
         if !heif.found && find("ffmpeg").is_some() {
             heif.note = Some("ffmpeg is installed and is used for HEIC and AVIF photos instead.".to_string());
+        }
+        // Debian and Ubuntu ship libheif's decoders as plugins: without the HEVC one,
+        // heif-convert runs but reads no HEIC photo ("Unsupported codec").
+        if heif.found && !heic_decoder_installed() {
+            heif.note = Some("heif-convert is installed but cannot read HEIC photos: its HEIC decoder is missing. Install it with: sudo apt install libheif-plugin-libde265".to_string());
         }
         tools.push(heif);
     }
@@ -120,6 +125,17 @@ fn install(mac: &'static str, linux: &'static str, windows: &'static str) -> Opt
     } else {
         Some(linux)
     }
+}
+
+/// Whether heif-convert has a HEIC decoder (libheif 1.16 and later list them; older ones had
+/// the decoder built in).
+fn heic_decoder_installed() -> bool {
+    let Ok(output) = std::process::Command::new("heif-convert").arg("--list-decoders").stdin(std::process::Stdio::null()).output() else { return true };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let Some(section) = text.split("HEIC decoders:").nth(1) else { return true };
+    let listed = section.lines().skip(1).take_while(|line| line.starts_with("- ") || line.trim().is_empty()).any(|line| line.starts_with("- "));
+    // The section right after the heading: "- libde265 = …" lines, until the next heading.
+    listed || section.lines().nth(1).is_some_and(|line| line.starts_with("- "))
 }
 
 fn tool(name: &'static str, args: &[&str], purpose: &'static str, without: &'static str, install: Option<&'static str>) -> HelperTool {

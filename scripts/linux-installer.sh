@@ -21,7 +21,7 @@ if [ "$(id -u)" != 0 ] && [ "${1:-}" != --help ] && [ "${1:-}" != -h ]; then
 	exec sudo sh "$0" "$@"
 fi
 
-ROOT=""; DATA=""; RUN_AS=""; ADDR=""; YES=0; NO_SERVICE=0; CLIENTS=1; ACCOUNT=""; UNINSTALL=0; RECONF=0
+ROOT=""; DATA=""; RUN_AS=""; ADDR=""; YES=0; NO_SERVICE=0; CLIENTS=1; ACCOUNT=""; UNINSTALL=0; HELPERS=""; RECONF=0
 
 usage() {
 	cat <<EOF
@@ -41,6 +41,9 @@ Options:
                     from OWNNAS_PASSWORD)
   --no-service      install the binaries only
   --no-clients      skip ownnas-sync, ownnas-mount and ownnascli
+  --with-helpers    install the tools OwnNAS uses (video and HEIC thumbnails,
+                    backups, text in PDFs and pictures) with apt, without asking
+  --no-helpers      do not offer them
   --yes             take the defaults instead of asking
   --reconfigure     ask the questions again (current answers are the defaults)
   --uninstall       remove the service and binaries (the data and library stay)
@@ -56,6 +59,8 @@ while [ $# -gt 0 ]; do
 		--account) ACCOUNT=$2; shift 2 ;;
 		--no-service) NO_SERVICE=1; shift ;;
 		--no-clients) CLIENTS=0; shift ;;
+		--with-helpers) HELPERS=yes; shift ;;
+		--no-helpers) HELPERS=no; shift ;;
 		--yes|-y) YES=1; shift ;;
 		--uninstall) UNINSTALL=1; shift ;;
 		--reconfigure) RECONF=1; shift ;;
@@ -142,6 +147,30 @@ if [ "$NO_SERVICE" = 0 ]; then
 		useradd --system --home-dir "$DATA" --shell /usr/sbin/nologin ownnas
 		say "Created the system user ownnas. Give it access to $ROOT, for example: sudo chown -R ownnas $ROOT"
 	fi
+fi
+
+# --- helper tools (Debian, Ubuntu) ---------------------------------------------
+# ffmpeg: video thumbnails; libheif + its HEVC plugin: HEIC photos (Debian and Ubuntu ship the
+# decoder apart, and heif-convert reads no iPhone photo without it); restic: backups;
+# tesseract and poppler: words in pictures and PDFs for search; smartmontools: drive health.
+HELPER_PACKAGES="ffmpeg libheif-examples libheif-plugin-libde265 restic tesseract-ocr poppler-utils smartmontools"
+if command -v apt-get >/dev/null 2>&1 && [ "$HELPERS" != no ]; then
+	if [ -z "$HELPERS" ]; then
+		if [ "$YES" = 1 ] || [ ! -t 0 ]; then
+			HELPERS=no
+		else
+			ask HELPERS "Install the tools OwnNAS uses ($HELPER_PACKAGES)? yes/no" "yes"
+		fi
+	fi
+	case "$HELPERS" in
+		y|Y|yes|YES|Yes)
+			say "Installing helper tools…"
+			apt-get update -qq || true
+			# One at a time: a package missing on an older release must not stop the others.
+			for package in $HELPER_PACKAGES; do
+				DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$package" >/dev/null 2>&1 || echo "  (could not install $package)"
+			done ;;
+	esac
 fi
 
 # --- binaries ---------------------------------------------------------------
