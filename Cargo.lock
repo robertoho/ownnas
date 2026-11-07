@@ -3283,6 +3283,8 @@ dependencies = [
  "clap",
  "ownnas-core",
  "rpassword",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
