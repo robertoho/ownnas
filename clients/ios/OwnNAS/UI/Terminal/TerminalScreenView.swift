@@ -39,9 +39,13 @@ struct TerminalScreenView: View {
             }
             .sheet(isPresented: $pickingFile) {
                 ServerFilePicker(server: server, serverName: hub.server(server)?.name ?? "", start: folder) { paths in
-                    // Relative to the folder the terminal opened in, so the shell and agents there find them.
-                    model.session?.pastePaths(paths: paths.map { relativePath(from: folder, to: $0) })
-                    model.view?.becomeFirstResponder()
+                    Task {
+                        // As the shell sees them now (following cd), as dragging files in on the web does.
+                        let typed = (try? await hub.call(server) { [id] in try $0.terminalPaths(id: id, paths: paths) })
+                            ?? paths.map { relativePath(from: folder, to: $0) }
+                        model.session?.pastePaths(paths: typed)
+                        model.view?.becomeFirstResponder()
+                    }
                 }
             }
             .onDisappear { model.disconnect() }

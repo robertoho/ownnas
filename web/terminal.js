@@ -349,6 +349,113 @@ async function pasteLibraryPaths(paths) {
   }
 }
 
+// Picking files that are on the server already, to type their paths (such as to point an
+// agent at a file): the same paths as dragging them in from the file list.
+const pick = document.getElementById("terminal-pick");
+const pickList = document.getElementById("terminal-pick-list");
+const pickWhere = document.getElementById("terminal-pick-where");
+const pickInsert = pick.querySelector('[data-pick="insert"]');
+let pickAt = null;
+const picked = new Set();
+
+async function api(path) {
+  const response = await fetch(path, { credentials: "same-origin", headers: { "X-OwnNAS": "1" }, cache: "no-store" });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || "Could not reach the server");
+  return data;
+}
+
+function paintPickCount() {
+  pickInsert.disabled = picked.size === 0;
+  pickInsert.textContent = picked.size > 1 ? `Insert ${picked.size}` : "Insert";
+}
+
+async function showPickFolder(path) {
+  pickAt = path;
+  pickWhere.textContent = path ? `/${path}` : "/";
+  pick.querySelector('[data-pick="up"]').disabled = !path;
+  pickList.replaceChildren(Object.assign(document.createElement("li"), { className: "terminal-pick-empty", textContent: "Loading…" }));
+  try {
+    const data = await api(`/api/list?path=${encodeURIComponent(path)}`);
+    if (pickAt !== path) return;
+    const entries = (data.entries || [])
+      .filter((entry) => entry.kind !== "trash-folder")
+      .sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }) : a.dir ? -1 : 1));
+    pickList.replaceChildren(...entries.map((entry) => {
+      const item = document.createElement("li");
+      const button = document.createElement("button");
+      button.type = "button";
+      const mark = Object.assign(document.createElement("span"), { className: "terminal-pick-mark" });
+      const name = Object.assign(document.createElement("span"), { className: "terminal-pick-name", textContent: entry.dir ? `${entry.name}/` : entry.name });
+      const paint = () => {
+        mark.textContent = entry.dir ? "📁" : picked.has(entry.path) ? "✓" : "○";
+        if (!entry.dir) button.setAttribute("aria-pressed", String(picked.has(entry.path)));
+      };
+      paint();
+      button.addEventListener("click", () => {
+        if (entry.dir) {
+          showPickFolder(entry.path);
+          return;
+        }
+        if (picked.has(entry.path)) picked.delete(entry.path);
+        else picked.add(entry.path);
+        paint();
+        paintPickCount();
+      });
+      button.append(mark, name);
+      item.append(button);
+      return item;
+    }));
+    if (!entries.length) pickList.replaceChildren(Object.assign(document.createElement("li"), { className: "terminal-pick-empty", textContent: "This folder is empty" }));
+  } catch (err) {
+    pickList.replaceChildren(Object.assign(document.createElement("li"), { className: "terminal-pick-empty", textContent: err.message }));
+  }
+}
+
+/// Opens the picker at the terminal's folder.
+async function openPicker() {
+  if (finished) return;
+  picked.clear();
+  paintPickCount();
+  pick.hidden = false;
+  let start = "";
+  try {
+    const data = await api("/api/terminals");
+    start = (data.terminals || []).find((item) => item.id === id)?.path || "";
+  } catch {}
+  await showPickFolder(start);
+  pickList.querySelector("button")?.focus();
+}
+
+function closePicker() {
+  pick.hidden = true;
+  term.focus();
+}
+
+pick.addEventListener("click", (event) => {
+  const action = event.target.closest("[data-pick]")?.dataset.pick;
+  if (action === "close") closePicker();
+  if (action === "up" && pickAt) showPickFolder(pickAt.includes("/") ? pickAt.slice(0, pickAt.lastIndexOf("/")) : "");
+  if (action === "folder" && pickAt !== null) {
+    closePicker();
+    pasteLibraryPaths([pickAt]);
+  }
+  if (action === "insert" && picked.size) {
+    const paths = [...picked];
+    closePicker();
+    pasteLibraryPaths(paths);
+  }
+});
+pick.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closePicker();
+  }
+});
+window.addEventListener("message", (event) => {
+  if (event.origin === location.origin && event.data?.type === "ownnas-terminal-insert-file") openPicker();
+});
+
 host.addEventListener("dragover", (event) => {
   const types = [...(event.dataTransfer?.types || [])];
   if (!types.includes("Files") && !types.includes(LIBRARY_DRAG)) return;
@@ -452,6 +559,8 @@ keys.addEventListener("click", async (event) => {
     armCtrl(!ctrlArmed);
   } else if (key === "alt") {
     armAlt(!altArmed);
+  } else if (key === "file") {
+    openPicker();
   } else if (key === "paste") {
     try {
       // An image on the clipboard (such as a screenshot) is uploaded like a pasted file.

@@ -54,7 +54,8 @@ What works now:
   Pasting a copied image or file, inserting one from the keyboard, or attaching one uploads
   it to the terminal's temporary folder and pastes its path, as the web terminal does.
   "File on the server…" in the same 📎 menu picks files (or a folder) already on the server
-  and types their paths, relative to the terminal's folder, to point an agent at them. The
+  and types their paths as the shell sees them (relative to the folder it is in now), to point
+  an agent at them. The
   terminal button shows how many terminals want attention, and folders with open terminals
   carry a badge in their agent's status color.
   The emulator and the WebSocket run in Rust (`crates/ownnas-core/src/terminal.rs`, using

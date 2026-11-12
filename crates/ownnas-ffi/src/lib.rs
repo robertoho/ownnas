@@ -798,6 +798,12 @@ impl Server {
         Ok(self.api.open_terminal(&path, cols, rows)?.into())
     }
 
+    /// Library paths as the terminal's shell sees them now: relative to its current folder,
+    /// or full paths outside it.
+    pub fn terminal_paths(&self, id: String, paths: Vec<String>) -> Result<Vec<String>, ClientError> {
+        Ok(self.api.terminal_paths(&id, &paths)?)
+    }
+
     /// Ends a terminal and everything running in it.
     pub fn close_terminal(&self, id: String) -> Result<(), ClientError> {
         Ok(self.api.close_terminal(&id)?)

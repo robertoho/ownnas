@@ -77,7 +77,8 @@ What works now:
     Alt, arrows, Home/End, PgUp/PgDn, ^C…). A hardware keyboard works too.
   - Drag to scroll back. The menu pastes and sets the text size.
   - "Insert a file from the server…" in the menu picks files (or a folder) on the server and
-    types their paths, relative to the terminal's folder, to point an agent at them.
+    types their paths as the shell sees them (relative to the folder it is in now), to point an
+    agent at them.
 
 Not yet, compared with Android:
 

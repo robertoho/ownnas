@@ -555,6 +555,13 @@ function tileFor(id) {
   const folder = tool("folder", "Show the terminal's current folder in the files",
     '<path d="M2 4.5A1.5 1.5 0 0 1 3.5 3H7l1.2 1.5h4.3A1.5 1.5 0 0 1 14 6v6.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 12.5z"/>',
     () => showFolder(id).catch((err) => ctx.toast(err.message, true)));
+  const insert = tool("insert", "Insert a file from the server: type its path, such as to point an agent at it",
+    '<path d="M2 4.5A1.5 1.5 0 0 1 3.5 3H7l1.2 1.5h4.3A1.5 1.5 0 0 1 14 6v6.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 12.5z"/><path d="M8 7.5v4M6 9.5h4"/>',
+    () => {
+      setView("terminal");
+      activate(id);
+      frames.get(id)?.querySelector("iframe")?.contentWindow?.postMessage({ type: "ownnas-terminal-insert-file" }, location.origin);
+    });
   const popout = tool("popout", "Pop out: open this terminal in its own browser tab",
     '<path d="M9.5 2.5h4v4M13.5 2.5 8 8M12 9.5v3a1 1 0 0 1-1 1H3.5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h3"/>',
     () => window.open(`/terminal?id=${encodeURIComponent(id)}`, "_blank", "noopener"));
@@ -568,7 +575,7 @@ function tileFor(id) {
     "aria-label": "Hide this terminal",
   }, "✕");
   close.addEventListener("click", () => stashTerminal(id));
-  head.append(title, changes, folder, popout, expand, close);
+  head.append(title, changes, folder, insert, popout, expand, close);
   const frame = el("iframe", { src: `/terminal?id=${encodeURIComponent(id)}`, title: "Terminal", class: "terminals-frame is-loading", "data-id": id });
   // A page is white until its styles load; show the panel's background meanwhile.
   frame.addEventListener("load", () => {

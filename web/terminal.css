@@ -95,3 +95,57 @@ body.terminal-page {
   background: var(--accent);
   color: var(--accent-ink);
 }
+
+/* Picking files on the server to type their paths. */
+.terminal-pick {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel-deep);
+  color: var(--text);
+  font: 0.9rem var(--sans);
+}
+.terminal-pick[hidden] { display: none; }
+.terminal-pick #terminal-pick-where { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.terminal-pick-list { flex: 1; margin: 0; padding: 0.25rem 0; overflow-y: auto; list-style: none; }
+.terminal-pick-list li button {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  width: 100%;
+  padding: 0.5rem 0.9rem;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.terminal-pick-list li button:hover,
+.terminal-pick-list li button:focus-visible { background: var(--bg-2); }
+.terminal-pick-list li button[aria-pressed="true"] { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+.terminal-pick-list .terminal-pick-mark { width: 1.2rem; flex: none; text-align: center; color: var(--accent); }
+.terminal-pick-list .terminal-pick-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.terminal-pick-list .terminal-pick-empty { padding: 1rem; color: var(--muted); }
+.terminal-pick-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  padding: 0.6rem 0.9rem;
+  border-top: 1px solid var(--line);
+  background: var(--bg-2);
+}
+.terminal-pick button {
+  padding: 0.35rem 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-2);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+.terminal-pick button:disabled { opacity: 0.5; cursor: default; }
+.terminal-pick button.is-primary { border-color: var(--accent); background: var(--accent); color: var(--accent-ink); }
+.terminal-pick-list li button { justify-content: flex-start; border: 0; border-radius: 0; background: none; }

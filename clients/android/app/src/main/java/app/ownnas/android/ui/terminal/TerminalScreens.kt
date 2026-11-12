@@ -653,9 +653,13 @@ fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String, start
             onDismiss = { pickingServerFile = false },
             onPick = { paths ->
                 pickingServerFile = false
-                // Relative to the folder the terminal opened in, so the shell and agents there find them.
-                session?.pastePaths(paths.map { app.ownnas.android.ui.relativePath(here, it) })
-                view?.showKeyboard()
+                scope.launch {
+                    // As the shell sees them now (following cd), as dragging files in on the web does.
+                    val typed = runCatching { vm.call(serverId) { it.terminalPaths(terminalId, paths) } }
+                        .getOrElse { paths.map { path -> app.ownnas.android.ui.relativePath(here, path) } }
+                    session?.pastePaths(typed)
+                    view?.showKeyboard()
+                }
             },
         )
     }

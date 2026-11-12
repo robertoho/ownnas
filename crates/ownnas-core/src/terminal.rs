@@ -83,6 +83,22 @@ impl Api {
         Ok(body.terminal)
     }
 
+    /// Library paths as the terminal's shell sees them: relative to the folder it is in now
+    /// (following `cd`), or full paths for files outside it. As dragging files in does.
+    pub fn terminal_paths(&self, id: &str, paths: &[String]) -> Result<Vec<String>, ApiError> {
+        #[derive(serde::Deserialize)]
+        struct Resolved {
+            paths: Vec<String>,
+        }
+        let response = self
+            .request("POST", "/api/terminals/paths")
+            .query("id", id)
+            .send_json(json!({ "paths": paths }))
+            .map_err(crate::api::map_err)?;
+        let body: Resolved = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
+        Ok(body.paths)
+    }
+
     /// Ends a terminal and its programs.
     pub fn close_terminal(&self, id: &str) -> Result<(), ApiError> {
         self.request("DELETE", "/api/terminals").query("id", id).fetch()?;
