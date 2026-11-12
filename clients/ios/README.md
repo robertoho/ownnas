@@ -79,6 +79,9 @@ What works now:
   - "Insert a file from the server…" in the menu picks files (or a folder) on the server and
     types their paths as the shell sees them (relative to the folder it is in now), to point an
     agent at them.
+  - "Open terminal here" and "Open Claude Code here" (and other agents an administrator allowed
+    in the web app's Settings → Terminal → Agents) in a folder's menus start the agent in a new
+    terminal in that folder.
 
 Not yet, compared with Android:
 

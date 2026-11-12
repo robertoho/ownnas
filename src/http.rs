@@ -538,6 +538,8 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/terminals/diff", get(terminal_diff))
         .route("/api/agents/stream", get(agent_stream))
         .route("/api/agents/integrations", get(agent_integrations).post(set_agent_integration))
+        .route("/api/agents/found", get(agents_found))
+        .route("/api/agents/launchers", get(agent_launchers).post(set_agent_launchers))
         .route("/api/sync/tree", get(sync_tree))
         .route(
             "/api/sync/file",
@@ -6720,6 +6722,8 @@ struct TerminalUnlockBody {
 #[derive(Deserialize)]
 struct TerminalOpenBody {
     path: Option<String>,
+    /// Start this enabled agent (such as "claude") in the new terminal.
+    agent: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
 }
@@ -6940,6 +6944,15 @@ async fn open_terminal(
     if !resolved.full.is_dir() {
         return Err(FileError::NotADirectory.into());
     }
+    let launcher = match body.agent.as_deref().filter(|agent| !agent.is_empty()) {
+        Some(agent) => Some(
+            crate::agents::launchers(setting(&state, crate::agents::SETTING_LAUNCHERS).as_deref())
+                .into_iter()
+                .find(|item| item.id == agent)
+                .ok_or_else(|| ApiError::new(StatusCode::FORBIDDEN, "An administrator has not enabled that agent"))?,
+        ),
+        None => None,
+    };
     let shell = setting(&state, crate::terminal::SETTING_SHELL);
     let agent_url = state.agent_url.get().cloned();
     let label = resolved.rel.clone();
@@ -6959,7 +6972,23 @@ async fn open_terminal(
     .await
     .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not open a terminal"))?
     .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
-    record(&state, &user, "terminal-open", if label.is_empty() { "/" } else { &label });
+    let where_ = if label.is_empty() { "/" } else { label.as_str() };
+    let info = match &launcher {
+        Some(launcher) => {
+            if let Some(session) = state.terminals.get(&info.id) {
+                session.rename(&launcher.label);
+                session.type_when_ready(format!("{}\r", launcher.command));
+                session.info()
+            } else {
+                info
+            }
+        }
+        None => info,
+    };
+    match &launcher {
+        Some(launcher) => record(&state, &user, "terminal-agent", &format!("{} in {where_}", launcher.label)),
+        None => record(&state, &user, "terminal-open", where_),
+    }
     Ok(Json(json!({ "terminal": info })))
 }
 
@@ -7652,6 +7681,80 @@ fn git_diff(cwd: &std::path::Path, file: &str) -> Result<serde_json::Value, Stri
 struct IntegrationBody {
     agent: String,
     installed: bool,
+}
+
+/// The agents found on this computer, and which are enabled with what command (administrators
+/// with terminal access).
+async fn agents_found(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    peer: Peer,
+) -> Result<impl IntoResponse, ApiError> {
+    terminal_access(&state, &headers, &peer)?;
+    let shell = setting(&state, crate::terminal::SETTING_SHELL)
+        .filter(|shell| !shell.trim().is_empty())
+        .unwrap_or_else(crate::terminal::default_shell);
+    let found = tokio::task::spawn_blocking(move || crate::agents::detect(&shell))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not look for agents"))?;
+    let enabled = crate::agents::launchers(setting(&state, crate::agents::SETTING_LAUNCHERS).as_deref());
+    let agents: Vec<_> = found
+        .into_iter()
+        .map(|agent| {
+            let on = enabled.iter().find(|item| item.id == agent.id);
+            json!({
+                "id": agent.id,
+                "label": agent.label,
+                "path": agent.path,
+                "enabled": on.is_some(),
+                "command": on.map(|item| item.command.clone()).unwrap_or_else(|| agent.id.clone()),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "agents": agents })))
+}
+
+/// The agents people may start in a folder. Empty unless terminals are on and this account may
+/// use them, so apps can simply hide the choices.
+async fn agent_launchers(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    if !user.is_admin || !terminal_enabled(&state) || !crate::terminal::available() {
+        return Ok(Json(json!({ "launchers": [] })));
+    }
+    let list: Vec<_> = crate::agents::launchers(setting(&state, crate::agents::SETTING_LAUNCHERS).as_deref())
+        .into_iter()
+        .map(|item| json!({ "id": item.id, "label": item.label }))
+        .collect();
+    Ok(Json(json!({ "launchers": list })))
+}
+
+#[derive(Deserialize)]
+struct LaunchersBody {
+    launchers: Vec<crate::agents::Launcher>,
+}
+
+/// Chooses which agents may be started in a folder, and the command that starts each.
+async fn set_agent_launchers(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    peer: Peer,
+    Json(body): Json<LaunchersBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = terminal_access(&state, &headers, &peer)?;
+    let clean = crate::agents::validate(&body.launchers).map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    let text = serde_json::to_string(&clean).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        db::set_setting(&conn, crate::agents::SETTING_LAUNCHERS, (!clean.is_empty()).then_some(text.as_str()))
+            .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    }
+    let names: Vec<_> = clean.iter().map(|item| crate::agents::display_name(&item.id).to_string()).collect();
+    record(&state, &user, "agent-launchers", &if names.is_empty() { "none".to_string() } else { names.join(", ") });
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn agent_integrations(

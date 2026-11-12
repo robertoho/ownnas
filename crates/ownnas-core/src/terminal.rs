@@ -78,9 +78,35 @@ impl Api {
 
     /// Starts a shell in `path` (a folder relative to the shared folder).
     pub fn open_terminal(&self, path: &str, cols: u16, rows: u16) -> Result<TerminalInfo, ApiError> {
-        let response = self.post_json("/api/terminals", json!({ "path": path, "cols": cols, "rows": rows }))?;
+        self.open_terminal_with(path, cols, rows, None)
+    }
+
+    /// Opens a terminal in `path` and, with `agent` (such as "claude"), starts that agent in it,
+    /// when an administrator enabled it.
+    pub fn open_terminal_with(&self, path: &str, cols: u16, rows: u16, agent: Option<&str>) -> Result<TerminalInfo, ApiError> {
+        let mut body = json!({ "path": path, "cols": cols, "rows": rows });
+        if let Some(agent) = agent {
+            body["agent"] = json!(agent);
+        }
+        let response = self.post_json("/api/terminals", body)?;
         let body: Opened = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
         Ok(body.terminal)
+    }
+
+    /// The coding agents an administrator lets people start in a folder: (id, label).
+    pub fn agent_launchers(&self) -> Result<Vec<(String, String)>, ApiError> {
+        #[derive(serde::Deserialize)]
+        struct Launcher {
+            id: String,
+            label: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Launchers {
+            launchers: Vec<Launcher>,
+        }
+        let response = self.request("GET", "/api/agents/launchers").call().map_err(crate::api::map_err)?;
+        let list: Launchers = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
+        Ok(list.launchers.into_iter().map(|item| (item.id, item.label)).collect())
     }
 
     /// Library paths as the terminal's shell sees them: relative to the folder it is in now

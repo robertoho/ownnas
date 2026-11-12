@@ -85,6 +85,14 @@ pub struct Entry {
     pub protected: Option<String>,
 }
 
+/// A coding agent that can be started in a folder.
+#[derive(uniffi::Record)]
+pub struct AgentLauncher {
+    /// Such as "claude", "codex", "opencode".
+    pub id: String,
+    pub label: String,
+}
+
 /// Files with the same contents.
 #[derive(uniffi::Record)]
 pub struct Duplicates {
@@ -796,6 +804,17 @@ impl Server {
     /// Starts a shell in the folder `path`.
     pub fn open_terminal(&self, path: String, rows: u16, cols: u16) -> Result<TerminalInfo, ClientError> {
         Ok(self.api.open_terminal(&path, cols, rows)?.into())
+    }
+
+    /// Opens a terminal in `path` with an enabled coding agent (such as "claude") started in it.
+    pub fn open_terminal_with_agent(&self, path: String, rows: u16, cols: u16, agent: String) -> Result<TerminalInfo, ClientError> {
+        Ok(self.api.open_terminal_with(&path, cols, rows, Some(&agent))?.into())
+    }
+
+    /// The coding agents an administrator lets this account start in a folder (empty when none,
+    /// or when terminals are off).
+    pub fn agent_launchers(&self) -> Result<Vec<AgentLauncher>, ClientError> {
+        Ok(self.api.agent_launchers()?.into_iter().map(|(id, label)| AgentLauncher { id, label }).collect())
     }
 
     /// Library paths as the terminal's shell sees them now: relative to its current folder,

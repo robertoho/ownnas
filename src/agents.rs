@@ -760,3 +760,151 @@ mod tests {
         assert_eq!(event, json!({"tool_input": {"file_path": "a"}}));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Launchers: agents an administrator lets people start straight in a folder
+// ---------------------------------------------------------------------------
+
+/// Setting holding the enabled launchers, as JSON: `[{"id": "claude", "command": "claude"}]`.
+pub const SETTING_LAUNCHERS: &str = "agent_launchers";
+
+/// An agent found on this computer.
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Found {
+    pub id: String,
+    pub label: String,
+    /// Where its program is, when found.
+    pub path: Option<String>,
+}
+
+/// An agent that may be started in a folder, and the command that starts it.
+#[derive(Debug, Serialize, serde::Deserialize, Clone, PartialEq)]
+pub struct Launcher {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    pub command: String,
+}
+
+/// Whether `id` is one of the agents OwnNAS knows.
+pub fn known(id: &str) -> bool {
+    KNOWN_AGENTS.iter().any(|(name, _)| *name == id)
+}
+
+/// The enabled launchers from the stored setting, labelled, in the known agents' order.
+pub fn launchers(stored: Option<&str>) -> Vec<Launcher> {
+    let list: Vec<Launcher> = stored.and_then(|text| serde_json::from_str(text).ok()).unwrap_or_default();
+    KNOWN_AGENTS
+        .iter()
+        .filter_map(|(id, label)| {
+            list.iter().find(|item| item.id == *id).map(|item| Launcher { id: item.id.clone(), label: label.to_string(), command: item.command.clone() })
+        })
+        .collect()
+}
+
+/// Checks launchers before they are stored: known agents, one short line each.
+pub fn validate(list: &[Launcher]) -> Result<Vec<Launcher>, String> {
+    let mut clean = Vec::new();
+    for item in list {
+        if !known(&item.id) {
+            return Err(format!("Unknown agent: {}", item.id));
+        }
+        let command = item.command.trim();
+        if command.is_empty() {
+            return Err(format!("Enter the command that starts {}", display_name(&item.id)));
+        }
+        if command.len() > 300 || command.contains(['\n', '\r']) {
+            return Err(format!("The command for {} must be one line of up to 300 characters", display_name(&item.id)));
+        }
+        if !clean.iter().any(|done: &Launcher| done.id == item.id) {
+            clean.push(Launcher { id: item.id.clone(), label: String::new(), command: command.to_string() });
+        }
+    }
+    Ok(clean)
+}
+
+/// Looks for each known agent's program, as a terminal would: through the login shell (so
+/// ~/.local/bin, npm's and Homebrew's folders count even when OwnNAS runs as a service), and
+/// in OwnNAS's own PATH.
+pub fn detect(shell: &str) -> Vec<Found> {
+    let names: Vec<&str> = KNOWN_AGENTS.iter().map(|(name, _)| *name).collect();
+    let mut paths = from_login_shell(shell, &names);
+    for name in &names {
+        if !paths.contains_key(*name) {
+            if let Some(path) = on_path(name) {
+                paths.insert(name.to_string(), path);
+            }
+        }
+    }
+    KNOWN_AGENTS
+        .iter()
+        .map(|(id, label)| Found { id: id.to_string(), label: label.to_string(), path: paths.get(*id).cloned() })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn from_login_shell(shell: &str, names: &[&str]) -> std::collections::HashMap<String, String> {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+    let mut found = std::collections::HashMap::new();
+    let shell_name = Path::new(shell).file_name().and_then(|name| name.to_str()).unwrap_or("");
+    if !matches!(shell_name, "bash" | "zsh" | "sh" | "ksh" | "dash") {
+        return found;
+    }
+    // Only names from KNOWN_AGENTS reach the script, so nothing needs quoting.
+    let script = format!("for a in {}; do p=$(command -v \"$a\" 2>/dev/null) && printf '%s\\t%s\\n' \"$a\" \"$p\"; done", names.join(" "));
+    let Ok(mut child) = Command::new(shell).args(["-l", "-c", &script]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else {
+        return found;
+    };
+    // A profile that waits for input or hangs must not hold the request.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return found;
+            }
+        }
+    }
+    let mut out = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_string(&mut out);
+    }
+    for line in out.lines() {
+        if let Some((name, path)) = line.split_once('\t') {
+            // `command -v` names aliases and functions too; keep real programs.
+            if names.contains(&name) && path.starts_with('/') {
+                found.insert(name.to_string(), path.to_string());
+            }
+        }
+    }
+    found
+}
+
+#[cfg(windows)]
+fn from_login_shell(_: &str, _: &[&str]) -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::new()
+}
+
+/// A program in OwnNAS's own PATH (with Windows' extensions such as .exe and .cmd).
+fn on_path(name: &str) -> Option<String> {
+    let paths = std::env::var_os("PATH")?;
+    let extensions: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT".into()).split(';').map(|ext| ext.to_ascii_lowercase()).collect()
+    } else {
+        vec![String::new()]
+    };
+    for dir in std::env::split_paths(&paths) {
+        for ext in &extensions {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate.display().to_string());
+            }
+        }
+    }
+    None
+}

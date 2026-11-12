@@ -86,6 +86,7 @@ import androidx.compose.material.icons.automirrored.outlined.NoteAdd
 import androidx.compose.material.icons.outlined.FileCopy
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.automirrored.outlined.DriveFileMove
+import androidx.compose.material.icons.outlined.SmartToy
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -190,6 +191,11 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
     // stopped) until someone opens them.
     // Ended terminals count too: they stay until closed, and the user should see what happened.
     val attention = terminals.count { it.agent.attention != null || !it.running }
+    // Coding agents an administrator enabled, offered as "Open … here".
+    var agents by remember(serverId) { mutableStateOf<List<app.ownnas.core.AgentLauncher>>(emptyList()) }
+    LaunchedEffect(serverId, terminalsOn) {
+        agents = if (terminalsOn) runCatching { vm.call(serverId) { it.agentLaunchers() } }.getOrDefault(emptyList()) else emptyList()
+    }
     val terminalsByPath = remember(terminals) { terminals.groupBy { it.path } }
 
     LaunchedEffect(reload, revision, showHidden) {
@@ -277,6 +283,25 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
                 action()?.let(::report)
             } catch (err: Exception) {
                 report(err.userMessage())
+            }
+        }
+    }
+
+    /** Opens a terminal in `folder`, starting `agent` in it when given. */
+    fun openTerminalIn(folder: String, agent: app.ownnas.core.AgentLauncher? = null) {
+        scope.launch {
+            try {
+                val info = if (agent == null) {
+                    vm.openTerminal(serverId, folder)
+                } else {
+                    vm.call(serverId) { it.openTerminalWithAgent(folder, 30u, 100u, agent.id) }
+                }
+                vm.push(Screen.Terminal(serverId, info.id))
+            } catch (err: ClientException.Locked) {
+                // The terminals screen asks for the terminal password.
+                vm.push(Screen.Terminals(serverId, folder))
+            } catch (err: Exception) {
+                snackbar.showSnackbar(err.userMessage())
             }
         }
     }
@@ -595,6 +620,20 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
                                     }
                                 },
                             )
+                            if (terminalsOn && !inTrash(path)) {
+                                DropdownMenuItem(
+                                    text = { Text("Open terminal here") },
+                                    leadingIcon = { Icon(Icons.Outlined.Terminal, contentDescription = null) },
+                                    onClick = { menu = false; openTerminalIn(path) },
+                                )
+                                agents.forEach { agent ->
+                                    DropdownMenuItem(
+                                        text = { Text("Open ${agent.label} here") },
+                                        leadingIcon = { Icon(Icons.Outlined.SmartToy, contentDescription = null) },
+                                        onClick = { menu = false; openTerminalIn(path, agent) },
+                                    )
+                                }
+                            }
                             DropdownMenuItem(
                                 text = { Text("Find duplicates…") },
                                 leadingIcon = { Icon(Icons.Outlined.FileCopy, contentDescription = null) },
@@ -679,19 +718,9 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
                     },
                     onSelect = { entry -> selected = if (entry.path in selected) selected - entry.path else selected + entry.path },
                     onAction = { action, entry -> onBulk(action, listOf(entry)) },
-                    onTerminal = { entry ->
-                        scope.launch {
-                                try {
-                                    val info = vm.openTerminal(serverId, entry.path)
-                                    vm.push(Screen.Terminal(serverId, info.id))
-                                } catch (err: ClientException.Locked) {
-                                    // The terminals screen asks for the terminal password.
-                                    vm.push(Screen.Terminals(serverId, entry.path))
-                                } catch (err: Exception) {
-                                    snackbar.showSnackbar(err.userMessage())
-                                }
-                        }
-                    },
+                    onTerminal = { entry -> openTerminalIn(entry.path) },
+                    agents = agents,
+                    onAgent = { entry, agent -> openTerminalIn(entry.path, agent) },
                 )
             }
         }
@@ -993,6 +1022,8 @@ private fun Listing(
     onSelect: (Entry) -> Unit,
     onAction: (Bulk, Entry) -> Unit,
     onTerminal: (Entry) -> Unit,
+    agents: List<app.ownnas.core.AgentLauncher>,
+    onAgent: (Entry, app.ownnas.core.AgentLauncher) -> Unit,
 ) {
     val context = LocalContext.current
     val selecting = selected.isNotEmpty()
@@ -1051,6 +1082,8 @@ private fun Listing(
                                 onSelect = { onSelect(entry) },
                                 onTerminal = { onTerminal(entry) },
                                 onAction = { onAction(it, entry) },
+                                agents = agents,
+                                onAgent = { onAgent(entry, it) },
                             )
                         }
                     }

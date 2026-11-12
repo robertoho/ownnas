@@ -277,6 +277,29 @@ impl Session {
         }
     }
 
+    /// Types `text` once the shell is ready: after its first output (the prompt) has gone
+    /// quiet for a moment, or after a few seconds at most. Used to start an agent in a new
+    /// terminal, as if typed, so the shell's profile has set everything up first.
+    pub fn type_when_ready(self: &Arc<Self>, text: String) {
+        let session = Arc::clone(self);
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let mut last_len = 0;
+            let mut quiet_since = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_secs(6) {
+                let len = session.screen.lock().unwrap_or_else(|err| err.into_inner()).scrollback.len();
+                if len != last_len {
+                    last_len = len;
+                    quiet_since = std::time::Instant::now();
+                } else if len > 0 && quiet_since.elapsed() >= std::time::Duration::from_millis(400) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            session.write(text.into_bytes());
+        });
+    }
+
     pub fn resize(&self, cols: u16, rows: u16) {
         self.poked();
         #[cfg(not(target_os = "android"))]

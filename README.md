@@ -192,6 +192,9 @@ files. It is off by default: turn it on in **Settings → Terminal**.
   your home screen to use it full screen without the browser's address bar.
 - Drag files from the file list into a terminal to type their paths (relative to the folder
   the shell is in, when they are inside it).
+- **Insert a file** (the folder-with-a-plus on a terminal's tile, or **File** on the phone key
+  row) picks files on the server and types their paths the same way, such as to point an
+  agent at them.
 - Paste or drop files (such as a screenshot) into a terminal to upload them and type their
   paths, as a local terminal would. They are kept in a temporary folder for that terminal and
   deleted when it closes or the server restarts.
@@ -216,6 +219,13 @@ permission, asks a question, or finishes. **Edited** lists the files the agent c
   other agents from the terminal's foreground process (macOS and Linux), and treats the
   terminal bell and desktop-notification escape codes (OSC 9, 99, 777) as requests for
   attention.
+- **Settings → Terminal → Agents** lists the agents installed on the server (found through
+  the login shell, so `~/.local/bin`, npm's, and Homebrew's folders count even when OwnNAS
+  runs as a service). Those an administrator allows appear as **Open Claude Code here** (and
+  so on) in folder menus, on the web and in the Android and iPhone apps: a new terminal in
+  that folder, named after the agent, with its command typed once the shell is ready. The
+  command can carry options, such as a model. Nothing is allowed until an administrator
+  chooses.
 - **Settings → Terminal → Agent integrations** installs a Claude Code hook (in
   `~/.claude/settings.json`, backed up first) or an opencode plugin
   (`~/.config/opencode/plugins/ownnas.js`) for step-by-step status. They report only from

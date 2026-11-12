@@ -55,7 +55,10 @@ What works now:
   it to the terminal's temporary folder and pastes its path, as the web terminal does.
   "File on the server…" in the same 📎 menu picks files (or a folder) already on the server
   and types their paths as the shell sees them (relative to the folder it is in now), to point
-  an agent at them. The
+  an agent at them.
+  Folder menus (a row's ⋮ and the folder's own ⋮) also offer "Open terminal here" and "Open
+  Claude Code here" (and other agents an administrator allowed in the web app's Settings →
+  Terminal → Agents), which start the agent in a new terminal in that folder. The
   terminal button shows how many terminals want attention, and folders with open terminals
   carry a badge in their agent's status color.
   The emulator and the WebSocket run in Rust (`crates/ownnas-core/src/terminal.rs`, using

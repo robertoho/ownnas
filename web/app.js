@@ -1406,6 +1406,7 @@ function openSelectionMenu(x, y, pasteInto) {
     buttons.push(`<button type="button" data-menu="toggleHidden">${state.hidden ? "Hide dotfiles" : "Show hidden files"}</button>`);
     if (state.me && state.me.terminal && !inTrash) {
       buttons.push(`<button type="button" data-menu="terminal">Open terminal here</button>`);
+      buttons.push(...agentButtons());
       buttons.push(`<button type="button" data-menu="terminals">Terminals</button>`);
     }
     if (write && inTrash) {
@@ -1416,6 +1417,7 @@ function openSelectionMenu(x, y, pasteInto) {
     if (one) buttons.push(`<button type="button" data-menu="open">Open</button>`);
     if (one && one.dir && state.me && state.me.terminal && !allInTrash) {
       buttons.push(`<button type="button" data-menu="terminal">Open terminal here</button>`);
+      buttons.push(...agentButtons());
     }
     if (one && one.dir) buttons.push(`<button type="button" data-menu="reindex">Reindex</button>`);
     if (one && one.dir && !allInTrash) {
@@ -2163,7 +2165,9 @@ async function terminalPanel() {
       refreshMe: async () => {
         Object.assign(state.me, await api("/api/me"));
         syncTerminalButton();
+        refreshAgentLaunchers();
       },
+      agentsChanged: () => refreshAgentLaunchers(),
       openFile: (path) => {
         closeSettings();
         openFileByPath(path).catch((err) => toast(err.message, true));
@@ -2556,9 +2560,10 @@ async function route() {
   await load(hashToPath());
 }
 
-function openTerminalAt(path) {
+/// Opens a terminal in `path`, starting the enabled agent `agent` (such as "claude") in it.
+function openTerminalAt(path, agent) {
   terminalPanel()
-    .then((module) => module.open(path))
+    .then((module) => module.open(path, agent))
     .catch((err) => toast(err.message, true));
 }
 
@@ -5752,6 +5757,20 @@ function syncControls() {
   $("hidden-toggle").checked = state.hidden;
 }
 
+/// The coding agents an administrator enabled, offered as "Open … here" in folder menus.
+function refreshAgentLaunchers() {
+  if (!state.me || !state.me.terminal) {
+    state.agentLaunchers = [];
+    return;
+  }
+  api("/api/agents/launchers").then((data) => { state.agentLaunchers = data.launchers || []; }).catch(() => { state.agentLaunchers = []; });
+}
+
+function agentButtons() {
+  return (state.agentLaunchers || []).map((agent) =>
+    `<button type="button" data-menu="agent" data-format="${esc(agent.id)}">Open ${esc(agent.label)} here</button>`);
+}
+
 /// Whether there are Gallery workspaces, so the files' menu offers Show in workspace.
 function refreshWorkspaceCount() {
   api("/api/workspaces").then((data) => { state.workspaceCount = data.workspaces.length; }).catch(() => {});
@@ -5788,6 +5807,7 @@ async function boot() {
   if (savedMusic) music().then((player) => player.restore()).catch(() => {});
   refreshSmartStatus().then(syncSimilarButton);
   refreshWorkspaceCount();
+  refreshAgentLaunchers();
   pollHealthAlerts().catch(() => {});
   if (!healthTimer) healthTimer = setInterval(() => pollHealthAlerts().catch(() => {}), 10 * 60 * 1000);
   pollTrashReminder();
@@ -6494,6 +6514,7 @@ function runMenuAction(button, entries, pasteInto) {
   if (action === "bulkTag") bulkTagEntries(entries).catch((err) => toast(err.message, true));
   if (action === "emptyTrash") $("empty-trash-btn").click();
   if (action === "terminal") openTerminalAt(one && one.dir ? one.path : state.path);
+  if (action === "agent") openTerminalAt(one && one.dir ? one.path : state.path, format);
   if (action === "terminals") {
     terminalPanel().then((module) => module.show()).catch((err) => toast(err.message, true));
   }

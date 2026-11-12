@@ -23,6 +23,7 @@ import androidx.compose.material.icons.outlined.DriveFileRenameOutline
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Terminal
+import androidx.compose.material.icons.outlined.SmartToy
 import androidx.compose.material.icons.outlined.UploadFile
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
@@ -72,12 +73,15 @@ fun EntryMenu(
     onSelect: () -> Unit,
     onTerminal: () -> Unit,
     onAction: (Bulk) -> Unit,
+    agents: List<app.ownnas.core.AgentLauncher> = emptyList(),
+    onAgent: (app.ownnas.core.AgentLauncher) -> Unit = {},
 ) {
     DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
         MenuItem("Select", Icons.Outlined.CheckCircle) { onDismiss(); onSelect() }
         // As in the web app's folder menu.
         if (entry.dir && terminals && !inTrash(entry.path)) {
             MenuItem("Open terminal here", Icons.Outlined.Terminal) { onDismiss(); onTerminal() }
+            agents.forEach { agent -> MenuItem("Open ${agent.label} here", Icons.Outlined.SmartToy) { onDismiss(); onAgent(agent) } }
         }
         actions.forEach { action -> MenuItem(action.label(listOf(entry)), action.icon) { onDismiss(); onAction(action) } }
     }

@@ -33,6 +33,8 @@ struct BrowserView: View {
     @State private var bookmarked: Bool?
     @State private var showingBookmarks = false
     @AppStorage("showHidden") private var showHidden = false
+    /// Coding agents an administrator enabled, offered as "Open … here".
+    @State private var agents: [AgentLauncher] = []
     @State private var pickedPhotos: [PhotosPickerItem] = []
     @State private var choosingPhotos = false
     @State private var choosingFiles = false
@@ -89,6 +91,9 @@ struct BrowserView: View {
             .task(id: "\(hub.revision) \(showHidden)") { await load() }
             .task(id: path) { bookmarked = try? await hub.call(server) { [path] in try $0.bookmarks().contains(path) } }
             .task(id: account?.terminal) { await followTerminals() }
+            .task(id: account?.terminal) {
+                agents = account?.terminal == true ? ((try? await hub.call(server) { try $0.agentLaunchers() }) ?? []) : []
+            }
             .opener(opener)
             .uploads(uploader)
             .namePrompt($prompt)
@@ -299,6 +304,9 @@ struct BrowserView: View {
         }
         if entry.dir, account?.terminal == true, !inTrash(entry.path) {
             Button("Open terminal here", systemImage: "terminal") { openTerminal(entry.path) }
+            ForEach(agents, id: \.id) { agent in
+                Button("Open \(agent.label) here", systemImage: "sparkles") { openTerminal(entry.path, agent: agent.id) }
+            }
         }
         ForEach(bulkActions([entry], writable: writable), id: \.self) { action in
             Button(action.label([entry]), systemImage: action.systemImage, role: action.destructive ? .destructive : nil) { perform(action, on: [entry]) }
@@ -638,6 +646,12 @@ struct BrowserView: View {
                 Button("Search", systemImage: "magnifyingglass") { hub.path.append(.search(server: server, path: path)) }
                 Button("Gallery", systemImage: "photo.on.rectangle.angled") { hub.path.append(.gallery(server: server)) }
                 Button("Photo backup", systemImage: "photo.badge.arrow.down") { hub.path.append(.backup) }
+                if account?.terminal == true, !inTrash(path) {
+                    Button("Open terminal here", systemImage: "terminal") { openTerminal(path) }
+                    ForEach(agents, id: \.id) { agent in
+                        Button("Open \(agent.label) here", systemImage: "sparkles") { openTerminal(path, agent: agent.id) }
+                    }
+                }
                 if account?.terminal == true {
                     let attention = terminals.filter { $0.agent.attention != nil || !$0.running }.count
                     Button(attention > 0 ? "Terminals (\(attention) need you)" : "Terminals", systemImage: "terminal") {
@@ -674,10 +688,14 @@ struct BrowserView: View {
         }
     }
 
-    private func openTerminal(_ folder: String) {
+    /// Opens a terminal in `folder`, starting the enabled agent `agent` (such as "claude") in it.
+    private func openTerminal(_ folder: String, agent: String? = nil) {
         Task {
             do {
-                let info = try await hub.call(server) { try $0.openTerminal(path: folder, rows: 40, cols: 80) }
+                let info = try await hub.call(server) { server in
+                    if let agent { return try server.openTerminalWithAgent(path: folder, rows: 40, cols: 80, agent: agent) }
+                    return try server.openTerminal(path: folder, rows: 40, cols: 80)
+                }
                 hub.path.append(.terminal(server: server, id: info.id))
             } catch ClientError.Locked {
                 hub.path.append(.terminals(server: server, path: folder))

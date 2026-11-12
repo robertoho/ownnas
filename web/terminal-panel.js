@@ -1214,8 +1214,10 @@ function togglePanel() {
     .catch((err) => ctx.toast(err.message, true));
 }
 
-async function openTerminal(path) {
-  const data = await withUnlock(() => ctx.api("/api/terminals", { method: "POST", json: { path: path || "", cols: 100, rows: 30 } }));
+async function openTerminal(path, agent) {
+  const json = { path: path || "", cols: 100, rows: 30 };
+  if (agent) json.agent = agent;
+  const data = await withUnlock(() => ctx.api("/api/terminals", { method: "POST", json }));
   if (!data) return;
   await refresh();
   view = "terminal";
@@ -1240,8 +1242,8 @@ export function init(context) {
   if (!panel) build();
 }
 
-export async function open(path) {
-  await openTerminal(path);
+export async function open(path, agent) {
+  await openTerminal(path, agent);
 }
 
 export function toggle() {
@@ -1344,8 +1346,10 @@ export async function renderSettings(section) {
     section.append(lock);
   }
   if (config.enabled) {
+    const launchers = el("div", { class: "agent-integrations agent-launchers" });
     const box = el("div", { class: "agent-integrations" });
-    section.append(box);
+    section.append(launchers, box);
+    renderLaunchers(launchers).catch((err) => launchers.replaceChildren(el("p", { class: "form-error" }, err.message)));
     renderIntegrations(box).catch((err) => box.replaceChildren(el("p", { class: "form-error" }, err.message)));
   }
   form.addEventListener("submit", async (event) => {
@@ -1370,6 +1374,63 @@ export async function renderSettings(section) {
       error.textContent = err.message;
     }
   });
+}
+
+/// Coding agents found on this computer: enabled ones appear as "Open … here" in folder menus
+/// (on the web and in the apps), starting the agent in a new terminal there.
+async function renderLaunchers(box) {
+  box.replaceChildren(el("h3", {}, "Agents"), el("p", { class: "muted" }, "Looking for agents on this computer…"));
+  const data = await withUnlock(() => ctx.api("/api/agents/found"));
+  if (!data) {
+    box.replaceChildren(el("h3", {}, "Agents"), el("p", { class: "muted" }, "Unlock terminals to choose which agents can be started."));
+    return;
+  }
+  const rows = [];
+  const list = el("div", { class: "agent-launcher-list" });
+  for (const agent of data.agents) {
+    const row = el("div", { class: "agent-integration agent-launcher" });
+    const on = el("input", { type: "checkbox", "aria-label": `Allow ${agent.label}` });
+    on.checked = agent.enabled;
+    const label = el("label", { class: "check" });
+    label.append(on, " ", el("strong", {}, agent.label));
+    const where = el("p", { class: "muted" }, agent.path ? agent.path : "Not found on this computer");
+    const command = el("input", { autocomplete: "off", spellcheck: "false", value: agent.command, "aria-label": `Command that starts ${agent.label}` });
+    command.disabled = !agent.enabled;
+    on.addEventListener("change", () => { command.disabled = !on.checked; });
+    const text = el("div");
+    text.append(label, where);
+    row.append(text, command);
+    if (!agent.path && !agent.enabled) row.classList.add("is-missing");
+    rows.push({ agent, on, command });
+    list.append(row);
+  }
+  const save = el("button", { type: "button", class: "primary" }, "Save agents");
+  const again = el("button", { type: "button" }, "Look again");
+  const error = el("p", { class: "form-error" });
+  save.addEventListener("click", async () => {
+    error.textContent = "";
+    save.disabled = true;
+    try {
+      const launchers = rows.filter((row) => row.on.checked).map((row) => ({ id: row.agent.id, command: row.command.value.trim() }));
+      await ctx.api("/api/agents/launchers", { method: "POST", json: { launchers } });
+      ctx.toast(launchers.length ? `${launchers.length === 1 ? "1 agent" : `${launchers.length} agents`} can be started from folder menus` : "No agents can be started from folder menus");
+      ctx.agentsChanged?.();
+      await renderLaunchers(box);
+    } catch (err) {
+      error.textContent = err.message;
+      save.disabled = false;
+    }
+  });
+  again.addEventListener("click", () => renderLaunchers(box).catch((err) => box.replaceChildren(el("p", { class: "form-error" }, err.message))));
+  const actions = el("div", { class: "agent-launcher-actions" });
+  actions.append(save, again);
+  box.replaceChildren(
+    el("h3", {}, "Agents"),
+    el("p", { class: "muted" }, "Coding agents installed on this computer. Those you allow appear as “Open … here” in folder menus, here and in the OwnNAS apps, and start in a new terminal in that folder. The command is typed as you would, so you can add options, such as a model."),
+    list,
+    actions,
+    error,
+  );
 }
 
 /// Agent integrations: hooks that report each step to OwnNAS. They only act inside OwnNAS

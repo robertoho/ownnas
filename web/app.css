@@ -4786,3 +4786,11 @@ body.is-remotes .app > .explorer-status-bar { display: none; }
 .remote-preview-text { align-self: stretch; flex: 1 1 auto; margin: 0; padding: 0.75rem 1rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.85rem; background: var(--bg); }
 .remote-preview-none { text-align: center; }
 .remote-preview-none span { font-size: 3rem; }
+
+/* Settings → Terminal → Agents: which coding agents can be started from folder menus. */
+.agent-launcher { align-items: center; }
+.agent-launcher .check { display: inline-flex; gap: 0.4rem; align-items: center; }
+.agent-launcher p.muted { margin: 0.15rem 0 0; font-size: 0.8rem; overflow-wrap: anywhere; }
+.agent-launcher input:not([type="checkbox"]) { width: min(16rem, 45%); font-family: var(--mono); font-size: 0.85rem; }
+.agent-launcher.is-missing { opacity: 0.6; }
+.agent-launcher-actions { display: flex; gap: 0.5rem; margin-top: 0.75rem; }
