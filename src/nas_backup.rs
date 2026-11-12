@@ -50,8 +50,10 @@ const EXIT_GAVE_UP: i32 = -2;
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Destination {
-    /// "local", "s3", or "sftp".
+    /// "local", "s3", "sftp", or "rclone".
     pub kind: String,
+    /// rclone: the remote's name in rclone's config (the folder in it is `path`).
+    pub remote: String,
     /// local: a folder on this computer, such as a USB drive. sftp: the folder on the other machine.
     pub path: String,
     /// s3: "s3.amazonaws.com", "https://s3.eu-central-003.backblazeb2.com", "http://minio:9000"…
@@ -276,7 +278,7 @@ pub fn new_password() -> String {
 /// Checks a destination before it is saved. Returns it tidied up.
 pub fn validate(destination: &Destination, root: &Path, data: &Path) -> Result<Destination, String> {
     let mut d = destination.clone();
-    for field in [&mut d.path, &mut d.endpoint, &mut d.bucket, &mut d.prefix, &mut d.region, &mut d.access_key_id, &mut d.host, &mut d.user] {
+    for field in [&mut d.remote, &mut d.path, &mut d.endpoint, &mut d.bucket, &mut d.prefix, &mut d.region, &mut d.access_key_id, &mut d.host, &mut d.user] {
         *field = field.trim().to_string();
     }
     match d.kind.as_str() {
@@ -324,6 +326,12 @@ pub fn validate(destination: &Destination, root: &Path, data: &Path) -> Result<D
                 d.port = 22;
             }
         }
+        "rclone" => {
+            if !crate::remotes::valid_name(&d.remote) {
+                return Err("Choose one of rclone's remotes".into());
+            }
+            d.path = crate::remotes::clean_path(&d.path).filter(|path| !path.is_empty()).ok_or("Enter the folder on the remote, such as backups/ownnas")?;
+        }
         _ => return Err("Choose where backups go".into()),
     }
     Ok(d)
@@ -342,6 +350,7 @@ pub fn repository(d: &Destination) -> String {
             let port = if d.port == 0 { 22 } else { d.port };
             format!("sftp://{}@{}:{}/{}", d.user, d.host, port, d.path)
         }
+        "rclone" => format!("rclone:{}:{}", d.remote, d.path),
         _ => d.path.clone(),
     }
 }
@@ -351,6 +360,7 @@ pub fn describe(d: &Destination) -> String {
     match d.kind.as_str() {
         "s3" => format!("{}/{}{}", d.endpoint, d.bucket, if d.prefix.is_empty() { String::new() } else { format!("/{}", d.prefix) }),
         "sftp" => format!("{}@{}:{}", d.user, d.host, d.path),
+        "rclone" => format!("{}:{}", d.remote, d.path),
         _ => d.path.clone(),
     }
 }
@@ -461,6 +471,16 @@ impl Context {
             // No password prompts: the other machine must accept this computer's SSH key.
             let port = if d.port == 0 { 22 } else { d.port };
             cmd.arg("-o").arg(format!("sftp.args=-p {port} -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20"));
+        }
+        if d.kind == "rclone" {
+            // restic starts rclone itself, with the remotes' settings OwnNAS was given.
+            let settings = crate::remotes::settings_from(&self.db_path);
+            if let Some(program) = crate::remotes::program(&settings) {
+                cmd.arg("-o").arg(format!("rclone.program={}", program.display()));
+            }
+            if !settings.config.is_empty() {
+                cmd.env("RCLONE_CONFIG", &settings.config);
+            }
         }
         cmd.args(args)
             .env("RESTIC_REPOSITORY", repository(d))
@@ -1100,6 +1120,11 @@ mod tests {
         assert_eq!(repository(&sftp), "sftp://me@box:2222//srv/backup");
         let relative = Destination { path: "backup".into(), ..sftp };
         assert_eq!(repository(&relative), "sftp://me@box:2222/backup");
+        let remote = Destination { kind: "rclone".into(), remote: "onedrive".into(), path: "/Backups//OwnNAS/".into(), ..Default::default() };
+        let checked = validate(&remote, Path::new("/library"), Path::new("/data")).unwrap();
+        assert_eq!((repository(&checked), describe(&checked)), ("rclone:onedrive:Backups/OwnNAS".to_string(), "onedrive:Backups/OwnNAS".to_string()));
+        assert!(validate(&Destination { remote: "a:b".into(), ..remote.clone() }, Path::new("/library"), Path::new("/data")).is_err());
+        assert!(validate(&Destination { path: "".into(), ..remote }, Path::new("/library"), Path::new("/data")).is_err());
     }
 
     #[test]

@@ -336,6 +336,7 @@ function showApp() {
   $("preview-duplicate").hidden = !write;
   $("preview-move").hidden = !write;
   $("empty-trash-btn").hidden = true;
+  $("remotes-btn").hidden = !state.me.remotes;
   syncTerminalButton();
   refreshLibrary().catch((err) => toast(err.message, true));
 }
@@ -2398,6 +2399,25 @@ async function loadNotes() {
   return notesApi;
 }
 
+let remotesApi = null;
+
+function remotesOpen() {
+  return document.body.classList.contains("is-remotes");
+}
+
+/// Loads Remotes (rclone's servers and clouds) on first use.
+async function remotes() {
+  if (!remotesApi) {
+    const module = await import("/assets/remotes.js");
+    remotesApi = module.mountRemotes($("remotes-view"), {
+      api,
+      toast,
+      isAdmin: () => !!(state.me && state.me.admin),
+    });
+  }
+  return remotesApi;
+}
+
 /// An MCP client (Claude, say) asking to connect with OAuth: an administrator chooses what it
 /// may reach and do, or says no. Either way the browser goes back to the client.
 async function showOAuthApproval(query) {
@@ -2480,6 +2500,27 @@ async function route() {
   if (location.hash.startsWith("#oauth?")) {
     await showOAuthApproval(location.hash.slice("#oauth?".length));
     return;
+  }
+  if (location.hash.startsWith("#remotes")) {
+    if (galleryOpen()) {
+      document.body.classList.remove("is-gallery");
+      galleryApi?.hide();
+    }
+    if (notesOpen()) {
+      document.body.classList.remove("is-notes");
+      notesApi?.hide();
+    }
+    const api = await remotes();
+    closeMenu();
+    state.selected = new Set();
+    document.body.classList.add("is-remotes");
+    $("crumbs").innerHTML = `<button type="button" data-go="">${esc(state.me.rootName || "Library")}</button><span class="muted">/</span><button type="button" aria-current="page">Remotes</button>`;
+    await api.show(location.hash);
+    return;
+  }
+  if (remotesOpen()) {
+    document.body.classList.remove("is-remotes");
+    remotesApi?.hide();
   }
   if (location.hash.startsWith("#notes")) {
     if (galleryOpen()) {
@@ -6132,6 +6173,10 @@ $("crumbs").addEventListener("click", (event) => {
 
 $("notes-btn").addEventListener("click", () => {
   location.hash = "#notes";
+});
+
+$("remotes-btn").addEventListener("click", () => {
+  location.hash = "#remotes";
 });
 
 $("gallery-btn").addEventListener("click", () => {

@@ -354,11 +354,21 @@ Files are also offered as MCP resources (`ownnas:///path`), with a few ready-mad
 
 Hidden files and the Trash are never visible to a key. Albums and people show only when they have photos in the key's folders. Every call, refused ones included, is in the key's activity log. The plans for MCP are in [todo/mcp.md](todo/mcp.md).
 
+## Remotes (rclone)
+
+The cloud button in the top bar opens **Remotes**: the servers and clouds set up in [rclone](https://rclone.org) on the server (SFTP machines, OneDrive, Google Drive, Nextcloud and WebDAV, S3 buckets, and the rest). Open a remote to browse its folders. Photos, videos, music, PDFs, and text files preview, videos can be skipped through, and any file downloads.
+
+- **Setting up:** install rclone (`brew install rclone`, `sudo apt install rclone`, or `winget install Rclone.Rclone`) and add remotes with `rclone config`. OwnNAS uses the config file of the account it runs as. When OwnNAS runs as a service (root, or a user of its own), that is not your own config file: under **Remotes**, administrators can choose the config file, and where rclone is.
+- **Who sees them:** administrators see every remote. **Shared with…** on a remote's card chooses which other accounts may browse it and download from it. The remotes' passwords and tokens stay in rclone's config file and never reach the browser.
+- **How:** OwnNAS starts its own rclone (`rclone rcd`), reachable only from this computer, with a password of its own, so connections and sign-ins stay open between clicks. It stops after 15 minutes without use, and with OwnNAS.
+- **Signed out:** some remotes (iCloud, and OneDrive or Google Drive after a long time) need signing in again. OwnNAS says so: run `rclone config reconnect <remote>:` on the server.
+- **Backups:** Settings → Backup can back up to a remote, too.
+
 ## Backups
 
 **Settings → Backup** (administrators) backs up the library and OwnNAS's own data with [restic](https://restic.net), which needs to be installed (`brew install restic`, `sudo apt install restic`, or `winget install restic.restic`; 0.17 or newer). The data includes the database with users, albums, tags, and settings, and the file history. Thumbnails and caches are left out, because OwnNAS can make them again.
 
-- **Where:** a folder on another drive (the drives plugged in are listed: click one to put the backup on it, and use Back up now whenever you like), an S3-compatible bucket (AWS, Backblaze B2, Cloudflare R2, Wasabi, MinIO…), or another computer over SFTP, signed in with this computer's SSH key. The page shows the key, or makes one.
+- **Where:** a folder on another drive (the drives plugged in are listed: click one to put the backup on it, and use Back up now whenever you like), an S3-compatible bucket (AWS, Backblaze B2, Cloudflare R2, Wasabi, MinIO…), or another computer over SFTP, signed in with this computer's SSH key. The page shows the key, or makes one. Or any of rclone's remotes (OneDrive, Nextcloud, Google Drive, another server…): restic writes through rclone (see Remotes).
 - **Encrypted:** OwnNAS makes up a password for the backup and shows it once. Write it down somewhere else: without it the backup cannot be restored, also by you. Settings → Backup shows it again after you enter your account password.
 - **When:** every day or every week at a time you choose, or only when you click Back up now. A backup missed while the computer was off runs when it is back. A failed one is tried again an hour later, up to three times. After the first backup, only what changed is sent.
 - **How long:** one snapshot a day for 7 days, one a week for 4 weeks, and one a month for 12 months by default. Older ones are removed after each backup.

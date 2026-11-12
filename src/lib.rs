@@ -46,6 +46,7 @@ pub mod mcp_notes;
 pub mod notes;
 pub mod oauth;
 pub mod drives;
+pub mod remotes;
 pub mod cleanup;
 pub mod near_dupes;
 pub mod rename_many;

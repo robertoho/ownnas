@@ -40,6 +40,7 @@ mod mcp_notes;
 mod notes;
 mod oauth;
 mod drives;
+mod remotes;
 mod cleanup;
 mod near_dupes;
 mod rename_many;

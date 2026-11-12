@@ -107,6 +107,22 @@ pub fn check() -> Vec<HelperTool> {
         "Backups are not available.",
         install("brew install restic", "sudo apt install restic", "winget install restic.restic"),
     ));
+    let mut rclone = tool(
+        "rclone",
+        &["version"],
+        "Reaches the servers and clouds set up in it (SFTP, OneDrive, Nextcloud, S3…): browse them under Remotes, and back up to them.",
+        "Remotes are not available.",
+        install("brew install rclone", "sudo apt install rclone", "winget install Rclone.Rclone"),
+    );
+    if !rclone.found {
+        // Also where a service's bare PATH does not look.
+        if let Some(path) = crate::remotes::program(&crate::remotes::Settings::default()) {
+            rclone.found = true;
+            rclone.version = crate::remotes::version(&path);
+            rclone.path = Some(path.display().to_string());
+        }
+    }
+    tools.push(rclone);
     tools.push(tool(
         "git",
         &["--version"],

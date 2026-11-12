@@ -202,7 +202,7 @@ function renderForm() {
   const { config } = status;
   const d = config.destination;
   const form = el("form", { class: "user-form backup-form" });
-  const kinds = [["local", "Drive or folder"], ["s3", "S3-compatible bucket"], ["sftp", "Another computer (SFTP)"]];
+  const kinds = [["local", "Drive or folder"], ["s3", "S3-compatible bucket"], ["sftp", "Another computer (SFTP)"], ["rclone", "An rclone remote"]];
   let kind = d.kind || "local";
 
   // Where.
@@ -220,6 +220,30 @@ function renderForm() {
     port: el("input", { type: "number", min: "1", max: "65535", value: d.port || 22 }),
     user: el("input", { autocomplete: "off", spellcheck: "false", value: d.user }),
     remotePath: el("input", { autocomplete: "off", spellcheck: "false", value: d.kind === "sftp" ? d.path : "", placeholder: "/srv/backups/ownnas" }),
+    remote: el("select", {}, d.remote ? el("option", { value: d.remote }, d.remote) : null),
+    remoteFolder: el("input", { autocomplete: "off", spellcheck: "false", value: d.kind === "rclone" ? d.path : "OwnNAS backup", placeholder: "backups/ownnas" }),
+  };
+  inputs.remote.value = d.remote || "";
+  /// rclone's remotes (OneDrive, Nextcloud, another server…), to pick one for the backups.
+  const remotesBox = () => {
+    const box = el("p", { class: "muted backup-hint" }, "Looking for rclone's remotes…");
+    ctx.api("/api/remotes").then((data) => {
+      if (!data.available) {
+        box.textContent = "rclone is not installed on the server. Install it and set up a remote with: rclone config";
+        return;
+      }
+      if (data.error) {
+        box.textContent = data.error;
+        return;
+      }
+      const chosen = inputs.remote.value;
+      inputs.remote.replaceChildren(el("option", { value: "" }, "Choose a remote"), ...data.remotes.map((remote) => el("option", { value: remote.name }, `${remote.name}${remote.type ? ` (${remote.type})` : ""}`)));
+      inputs.remote.value = chosen;
+      box.textContent = data.remotes.length
+        ? `restic writes through rclone, with the remotes in ${data.config || "rclone's config file"}.`
+        : "rclone has no remotes yet. Set one up on the server with: rclone config";
+    }).catch((err) => { box.textContent = err.message; });
+    return box;
   };
   /// The drives plugged in now: one click puts a backup folder on it.
   const drivesBox = () => {
@@ -268,6 +292,11 @@ function renderForm() {
         el("div", { class: "backup-row" }, field("Bucket", inputs.bucket), field("Folder in the bucket", inputs.prefix)),
         field("Region", inputs.region),
         el("div", { class: "backup-row" }, field("Access key ID", inputs.accessKeyId), field("Secret access key", inputs.s3Secret)),
+      );
+    } else if (kind === "rclone") {
+      pane.append(
+        el("div", { class: "backup-row" }, field("Remote", inputs.remote), field("Folder on it", inputs.remoteFolder)),
+        remotesBox(),
       );
     } else {
       pane.append(
@@ -360,6 +389,7 @@ function renderForm() {
     if (kind === "local") destination.path = inputs.path.value;
     if (kind === "s3") Object.assign(destination, { endpoint: inputs.endpoint.value, bucket: inputs.bucket.value, prefix: inputs.prefix.value, region: inputs.region.value, accessKeyId: inputs.accessKeyId.value });
     if (kind === "sftp") Object.assign(destination, { host: inputs.host.value, port: Number(inputs.port.value) || 22, user: inputs.user.value, path: inputs.remotePath.value });
+    if (kind === "rclone") Object.assign(destination, { remote: inputs.remote.value, path: inputs.remoteFolder.value });
     const body = {
       accountPassword: account.value,
       config: {

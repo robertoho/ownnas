@@ -39,6 +39,7 @@ const PHOTO_UPLOAD_JS: &str = include_str!("../web/photo-upload.js");
 const THEME_JS: &str = include_str!("../web/theme.js");
 const GALLERY_JS: &str = include_str!("../web/gallery.js");
 const NOTES_JS: &str = include_str!("../web/notes.js");
+const REMOTES_JS: &str = include_str!("../web/remotes.js");
 const VIEWERS_JS: &str = include_str!("../web/viewers.js");
 const APP_JS: &str = include_str!("../web/app.js");
 const MODEL_VIEWER_JS: &str = include_str!("../web/model-viewer.js");
@@ -260,6 +261,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/assets/theme.js", get(theme_javascript))
         .route("/assets/gallery.js", get(gallery_javascript))
         .route("/assets/notes.js", get(notes_javascript))
+        .route("/assets/remotes.js", get(remotes_javascript))
         .route("/assets/viewers.js", get(viewers_javascript))
         .route("/assets/vendor/three/addons/{*file}", get(three_addon))
         .route("/assets/docx-editor.css", get(docx_editor_css))
@@ -411,6 +413,11 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/duplicates", get(find_duplicates))
         .route("/api/near-duplicates", get(find_near_duplicates))
         .route("/api/drives", get(list_drives))
+        .route("/api/remotes", get(remotes_overview))
+        .route("/api/remotes/list", get(remote_list))
+        .route("/api/remotes/file", get(remote_file))
+        .route("/api/remotes/access", post(remote_access))
+        .route("/api/remotes/settings", post(remote_settings))
         .route("/api/cleanup/large", get(cleanup_large))
         .route("/api/cleanup/empty", get(cleanup_empty))
         .route("/api/cleanup/dates", get(cleanup_dates).post(cleanup_fix_dates))
@@ -1146,6 +1153,10 @@ async fn notes_javascript() -> impl IntoResponse {
     app_module_javascript(NOTES_JS)
 }
 
+async fn remotes_javascript() -> impl IntoResponse {
+    app_module_javascript(REMOTES_JS)
+}
+
 async fn viewers_javascript() -> impl IntoResponse {
     app_module_javascript(VIEWERS_JS)
 }
@@ -1309,6 +1320,10 @@ async fn me(
         "updatesSigned": state.update.pubkey.is_some(),
         "updateTarget": crate::update::current_target(),
         "terminal": user.is_admin && terminal_enabled(&state),
+        "remotes": user.is_admin || {
+            let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+            crate::remotes::shared_with_any(&conn, user.id)
+        },
     })))
 }
 
@@ -5439,6 +5454,211 @@ async fn list_drives(State(state): State<std::sync::Arc<AppState>>, headers: Hea
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not list the drives"))?;
     Ok(Json(json!({ "drives": drives })))
+}
+
+// ---- rclone's remotes (remotes.rs) ----
+
+fn remote_settings_of(state: &AppState) -> crate::remotes::Settings {
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    crate::remotes::load_settings(&conn)
+}
+
+/// Whether this user may use the remote (administrators may use them all).
+fn may_use_remote(state: &AppState, user: &User, remote: &str) -> Result<(), ApiError> {
+    if !crate::remotes::valid_name(remote) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "That is not a remote's name"));
+    }
+    if user.is_admin {
+        return Ok(());
+    }
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    if crate::remotes::shared_with(&conn, remote, user.id) {
+        Ok(())
+    } else {
+        Err(ApiError::new(StatusCode::NOT_FOUND, "There is no such remote"))
+    }
+}
+
+/// rclone's remotes this user may use; for administrators also rclone's settings and who
+/// each remote is shared with.
+async fn remotes_overview(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    let settings = remote_settings_of(&state);
+    let (access, users) = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        (crate::remotes::access(&conn), if user.is_admin { db::list_user_infos(&conn).unwrap_or_default() } else { Vec::new() })
+    };
+    let is_admin = user.is_admin;
+    let answer = tokio::task::spawn_blocking(move || {
+        let program = crate::remotes::program(&settings);
+        let mut out = json!({ "available": program.is_some(), "remotes": [] });
+        if is_admin {
+            out["settings"] = json!(settings);
+            out["program"] = json!(program.as_ref().map(|path| path.display().to_string()));
+            out["version"] = json!(program.as_deref().and_then(crate::remotes::version));
+            out["config"] = json!(program.as_deref().and_then(|path| crate::remotes::config_file(path, &settings)));
+        }
+        if program.is_none() {
+            return out;
+        }
+        match crate::remotes::rclone().endpoint(&settings).and_then(|endpoint| crate::remotes::remotes(&endpoint)) {
+            Ok(remotes) => {
+                let listed: Vec<serde_json::Value> = remotes
+                    .into_iter()
+                    .filter(|remote| is_admin || access.get(&remote.name).is_some_and(|ids| ids.contains(&user.id)))
+                    .map(|remote| {
+                        let mut item = json!(remote);
+                        if is_admin {
+                            item["users"] = json!(access.get(&remote.name).cloned().unwrap_or_default());
+                        }
+                        item
+                    })
+                    .collect();
+                out["remotes"] = json!(listed);
+            }
+            Err(err) => out["error"] = json!(err),
+        }
+        out
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not ask rclone"))?;
+    if is_admin {
+        let mut answer = answer;
+        answer["users"] = json!(users.iter().filter(|other| !other.is_admin).map(|other| json!({ "id": other.id, "username": other.username })).collect::<Vec<_>>());
+        return Ok(Json(answer));
+    }
+    Ok(Json(answer))
+}
+
+#[derive(Deserialize)]
+struct RemotePathQuery {
+    remote: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    download: Option<String>,
+}
+
+async fn remote_list(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, Query(query): Query<RemotePathQuery>) -> Result<impl IntoResponse, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    may_use_remote(&state, &user, &query.remote)?;
+    let path = crate::remotes::clean_path(&query.path).ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "That path leaves the remote"))?;
+    let settings = remote_settings_of(&state);
+    let remote = query.remote.clone();
+    let entries = tokio::task::spawn_blocking(move || crate::remotes::rclone().endpoint(&settings).and_then(|endpoint| crate::remotes::list(&endpoint, &remote, &path)))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not ask rclone"))?
+        .map_err(|err| ApiError::new(StatusCode::BAD_GATEWAY, err))?;
+    Ok(Json(json!({ "entries": entries })))
+}
+
+/// A file of a remote, streamed through rclone (byte ranges too, for skipping through videos).
+async fn remote_file(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, Query(query): Query<RemotePathQuery>) -> Result<Response, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    may_use_remote(&state, &user, &query.remote)?;
+    let path = crate::remotes::clean_path(&query.path).filter(|path| !path.is_empty()).ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Choose a file"))?;
+    let name = path.rsplit('/').next().unwrap_or_default().to_string();
+    let range = headers.get(header::RANGE).and_then(|value| value.to_str().ok()).map(str::to_string);
+    let settings = remote_settings_of(&state);
+    let remote = query.remote.clone();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
+    let (head_sender, head_receiver) = tokio::sync::oneshot::channel::<Result<(u16, Vec<(String, String)>), String>>();
+    // ureq reads in a thread of its own; the body comes over in chunks.
+    tokio::task::spawn_blocking(move || {
+        let response = match crate::remotes::rclone().endpoint(&settings).and_then(|endpoint| endpoint.open(&remote, &path, range.as_deref())) {
+            Ok(response) => response,
+            Err(err) => {
+                let _ = head_sender.send(Err(err));
+                return;
+            }
+        };
+        let kept: Vec<(String, String)> = ["content-length", "content-range", "accept-ranges", "last-modified"]
+            .iter()
+            .filter_map(|name| response.header(name).map(|value| (name.to_string(), value.to_string())))
+            .collect();
+        if head_sender.send(Ok((response.status(), kept))).is_err() {
+            return;
+        }
+        let mut reader = response.into_reader();
+        let mut buffer = vec![0u8; 256 * 1024];
+        loop {
+            match std::io::Read::read(&mut reader, &mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    if sender.blocking_send(Ok(axum::body::Bytes::copy_from_slice(&buffer[..read]))).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = sender.blocking_send(Err(err));
+                    break;
+                }
+            }
+        }
+    });
+    let (status, kept) = head_receiver
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not ask rclone"))?
+        .map_err(|err| ApiError::new(StatusCode::BAD_GATEWAY, err))?;
+    let download = query.download.is_some();
+    let mime = raw_media_type(std::path::Path::new(&name), &name);
+    let mut response = Response::builder()
+        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
+        .header(header::CONTENT_TYPE, &mime)
+        .header(header::CONTENT_DISPOSITION, files::content_disposition(&name, download || mime == "application/octet-stream"))
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CACHE_CONTROL, "private, max-age=60");
+    for (key, value) in kept {
+        response = response.header(key, value);
+    }
+    if files::active_content(&name) {
+        response = response.header(header::CONTENT_SECURITY_POLICY, "sandbox; default-src 'none'");
+    }
+    let body = futures_util::stream::poll_fn(move |cx| receiver.poll_recv(cx));
+    response.body(Body::from_stream(body)).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not send the file"))
+}
+
+#[derive(Deserialize)]
+struct RemoteAccessBody {
+    remote: String,
+    users: Vec<i64>,
+}
+
+/// Who besides administrators may use a remote.
+async fn remote_access(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, Json(body): Json<RemoteAccessBody>) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    if !crate::remotes::valid_name(&body.remote) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "That is not a remote's name"));
+    }
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    crate::remotes::set_access(&conn, &body.remote, &body.users).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not save who may use the remote"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Where rclone and its config file are.
+async fn remote_settings(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, Json(body): Json<crate::remotes::Settings>) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let settings = crate::remotes::Settings { program: body.program.trim().to_string(), config: body.config.trim().to_string() };
+    if !settings.program.is_empty() {
+        let program = std::path::PathBuf::from(&settings.program);
+        let works = tokio::task::spawn_blocking(move || program.is_absolute() && crate::remotes::version(&program).is_some_and(|line| line.starts_with("rclone"))).await.unwrap_or(false);
+        if !works {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "That is not rclone: give the full path of the rclone program"));
+        }
+    }
+    if !settings.config.is_empty() && !std::path::Path::new(&settings.config).is_file() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "There is no config file there"));
+    }
+    {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::remotes::save_settings(&conn, &settings).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not save the settings"))?;
+    }
+    tokio::task::spawn_blocking(|| crate::remotes::rclone().stop()).await.ok();
+    Ok(Json(json!({ "ok": true })))
 }
 
 // ---- Signing MCP clients in with OAuth (oauth.rs) ----
