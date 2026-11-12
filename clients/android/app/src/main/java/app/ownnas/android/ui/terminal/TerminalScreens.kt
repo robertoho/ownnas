@@ -419,6 +419,7 @@ fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String, start
     }
     var info by remember { mutableStateOf<TerminalInfo?>(null) }
     val snackbar = remember { SnackbarHostState() }
+    var pickingServerFile by remember { mutableStateOf(false) }
 
     // Paste → upload to the terminal's temporary folder → paste the paths, as the web terminal does.
     fun pasteFiles(uris: List<Uri>) {
@@ -548,6 +549,7 @@ fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String, start
                                 pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
                             })
                             DropdownMenuItem(text = { Text("Files") }, onClick = { attach = false; pickFiles.launch(arrayOf("*/*")) })
+                            DropdownMenuItem(text = { Text("File on the server…") }, onClick = { attach = false; pickingServerFile = true })
                         }
                     }
                     var menu by remember { mutableStateOf(false) }
@@ -640,6 +642,22 @@ fun TerminalScreen(vm: AppViewModel, serverId: String, terminalId: String, start
     }
     if (newSnippet) {
         SnippetDialog(null, onDismiss = { newSnippet = false }) { vm.shortcuts.save(it); newSnippet = false }
+    }
+    if (pickingServerFile) {
+        val here = info?.path.orEmpty()
+        app.ownnas.android.ui.ServerFilePicker(
+            vm = vm,
+            serverId = serverId,
+            serverName = vm.server(serverId)?.name.orEmpty(),
+            start = here,
+            onDismiss = { pickingServerFile = false },
+            onPick = { paths ->
+                pickingServerFile = false
+                // Relative to the folder the terminal opened in, so the shell and agents there find them.
+                session?.pastePaths(paths.map { app.ownnas.android.ui.relativePath(here, it) })
+                view?.showKeyboard()
+            },
+        )
     }
     if (savingShortcut) {
         val serverName = vm.server(serverId)?.name ?: ""

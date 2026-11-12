@@ -7,6 +7,9 @@ struct TerminalScreenView: View {
     let server: String
     let id: String
     @StateObject private var model = TerminalModel()
+    @State private var pickingFile = false
+    /// The folder the terminal opened in, which inserted paths are relative to.
+    @State private var folder = ""
 
     var body: some View {
         TerminalCanvas(model: model)
@@ -23,6 +26,7 @@ struct TerminalScreenView: View {
                 ToolbarItem(placement: .primaryAction) {
                     Menu {
                         Button("Paste", systemImage: "doc.on.clipboard") { model.pasteClipboard() }
+                        Button("Insert a file from the server…", systemImage: "doc.badge.arrow.up") { pickingFile = true }
                         Button("Smaller text", systemImage: "textformat.size.smaller") { model.fontSize = max(8, model.fontSize - 1) }
                         Button("Larger text", systemImage: "textformat.size.larger") { model.fontSize = min(24, model.fontSize + 1) }
                         Button("Hide keyboard", systemImage: "keyboard.chevron.compact.down") { model.view?.resignFirstResponder() }
@@ -31,6 +35,14 @@ struct TerminalScreenView: View {
             }
             .task {
                 await model.connect(hub, server: server, id: id)
+                if let info = try? await hub.call(server, { [id] in try $0.terminals().first { $0.id == id } }) { folder = info.path }
+            }
+            .sheet(isPresented: $pickingFile) {
+                ServerFilePicker(server: server, serverName: hub.server(server)?.name ?? "", start: folder) { paths in
+                    // Relative to the folder the terminal opened in, so the shell and agents there find them.
+                    model.session?.pastePaths(paths: paths.map { relativePath(from: folder, to: $0) })
+                    model.view?.becomeFirstResponder()
+                }
             }
             .onDisappear { model.disconnect() }
     }

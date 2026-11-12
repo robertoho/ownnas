@@ -76,6 +76,8 @@ What works now:
   - A terminal opens in a native view with the web app's extra keys (Esc, Tab, sticky Ctrl and
     Alt, arrows, Home/End, PgUp/PgDn, ^C…). A hardware keyboard works too.
   - Drag to scroll back. The menu pastes and sets the text size.
+  - "Insert a file from the server…" in the menu picks files (or a folder) on the server and
+    types their paths, relative to the terminal's folder, to point an agent at them.
 
 Not yet, compared with Android:
 

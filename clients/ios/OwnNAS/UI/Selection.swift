@@ -711,3 +711,115 @@ struct BookmarksSheet: View {
         }
     }
 }
+
+/// `to` as seen from the folder `from` (both from the library's top), such as "../Photos/a.jpg".
+func relativePath(from: String, to: String) -> String {
+    let base = from.split(separator: "/").map(String.init)
+    let target = to.split(separator: "/").map(String.init)
+    var common = 0
+    while common < base.count && common < target.count && base[common] == target[common] { common += 1 }
+    let parts = Array(repeating: "..", count: base.count - common) + target.dropFirst(common)
+    return parts.isEmpty ? "." : parts.joined(separator: "/")
+}
+
+/// Picks files (or a folder) on the server, starting at `start`: tap folders to go in, tick
+/// files, then insert them. Used by terminals to point a program, such as a coding agent, at a
+/// file without uploading anything.
+struct ServerFilePicker: View {
+    @EnvironmentObject private var hub: Hub
+    @Environment(\.dismiss) private var dismiss
+    let server: String
+    let serverName: String
+    let start: String
+    let pick: ([String]) -> Void
+
+    @State private var at: String
+    @State private var folder: Folder?
+    @State private var problem: String?
+    @State private var picked: [String] = []
+
+    init(server: String, serverName: String, start: String, pick: @escaping ([String]) -> Void) {
+        self.server = server
+        self.serverName = serverName
+        self.start = start
+        self.pick = pick
+        _at = State(initialValue: start)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if let problem {
+                    ContentUnavailableView(problem, systemImage: "exclamationmark.triangle")
+                } else if let folder {
+                    let entries = folder.entries.filter { !isTrashFolder($0) }.sorted { a, b in
+                        if a.dir != b.dir { return a.dir }
+                        return a.name.localizedStandardCompare(b.name) == .orderedAscending
+                    }
+                    List {
+                        if !at.isEmpty {
+                            Button { at = (at as NSString).deletingLastPathComponent } label: { Label("Up a folder", systemImage: "arrow.turn.left.up") }
+                        }
+                        ForEach(entries, id: \.path) { entry in
+                            Button {
+                                if entry.dir {
+                                    at = entry.path
+                                } else if let index = picked.firstIndex(of: entry.path) {
+                                    picked.remove(at: index)
+                                } else {
+                                    picked.append(entry.path)
+                                }
+                            } label: {
+                                HStack(spacing: 12) {
+                                    if entry.dir {
+                                        Image(systemName: "folder.fill").foregroundStyle(.tint)
+                                    } else {
+                                        Image(systemName: picked.contains(entry.path) ? "checkmark.circle.fill" : "circle").foregroundStyle(.tint)
+                                    }
+                                    Text(specialFolderLabel(entry.name)).foregroundStyle(.primary).lineLimit(1)
+                                }
+                            }
+                        }
+                        if entries.isEmpty { Text("This folder is empty").foregroundStyle(.secondary) }
+                    }
+                    .listStyle(.plain)
+                } else {
+                    ProgressView()
+                }
+            }
+            .safeAreaInset(edge: .top) {
+                Text(at.isEmpty ? serverName : serverName + "/" + at).font(.footnote).foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal).padding(.vertical, 6).background(.bar)
+            }
+            .navigationTitle("Insert a file")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(picked.count <= 1 ? "Insert" : "Insert \(picked.count)") {
+                        dismiss()
+                        pick(picked)
+                    }
+                    .disabled(picked.isEmpty)
+                }
+                ToolbarItem(placement: .bottomBar) {
+                    Button("Insert this folder") {
+                        dismiss()
+                        pick([at])
+                    }
+                    .disabled(folder == nil)
+                }
+            }
+            .task(id: at) {
+                folder = nil
+                problem = nil
+                do {
+                    let path = at
+                    folder = try await hub.call(server) { try $0.list(path: path) }
+                } catch {
+                    problem = userMessage(error)
+                }
+            }
+        }
+    }
+}

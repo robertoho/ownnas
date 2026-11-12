@@ -3,6 +3,7 @@ package app.ownnas.android.ui
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -752,4 +753,119 @@ fun BookmarksDialog(serverName: String, paths: List<String>?, onDismiss: () -> U
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
     )
+}
+
+/** `to` as seen from the folder `from` (both from the library's top), such as "../Photos/a.jpg". */
+fun relativePath(from: String, to: String): String {
+    val base = from.split('/').filter { it.isNotEmpty() }
+    val target = to.split('/').filter { it.isNotEmpty() }
+    var common = 0
+    while (common < base.size && common < target.size && base[common] == target[common]) common++
+    return (List(base.size - common) { ".." } + target.drop(common)).joinToString("/").ifEmpty { "." }
+}
+
+/**
+ * Picks files (or a folder) on the server, starting at `start`: tap folders to go in, tick
+ * files, then insert them. Used by terminals to point a program, such as a coding agent, at a
+ * file without uploading anything.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ServerFilePicker(
+    vm: AppViewModel,
+    serverId: String,
+    serverName: String,
+    start: String,
+    onDismiss: () -> Unit,
+    onPick: (List<String>) -> Unit,
+) {
+    var at by remember { mutableStateOf(start) }
+    var folder by remember { mutableStateOf<Folder?>(null) }
+    var problem by remember { mutableStateOf<String?>(null) }
+    val picked = remember { androidx.compose.runtime.mutableStateListOf<String>() }
+
+    LaunchedEffect(at) {
+        folder = null
+        problem = null
+        try {
+            folder = vm.list(serverId, at)
+        } catch (err: Exception) {
+            problem = err.userMessage()
+        }
+    }
+
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(Modifier.fillMaxSize()) {
+            Scaffold(
+                topBar = {
+                    TopAppBar(
+                        title = {
+                            Column {
+                                Text("Insert a file", maxLines = 1)
+                                Text(
+                                    if (at.isEmpty()) serverName else "$serverName/" + at.split('/').joinToString("/", transform = ::specialFolderLabel),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        },
+                        navigationIcon = {
+                            if (at.isEmpty()) {
+                                IconButton(onClick = onDismiss) { Icon(Icons.Filled.Close, contentDescription = "Cancel") }
+                            } else {
+                                IconButton(onClick = { at = at.parentPath() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Up") }
+                            }
+                        },
+                    )
+                },
+                bottomBar = {
+                    Column(Modifier.navigationBarsPadding()) {
+                        HorizontalDivider()
+                        Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            TextButton(onClick = { onPick(listOf(at)) }, enabled = folder != null) { Text("This folder") }
+                            Spacer(Modifier.weight(1f))
+                            Button(onClick = { onPick(picked.toList()) }, enabled = picked.isNotEmpty()) {
+                                Text(if (picked.size <= 1) "Insert" else "Insert ${picked.size}")
+                            }
+                        }
+                    }
+                },
+            ) { padding ->
+                val shown = folder
+                Box(Modifier.padding(padding).fillMaxSize()) {
+                    when {
+                        problem != null -> Text(problem!!, textAlign = TextAlign.Center, modifier = Modifier.align(Alignment.Center).padding(32.dp))
+                        shown == null -> CircularProgressIndicator(Modifier.align(Alignment.Center))
+                        else -> LazyColumn(Modifier.fillMaxSize()) {
+                            val entries = shown.entries.filter { !it.isTrashFolder() }
+                                .sortedWith(compareBy<Entry> { !it.dir }.thenBy(String.CASE_INSENSITIVE_ORDER) { it.name })
+                            items(entries, key = { it.path }) { entry ->
+                                val ticked = entry.path in picked
+                                ListItem(
+                                    modifier = Modifier.clickable {
+                                        when {
+                                            entry.dir -> at = entry.path
+                                            ticked -> picked.remove(entry.path)
+                                            else -> picked.add(entry.path)
+                                        }
+                                    },
+                                    leadingContent = {
+                                        if (entry.dir) {
+                                            Icon(Icons.Filled.Folder, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(32.dp))
+                                        } else {
+                                            androidx.compose.material3.Checkbox(checked = ticked, onCheckedChange = { if (it) picked.add(entry.path) else picked.remove(entry.path) })
+                                        }
+                                    },
+                                    headlineContent = { Text(specialFolderLabel(entry.name), maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                )
+                            }
+                            if (entries.isEmpty()) item { Text("This folder is empty", Modifier.padding(32.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
