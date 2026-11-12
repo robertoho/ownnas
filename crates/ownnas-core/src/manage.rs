@@ -160,6 +160,69 @@ fn form_parts(boundary: &str, name: &str) -> (Vec<u8>, Vec<u8>) {
     (head.into_bytes(), tail.into_bytes())
 }
 
+/// Files with the same contents.
+#[derive(Deserialize, Clone, Debug)]
+pub struct Duplicates {
+    pub groups: Vec<DuplicateGroup>,
+    /// Room the extra copies take.
+    pub wasted: u64,
+    /// More groups than listed.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct DuplicateGroup {
+    pub size: u64,
+    pub sha256: String,
+    pub copies: Vec<DuplicateCopy>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct DuplicateCopy {
+    pub path: String,
+    /// Seconds since 1970.
+    pub modified: i64,
+}
+
+/// Which copies of a group to keep and which to move to the Trash.
+#[derive(Clone, Debug)]
+pub struct DuplicateChoice {
+    pub sha256: String,
+    pub keep: Vec<String>,
+    pub remove: Vec<String>,
+}
+
+/// A file a sort moves: from where, into which folder.
+#[derive(Clone, Debug)]
+pub struct SortMove {
+    pub from: String,
+    pub to: String,
+}
+
+/// What a sort would do (or did).
+#[derive(Clone, Debug)]
+pub struct SortResult {
+    /// The moves (a preview lists the first few hundred).
+    pub moves: Vec<SortMove>,
+    pub total: u64,
+    pub folders: u64,
+    /// Files already where the pattern puts them.
+    pub in_place: u64,
+    pub failed: u64,
+}
+
+/// Something someone did on the server.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityEvent {
+    pub username: String,
+    pub action: String,
+    pub detail: String,
+    /// Seconds since 1970.
+    pub created_at: i64,
+}
+
 /// How much a folder holds.
 #[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -442,6 +505,71 @@ impl Api {
     pub fn cancel_video_job(&self, id: &str) -> Result<(), ApiError> {
         self.request("DELETE", "/api/videos/job").query("id", id).fetch()?;
         Ok(())
+    }
+
+    /// Files with the same contents in `path` and below.
+    pub fn duplicates(&self, path: &str) -> Result<Duplicates, ApiError> {
+        self.get_json("/api/duplicates", &[("path", path)])
+    }
+
+    /// Moves extra copies to the Trash, checking first that each still matches its group and
+    /// that a kept copy remains. Returns how many went and the bytes freed.
+    pub fn trash_duplicates(&self, choices: &[DuplicateChoice]) -> Result<(u64, u64, Vec<String>), ApiError> {
+        #[derive(Deserialize)]
+        struct Skip {
+            path: String,
+            reason: String,
+        }
+        #[derive(Deserialize)]
+        struct Done {
+            trashed: u64,
+            freed: u64,
+            #[serde(default)]
+            skipped: Vec<Skip>,
+        }
+        let groups: Vec<_> = choices.iter().map(|c| json!({ "sha256": c.sha256, "keep": c.keep, "remove": c.remove })).collect();
+        let done: Done = self.post_json("/api/duplicates/trash", json!({ "groups": groups }))?.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
+        Ok((done.trashed, done.freed, done.skipped.into_iter().map(|skip| format!("{}: {}", skip.path, skip.reason)).collect()))
+    }
+
+    /// What sorting `path` into folders by `pattern` would do ("{YYYY}/{MM}", "{type}"…),
+    /// dating files by `date` ("taken", "modified", "created", "name"); with `apply`, does it.
+    pub fn sort_folder(&self, path: &str, pattern: &str, date: &str, recursive: bool, months: &[String], apply: bool) -> Result<SortResult, ApiError> {
+        let body = json!({ "path": path, "pattern": pattern, "date": date, "recursive": recursive, "months": months, "apply": apply });
+        let value: serde_json::Value = self.post_json("/api/sort-folder", body)?.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
+        let moves = |key: &str| -> Vec<SortMove> {
+            value[key].as_array().into_iter().flatten().filter_map(|m| Some(SortMove { from: m["from"].as_str()?.to_string(), to: m["to"].as_str()?.to_string() })).collect()
+        };
+        if apply {
+            let made = moves("made");
+            let failed = value["failed"].as_array().map_or(0, Vec::len) as u64;
+            let folders = value["folders"].as_u64().unwrap_or(0);
+            return Ok(SortResult { total: made.len() as u64, moves: made, folders, in_place: 0, failed });
+        }
+        Ok(SortResult {
+            moves: moves("moves"),
+            total: value["total"].as_u64().unwrap_or(0),
+            folders: value["folders"].as_object().map_or(0, |f| f.len() as u64),
+            in_place: value["inPlace"].as_u64().unwrap_or(0),
+            failed: 0,
+        })
+    }
+
+    /// Puts back what a sort moved; returns how many went back.
+    pub fn undo_sort(&self, moves: &[SortMove]) -> Result<u64, ApiError> {
+        let moves: Vec<_> = moves.iter().map(|m| json!({ "from": m.from, "to": m.to })).collect();
+        let value: serde_json::Value = self.post_json("/api/sort-folder/undo", json!({ "moves": moves }))?.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
+        Ok(value["back"].as_array().map_or_else(|| value["back"].as_u64().unwrap_or(0), |b| b.len() as u64))
+    }
+
+    /// What people did on the server lately (uploads, moves, deletions, sign-ins…).
+    pub fn activity(&self) -> Result<Vec<ActivityEvent>, ApiError> {
+        #[derive(Deserialize)]
+        struct Events {
+            events: Vec<ActivityEvent>,
+        }
+        let events: Events = self.get_json("/api/activity", &[])?;
+        Ok(events.events)
     }
 
     /// Whether the library already has a photo with these contents.

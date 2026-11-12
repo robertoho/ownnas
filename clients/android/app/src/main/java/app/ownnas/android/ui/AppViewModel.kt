@@ -59,6 +59,15 @@ sealed interface Screen {
 
     data object Sync : Screen
 
+    /** Files with the same contents in a folder and below. */
+    data class Duplicates(val serverId: String, val path: String) : Screen
+
+    /** Sorting a folder's files into folders by date, kind, and so on. */
+    data class SortFolder(val serverId: String, val path: String) : Screen
+
+    /** What people did on the server lately. */
+    data class Activity(val serverId: String) : Screen
+
     /** A server's Gallery: photos by date, albums, people, and tags. */
     data class Gallery(val serverId: String, val tab: String = "photos") : Screen
 
@@ -478,6 +487,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         browserPrefs.edit().putBoolean("hidden", show).apply()
         hiddenState.value = show
     }
+
+    /** Tells open folders (and the Files app) that `dir` changed. */
+    fun changedFolder(id: String, dir: String) = hub.changed(id, dir)
 
     suspend fun folderUsage(id: String, path: String) = call(id) { it.folderUsage(path) }
 

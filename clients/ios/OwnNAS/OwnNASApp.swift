@@ -34,6 +34,9 @@ struct RootView: View {
                     switch route {
                     case let .browse(server, path): BrowserView(server: server, path: path)
                     case let .search(server, path): SearchView(server: server, path: path)
+                    case let .duplicates(server, path): DuplicatesView(server: server, path: path)
+                    case let .sortFolder(server, path): SortFolderView(server: server, path: path)
+                    case let .activity(server): ActivityView(server: server)
                     case let .gallery(server): GalleryView(server: server)
                     case let .album(server, id): AlbumView(server: server, id: id)
                     case let .person(server, id): PersonView(server: server, id: id)

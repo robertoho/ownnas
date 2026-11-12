@@ -44,6 +44,9 @@ What works now:
   progress and Stop. The ⋯ menu adds New file (text, Markdown, Word, spreadsheet, and more),
   Folder size, Download as ZIP (to share), Bookmark this folder and Bookmarks…, and Show hidden
   files.
+- **Folder tools:** Find duplicates (keeps the oldest copy of each by default; untick to keep
+  more, then move the rest to the Trash), Sort into folders (by date, kind, extension, first
+  letter, or your own pattern, with a preview and Undo), and Activity.
 - **Gallery:**
   - Photos by day, with On this day above them.
   - Albums inside albums, people (when the server has faces on), places on a map, and tags.

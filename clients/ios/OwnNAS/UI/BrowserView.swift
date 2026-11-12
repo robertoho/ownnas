@@ -626,6 +626,11 @@ struct BrowserView: View {
                     }
                 }
                 Button("Bookmarks…", systemImage: "books.vertical") { showingBookmarks = true }
+                Button("Find duplicates…", systemImage: "doc.on.doc") { hub.path.append(.duplicates(server: server, path: path)) }
+                if writable, !inTrash(path) {
+                    Button("Sort into folders…", systemImage: "folder.badge.gearshape") { hub.path.append(.sortFolder(server: server, path: path)) }
+                }
+                Button("Activity", systemImage: "clock.arrow.circlepath") { hub.path.append(.activity(server: server)) }
                 Button(showHidden ? "Hide hidden files" : "Show hidden files", systemImage: showHidden ? "eye.slash" : "eye") { showHidden.toggle() }
                 if writable, path == ".ownnas-trash" || path == "Trash" {
                     Button("Empty Trash", systemImage: "trash.slash", role: .destructive) { emptyingTrash = true }

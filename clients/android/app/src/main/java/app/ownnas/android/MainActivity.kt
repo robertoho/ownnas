@@ -20,6 +20,9 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import app.ownnas.android.ui.AppViewModel
 import app.ownnas.android.ui.BrowserScreen
 import app.ownnas.android.ui.SearchScreen
+import app.ownnas.android.ui.DuplicatesScreen
+import app.ownnas.android.ui.SortFolderScreen
+import app.ownnas.android.ui.ActivityScreen
 import app.ownnas.android.ui.ConflictDialog
 import app.ownnas.android.ui.Screen
 import app.ownnas.android.ui.HomeScreen
@@ -81,6 +84,9 @@ private fun App(showBackup: Int, vm: AppViewModel = viewModel()) {
                 is Screen.SignIn -> SignInScreen(vm, target.existing)
                 is Screen.Browse -> BrowserScreen(vm, target.serverId, target.path)
                 is Screen.Search -> SearchScreen(vm, target.serverId, target.path)
+                is Screen.Duplicates -> DuplicatesScreen(vm, target.serverId, target.path)
+                is Screen.SortFolder -> SortFolderScreen(vm, target.serverId, target.path)
+                is Screen.Activity -> ActivityScreen(vm, target.serverId)
                 is Screen.Terminals -> TerminalsScreen(vm, target.serverId, target.path)
                 is Screen.Terminal -> TerminalScreen(vm, target.serverId, target.terminalId, target.startup)
                 Screen.Sync -> SyncScreen(vm)

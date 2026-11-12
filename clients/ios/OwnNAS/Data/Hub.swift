@@ -5,6 +5,9 @@ import SwiftUI
 enum Route: Hashable {
     case browse(server: String, path: String)
     case search(server: String, path: String)
+    case duplicates(server: String, path: String)
+    case sortFolder(server: String, path: String)
+    case activity(server: String)
     case gallery(server: String)
     case album(server: String, id: Int64)
     case person(server: String, id: Int64)

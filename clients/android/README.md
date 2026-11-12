@@ -39,6 +39,10 @@ What works now:
 - Convert video (format, size, speed, sound), followed on the server with progress and Stop.
 - The folder's ⋮ menu: New file (text, Markdown, Word, spreadsheet, and more), Folder size,
   Download as ZIP (to share), Bookmark this folder and Bookmarks…, and Show hidden files.
+- Folder tools: Find duplicates (keeps the oldest copy of each by default; untick to keep
+  more, then move the rest to the Trash), Sort into folders (by date taken, modified, or in
+  the name; kind; extension; first letter; or your own pattern, with a preview and Undo), and
+  Activity (what people did on the server lately).
   Servers started with `--readonly` show no write actions.
 
 - Each signed-in server appears in the system file picker and the Files app, so any app can

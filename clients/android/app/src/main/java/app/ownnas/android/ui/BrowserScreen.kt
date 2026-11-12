@@ -83,6 +83,9 @@ import androidx.compose.material.icons.outlined.DataUsage
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material.icons.automirrored.outlined.NoteAdd
+import androidx.compose.material.icons.outlined.FileCopy
+import androidx.compose.material.icons.outlined.History
+import androidx.compose.material.icons.automirrored.outlined.DriveFileMove
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -591,6 +594,23 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
                                         if (dialog is Dialog.Bookmarks) dialog = Dialog.Bookmarks(paths)
                                     }
                                 },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Find duplicates…") },
+                                leadingIcon = { Icon(Icons.Outlined.FileCopy, contentDescription = null) },
+                                onClick = { menu = false; vm.push(Screen.Duplicates(serverId, path)) },
+                            )
+                            if (writable && !inTrash(path)) {
+                                DropdownMenuItem(
+                                    text = { Text("Sort into folders…") },
+                                    leadingIcon = { Icon(Icons.AutoMirrored.Outlined.DriveFileMove, contentDescription = null) },
+                                    onClick = { menu = false; vm.push(Screen.SortFolder(serverId, path)) },
+                                )
+                            }
+                            DropdownMenuItem(
+                                text = { Text("Activity") },
+                                leadingIcon = { Icon(Icons.Outlined.History, contentDescription = null) },
+                                onClick = { menu = false; vm.push(Screen.Activity(serverId)) },
                             )
                             DropdownMenuItem(
                                 text = { Text(if (showHidden) "Hide hidden files" else "Show hidden files") },

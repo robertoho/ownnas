@@ -85,6 +85,72 @@ pub struct Entry {
     pub protected: Option<String>,
 }
 
+/// Files with the same contents.
+#[derive(uniffi::Record)]
+pub struct Duplicates {
+    pub groups: Vec<DuplicateGroup>,
+    /// Room the extra copies take.
+    pub wasted: u64,
+    pub truncated: bool,
+}
+
+#[derive(uniffi::Record)]
+pub struct DuplicateGroup {
+    pub size: u64,
+    pub sha256: String,
+    pub copies: Vec<DuplicateCopy>,
+}
+
+#[derive(uniffi::Record)]
+pub struct DuplicateCopy {
+    pub path: String,
+    /// Milliseconds since 1970.
+    pub modified: i64,
+}
+
+/// Which copies of a group to keep and which to move to the Trash.
+#[derive(uniffi::Record)]
+pub struct DuplicateChoice {
+    pub sha256: String,
+    pub keep: Vec<String>,
+    pub remove: Vec<String>,
+}
+
+#[derive(uniffi::Record)]
+pub struct TrashedDuplicates {
+    pub trashed: u64,
+    pub freed: u64,
+    /// "path: why" for copies left alone.
+    pub skipped: Vec<String>,
+}
+
+/// A file a sort moves: from where, into which folder.
+#[derive(uniffi::Record, Clone)]
+pub struct SortMove {
+    pub from: String,
+    pub to: String,
+}
+
+/// What a sort would do (or did).
+#[derive(uniffi::Record)]
+pub struct SortResult {
+    pub moves: Vec<SortMove>,
+    pub total: u64,
+    pub folders: u64,
+    pub in_place: u64,
+    pub failed: u64,
+}
+
+/// Something someone did on the server.
+#[derive(uniffi::Record)]
+pub struct ActivityEvent {
+    pub username: String,
+    pub action: String,
+    pub detail: String,
+    /// Milliseconds since 1970.
+    pub created_at: i64,
+}
+
 /// How much a folder holds.
 #[derive(uniffi::Record)]
 pub struct FolderUsage {
@@ -499,6 +565,62 @@ impl Server {
 
     pub fn cancel_video_job(&self, id: String) -> Result<(), ClientError> {
         Ok(self.api.cancel_video_job(&id)?)
+    }
+
+    /// Files with the same contents in `path` and below.
+    pub fn duplicates(&self, path: String) -> Result<Duplicates, ClientError> {
+        let found = self.api.duplicates(&path)?;
+        Ok(Duplicates {
+            wasted: found.wasted,
+            truncated: found.truncated,
+            groups: found
+                .groups
+                .into_iter()
+                .map(|group| DuplicateGroup {
+                    size: group.size,
+                    sha256: group.sha256,
+                    copies: group.copies.into_iter().map(|copy| DuplicateCopy { path: copy.path, modified: copy.modified * 1000 }).collect(),
+                })
+                .collect(),
+        })
+    }
+
+    /// Moves extra copies to the Trash.
+    pub fn trash_duplicates(&self, choices: Vec<DuplicateChoice>) -> Result<TrashedDuplicates, ClientError> {
+        let choices: Vec<_> = choices
+            .into_iter()
+            .map(|c| ownnas_core::manage::DuplicateChoice { sha256: c.sha256, keep: c.keep, remove: c.remove })
+            .collect();
+        let (trashed, freed, skipped) = self.api.trash_duplicates(&choices)?;
+        Ok(TrashedDuplicates { trashed, freed, skipped })
+    }
+
+    /// What sorting a folder by `pattern` would do; with `apply`, does it.
+    pub fn sort_folder(&self, path: String, pattern: String, date: String, recursive: bool, months: Vec<String>, apply: bool) -> Result<SortResult, ClientError> {
+        let result = self.api.sort_folder(&path, &pattern, &date, recursive, &months, apply)?;
+        Ok(SortResult {
+            moves: result.moves.into_iter().map(|m| SortMove { from: m.from, to: m.to }).collect(),
+            total: result.total,
+            folders: result.folders,
+            in_place: result.in_place,
+            failed: result.failed,
+        })
+    }
+
+    /// Puts back what a sort moved; returns how many went back.
+    pub fn undo_sort(&self, moves: Vec<SortMove>) -> Result<u64, ClientError> {
+        let moves: Vec<_> = moves.into_iter().map(|m| ownnas_core::manage::SortMove { from: m.from, to: m.to }).collect();
+        Ok(self.api.undo_sort(&moves)?)
+    }
+
+    /// What people did on the server lately.
+    pub fn activity(&self) -> Result<Vec<ActivityEvent>, ClientError> {
+        Ok(self
+            .api
+            .activity()?
+            .into_iter()
+            .map(|e| ActivityEvent { username: e.username, action: e.action, detail: e.detail, created_at: e.created_at * 1000 })
+            .collect())
     }
 
     /// Files and folders in `path` and below whose name, tags, or contents (text, PDFs, and
