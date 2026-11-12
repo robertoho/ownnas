@@ -41,6 +41,10 @@ pub struct Entry {
     pub kind: String,
     /// The server can make a thumbnail for it.
     pub thumb: bool,
+    /// Protected from deletion: "self", "contents" (a folder and everything in it), or
+    /// "inside" a protected folder.
+    #[serde(default)]
+    pub protected: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]

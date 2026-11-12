@@ -146,6 +146,8 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.work.runtime.ktx)
+    // The document scanner in the + sheet (runs in Google Play services).
+    implementation(libs.mlkit.document.scanner)
     implementation("${libs.jna.get()}@aar")
     debugImplementation(libs.androidx.compose.ui.tooling)
 }

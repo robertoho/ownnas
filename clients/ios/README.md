@@ -20,8 +20,26 @@ What works now:
     web app's endpoint.
   - When a name is taken, the app asks with the same choices: replace, keep both, keep the
     newer one, archive the existing one, or skip.
+  - **Scan documents:** the system document camera finds the page's edges, takes the photo when
+    the page is steady and in focus, straightens it, and offers more pages, retakes, cropping,
+    and filters (colour, greyscale, black and white, photo). The scan is then named and
+    uploaded as one PDF or a JPEG per page. PDFs carry the text Vision reads on each page as an
+    invisible layer, so they can be searched (on the server too) and their text selected.
+    Debug builds on the Simulator, which has no camera, scan two sample pages instead.
 - **Changing files:** new folder, rename, and move to the Trash. Servers started with
   `--readonly` show no write actions.
+- **Selecting several:** "Select" in the ⋯ menu (or in a row's long-press menu), then tap rows
+  or Select All. The bottom bar has Share, Move to…, Copy to…, and Trash (Restore and Delete in
+  the Trash), and More has Rename, Duplicate, Tag…, Compress to ZIP, Extract (an archive), and
+  New folder with the selection. Move and copy pick the destination in a folder browser that
+  can make new folders; when a name is taken there the server keeps both. A row's long-press
+  menu has the same actions for that item alone.
+- **More actions, as in the web app:** Cut or Copy, then "Paste here" in another folder;
+  Protect from deletion and Allow deletion; Compress to ZIP, TAR.GZ, TAR.XZ, or TAR, and Extract
+  here; photos: Convert to (JPEG, PNG, WebP, GIF, BMP, TIFF) and Resize (Small to 4K, half,
+  quarter; as copies or in place); PDFs: Join, Extract pages, Split into pages, Rotate pages;
+  Versions (restore or delete an earlier version); Add to album. Inside the Trash, the ⋯ menu
+  empties it.
 - **Gallery:**
   - Photos by day, with On this day above them.
   - Albums inside albums, people (when the server has faces on), places on a map, and tags.

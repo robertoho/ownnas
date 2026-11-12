@@ -27,6 +27,8 @@ final class Hub: ObservableObject {
     @Published var path: [Route] = []
     /// Bumped after every change made from this device, so open folders reload.
     @Published private(set) var revision = 0
+    /// Items cut or copied in one folder, waiting to be pasted in another.
+    @Published var clipboard: Clip?
 
     let store = ServerStore()
     private var connections: [String: Server] = [:]
@@ -198,4 +200,11 @@ func userMessage(_ error: Error) -> String {
 func isCancel(_ error: Error) -> Bool {
     if case ClientError.Cancelled = error { return true }
     return error is CancellationError
+}
+
+/// Items cut or copied, waiting to be pasted into another folder of the same server.
+struct Clip {
+    let server: String
+    let entries: [Entry]
+    let cut: Bool
 }

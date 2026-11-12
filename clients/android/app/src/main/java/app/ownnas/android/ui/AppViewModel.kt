@@ -109,6 +109,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private var uploader: Job? = null
     private var uploadTracker: Tracker? = null
     private var lastUploadError: String? = null
+    /** Items cut or copied in one folder, waiting to be pasted in another. */
+    private val clipState = MutableStateFlow<Clip?>(null)
+    val clipboard: StateFlow<Clip?> = clipState.asStateFlow()
+
+    fun clip(items: Clip?) {
+        clipState.value = items
+    }
+
     private val conflictState = MutableStateFlow<ConflictPrompt?>(null)
     val conflict: StateFlow<ConflictPrompt?> = conflictState.asStateFlow()
 
@@ -203,6 +211,62 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     suspend fun trash(id: String, entry: Entry) {
         change(id, entry.path.parentPath()) { it.trash(entry.path) }
+    }
+
+    /** Moves into the folder `dest`; returns the new path. */
+    suspend fun moveTo(id: String, entry: Entry, dest: String): String =
+        change(id, entry.path.parentPath()) { it.moveTo(entry.path, dest) }.also { hub.changed(id, dest) }
+
+    /** Copies into the folder `dest`, keeping both when the name is taken; returns the copy's path. */
+    suspend fun copyTo(id: String, entry: Entry, dest: String): String =
+        change(id, dest) { it.copyTo(entry.path, dest) }
+
+    suspend fun duplicate(id: String, entry: Entry): String =
+        change(id, entry.path.parentPath()) { it.duplicate(entry.path) }
+
+    /** Puts an item in the Trash back where it was. */
+    suspend fun restore(id: String, entry: Entry): String =
+        change(id, entry.path.parentPath()) { it.restore(entry.path) }.also { hub.changed(id, it.parentPath()) }
+
+    /** Packs items from the folder `dir` into an archive there; returns its path. */
+    suspend fun compress(id: String, dir: String, entries: List<Entry>, format: String): String =
+        change(id, dir) { server -> server.compress(entries.map { it.path }, format) }
+
+    /** Unpacks an archive into a folder beside it. */
+    suspend fun extract(id: String, entry: Entry): List<String> =
+        change(id, entry.path.parentPath()) { it.extract(entry.path, false) }
+
+    suspend fun addTag(id: String, entry: Entry, tag: String): String =
+        call(id) { it.addTag(entry.path, tag.trim()) }
+
+    /** Unpacks an archive loose into the folder it is in. */
+    suspend fun extractHere(id: String, entry: Entry): List<String> =
+        change(id, entry.path.parentPath()) { it.extract(entry.path, true) }
+
+    suspend fun setProtection(id: String, dir: String, entries: List<Entry>, protect: Boolean, contents: Boolean) =
+        change(id, dir) { server -> server.setProtection(entries.map { it.path }, protect, contents) }
+
+    suspend fun convertImage(id: String, entry: Entry, format: String): String =
+        change(id, entry.path.parentPath()) { it.convertImage(entry.path, format) }
+
+    /** False when the photo was that small already. */
+    suspend fun resizeImage(id: String, entry: Entry, choice: ResizeChoice): Boolean =
+        change(id, entry.path.parentPath()) { it.resizeImage(entry.path, choice.percent?.toUInt(), choice.longest?.toUInt(), choice.replace) }
+
+    suspend fun pdfMerge(id: String, entries: List<Entry>): String =
+        change(id, entries.first().path.parentPath()) { server -> server.pdfMerge(entries.map { it.path }) }
+
+    suspend fun pdfExtract(id: String, entry: Entry, pages: String, separate: Boolean): List<String> =
+        change(id, entry.path.parentPath()) { it.pdfExtract(entry.path, pages, separate) }
+
+    suspend fun pdfSplit(id: String, entry: Entry): List<String> =
+        change(id, entry.path.parentPath()) { it.pdfSplit(entry.path) }
+
+    suspend fun pdfRotate(id: String, entry: Entry, pages: String, degrees: Long): String =
+        change(id, entry.path.parentPath()) { it.pdfRotate(entry.path, pages, degrees) }
+
+    suspend fun emptyTrash(id: String, trash: String) {
+        change(id, trash) { it.emptyTrash() }
     }
 
     /** Queues picked files; they upload one at a time, in order, while the app is open. */
@@ -464,3 +528,6 @@ fun Throwable.userMessage(): String = when (this) {
     is ClientException.Failed -> reason
     else -> message ?: "Something went wrong"
 }
+
+/** Items cut or copied, waiting to be pasted into another folder of the same server. */
+data class Clip(val serverId: String, val entries: List<Entry>, val cut: Boolean)

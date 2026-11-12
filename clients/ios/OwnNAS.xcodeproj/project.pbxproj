@@ -21,10 +21,12 @@
 		5070C8488EC0955B5B70CBCD /* ownnas_ffi.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04AA69F933C6090E0AE462DC /* ownnas_ffi.swift */; };
 		5AAE3048D51CEFF6795D0A57 /* KeepActions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CEC9B48F0B4BEA503B3E10B /* KeepActions.swift */; };
 		908F00D15D2DA029B5697E05 /* FileProviderExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7411204C4EF3C9D33BE13749 /* FileProviderExtension.swift */; };
+		929A0A361696EBDFA225A6FE /* Selection.swift in Sources */ = {isa = PBXBuildFile; fileRef = ED414A398AA6A65B7359DA31 /* Selection.swift */; };
 		942BFB2D2DFAEED938032004 /* PhotoViewer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A8416C60AC061B7AEC9D9DA /* PhotoViewer.swift */; };
 		95CC32D8BF8D704129E98A02 /* TerminalsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E109B2DCCECD9C31053600D9 /* TerminalsView.swift */; };
 		97CB8FAE87ADAD790EFE9104 /* OwnNASCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 928AE3C0126BC1ABA1DEC5F2 /* OwnNASCore.xcframework */; };
 		98053B969B48DECB6A4BC650 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = E133809D16D6B176C6A59473 /* Assets.xcassets */; };
+		9BC6BE40BD362731C1F71BF8 /* Scanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0E576D1B1F3CAA686EE9C22 /* Scanner.swift */; };
 		A16CF766511BAE39893A1DD4 /* Thumbnails.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFB1417D2601BB3E7132C727 /* Thumbnails.swift */; };
 		A70AEA8B47BA5631053744E4 /* OwnNASApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = BAEAF5CDE1B66B842C0689A0 /* OwnNASApp.swift */; };
 		B81BB4028C0710CAE89E144E /* ServersView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20D342AB6339FE835FDC93CE /* ServersView.swift */; };
@@ -90,11 +92,13 @@
 		B031F36731800352F9D3B2A5 /* ItemIds.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ItemIds.swift; sourceTree = "<group>"; };
 		B78C6CABDFDE4B44556FD3FF /* FilesDomains.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilesDomains.swift; sourceTree = "<group>"; };
 		BAEAF5CDE1B66B842C0689A0 /* OwnNASApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OwnNASApp.swift; sourceTree = "<group>"; };
+		C0E576D1B1F3CAA686EE9C22 /* Scanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Scanner.swift; sourceTree = "<group>"; };
 		CFB1417D2601BB3E7132C727 /* Thumbnails.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Thumbnails.swift; sourceTree = "<group>"; };
 		E109B2DCCECD9C31053600D9 /* TerminalsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalsView.swift; sourceTree = "<group>"; };
 		E133809D16D6B176C6A59473 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		EB0BD4B1B50C206BAA75C117 /* OwnNASFiles.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = OwnNASFiles.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		EBC692B849F9A358CE574E20 /* TerminalScreenView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalScreenView.swift; sourceTree = "<group>"; };
+		ED414A398AA6A65B7359DA31 /* Selection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Selection.swift; sourceTree = "<group>"; };
 		F0DB9F497AB77453B1F38215 /* BrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrowserView.swift; sourceTree = "<group>"; };
 		F5249859B6A73AF340C3C0E1 /* OwnNAS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = OwnNAS.entitlements; sourceTree = "<group>"; };
 		FEA07065F0F048990E55F0FB /* WalkthroughTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalkthroughTests.swift; sourceTree = "<group>"; };
@@ -126,6 +130,8 @@
 				2D6DDB83F02A6DAC193CBE3D /* BackupView.swift */,
 				F0DB9F497AB77453B1F38215 /* BrowserView.swift */,
 				93EB9DB33C50051205E95F57 /* FileActions.swift */,
+				C0E576D1B1F3CAA686EE9C22 /* Scanner.swift */,
+				ED414A398AA6A65B7359DA31 /* Selection.swift */,
 				20D342AB6339FE835FDC93CE /* ServersView.swift */,
 				60C85EAC6C24FFBC09BBF7FF /* SignInView.swift */,
 				DF5CAB5BB3DDEE027586119C /* Gallery */,
@@ -387,6 +393,8 @@
 				1C6ADCBA7CE70C94B1FA9822 /* PhotoBackup.swift in Sources */,
 				0C4CD0A871629C639FBED2E7 /* PhotoGrid.swift in Sources */,
 				942BFB2D2DFAEED938032004 /* PhotoViewer.swift in Sources */,
+				9BC6BE40BD362731C1F71BF8 /* Scanner.swift in Sources */,
+				929A0A361696EBDFA225A6FE /* Selection.swift in Sources */,
 				09EF7119196095C2D4AB13FA /* ServerStore.swift in Sources */,
 				B81BB4028C0710CAE89E144E /* ServersView.swift in Sources */,
 				097F5194A640DAD9E3CEEA8D /* SignInView.swift in Sources */,

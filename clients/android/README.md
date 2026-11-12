@@ -17,7 +17,25 @@ What works now:
   with the same choices (overwrite, keep both, archive older, archive existing, ignore), and
   the activity log records them the same way. Files stream from the picker, show progress,
   and can be cancelled.
+- Scan documents (the + button): Google's document scanner (ML Kit, run by Google Play
+  services, which downloads it the first time) finds the page's edges, takes the photo when the
+  page is steady, straightens it, and offers crop and rotate, filters (colour, greyscale, black
+  and white), removing stains and fingers, more pages, and importing photos from the gallery.
+  The scan is then named ("Scan 2026-11-12 14.30" by default) and uploaded as one PDF or a JPEG
+  per page. Phones without Google Play services cannot scan.
 - New folder, rename, and move to the server's Trash (restorable from the web app).
+- Select several files and folders: long-press a row (or "Select" in its ⋮ menu), tap more,
+  or select all. The bar below offers Share, Move to…, Copy to…, and Trash (Restore and
+  Delete in the Trash), and More has Rename, Duplicate, Tag…, Compress to ZIP, Extract (an
+  archive), and New folder with the selection. Move and copy choose the destination in a
+  folder picker that can make new folders; when a name is taken there the server keeps both.
+  Each row's ⋮ menu has the same actions for that item alone.
+- More actions on selections, as in the web app: Cut or Copy, then "Paste here" in another
+  folder; Protect from deletion (for folders: the folder itself, or everything in it) and
+  Allow deletion; Compress to ZIP, TAR.GZ, TAR.XZ, or TAR, and Extract here; photos: Convert
+  to (JPEG, PNG, WebP, GIF, BMP, TIFF) and Resize (Small to 4K, half, quarter; as copies or in
+  place); PDFs: Join, Extract pages, Split into pages, Rotate pages; Versions (restore or
+  delete an earlier version); Add to album. Inside the Trash, the folder menu empties it.
   Servers started with `--readonly` show no write actions.
 
 - Each signed-in server appears in the system file picker and the Files app, so any app can

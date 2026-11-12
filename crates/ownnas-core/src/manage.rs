@@ -160,6 +160,36 @@ fn form_parts(boundary: &str, name: &str) -> (Vec<u8>, Vec<u8>) {
     (head.into_bytes(), tail.into_bytes())
 }
 
+/// An earlier version of a file, kept when it was replaced.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct FileVersion {
+    pub id: i64,
+    /// When it was replaced (seconds since 1970).
+    pub saved_at: i64,
+    /// When it had last been changed before that (seconds since 1970).
+    pub modified: i64,
+    pub size: u64,
+    pub by: String,
+    /// What replaced it: "edit", "upload", "sync", or "restore".
+    pub reason: String,
+}
+
+fn paths_of(response: ureq::Response) -> Result<Vec<String>, ApiError> {
+    #[derive(Deserialize)]
+    struct Made {
+        #[serde(default)]
+        paths: Vec<String>,
+    }
+    let made: Made = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
+    Ok(made.paths)
+}
+
+fn path_of(response: ureq::Response) -> Result<String, ApiError> {
+    let body: PathResponse = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
+    body.path.ok_or_else(|| ApiError::Other("The server did not say where the item went".into()))
+}
+
 impl Api {
     /// Creates `name` inside `parent` and returns its path.
     pub fn create_folder(&self, parent: &str, name: &str) -> Result<String, ApiError> {
@@ -179,6 +209,152 @@ impl Api {
         let response = self.post_json("/api/move", json!({ "path": path, "dest": dest }))?;
         let body: PathResponse = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
         body.path.ok_or_else(|| ApiError::Other("The server did not say where the item went".into()))
+    }
+
+    /// Copies a file or folder into the folder `dest`; returns the copy's path. When the name
+    /// is taken there, the server keeps both ("name (2)").
+    pub fn copy_to(&self, path: &str, dest: &str) -> Result<String, ApiError> {
+        let response = self.post_json("/api/copy", json!({ "path": path, "dest": dest }))?;
+        path_of(response)
+    }
+
+    /// Copies a file or folder next to itself ("name copy"); returns the copy's path.
+    pub fn duplicate(&self, path: &str) -> Result<String, ApiError> {
+        let response = self.post_json("/api/duplicate", json!({ "path": path }))?;
+        path_of(response)
+    }
+
+    /// Puts an item in the Trash back where it was; returns its path.
+    pub fn restore(&self, path: &str) -> Result<String, ApiError> {
+        let response = self.post_json("/api/restore", json!({ "path": path }))?;
+        path_of(response)
+    }
+
+    /// Packs `paths` (all in one folder) into an archive next to them; `format` is "zip",
+    /// "tar", "tar.gz", or "tar.xz". Returns the archive's path.
+    pub fn compress(&self, paths: &[String], format: &str) -> Result<String, ApiError> {
+        let response = self.post_json("/api/compress", json!({ "paths": paths, "format": format }))?;
+        path_of(response)
+    }
+
+    /// Unpacks an archive into a folder next to it, or straight beside it with `here`.
+    /// Returns the paths it made.
+    pub fn extract(&self, path: &str, here: bool) -> Result<Vec<String>, ApiError> {
+        #[derive(serde::Deserialize)]
+        struct Made {
+            #[serde(default)]
+            paths: Vec<String>,
+        }
+        let response = self.post_json("/api/extract", json!({ "path": path, "here": here }))?;
+        let made: Made = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
+        Ok(made.paths)
+    }
+
+    /// Adds a tag to a file or folder; returns the tag as the server stored it.
+    pub fn add_tag(&self, path: &str, tag: &str) -> Result<String, ApiError> {
+        #[derive(serde::Deserialize)]
+        struct Tagged {
+            tag: String,
+        }
+        let response = self.post_json("/api/tags", json!({ "path": path, "tag": tag }))?;
+        let tagged: Tagged = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
+        Ok(tagged.tag)
+    }
+
+    /// Protects items from deletion, or allows it again. `contents` also covers everything in
+    /// folders.
+    pub fn set_protection(&self, paths: &[String], protect: bool, contents: bool) -> Result<(), ApiError> {
+        self.post_json("/api/protect", json!({ "paths": paths, "protect": protect, "contents": contents }))?;
+        Ok(())
+    }
+
+    /// Saves a copy of a photo in another format ("jpeg", "png", "webp", "gif", "bmp",
+    /// "tiff") beside it; returns the copy's path.
+    pub fn convert_image(&self, path: &str, format: &str) -> Result<String, ApiError> {
+        path_of(self.post_json("/api/convert-image", json!({ "path": path, "format": format }))?)
+    }
+
+    /// Makes a photo smaller: to `percent` of its size, or to fit `longest` pixels on its long
+    /// side. With `replace` the original goes to the Trash; otherwise a copy is made. Returns
+    /// whether it was resized (photos already that small are left alone).
+    pub fn resize_image(&self, path: &str, percent: Option<u32>, longest: Option<u32>, replace: bool) -> Result<bool, ApiError> {
+        #[derive(serde::Deserialize)]
+        struct Problem {
+            #[serde(default)]
+            error: serde_json::Value,
+        }
+        #[derive(serde::Deserialize)]
+        struct Resized {
+            #[serde(default)]
+            resized: Vec<serde_json::Value>,
+            #[serde(default)]
+            problems: Vec<Problem>,
+        }
+        let mut body = json!({ "paths": [path], "replace": replace });
+        if let Some(percent) = percent {
+            body["percent"] = json!(percent);
+        }
+        if let Some(longest) = longest {
+            body["width"] = json!(longest);
+            body["height"] = json!(longest);
+        }
+        let done: Resized = self.post_json("/api/images/resize", body)?.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
+        if let Some(problem) = done.problems.first() {
+            let message = problem.error.as_str().map(String::from).unwrap_or_else(|| problem.error.to_string());
+            return Err(ApiError::Other(message));
+        }
+        Ok(!done.resized.is_empty())
+    }
+
+    /// Copies pages ("1,3,5-8") of a PDF into a new PDF, or one PDF per page with
+    /// `separate`; returns the paths made.
+    pub fn pdf_extract(&self, path: &str, pages: &str, separate: bool) -> Result<Vec<String>, ApiError> {
+        let mode = if separate { "separate" } else { "combined" };
+        paths_of(self.post_json("/api/pdf/extract", json!({ "path": path, "pages": pages, "mode": mode }))?)
+    }
+
+    /// One PDF per page, in a folder beside it; returns the paths made.
+    pub fn pdf_split(&self, path: &str) -> Result<Vec<String>, ApiError> {
+        paths_of(self.post_json("/api/pdf/split", json!({ "path": path }))?)
+    }
+
+    /// Joins PDFs, in this order, into a new one beside the first; returns its path.
+    pub fn pdf_merge(&self, paths: &[String]) -> Result<String, ApiError> {
+        path_of(self.post_json("/api/pdf/merge", json!({ "paths": paths }))?)
+    }
+
+    /// Turns pages (all when `pages` is empty) clockwise by 90, 180, or 270 degrees, into a
+    /// new PDF; returns its path.
+    pub fn pdf_rotate(&self, path: &str, pages: &str, degrees: i64) -> Result<String, ApiError> {
+        let pages = if pages.trim().is_empty() { serde_json::Value::Null } else { json!(pages.trim()) };
+        path_of(self.post_json("/api/pdf/rotate", json!({ "path": path, "pages": pages, "degrees": degrees }))?)
+    }
+
+    /// Earlier versions of a file, newest first.
+    pub fn versions(&self, path: &str) -> Result<Vec<FileVersion>, ApiError> {
+        #[derive(serde::Deserialize)]
+        struct Versions {
+            versions: Vec<FileVersion>,
+        }
+        let found: Versions = self.get_json("/api/versions", &[("path", path)])?;
+        Ok(found.versions)
+    }
+
+    /// Puts an earlier version back; what it replaces becomes a version too.
+    pub fn restore_version(&self, id: i64) -> Result<(), ApiError> {
+        self.post_json("/api/versions/restore", json!({ "id": id }))?;
+        Ok(())
+    }
+
+    pub fn delete_version(&self, id: i64) -> Result<(), ApiError> {
+        self.post_json("/api/versions/delete", json!({ "id": id }))?;
+        Ok(())
+    }
+
+    /// Deletes everything in the Trash for good.
+    pub fn empty_trash(&self) -> Result<(), ApiError> {
+        self.post_json("/api/trash/empty", json!({}))?;
+        Ok(())
     }
 
     /// Whether the library already has a photo with these contents.

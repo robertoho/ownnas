@@ -28,6 +28,8 @@
 	<false/>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>OwnNAS uses the camera to scan documents into your server.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>OwnNAS connects to your OwnNAS server on your home network or VPN.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>

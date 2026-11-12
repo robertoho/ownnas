@@ -80,6 +80,23 @@ pub struct Entry {
     pub modified: i64,
     pub kind: String,
     pub thumb: bool,
+    /// Protected from deletion: "self", "contents", or "inside" a protected folder.
+    #[uniffi(default = None)]
+    pub protected: Option<String>,
+}
+
+/// An earlier version of a file, kept when it was replaced.
+#[derive(uniffi::Record)]
+pub struct FileVersion {
+    pub id: i64,
+    /// When it was replaced (milliseconds since 1970).
+    pub saved_at: i64,
+    /// When it had last been changed before that (milliseconds since 1970).
+    pub modified: i64,
+    pub size: u64,
+    pub by: String,
+    /// What replaced it: "edit", "upload", "sync", or "restore".
+    pub reason: String,
 }
 
 #[derive(uniffi::Record)]
@@ -276,6 +293,7 @@ impl Server {
                     modified: if entry.mtime_ms > 0 { entry.mtime_ms } else { entry.modified.saturating_mul(1000) },
                     kind: entry.kind,
                     thumb: entry.thumb,
+                    protected: entry.protected,
                 })
                 .collect(),
         })
@@ -311,6 +329,105 @@ impl Server {
     /// Moves into the folder `dest` (`""` is the top); returns the new path.
     pub fn move_to(&self, path: String, dest: String) -> Result<String, ClientError> {
         Ok(self.api.move_to(&path, &dest)?)
+    }
+
+    /// Copies into the folder `dest`, keeping both when the name is taken; returns the copy's path.
+    pub fn copy_to(&self, path: String, dest: String) -> Result<String, ClientError> {
+        Ok(self.api.copy_to(&path, &dest)?)
+    }
+
+    /// Copies next to itself ("name copy"); returns the copy's path.
+    pub fn duplicate(&self, path: String) -> Result<String, ClientError> {
+        Ok(self.api.duplicate(&path)?)
+    }
+
+    /// Puts an item in the Trash back where it was; returns its path.
+    pub fn restore(&self, path: String) -> Result<String, ClientError> {
+        Ok(self.api.restore(&path)?)
+    }
+
+    /// Packs items from one folder into an archive beside them ("zip", "tar", "tar.gz",
+    /// "tar.xz"); returns its path.
+    pub fn compress(&self, paths: Vec<String>, format: String) -> Result<String, ClientError> {
+        Ok(self.api.compress(&paths, &format)?)
+    }
+
+    /// Unpacks an archive into a folder beside it, or loose beside it with `here`; returns
+    /// the paths made.
+    pub fn extract(&self, path: String, here: bool) -> Result<Vec<String>, ClientError> {
+        Ok(self.api.extract(&path, here)?)
+    }
+
+    /// Tags a file or folder; returns the tag as stored.
+    pub fn add_tag(&self, path: String, tag: String) -> Result<String, ClientError> {
+        Ok(self.api.add_tag(&path, &tag)?)
+    }
+
+    /// Protects items from deletion, or allows it again; `contents` covers what folders hold.
+    pub fn set_protection(&self, paths: Vec<String>, protect: bool, contents: bool) -> Result<(), ClientError> {
+        Ok(self.api.set_protection(&paths, protect, contents)?)
+    }
+
+    /// A copy of a photo in another format beside it; returns its path.
+    pub fn convert_image(&self, path: String, format: String) -> Result<String, ClientError> {
+        Ok(self.api.convert_image(&path, &format)?)
+    }
+
+    /// Makes a photo smaller (to `percent`, or to fit `longest` pixels), as a copy or in place
+    /// with `replace`. False when it was that small already.
+    pub fn resize_image(&self, path: String, percent: Option<u32>, longest: Option<u32>, replace: bool) -> Result<bool, ClientError> {
+        Ok(self.api.resize_image(&path, percent, longest, replace)?)
+    }
+
+    /// Pages ("1,3,5-8") of a PDF into a new one, or one per page with `separate`.
+    pub fn pdf_extract(&self, path: String, pages: String, separate: bool) -> Result<Vec<String>, ClientError> {
+        Ok(self.api.pdf_extract(&path, &pages, separate)?)
+    }
+
+    /// One PDF per page, in a folder beside it.
+    pub fn pdf_split(&self, path: String) -> Result<Vec<String>, ClientError> {
+        Ok(self.api.pdf_split(&path)?)
+    }
+
+    /// Joins PDFs in this order; returns the new one's path.
+    pub fn pdf_merge(&self, paths: Vec<String>) -> Result<String, ClientError> {
+        Ok(self.api.pdf_merge(&paths)?)
+    }
+
+    /// Turns pages (all when `pages` is empty) clockwise; returns the new PDF's path.
+    pub fn pdf_rotate(&self, path: String, pages: String, degrees: i64) -> Result<String, ClientError> {
+        Ok(self.api.pdf_rotate(&path, &pages, degrees)?)
+    }
+
+    /// Earlier versions of a file, newest first.
+    pub fn versions(&self, path: String) -> Result<Vec<FileVersion>, ClientError> {
+        Ok(self
+            .api
+            .versions(&path)?
+            .into_iter()
+            .map(|version| FileVersion {
+                id: version.id,
+                saved_at: version.saved_at * 1000,
+                modified: version.modified * 1000,
+                size: version.size,
+                by: version.by,
+                reason: version.reason,
+            })
+            .collect())
+    }
+
+    /// Puts an earlier version back.
+    pub fn restore_version(&self, id: i64) -> Result<(), ClientError> {
+        Ok(self.api.restore_version(id)?)
+    }
+
+    pub fn delete_version(&self, id: i64) -> Result<(), ClientError> {
+        Ok(self.api.delete_version(id)?)
+    }
+
+    /// Deletes everything in the Trash for good.
+    pub fn empty_trash(&self) -> Result<(), ClientError> {
+        Ok(self.api.empty_trash()?)
     }
 
     /// Files and folders in `path` and below whose name, tags, or contents (text, PDFs, and

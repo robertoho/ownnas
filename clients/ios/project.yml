@@ -44,6 +44,7 @@ targets:
           UIApplicationSupportsMultipleScenes: true
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        NSCameraUsageDescription: OwnNAS uses the camera to scan documents into your server.
         NSLocalNetworkUsageDescription: OwnNAS connects to your OwnNAS server on your home network or VPN.
         NSPhotoLibraryAddUsageDescription: OwnNAS saves the photos and videos you choose to your library.
         NSPhotoLibraryUsageDescription: OwnNAS backs up your photos and videos to your OwnNAS server.

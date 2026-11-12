@@ -15,8 +15,10 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.CreateNewFolder
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.DocumentScanner
 import androidx.compose.material.icons.outlined.DriveFileRenameOutline
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.Share
@@ -59,31 +61,25 @@ import app.ownnas.core.Conflict
 import app.ownnas.core.Entry
 import java.io.File
 
-enum class EntryAction { Share, Rename, Trash, OpenTerminal }
-
+/** A row's ⋮ menu: select it, open a terminal in a folder, and the selection actions for it alone. */
 @Composable
 fun EntryMenu(
     entry: Entry,
-    writable: Boolean,
+    actions: List<Bulk>,
     terminals: Boolean,
     expanded: Boolean,
     onDismiss: () -> Unit,
-    onPick: (EntryAction) -> Unit,
+    onSelect: () -> Unit,
+    onTerminal: () -> Unit,
+    onAction: (Bulk) -> Unit,
 ) {
     DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
-        val pick = { action: EntryAction -> onDismiss(); onPick(action) }
-        if (!entry.dir) MenuItem("Share", Icons.Outlined.Share) { pick(EntryAction.Share) }
+        MenuItem("Select", Icons.Outlined.CheckCircle) { onDismiss(); onSelect() }
         // As in the web app's folder menu.
         if (entry.dir && terminals && !inTrash(entry.path)) {
-            MenuItem("Open terminal here", Icons.Outlined.Terminal) { pick(EntryAction.OpenTerminal) }
+            MenuItem("Open terminal here", Icons.Outlined.Terminal) { onDismiss(); onTerminal() }
         }
-        if (writable) {
-            MenuItem("Rename", Icons.Outlined.DriveFileRenameOutline) { pick(EntryAction.Rename) }
-            MenuItem(if (inTrash(entry.path)) "Delete permanently" else "Move to Trash", Icons.Outlined.Delete) { pick(EntryAction.Trash) }
-        }
-        if (entry.dir && !writable && !terminals) {
-            DropdownMenuItem(text = { Text("This server is read-only") }, enabled = false, onClick = {})
-        }
+        actions.forEach { action -> MenuItem(action.label(listOf(entry)), action.icon) { onDismiss(); onAction(action) } }
     }
 }
 
@@ -94,11 +90,12 @@ private fun MenuItem(label: String, icon: ImageVector, onClick: () -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AddSheet(onDismiss: () -> Unit, onMedia: () -> Unit, onFiles: () -> Unit, onFolder: () -> Unit) {
+fun AddSheet(onDismiss: () -> Unit, onMedia: () -> Unit, onFiles: () -> Unit, onScan: () -> Unit, onFolder: () -> Unit) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(Modifier.navigationBarsPadding().padding(bottom = 16.dp)) {
             SheetRow("Upload photos and videos", Icons.Outlined.PhotoLibrary, onMedia)
             SheetRow("Upload files", Icons.Outlined.UploadFile, onFiles)
+            SheetRow("Scan documents", Icons.Outlined.DocumentScanner, onScan)
             SheetRow("New folder", Icons.Outlined.CreateNewFolder, onFolder)
         }
     }
@@ -156,13 +153,19 @@ fun NameDialog(
 }
 
 @Composable
-fun TrashDialog(entry: Entry, onDismiss: () -> Unit, onConfirm: () -> Unit) {
-    if (inTrash(entry.path)) {
+fun TrashDialog(entries: List<Entry>, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    val one = entries.singleOrNull()
+    if (entries.all { inTrash(it.path) }) {
         AlertDialog(
             onDismissRequest = onDismiss,
             icon = { Icon(Icons.Outlined.Delete, contentDescription = null) },
             title = { Text("Delete permanently?") },
-            text = { Text("“${entry.name}” is already in the Trash. Deleting it here cannot be undone.") },
+            text = {
+                Text(
+                    if (one != null) "“${one.name}” is already in the Trash. Deleting it here cannot be undone."
+                    else "These ${entries.size} items are already in the Trash. Deleting them here cannot be undone.",
+                )
+            },
             confirmButton = { TextButton(onClick = onConfirm) { Text("Delete") } },
             dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
         )
@@ -174,10 +177,10 @@ fun TrashDialog(entry: Entry, onDismiss: () -> Unit, onConfirm: () -> Unit) {
         title = { Text("Move to Trash?") },
         text = {
             Text(
-                if (entry.dir) {
-                    "“${entry.name}” and everything in it go to the server's Trash. You can restore them from the web app."
-                } else {
-                    "“${entry.name}” goes to the server's Trash. You can restore it from the web app."
+                when {
+                    one == null -> "These ${entries.size} items go to the server's Trash. You can restore them from the Trash."
+                    one.dir -> "“${one.name}” and everything in it go to the server's Trash. You can restore them from the Trash."
+                    else -> "“${one.name}” goes to the server's Trash. You can restore it from the Trash."
                 },
             )
         },
@@ -249,9 +252,9 @@ fun UploadBar(status: UploadStatus, onCancel: () -> Unit) {
     }
 }
 
-private fun File.contentUri(context: Context) = FileProvider.getUriForFile(context, "${context.packageName}.files", this)
+internal fun File.contentUri(context: Context) = FileProvider.getUriForFile(context, "${context.packageName}.files", this)
 
-private fun File.mimeType() =
+internal fun File.mimeType() =
     MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension.lowercase()) ?: "application/octet-stream"
 
 /** Shows the file in whichever app handles its type, such as Photos, a PDF reader, or a player. */
@@ -267,6 +270,18 @@ fun shareWithAnotherApp(context: Context, file: File) {
     val send = Intent(Intent.ACTION_SEND)
         .setType(file.mimeType())
         .putExtra(Intent.EXTRA_STREAM, file.contentUri(context))
+        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    context.startActivity(Intent.createChooser(send, null))
+}
+
+/** Offers several files to the share sheet at once. */
+fun shareManyWithAnotherApp(context: Context, files: List<File>) {
+    if (files.size == 1) return shareWithAnotherApp(context, files[0])
+    val types = files.map { it.mimeType() }.distinct()
+    val type = types.singleOrNull() ?: types.map { it.substringBefore('/') }.distinct().singleOrNull()?.let { "$it/*" } ?: "*/*"
+    val send = Intent(Intent.ACTION_SEND_MULTIPLE)
+        .setType(type)
+        .putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(files.map { it.contentUri(context) }))
         .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     context.startActivity(Intent.createChooser(send, null))
 }
