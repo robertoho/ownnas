@@ -40,6 +40,10 @@ What works now:
   quarter; as copies or in place); PDFs: Join, Extract pages, Split into pages, Rotate pages;
   Versions (restore or delete an earlier version); Add to album. Inside the Trash, the ⋯ menu
   empties it.
+- **Videos and folders:** Convert video (format, size, speed, sound), followed on the server with
+  progress and Stop. The ⋯ menu adds New file (text, Markdown, Word, spreadsheet, and more),
+  Folder size, Download as ZIP (to share), Bookmark this folder and Bookmarks…, and Show hidden
+  files.
 - **Gallery:**
   - Photos by day, with On this day above them.
   - Albums inside albums, people (when the server has faces on), places on a map, and tags.

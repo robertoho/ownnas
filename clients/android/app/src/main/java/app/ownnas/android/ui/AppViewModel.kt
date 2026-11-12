@@ -467,7 +467,43 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun cachedFolder(id: String, path: String): Folder? = folders[id to path]
 
     suspend fun list(id: String, path: String): Folder =
-        call(id) { it.list(path) }.also { folders[id to path] = it }
+        call(id) { it.listWithHidden(path, showHidden.value) }.also { folders[id to path] = it }
+
+    private val browserPrefs = application.getSharedPreferences("browser", android.content.Context.MODE_PRIVATE)
+    private val hiddenState = MutableStateFlow(browserPrefs.getBoolean("hidden", false))
+    /** Folders list hidden files (names starting with a dot), as the web app's toggle. */
+    val showHidden: StateFlow<Boolean> = hiddenState.asStateFlow()
+
+    fun setShowHidden(show: Boolean) {
+        browserPrefs.edit().putBoolean("hidden", show).apply()
+        hiddenState.value = show
+    }
+
+    suspend fun folderUsage(id: String, path: String) = call(id) { it.folderUsage(path) }
+
+    suspend fun bookmarks(id: String): List<String> = call(id) { it.bookmarks() }
+
+    suspend fun setBookmark(id: String, path: String, marked: Boolean) = call(id) { it.setBookmark(path, marked) }
+
+    suspend fun createFile(id: String, parent: String, name: String, kind: String): String =
+        change(id, parent) { it.createFile(parent, name.trim(), kind) }
+
+    /** A folder as a ZIP in the app's cache, ready to share. */
+    suspend fun downloadZip(id: String, path: String, name: String, tracker: Tracker): java.io.File = withContext(Dispatchers.IO) {
+        val file = java.io.File(getApplication<Application>().cacheDir, "opened/$id/zips/$name.zip")
+        file.parentFile?.mkdirs()
+        call(id) { it.downloadZip(path, file.absolutePath, tracker) }
+        file
+    }
+
+    suspend fun convertVideo(id: String, entry: Entry, choice: VideoChoice): app.ownnas.core.VideoJob =
+        call(id) { it.convertVideo(entry.path, choice.format, choice.height?.toUInt(), choice.speed, choice.audio) }
+
+    suspend fun videoJob(id: String, job: String): app.ownnas.core.VideoJob = call(id) { it.videoJob(job) }
+
+    suspend fun cancelVideoJob(id: String, job: String) {
+        runCatching { call(id) { it.cancelVideoJob(job) } }
+    }
 
     fun cachedThumbnail(key: String): ImageBitmap? = thumbnails.get(key)
 

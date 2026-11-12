@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -21,6 +22,8 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material.icons.outlined.VideoSettings
+import androidx.compose.material.icons.outlined.DataUsage
 import androidx.compose.material.icons.outlined.PhotoAlbum
 import androidx.compose.material.icons.outlined.RotateRight
 import androidx.compose.material.icons.outlined.PictureAsPdf
@@ -96,6 +99,8 @@ enum class Bulk(val label: String, val icon: ImageVector) {
     Versions("Versions…", Icons.Outlined.History),
     ConvertImage("Convert to…", Icons.Outlined.Transform),
     Resize("Resize…", Icons.Outlined.PhotoSizeSelectLarge),
+    ConvertVideo("Convert video…", Icons.Outlined.VideoSettings),
+    FolderSize("Folder size", Icons.Outlined.DataUsage),
     JoinPdfs("Join PDFs", Icons.Outlined.MergeType),
     PdfExtract("Extract pages…", Icons.Outlined.PictureAsPdf),
     PdfSplit("Split into pages", Icons.AutoMirrored.Outlined.CallSplit),
@@ -128,6 +133,7 @@ fun bulkActions(entries: List<Entry>, writable: Boolean): List<Bulk> {
     val one = entries.singleOrNull()
     val actions = mutableListOf<Bulk>()
     if (entries.any { !it.dir }) actions += Bulk.Share
+    if (one != null && one.dir) actions += Bulk.FolderSize
     if (!writable) {
         if (one != null && !one.dir) actions += Bulk.Versions
         return actions
@@ -142,6 +148,7 @@ fun bulkActions(entries: List<Entry>, writable: Boolean): List<Bulk> {
         actions += Bulk.ConvertImage
         if (entries.all { resizable.containsMatchIn(it.name) }) actions += Bulk.Resize
     }
+    if (entries.all { !it.dir && it.kind == "video" }) actions += Bulk.ConvertVideo
     if (entries.all { !it.dir && it.kind == "pdf" }) {
         if (entries.size >= 2) actions += Bulk.JoinPdfs
         if (one != null) actions += listOf(Bulk.PdfExtract, Bulk.PdfSplit, Bulk.PdfRotate)
@@ -202,12 +209,17 @@ class BulkProgress(val title: String, val total: Int) {
     var current by mutableStateOf("")
     /** Asked to stop after the item in hand. */
     @Volatile var stopped = false
+    /** How far the item in hand is, 0 to 1, when it says. */
+    var fraction by mutableStateOf<Float?>(null)
+    /** Called by Stop, such as to cancel a conversion on the server. */
+    @Volatile var onStop: (() -> Unit)? = null
     /** A download in progress, cancelled by Stop. */
     @Volatile var tracker: Tracker? = null
 
     fun stop() {
         stopped = true
         tracker?.cancelled = true
+        onStop?.invoke()
     }
 }
 
@@ -219,7 +231,11 @@ fun BulkProgressDialog(progress: BulkProgress) {
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(progress.current, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                if (progress.total > 1) {
+                val part = progress.fraction
+                if (part != null) {
+                    LinearProgressIndicator(progress = { (progress.done + part) / progress.total }, modifier = Modifier.fillMaxWidth())
+                    Text(if (progress.total > 1) "${progress.done + 1} of ${progress.total} · ${(part * 100).toInt()}%" else "${(part * 100).toInt()}%", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                } else if (progress.total > 1) {
                     LinearProgressIndicator(progress = { progress.done.toFloat() / progress.total }, modifier = Modifier.fillMaxWidth())
                     Text("${progress.done} of ${progress.total}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 } else {
@@ -228,7 +244,7 @@ fun BulkProgressDialog(progress: BulkProgress) {
             }
         },
         confirmButton = {
-            if (progress.total > 1 || progress.tracker != null) TextButton(onClick = { progress.stop() }, enabled = !progress.stopped) { Text("Stop") }
+            if (progress.total > 1 || progress.tracker != null || progress.onStop != null) TextButton(onClick = { progress.stop() }, enabled = !progress.stopped) { Text("Stop") }
         },
     )
 }
@@ -635,4 +651,105 @@ fun VersionsDialog(vm: AppViewModel, serverId: String, entry: Entry, writable: B
             dismissButton = { TextButton(onClick = { deleting = null }) { Text("Cancel") } },
         )
     }
+}
+
+/** What a video becomes: a format ("same" keeps it), a height, a speed, and whether it keeps its sound. */
+data class VideoChoice(val format: String, val height: Int?, val speed: Double, val audio: Boolean)
+
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@Composable
+fun VideoDialog(count: Int, onDismiss: () -> Unit, onConvert: (VideoChoice) -> Unit) {
+    val formats = listOf("mp4" to "MP4 (plays everywhere)", "same" to "The same format", "webm" to "WebM (smaller)", "mov" to "MOV", "mkv" to "MKV", "gif" to "GIF animation", "mp3" to "MP3 (only the sound)", "m4a" to "M4A (only the sound)")
+    val sizes = listOf(null to "As it is", 2160 to "4K", 1080 to "1080p", 720 to "720p", 480 to "480p", 360 to "360p")
+    val speeds = listOf(0.5 to "½×", 1.0 to "1×", 2.0 to "2×", 4.0 to "4×")
+    var format by remember { mutableStateOf("mp4") }
+    var height by remember { mutableStateOf<Int?>(null) }
+    var speed by remember { mutableStateOf(1.0) }
+    var audio by remember { mutableStateOf(true) }
+    val soundOnly = format == "mp3" || format == "m4a"
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (count == 1) "Convert video" else "Convert $count videos") },
+        text = {
+            Column(Modifier.verticalScroll(androidx.compose.foundation.rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                formats.forEach { (value, label) ->
+                    Row(Modifier.fillMaxWidth().clickable { format = value }, verticalAlignment = Alignment.CenterVertically) {
+                        androidx.compose.material3.RadioButton(selected = format == value, onClick = { format = value })
+                        Text(label)
+                    }
+                }
+                if (!soundOnly) {
+                    Text("Size", style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(top = 8.dp))
+                    androidx.compose.foundation.layout.FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        sizes.forEach { (value, label) ->
+                            androidx.compose.material3.FilterChip(selected = height == value, onClick = { height = value }, label = { Text(label) })
+                        }
+                    }
+                }
+                Text("Speed", style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(top = 8.dp))
+                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                    speeds.forEachIndexed { index, (value, label) ->
+                        SegmentedButton(selected = speed == value, onClick = { speed = value }, shape = SegmentedButtonDefaults.itemShape(index, speeds.size)) { Text(label) }
+                    }
+                }
+                if (!soundOnly && format != "gif") {
+                    Row(Modifier.fillMaxWidth().padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Keep the sound", Modifier.weight(1f))
+                        androidx.compose.material3.Switch(checked = audio, onCheckedChange = { audio = it })
+                    }
+                }
+                Text("A new file is made beside each video.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                onConvert(VideoChoice(format, if (soundOnly) null else height, speed, if (format == "gif") false else soundOnly || audio))
+            }) { Text("Convert") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+/** The kinds of file "New file" makes, as in the web app. */
+val newFileKinds = listOf(
+    "txt" to "Text",
+    "md" to "Markdown",
+    "docx" to "Word document",
+    "xlsx" to "Spreadsheet",
+    "odt" to "OpenDocument text",
+    "csv" to "CSV",
+    "json" to "JSON",
+    "html" to "Web page",
+    "m3u8" to "Playlist",
+)
+
+/** Folders bookmarked on this server; picking one opens it. */
+@Composable
+fun BookmarksDialog(serverName: String, paths: List<String>?, onDismiss: () -> Unit, onOpen: (String) -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Bookmarks") },
+        text = {
+            when {
+                paths == null -> Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+                paths.isEmpty() -> Text("No bookmarks yet. In a folder, choose Bookmark this folder.")
+                else -> LazyColumn {
+                    items(paths, key = { it }) { path ->
+                        ListItem(
+                            colors = androidx.compose.material3.ListItemDefaults.colors(containerColor = androidx.compose.ui.graphics.Color.Transparent),
+                            leadingContent = { Icon(Icons.Filled.Folder, contentDescription = null, tint = MaterialTheme.colorScheme.primary) },
+                            headlineContent = { Text(specialFolderLabel(path.substringAfterLast('/')).ifEmpty { serverName }, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                            supportingContent = if (path.contains('/')) {
+                                { Text(path.substringBeforeLast('/'), maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                            } else {
+                                null
+                            },
+                            modifier = Modifier.clickable { onOpen(path) },
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
 }

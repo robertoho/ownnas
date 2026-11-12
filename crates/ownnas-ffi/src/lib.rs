@@ -85,6 +85,33 @@ pub struct Entry {
     pub protected: Option<String>,
 }
 
+/// How much a folder holds.
+#[derive(uniffi::Record)]
+pub struct FolderUsage {
+    pub bytes: u64,
+    pub files: u64,
+    /// The count stopped early: at least this much.
+    pub truncated: bool,
+}
+
+/// A video conversion running on the server.
+#[derive(uniffi::Record)]
+pub struct VideoJob {
+    pub id: String,
+    /// Where the new file goes.
+    pub output: String,
+    /// 0 to 1.
+    pub progress: f64,
+    pub done: bool,
+    pub error: Option<String>,
+}
+
+impl From<ownnas_core::manage::VideoJob> for VideoJob {
+    fn from(job: ownnas_core::manage::VideoJob) -> Self {
+        VideoJob { id: job.id, output: job.output, progress: job.progress, done: job.done, error: job.error }
+    }
+}
+
 /// An earlier version of a file, kept when it was replaced.
 #[derive(uniffi::Record)]
 pub struct FileVersion {
@@ -273,7 +300,12 @@ impl Server {
     }
 
     pub fn list(&self, path: String) -> Result<Folder, ClientError> {
-        let folder = self.api.list(&path)?;
+        self.list_with_hidden(path, false)
+    }
+
+    /// Lists a folder, with hidden files (names starting with a dot) when `hidden`.
+    pub fn list_with_hidden(&self, path: String, hidden: bool) -> Result<Folder, ClientError> {
+        let folder = self.api.list_with(&path, hidden)?;
         Ok(Folder {
             // The server reports "" as the parent of a top-level folder and none for the top.
             parent: folder.parent,
@@ -428,6 +460,45 @@ impl Server {
     /// Deletes everything in the Trash for good.
     pub fn empty_trash(&self) -> Result<(), ClientError> {
         Ok(self.api.empty_trash()?)
+    }
+
+    /// How much a folder holds, everything inside counted.
+    pub fn folder_usage(&self, path: String) -> Result<FolderUsage, ClientError> {
+        let usage = self.api.folder_usage(&path)?;
+        Ok(FolderUsage { bytes: usage.bytes, files: usage.files, truncated: usage.truncated })
+    }
+
+    /// Folders this user bookmarked.
+    pub fn bookmarks(&self) -> Result<Vec<String>, ClientError> {
+        Ok(self.api.bookmarks()?)
+    }
+
+    pub fn set_bookmark(&self, path: String, marked: bool) -> Result<(), ClientError> {
+        if marked { Ok(self.api.add_bookmark(&path)?) } else { Ok(self.api.remove_bookmark(&path)?) }
+    }
+
+    /// A new file ("txt", "md", "docx", "xlsx", "odt", "csv", "json", "html", "m3u8") in
+    /// `parent`; returns its path.
+    pub fn create_file(&self, parent: String, name: String, kind: String) -> Result<String, ClientError> {
+        Ok(self.api.create_file(&parent, &name, &kind)?)
+    }
+
+    /// Downloads a folder as a ZIP to the local path `destination`; returns its size.
+    pub fn download_zip(&self, path: String, destination: String, transfer: Arc<dyn Transfer>) -> Result<u64, ClientError> {
+        Ok(self.api.zip_to(&path, Path::new(&destination), &|done| transfer.keep_going(done))?)
+    }
+
+    /// Starts converting a video beside it; follow it with `video_job`.
+    pub fn convert_video(&self, path: String, format: String, height: Option<u32>, speed: f64, audio: bool) -> Result<VideoJob, ClientError> {
+        Ok(self.api.convert_video(&path, &format, height, speed, audio)?.into())
+    }
+
+    pub fn video_job(&self, id: String) -> Result<VideoJob, ClientError> {
+        Ok(self.api.video_job(&id)?.into())
+    }
+
+    pub fn cancel_video_job(&self, id: String) -> Result<(), ClientError> {
+        Ok(self.api.cancel_video_job(&id)?)
     }
 
     /// Files and folders in `path` and below whose name, tags, or contents (text, PDFs, and

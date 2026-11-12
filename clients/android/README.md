@@ -36,6 +36,9 @@ What works now:
   to (JPEG, PNG, WebP, GIF, BMP, TIFF) and Resize (Small to 4K, half, quarter; as copies or in
   place); PDFs: Join, Extract pages, Split into pages, Rotate pages; Versions (restore or
   delete an earlier version); Add to album. Inside the Trash, the folder menu empties it.
+- Convert video (format, size, speed, sound), followed on the server with progress and Stop.
+- The folder's ⋮ menu: New file (text, Markdown, Word, spreadsheet, and more), Folder size,
+  Download as ZIP (to share), Bookmark this folder and Bookmarks…, and Show hidden files.
   Servers started with `--readonly` show no write actions.
 
 - Each signed-in server appears in the system file picker and the Files app, so any app can

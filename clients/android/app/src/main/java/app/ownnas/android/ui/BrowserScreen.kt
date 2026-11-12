@@ -76,6 +76,13 @@ import androidx.compose.material.icons.outlined.ContentPaste
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.TextButton
+import androidx.compose.material.icons.outlined.Bookmark
+import androidx.compose.material.icons.outlined.BookmarkBorder
+import androidx.compose.material.icons.outlined.Bookmarks
+import androidx.compose.material.icons.outlined.DataUsage
+import androidx.compose.material.icons.outlined.Visibility
+import androidx.compose.material.icons.outlined.VisibilityOff
+import androidx.compose.material.icons.automirrored.outlined.NoteAdd
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -123,6 +130,12 @@ private sealed interface Dialog {
     data class Versions(val entry: Entry) : Dialog
     data class Album(val entries: List<Entry>) : Dialog
     data object EmptyTrash : Dialog
+    data class Video(val entries: List<Entry>) : Dialog
+    data object NewFileKind : Dialog
+    data class NewFileName(val kind: String, val label: String) : Dialog
+    /** How much a folder holds; `usage` is null while it is counted. */
+    data class Usage(val path: String, val usage: app.ownnas.core.FolderUsage?, val problem: String? = null) : Dialog
+    data class Bookmarks(val paths: List<String>?) : Dialog
 }
 
 /** A file being fetched to open or share. */
@@ -151,6 +164,11 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
     val revision by vm.revision.collectAsStateWithLifecycle()
     val uploads by vm.uploads.collectAsStateWithLifecycle()
     val clip by vm.clipboard.collectAsStateWithLifecycle()
+    val showHidden by vm.showHidden.collectAsStateWithLifecycle()
+    var bookmarked by remember(serverId, path) { mutableStateOf<Boolean?>(null) }
+    LaunchedEffect(serverId, path) {
+        bookmarked = runCatching { path in vm.bookmarks(serverId) }.getOrNull()
+    }
     val account by produceState<app.ownnas.core.Account?>(null, serverId) {
         value = runCatching { vm.account(serverId) }.getOrNull()
     }
@@ -171,7 +189,7 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
     val attention = terminals.count { it.agent.attention != null || !it.running }
     val terminalsByPath = remember(terminals) { terminals.groupBy { it.path } }
 
-    LaunchedEffect(reload, revision) {
+    LaunchedEffect(reload, revision, showHidden) {
         refreshing = true
         try {
             folder = vm.list(serverId, path)
@@ -349,8 +367,80 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
         }
     }
 
+    /** Converts videos one at a time, following each conversion on the server. */
+    fun convertVideos(items: List<Entry>, choice: VideoChoice) {
+        val job = BulkProgress("Converting video", items.size)
+        bulk = job
+        selected = emptySet()
+        scope.launch {
+            var made = 0
+            val failures = mutableListOf<String>()
+            for (item in items) {
+                if (job.stopped) break
+                job.current = item.name
+                job.fraction = 0f
+                try {
+                    var running = vm.convertVideo(serverId, item, choice)
+                    job.onStop = { scope.launch { vm.cancelVideoJob(serverId, running.id) } }
+                    while (!running.done && !job.stopped) {
+                        delay(1000)
+                        running = vm.videoJob(serverId, running.id)
+                        job.fraction = running.progress.toFloat().coerceIn(0f, 1f)
+                    }
+                    when {
+                        job.stopped -> {}
+                        running.error != null -> failures += "${item.name}: ${running.error}"
+                        else -> made++
+                    }
+                } catch (err: Exception) {
+                    failures += "${item.name}: ${err.userMessage()}"
+                }
+                job.done++
+            }
+            bulk = null
+            reload++
+            report(
+                listOfNotNull(
+                    if (made > 0) (if (made == 1) "The video is ready" else "$made videos are ready") else null,
+                    if (job.stopped) "Stopped" else null,
+                    failures.firstOrNull()?.let { if (failures.size == 1) it else "${failures.size} failed ($it)" },
+                ).joinToString(". "),
+            )
+        }
+    }
+
+    fun showUsage(target: String) {
+        dialog = Dialog.Usage(target, null)
+        scope.launch {
+            val shown = runCatching { vm.folderUsage(serverId, target) }
+            if ((dialog as? Dialog.Usage)?.path == target) {
+                dialog = Dialog.Usage(target, shown.getOrNull(), shown.exceptionOrNull()?.userMessage())
+            }
+        }
+    }
+
+    fun shareZip() {
+        val name = specialFolderLabel(path.substringAfterLast('/')).ifEmpty { server.name }
+        val job = BulkProgress("Making $name.zip", 1)
+        val tracker = Tracker { done -> job.current = android.text.format.Formatter.formatShortFileSize(context, done) }
+        job.tracker = tracker
+        bulk = job
+        scope.launch {
+            try {
+                val file = vm.downloadZip(serverId, path, name, tracker)
+                if (!job.stopped) shareWithAnotherApp(context, file)
+            } catch (err: Exception) {
+                if (!err.isCancel()) report(err.userMessage())
+            } finally {
+                bulk = null
+            }
+        }
+    }
+
     fun onBulk(action: Bulk, items: List<Entry>) {
         when (action) {
+            Bulk.ConvertVideo -> dialog = Dialog.Video(items)
+            Bulk.FolderSize -> items.singleOrNull()?.let { selected = emptySet(); showUsage(it.path) }
             Bulk.Cut, Bulk.Copy -> {
                 vm.clip(Clip(serverId, items, cut = action == Bulk.Cut))
                 selected = emptySet()
@@ -458,6 +548,55 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
                     Box {
                         IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "Folder actions") }
                         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                            if (writable && !inTrash(path)) {
+                                DropdownMenuItem(
+                                    text = { Text("New file…") },
+                                    leadingIcon = { Icon(Icons.AutoMirrored.Outlined.NoteAdd, contentDescription = null) },
+                                    onClick = { menu = false; dialog = Dialog.NewFileKind },
+                                )
+                            }
+                            DropdownMenuItem(
+                                text = { Text("Folder size") },
+                                leadingIcon = { Icon(Icons.Outlined.DataUsage, contentDescription = null) },
+                                onClick = { menu = false; showUsage(path) },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Download as ZIP") },
+                                leadingIcon = { Icon(Icons.Outlined.FolderZip, contentDescription = null) },
+                                onClick = { menu = false; shareZip() },
+                            )
+                            if (writable && bookmarked != null) {
+                                val marked = bookmarked == true
+                                DropdownMenuItem(
+                                    text = { Text(if (marked) "Remove bookmark" else "Bookmark this folder") },
+                                    leadingIcon = { Icon(if (marked) Icons.Outlined.Bookmark else Icons.Outlined.BookmarkBorder, contentDescription = null) },
+                                    onClick = {
+                                        menu = false
+                                        act {
+                                            vm.setBookmark(serverId, path, !marked)
+                                            bookmarked = !marked
+                                            if (marked) "Bookmark removed" else "Bookmarked"
+                                        }
+                                    },
+                                )
+                            }
+                            DropdownMenuItem(
+                                text = { Text("Bookmarks…") },
+                                leadingIcon = { Icon(Icons.Outlined.Bookmarks, contentDescription = null) },
+                                onClick = {
+                                    menu = false
+                                    dialog = Dialog.Bookmarks(null)
+                                    scope.launch {
+                                        val paths = runCatching { vm.bookmarks(serverId) }.getOrElse { emptyList() }
+                                        if (dialog is Dialog.Bookmarks) dialog = Dialog.Bookmarks(paths)
+                                    }
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text(if (showHidden) "Hide hidden files" else "Show hidden files") },
+                                leadingIcon = { Icon(if (showHidden) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility, contentDescription = null) },
+                                onClick = { menu = false; vm.setShowHidden(!showHidden) },
+                            )
                             if (writable && (path == ".ownnas-trash" || path == "Trash")) {
                                 DropdownMenuItem(
                                     text = { Text("Empty Trash") },
@@ -726,6 +865,60 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
                 }) { Text("Empty Trash") }
             },
             dismissButton = { TextButton(onClick = { dialog = null }) { Text("Cancel") } },
+        )
+        is Dialog.Video -> VideoDialog(
+            count = shown.entries.size,
+            onDismiss = { dialog = null },
+            onConvert = { choice ->
+                dialog = null
+                convertVideos(shown.entries, choice)
+            },
+        )
+        Dialog.NewFileKind -> ChoiceDialog(
+            title = "New file",
+            choices = newFileKinds,
+            onDismiss = { dialog = null },
+            onPick = { kind -> dialog = Dialog.NewFileName(kind, newFileKinds.first { it.first == kind }.second) },
+        )
+        is Dialog.NewFileName -> NameDialog(
+            title = "New ${shown.label.lowercase()}",
+            initial = "",
+            confirm = "Create",
+            onDismiss = { dialog = null },
+            onConfirm = { name ->
+                dialog = null
+                act { "Made ${vm.createFile(serverId, path, name, shown.kind).substringAfterLast('/')}" }
+            },
+        )
+        is Dialog.Usage -> AlertDialog(
+            onDismissRequest = { dialog = null },
+            icon = { Icon(Icons.Outlined.DataUsage, contentDescription = null) },
+            title = { Text(specialFolderLabel(shown.path.substringAfterLast('/')).ifEmpty { server.name }) },
+            text = {
+                val usage = shown.usage
+                when {
+                    shown.problem != null -> Text(shown.problem)
+                    usage == null -> Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(Modifier.size(20.dp))
+                        Text("Counting…", Modifier.padding(start = 12.dp))
+                    }
+                    else -> Text(
+                        (if (usage.truncated) "At least " else "") +
+                            "${android.text.format.Formatter.formatFileSize(context, usage.bytes.toLong())} in " +
+                            "%,d".format(usage.files.toLong()) + if (usage.files == 1UL) " file" else " files",
+                    )
+                }
+            },
+            confirmButton = { TextButton(onClick = { dialog = null }) { Text("OK") } },
+        )
+        is Dialog.Bookmarks -> BookmarksDialog(
+            serverName = server.name,
+            paths = shown.paths,
+            onDismiss = { dialog = null },
+            onOpen = { target ->
+                dialog = null
+                if (target != path) vm.push(Screen.Browse(serverId, target))
+            },
         )
         is Dialog.Pick -> FolderPicker(
             vm = vm,

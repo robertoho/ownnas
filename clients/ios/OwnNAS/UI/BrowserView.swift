@@ -28,6 +28,11 @@ struct BrowserView: View {
     @State private var rotating: Entry?
     @State private var pagesText = ""
     @State private var emptyingTrash = false
+    @State private var videosFor: Items?
+    @State private var usage: Usage?
+    @State private var bookmarked: Bool?
+    @State private var showingBookmarks = false
+    @AppStorage("showHidden") private var showHidden = false
     @State private var pickedPhotos: [PhotosPickerItem] = []
     @State private var choosingPhotos = false
     @State private var choosingFiles = false
@@ -56,6 +61,13 @@ struct BrowserView: View {
         let entries: [Entry]
     }
 
+    /// How much a folder holds; `usage` is nil while it is counted.
+    struct Usage {
+        let path: String
+        var usage: FolderUsage?
+        var problem: String?
+    }
+
     struct SharedFiles: Identifiable {
         let id = UUID()
         let urls: [URL]
@@ -74,7 +86,8 @@ struct BrowserView: View {
             .toolbar { toolbar }
             .navigationBarBackButtonHidden(selecting)
             .refreshable { await load() }
-            .task(id: hub.revision) { await load() }
+            .task(id: "\(hub.revision) \(showHidden)") { await load() }
+            .task(id: path) { bookmarked = try? await hub.call(server) { [path] in try $0.bookmarks().contains(path) } }
             .task(id: account?.terminal) { await followTerminals() }
             .opener(opener)
             .uploads(uploader)
@@ -186,6 +199,15 @@ struct BrowserView: View {
                     }
                 }
             } message: { Text("Everything in it is deleted for good. This cannot be undone.") }
+            .sheet(item: $videosFor) { items in
+                VideoSheet(count: items.entries.count) { choice in
+                    runner.convertVideos(items.entries, choice: choice, server: server, hub: hub)
+                }
+            }
+            .sheet(isPresented: $showingBookmarks) { BookmarksSheet(server: server, serverName: saved?.name ?? "") }
+            .alert(usageTitle, isPresented: Binding(get: { usage != nil }, set: { if !$0 { usage = nil } })) {
+                Button("OK", role: .cancel) {}
+            } message: { Text(usageText) }
             .safeAreaInset(edge: .bottom) {
                 if let clip = hub.clipboard, clip.server == server, writable, !selecting {
                     HStack(spacing: 12) {
@@ -324,6 +346,9 @@ struct BrowserView: View {
         case .versions:
             if let one = items.first { endSelection(); versionsOf = one }
         case .convertImage: choosing = Choosing(kind: .convert, entries: items)
+        case .convertVideo: videosFor = Items(entries: items)
+        case .folderSize:
+            if let one = items.first { endSelection(); showUsage(one.path) }
         case .resize: resizing = Items(entries: items)
         case .joinPdfs:
             endSelection()
@@ -394,6 +419,54 @@ struct BrowserView: View {
             }
         case .trash:
             trashing = items
+        }
+    }
+
+    private var usageTitle: String {
+        guard let usage else { return "" }
+        return usage.path.isEmpty ? (saved?.name ?? "") : specialFolderLabel((usage.path as NSString).lastPathComponent)
+    }
+
+    private var usageText: String {
+        guard let usage else { return "" }
+        if let problem = usage.problem { return problem }
+        guard let found = usage.usage else { return "Counting…" }
+        return (found.truncated ? "At least " : "") + "\(bytes(found.bytes)) in \(found.files.formatted()) \(found.files == 1 ? "file" : "files")"
+    }
+
+    private func showUsage(_ target: String) {
+        usage = Usage(path: target)
+        Task {
+            do {
+                let found = try await hub.call(server) { try $0.folderUsage(path: target) }
+                if usage?.path == target { usage?.usage = found }
+            } catch {
+                if usage?.path == target { usage?.problem = userMessage(error) }
+            }
+        }
+    }
+
+    private func shareZip() {
+        let name = path.isEmpty ? (saved?.name ?? "Library") : specialFolderLabel((path as NSString).lastPathComponent)
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let file = caches.appendingPathComponent("opened/\(server)/zips/\(name).zip")
+        try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        runner.once("Making \(name).zip", hub: hub) { [server, path] in
+            let tracker = Tracker { _ in }
+            runner.onStop = { tracker.cancel() }
+            defer { runner.onStop = nil }
+            _ = try await hub.call(server) { try $0.downloadZip(path: path, destination: file.path, transfer: tracker) }
+            sharingFiles = SharedFiles(urls: [file])
+            return ""
+        }
+    }
+
+    private func newFile(kind: String, label: String) {
+        prompt = NamePrompt(title: "New \(label.lowercased())", confirm: "Create") { name in
+            runner.once("Making \(name)", hub: hub) { [server, path] in
+                let made = try await hub.call(server) { try $0.createFile(parent: path, name: name, kind: kind) }
+                return "Made \((made as NSString).lastPathComponent)"
+            }
         }
     }
 
@@ -531,6 +604,29 @@ struct BrowserView: View {
                 if !(folder?.entries.isEmpty ?? true) {
                     Button("Select", systemImage: "checkmark.circle") { withAnimation { editMode = .active } }
                 }
+                if writable, !inTrash(path) {
+                    Menu {
+                        ForEach(newFileKinds, id: \.kind) { item in
+                            Button(item.label) { newFile(kind: item.kind, label: item.label) }
+                        }
+                    } label: { Label("New file", systemImage: "doc.badge.plus") }
+                }
+                Button("Folder size", systemImage: "chart.pie") { showUsage(path) }
+                Button("Download as ZIP", systemImage: "doc.zipper") { shareZip() }
+                if writable, let marked = bookmarked {
+                    Button(marked ? "Remove bookmark" : "Bookmark this folder", systemImage: marked ? "bookmark.slash" : "bookmark") {
+                        Task {
+                            do {
+                                try await hub.call(server) { [path] in try $0.setBookmark(path: path, marked: !marked) }
+                                bookmarked = !marked
+                            } catch {
+                                message = userMessage(error)
+                            }
+                        }
+                    }
+                }
+                Button("Bookmarks…", systemImage: "books.vertical") { showingBookmarks = true }
+                Button(showHidden ? "Hide hidden files" : "Show hidden files", systemImage: showHidden ? "eye.slash" : "eye") { showHidden.toggle() }
                 if writable, path == ".ownnas-trash" || path == "Trash" {
                     Button("Empty Trash", systemImage: "trash.slash", role: .destructive) { emptyingTrash = true }
                 }
@@ -550,7 +646,7 @@ struct BrowserView: View {
     private func load() async {
         do {
             if account == nil { account = try? await hub.account(server) }
-            folder = try await hub.call(server) { [path] in try $0.list(path: path) }
+            folder = try await hub.call(server) { [path, showHidden] in try $0.listWithHidden(path: path, hidden: showHidden) }
             problem = nil
         } catch {
             problem = error

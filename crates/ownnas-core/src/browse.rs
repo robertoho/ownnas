@@ -70,11 +70,41 @@ impl Api {
 
     /// Lists one folder (`""` for the shared folder itself).
     pub fn list(&self, path: &str) -> Result<Folder, ApiError> {
-        let response = self
-            .request("GET", "/api/list")
-            .query("path", path)
-            .fetch()?;
+        self.list_with(path, false)
+    }
+
+    /// Lists one folder, with hidden files (names starting with a dot) when `hidden`.
+    pub fn list_with(&self, path: &str, hidden: bool) -> Result<Folder, ApiError> {
+        let mut request = self.request("GET", "/api/list").query("path", path);
+        if hidden {
+            request = request.query("hidden", "1");
+        }
+        let response = request.fetch()?;
         response.into_json().map_err(io_err)
+    }
+
+    /// Downloads a folder as a ZIP the server makes, to `destination`. Returns its size.
+    pub fn zip_to(&self, path: &str, destination: &Path, progress: Progress) -> Result<u64, ApiError> {
+        let response = self.request("GET", "/api/zip").query("path", path).fetch()?;
+        let temp = destination.with_extension("part");
+        let cancelled = std::cell::Cell::new(false);
+        let watch = |done: u64| {
+            let go_on = progress(done);
+            cancelled.set(!go_on);
+            go_on
+        };
+        let written = (|| {
+            let mut file = fs::File::create(&temp)?;
+            let written = std::io::copy(&mut Counted::new(response.into_reader(), &watch), &mut file)?;
+            file.flush()?;
+            Ok::<u64, std::io::Error>(written)
+        })()
+        .map_err(|err| {
+            let _ = fs::remove_file(&temp);
+            if cancelled.get() { ApiError::Cancelled } else { ApiError::Other(format!("Could not save the zip: {err}")) }
+        })?;
+        fs::rename(&temp, destination).map_err(|err| ApiError::Other(format!("Could not save the zip: {err}")))?;
+        Ok(written)
     }
 
     /// PNG bytes of a file's thumbnail.

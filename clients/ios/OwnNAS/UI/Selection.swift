@@ -3,7 +3,7 @@ import SwiftUI
 /// What can be done to one or more selected files and folders, as in the web app's menu.
 enum BulkAction: CaseIterable {
     case share, moveTo, copyTo, cut, copy, rename, duplicate, tag, protect, unprotect, versions
-    case convertImage, resize, joinPdfs, pdfExtract, pdfSplit, pdfRotate, addToAlbum
+    case convertImage, resize, convertVideo, folderSize, joinPdfs, pdfExtract, pdfSplit, pdfRotate, addToAlbum
     case compress, extract, extractHere, newFolderWith, restore, trash
 
     func label(_ entries: [Entry]) -> String {
@@ -21,6 +21,8 @@ enum BulkAction: CaseIterable {
         case .versions: return "Versions…"
         case .convertImage: return "Convert to…"
         case .resize: return "Resize…"
+        case .convertVideo: return "Convert video…"
+        case .folderSize: return "Folder size"
         case .joinPdfs: return "Join PDFs"
         case .pdfExtract: return "Extract pages…"
         case .pdfSplit: return "Split into pages"
@@ -50,6 +52,8 @@ enum BulkAction: CaseIterable {
         case .versions: return "clock.arrow.circlepath"
         case .convertImage: return "photo.badge.arrow.down"
         case .resize: return "arrow.down.right.and.arrow.up.left"
+        case .convertVideo: return "film.stack"
+        case .folderSize: return "chart.pie"
         case .joinPdfs: return "doc.on.doc.fill"
         case .pdfExtract: return "doc.text.below.ecg"
         case .pdfSplit: return "square.split.2x1"
@@ -82,6 +86,7 @@ func bulkActions(_ entries: [Entry], writable: Bool) -> [BulkAction] {
     let one = entries.count == 1 ? entries[0] : nil
     var actions: [BulkAction] = []
     if entries.contains(where: { !$0.dir }) { actions.append(.share) }
+    if let one, one.dir { actions.append(.folderSize) }
     guard writable else {
         if let one, !one.dir { actions.append(.versions) }
         return actions
@@ -96,6 +101,7 @@ func bulkActions(_ entries: [Entry], writable: Bool) -> [BulkAction] {
         actions.append(.convertImage)
         if entries.allSatisfy(resizable) { actions.append(.resize) }
     }
+    if entries.allSatisfy({ !$0.dir && $0.kind == "video" }) { actions.append(.convertVideo) }
     if entries.allSatisfy({ !$0.dir && $0.kind == "pdf" }) {
         if entries.count >= 2 { actions.append(.joinPdfs) }
         if one != nil { actions += [.pdfExtract, .pdfSplit, .pdfRotate] }
@@ -125,7 +131,11 @@ final class BulkRunner: ObservableObject {
     @Published var done = 0
     @Published var current = ""
     @Published var summary: String?
-    private var stopped = false
+    /// How far the item in hand is, 0 to 1, when it says.
+    @Published var fraction: Double?
+    /// Called by Stop, such as to cancel a conversion on the server.
+    var onStop: (() -> Void)?
+    private(set) var stopped = false
     private var tracker: Tracker?
 
     var running: Bool { job != nil }
@@ -203,6 +213,52 @@ final class BulkRunner: ObservableObject {
     func stop() {
         stopped = true
         tracker?.cancel()
+        onStop?()
+    }
+
+    /// Converts videos one at a time, following each conversion on the server.
+    func convertVideos(_ items: [Entry], choice: VideoChoice, server: String, hub: Hub) {
+        job = Job(title: "Converting video", total: items.count)
+        done = 0
+        stopped = false
+        Task {
+            var made = 0
+            var failures: [String] = []
+            for item in items {
+                if stopped { break }
+                current = item.name
+                fraction = 0
+                do {
+                    let path = item.path
+                    var running = try await hub.call(server) { try $0.convertVideo(path: path, format: choice.format, height: choice.height, speed: choice.speed, audio: choice.audio) }
+                    let id = running.id
+                    onStop = { Task { try? await hub.call(server) { try $0.cancelVideoJob(id: id) } } }
+                    while !running.done && !stopped {
+                        try await Task.sleep(for: .seconds(1))
+                        running = try await hub.call(server) { try $0.videoJob(id: id) }
+                        fraction = min(max(running.progress, 0), 1)
+                    }
+                    if stopped {
+                    } else if let error = running.error {
+                        failures.append("\(item.name): \(error)")
+                    } else {
+                        made += 1
+                    }
+                } catch {
+                    failures.append("\(item.name): \(userMessage(error))")
+                }
+                done += 1
+            }
+            job = nil
+            fraction = nil
+            onStop = nil
+            hub.changed()
+            var parts: [String] = []
+            if made > 0 { parts.append(made == 1 ? "The video is ready" : "\(made) videos are ready") }
+            if stopped { parts.append("Stopped") }
+            if let first = failures.first { parts.append(failures.count == 1 ? first : "\(failures.count) failed (\(first))") }
+            summary = parts.joined(separator: ". ")
+        }
     }
 }
 
@@ -214,13 +270,16 @@ private struct BulkProgressSheet: View {
         VStack(spacing: 14) {
             Text(job.title).font(.headline).lineLimit(1)
             Text(runner.current).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
-            if job.total > 1 {
+            if let part = runner.fraction {
+                ProgressView(value: Double(runner.done) + part, total: Double(job.total))
+                Text(job.total > 1 ? "\(runner.done + 1) of \(job.total) · \(Int(part * 100))%" : "\(Int(part * 100))%").font(.caption).foregroundStyle(.secondary)
+            } else if job.total > 1 {
                 ProgressView(value: Double(runner.done), total: Double(job.total))
                 Text("\(runner.done) of \(job.total)").font(.caption).foregroundStyle(.secondary)
             } else {
                 ProgressView()
             }
-            if job.total > 1 || job.title == "Preparing to share" {
+            if job.total > 1 || job.title == "Preparing to share" || job.title == "Converting video" || job.title.hasSuffix(".zip") {
                 Button("Stop", role: .cancel) { runner.stop() }
             }
         }
@@ -527,6 +586,127 @@ struct VersionsSheet: View {
                 done("Put back the version from \(Date(timeIntervalSince1970: Double(version.modified) / 1000).formatted(.relative(presentation: .named)))")
             } catch {
                 problem = userMessage(error)
+            }
+        }
+    }
+}
+
+/// What a video becomes: a format ("same" keeps it), a height, a speed, and whether it keeps its sound.
+struct VideoChoice {
+    var format = "mp4"
+    var height: UInt32?
+    var speed = 1.0
+    var audio = true
+}
+
+struct VideoSheet: View {
+    let count: Int
+    let convert: (VideoChoice) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var choice = VideoChoice()
+
+    private var soundOnly: Bool { choice.format == "mp3" || choice.format == "m4a" }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Picker("Format", selection: $choice.format) {
+                    Text("MP4 (plays everywhere)").tag("mp4")
+                    Text("The same format").tag("same")
+                    Text("WebM (smaller)").tag("webm")
+                    Text("MOV").tag("mov")
+                    Text("MKV").tag("mkv")
+                    Text("GIF animation").tag("gif")
+                    Text("MP3 (only the sound)").tag("mp3")
+                    Text("M4A (only the sound)").tag("m4a")
+                }
+                if !soundOnly {
+                    Picker("Size", selection: $choice.height) {
+                        Text("As it is").tag(UInt32?.none)
+                        Text("4K (2160p)").tag(UInt32?.some(2160))
+                        Text("Full HD (1080p)").tag(UInt32?.some(1080))
+                        Text("HD (720p)").tag(UInt32?.some(720))
+                        Text("Small (480p)").tag(UInt32?.some(480))
+                        Text("Smaller (360p)").tag(UInt32?.some(360))
+                    }
+                }
+                Picker("Speed", selection: $choice.speed) {
+                    Text("½×").tag(0.5)
+                    Text("1×").tag(1.0)
+                    Text("2×").tag(2.0)
+                    Text("4×").tag(4.0)
+                }
+                .pickerStyle(.segmented)
+                if !soundOnly && choice.format != "gif" {
+                    Toggle("Keep the sound", isOn: $choice.audio)
+                }
+                Section { } footer: { Text("A new file is made beside each video.") }
+            }
+            .navigationTitle(count == 1 ? "Convert video" : "Convert \(count) videos")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Convert") {
+                        var wanted = choice
+                        if soundOnly { wanted.height = nil; wanted.audio = true }
+                        if wanted.format == "gif" { wanted.audio = false }
+                        dismiss()
+                        convert(wanted)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The kinds of file "New file" makes, as in the web app.
+let newFileKinds: [(kind: String, label: String)] = [
+    ("txt", "Text"), ("md", "Markdown"), ("docx", "Word document"), ("xlsx", "Spreadsheet"),
+    ("odt", "OpenDocument text"), ("csv", "CSV"), ("json", "JSON"), ("html", "Web page"), ("m3u8", "Playlist"),
+]
+
+/// Folders bookmarked on this server; picking one opens it.
+struct BookmarksSheet: View {
+    @EnvironmentObject private var hub: Hub
+    @Environment(\.dismiss) private var dismiss
+    let server: String
+    let serverName: String
+    @State private var paths: [String]?
+    @State private var problem: String?
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if let problem {
+                    ContentUnavailableView(problem, systemImage: "exclamationmark.triangle")
+                } else if let paths {
+                    if paths.isEmpty {
+                        ContentUnavailableView("No bookmarks", systemImage: "bookmark", description: Text("In a folder, choose Bookmark this folder."))
+                    } else {
+                        List(paths, id: \.self) { path in
+                            Button {
+                                dismiss()
+                                hub.path.append(.browse(server: server, path: path))
+                            } label: {
+                                Label {
+                                    VStack(alignment: .leading) {
+                                        Text(path.isEmpty ? serverName : specialFolderLabel((path as NSString).lastPathComponent))
+                                        if path.contains("/") { Text((path as NSString).deletingLastPathComponent).font(.caption).foregroundStyle(.secondary) }
+                                    }
+                                } icon: { Image(systemName: "folder.fill") }
+                            }
+                        }
+                    }
+                } else {
+                    ProgressView()
+                }
+            }
+            .navigationTitle("Bookmarks")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .task {
+                do { paths = try await hub.call(server) { try $0.bookmarks() } } catch { problem = userMessage(error) }
             }
         }
     }

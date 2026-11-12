@@ -160,6 +160,33 @@ fn form_parts(boundary: &str, name: &str) -> (Vec<u8>, Vec<u8>) {
     (head.into_bytes(), tail.into_bytes())
 }
 
+/// How much a folder holds.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderUsage {
+    pub bytes: u64,
+    pub files: u64,
+    /// The count stopped early (a very large folder): at least this much.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// A video conversion running on the server.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoJob {
+    pub id: String,
+    /// Where the new file goes.
+    pub output: String,
+    /// 0 to 1.
+    #[serde(default)]
+    pub progress: f64,
+    #[serde(default)]
+    pub done: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 /// An earlier version of a file, kept when it was replaced.
 #[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -354,6 +381,66 @@ impl Api {
     /// Deletes everything in the Trash for good.
     pub fn empty_trash(&self) -> Result<(), ApiError> {
         self.post_json("/api/trash/empty", json!({}))?;
+        Ok(())
+    }
+
+    /// How much a folder holds, everything inside counted.
+    pub fn folder_usage(&self, path: &str) -> Result<FolderUsage, ApiError> {
+        self.get_json("/api/usage", &[("path", path)])
+    }
+
+    /// Folders this user bookmarked.
+    pub fn bookmarks(&self) -> Result<Vec<String>, ApiError> {
+        #[derive(Deserialize)]
+        struct Marks {
+            paths: Vec<String>,
+        }
+        let marks: Marks = self.get_json("/api/bookmarks", &[])?;
+        Ok(marks.paths)
+    }
+
+    pub fn add_bookmark(&self, path: &str) -> Result<(), ApiError> {
+        self.post_json("/api/bookmarks", json!({ "path": path }))?;
+        Ok(())
+    }
+
+    pub fn remove_bookmark(&self, path: &str) -> Result<(), ApiError> {
+        self.request("DELETE", "/api/bookmarks").query("path", path).fetch()?;
+        Ok(())
+    }
+
+    /// Makes a new file of a kind the web app can edit ("txt", "md", "docx", "xlsx", "odt",
+    /// "csv", "json", "html", "m3u8") in `parent`; returns its path.
+    pub fn create_file(&self, parent: &str, name: &str, kind: &str) -> Result<String, ApiError> {
+        path_of(self.post_json("/api/create", json!({ "path": parent, "name": name, "kind": kind }))?)
+    }
+
+    /// Starts converting a video into a new file beside it: `format` ("same", "mp4", "webm",
+    /// "mov", "mkv", "gif", "mp3", "m4a"), `height` (keeps the shape), `speed` (1 is normal),
+    /// and whether to keep the sound. Follow it with [`Api::video_job`].
+    pub fn convert_video(&self, path: &str, format: &str, height: Option<u32>, speed: f64, audio: bool) -> Result<VideoJob, ApiError> {
+        #[derive(Deserialize)]
+        struct Started {
+            job: VideoJob,
+        }
+        let started: Started = self
+            .post_json("/api/videos/convert", json!({ "path": path, "format": format, "height": height, "speed": speed, "audio": audio }))?
+            .into_json()
+            .map_err(|err| ApiError::Other(err.to_string()))?;
+        Ok(started.job)
+    }
+
+    pub fn video_job(&self, id: &str) -> Result<VideoJob, ApiError> {
+        #[derive(Deserialize)]
+        struct Follow {
+            job: VideoJob,
+        }
+        let follow: Follow = self.get_json("/api/videos/job", &[("id", id)])?;
+        Ok(follow.job)
+    }
+
+    pub fn cancel_video_job(&self, id: &str) -> Result<(), ApiError> {
+        self.request("DELETE", "/api/videos/job").query("id", id).fetch()?;
         Ok(())
     }
 
