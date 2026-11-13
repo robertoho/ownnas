@@ -397,6 +397,44 @@ pub struct NameHit {
 
 /// Files and folders under `rel` whose names have `query` in them (lower case), folders and the
 /// shallowest first.
+/// What `rel` and everything below it hold, from the index: bytes, files, and the photo-library
+/// packages inside it (indexed only by name: measure those on disk). `None` when `rel` is not
+/// in the index yet, or is inside a package itself.
+pub fn folder_total(conn: &Connection, rel: &str) -> Result<Option<(u64, u64, Vec<String>)>, String> {
+    let sql = |err: rusqlite::Error| err.to_string();
+    if inside_package(rel) {
+        return Ok(None);
+    }
+    if !rel.is_empty() {
+        let known: Option<i64> = conn
+            .query_row("SELECT 1 FROM file_index WHERE path = ?1 AND dir = 1", [rel], |row| row.get(0))
+            .optional()
+            .map_err(sql)?;
+        if known.is_none() {
+            return Ok(None);
+        }
+    }
+    // Paths below `rel` sort between "rel/" and "rel0" ('0' follows '/').
+    let (bytes, files): (i64, i64) = conn
+        .query_row(
+            "SELECT COALESCE(SUM(size), 0), COUNT(*) FROM file_index
+             WHERE dir = 0 AND (?1 = '' OR (path >= ?1 || '/' AND path < ?1 || '0'))",
+            [rel],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(sql)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT path FROM file_index
+             WHERE dir = 1 AND (?1 = '' OR (path >= ?1 || '/' AND path < ?1 || '0'))
+               AND (lower(path) LIKE '%.photoslibrary' OR lower(path) LIKE '%.photolibrary'
+                    OR lower(path) LIKE '%.aplibrary' OR lower(path) LIKE '%.migratedphotolibrary')",
+        )
+        .map_err(sql)?;
+    let packages = stmt.query_map([rel], |row| row.get::<_, String>(0)).map_err(sql)?.filter_map(Result::ok).collect();
+    Ok(Some((bytes.max(0) as u64, files.max(0) as u64, packages)))
+}
+
 pub fn search_names(conn: &Connection, rel: &str, query: &str, limit: usize) -> Result<Vec<NameHit>, String> {
     let mut stmt = conn
         .prepare(

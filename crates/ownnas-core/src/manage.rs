@@ -449,7 +449,7 @@ impl Api {
 
     /// How much a folder holds, everything inside counted.
     pub fn folder_usage(&self, path: &str) -> Result<FolderUsage, ApiError> {
-        self.get_json("/api/usage", &[("path", path)])
+        self.get_json("/api/usage", &[("path", path), ("full", "1")])
     }
 
     /// Folders this user bookmarked.

@@ -818,6 +818,8 @@ struct PathQuery {
     download: Option<String>,
     hidden: Option<String>,
     slow: Option<String>,
+    /// For a folder's size: count every file on disk now (and refresh the index from it).
+    full: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1582,6 +1584,31 @@ async fn list(
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not list the folder"))?
         .map_err(ApiError::from)?;
     let paths: Vec<String> = listing.entries.iter().map(|entry| entry.path.clone()).collect();
+    // Folder sizes from the index, which counts every level: those it cannot answer (not
+    // indexed yet, or photo-library packages) fall back to the sizes measured before.
+    let mut from_index = std::collections::HashSet::new();
+    if state.file_index.ready() {
+        let dirs: Vec<(usize, String)> = listing.entries.iter().enumerate().filter(|(_, entry)| entry.dir).map(|(index, entry)| (index, entry.path.clone())).collect();
+        let found = tokio::task::spawn_blocking({
+            let state = state.clone();
+            move || -> Vec<(usize, u64)> {
+                let Ok(conn) = own_connection(&state) else { return Vec::new() };
+                dirs.into_iter()
+                    .filter_map(|(index, path)| match crate::file_index::folder_total(&conn, &path) {
+                        Ok(Some((bytes, _, packages))) if packages.is_empty() => Some((index, bytes)),
+                        _ => None,
+                    })
+                    .collect()
+            }
+        })
+        .await
+        .unwrap_or_default();
+        for (index, bytes) in found {
+            listing.entries[index].measured_size = Some(bytes);
+            listing.entries[index].measured_truncated = Some(false);
+            from_index.insert(index);
+        }
+    }
     if !paths.is_empty() {
         // The sizes measured before, kept only for folders unchanged since: reading the folders
         // to tell happens after, without holding the database.
@@ -1595,7 +1622,7 @@ async fn list(
                     }
                 }
             }
-            for (index, entry) in listing.entries.iter().enumerate().filter(|(_, entry)| entry.dir) {
+            for (index, entry) in listing.entries.iter().enumerate().filter(|(index, entry)| entry.dir && !from_index.contains(index)) {
                 if let Ok(Some(row)) = db::get_folder_size(&conn, &entry.path) {
                     sizes.push((index, entry.path.clone(), row));
                 }
@@ -9155,59 +9182,81 @@ async fn folder_usage(
     let root = state.root.clone();
     let rel = rel_of(&query.path);
     let slow = flag(&query.slow);
-    let stamp = tokio::task::spawn_blocking({
-        let root = root.clone();
+    if flag(&query.full) {
+        // Asked for: every file, counted now, so changes the index has not seen yet count too.
+        let cancel = files::CancelFlag::new();
+        let _guard = CancelOnDrop(cancel.clone());
+        let usage = tokio::task::spawn_blocking({
+            let (root, rel) = (root.clone(), rel.clone());
+            move || files::usage_capped(&root, &rel, slow, files::USAGE_FULL_LIMIT, &cancel)
+        })
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not measure the folder"))?
+        .map_err(ApiError::from)?;
+        // Bring the index (and so the folder cards) up to date with what was found.
+        state.file_index.reindex(&rel);
+        return Ok(Json(usage));
+    }
+    let usage = tokio::task::spawn_blocking({
+        let state = state.clone();
         let rel = rel.clone();
-        move || files::folder_stamp(&root, &rel)
+        move || folder_size(&state, &rel, slow)
     })
     .await
-    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the folder"))?
-    .map_err(ApiError::from)?;
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not measure the folder"))??;
+    Ok(Json(usage))
+}
+
+/// A folder's size, everything inside counted. From the file index when it covers the folder
+/// (every level, no limit, and up to date within seconds of changes made through OwnNAS);
+/// otherwise measured on disk, up to `files::USAGE_QUICK_LIMIT` files, and cached.
+fn folder_size(state: &AppState, rel: &str, slow: bool) -> Result<files::Usage, ApiError> {
+    if state.file_index.ready() {
+        if let Ok(conn) = own_connection(state) {
+            if let Ok(Some((mut bytes, mut count, packages))) = crate::file_index::folder_total(&conn, rel) {
+                drop(conn);
+                // Photo-library packages are indexed by name only: measure what is inside them.
+                let mut truncated = false;
+                for package in packages {
+                    if let Ok(inner) = measured_size(state, &package, slow) {
+                        bytes += inner.bytes;
+                        count += inner.files;
+                        truncated |= inner.truncated;
+                    }
+                }
+                return Ok(files::Usage { bytes, files: count, truncated, cached: true, fingerprint: String::new(), max_mtime: 0 });
+            }
+        }
+    }
+    measured_size(state, rel, slow)
+}
+
+/// A folder measured on disk, kept while the folder's own entries are unchanged.
+fn measured_size(state: &AppState, rel: &str, slow: bool) -> Result<files::Usage, ApiError> {
+    let stamp = files::folder_stamp(&state.root, rel).map_err(ApiError::from)?;
     {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-        if let Ok(Some(row)) = db::get_folder_size(&conn, &rel) {
+        if let Ok(Some(row)) = db::get_folder_size(&conn, rel) {
             if row.fingerprint == stamp {
-                return Ok(Json(files::Usage {
+                return Ok(files::Usage {
                     bytes: row.bytes,
                     files: row.files,
                     truncated: row.truncated,
                     cached: true,
                     fingerprint: row.fingerprint,
                     max_mtime: row.max_mtime,
-                }));
+                });
             }
         }
     }
     let cancel = files::CancelFlag::new();
-    let _guard = CancelOnDrop(cancel.clone());
-    let usage = tokio::task::spawn_blocking({
-        let root = root.clone();
-        let rel = rel.clone();
-        move || {
-            if slow {
-                files::usage_paced(&root, &rel, true, &cancel)
-            } else {
-                files::usage_paced(&root, &rel, false, &cancel)
-            }
-        }
-    })
-    .await
-    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not measure the folder"))?
-    .map_err(ApiError::from)?;
+    let usage = files::usage_paced(&state.root, rel, slow, &cancel).map_err(ApiError::from)?;
     {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-        let _ = db::invalidate_folder_size_ancestors(&conn, &rel);
-        let _ = db::upsert_folder_size(
-            &conn,
-            &rel,
-            usage.bytes,
-            usage.files,
-            usage.truncated,
-            usage.max_mtime,
-            &usage.fingerprint,
-        );
+        let _ = db::invalidate_folder_size_ancestors(&conn, rel);
+        let _ = db::upsert_folder_size(&conn, rel, usage.bytes, usage.files, usage.truncated, usage.max_mtime, &usage.fingerprint);
     }
-    Ok(Json(usage))
+    Ok(usage)
 }
 
 async fn file_hash(

@@ -8092,7 +8092,7 @@ async function measureFolderSize() {
     onCancel: () => controller.abort(),
   });
   try {
-    const usage = await api(`/api/usage?path=${encodeURIComponent(state.path)}&slow=1`, {
+    const usage = await api(`/api/usage?path=${encodeURIComponent(state.path)}&slow=1&full=1`, {
       signal: controller.signal,
     });
     const extra = usage.truncated ? " (count stopped early)" : "";

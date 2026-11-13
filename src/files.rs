@@ -2068,6 +2068,22 @@ pub fn usage_paced(
     slow: bool,
     cancel: &CancelFlag,
 ) -> Result<Usage, FileError> {
+    usage_capped(root, rel, slow, USAGE_QUICK_LIMIT, cancel)
+}
+
+/// Files counted by a quick measure (folder cards) before it stops and says so.
+pub const USAGE_QUICK_LIMIT: u64 = 20_000;
+/// Files counted when someone asks for a folder's size, before it stops and says so.
+pub const USAGE_FULL_LIMIT: u64 = 2_000_000;
+
+/// Recursively measures a folder, stopping after `limit` files (and saying so).
+pub fn usage_capped(
+    root: &Path,
+    rel: &str,
+    slow: bool,
+    limit: u64,
+    cancel: &CancelFlag,
+) -> Result<Usage, FileError> {
     let start = resolve(root, rel)?;
     if !start.full.is_dir() {
         return Err(FileError::NotADirectory);
@@ -2083,7 +2099,7 @@ pub fn usage_paced(
         max_mtime: 0,
     };
     let mut since_yield = 0u32;
-    walk_usage(&root, &start.full, &mut usage, slow, &mut since_yield, cancel)?;
+    walk_usage(&root, &start.full, &mut usage, slow, limit, &mut since_yield, cancel)?;
     Ok(usage)
 }
 
@@ -2092,11 +2108,12 @@ fn walk_usage(
     dir: &Path,
     usage: &mut Usage,
     slow: bool,
+    limit: u64,
     since_yield: &mut u32,
     cancel: &CancelFlag,
 ) -> Result<(), FileError> {
     cancel.check()?;
-    if usage.files >= 20_000 {
+    if usage.files >= limit {
         usage.truncated = true;
         return Ok(());
     }
@@ -2105,7 +2122,7 @@ fn walk_usage(
     };
     for item in entries {
         cancel.check()?;
-        if usage.files >= 20_000 {
+        if usage.files >= limit {
             usage.truncated = true;
             return Ok(());
         }
@@ -2115,7 +2132,7 @@ fn walk_usage(
             _ => continue,
         };
         if canon.is_dir() {
-            walk_usage(root, &canon, usage, slow, since_yield, cancel)?;
+            walk_usage(root, &canon, usage, slow, limit, since_yield, cancel)?;
         } else {
             usage.files += 1;
             let meta = canon.metadata().ok();
