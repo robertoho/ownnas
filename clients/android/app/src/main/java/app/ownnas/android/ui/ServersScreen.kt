@@ -21,6 +21,7 @@ import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material.icons.outlined.CloudUpload
 import androidx.compose.material.icons.outlined.Sync
+import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
@@ -64,6 +65,7 @@ fun ServersScreen(vm: AppViewModel, insets: WindowInsets = ScaffoldDefaults.cont
             LargeTopAppBar(
                 title = { Text("OwnNAS") },
                 actions = {
+                    IconButton(onClick = { vm.push(Screen.Appearance) }) { Icon(Icons.Outlined.Palette, contentDescription = "Appearance") }
                     if (servers.isNotEmpty()) {
                         IconButton(onClick = { vm.push(Screen.Backup) }) { Icon(Icons.Outlined.CloudUpload, contentDescription = "Back up this phone") }
                         IconButton(onClick = { vm.push(Screen.Sync) }) { Icon(Icons.Outlined.Sync, contentDescription = "Sync") }

@@ -6,6 +6,7 @@ struct ServersView: View {
     @EnvironmentObject private var backup: PhotoBackup
     @State private var signingIn: SignInTarget?
     @State private var removing: SavedServer?
+    @State private var choosingLook = false
 
     var body: some View {
         List {
@@ -31,6 +32,7 @@ struct ServersView: View {
                         }
                     }
                 }
+                .themedFormRow()
             }
             ForEach(hub.servers) { server in
                 Button {
@@ -53,14 +55,19 @@ struct ServersView: View {
                 .swipeActions {
                     Button("Remove", role: .destructive) { removing = server }
                 }
+                .themedFormRow()
             }
         }
         .navigationTitle("OwnNAS")
         .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button("Appearance", systemImage: "paintpalette") { choosingLook = true }
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button("Add server", systemImage: "plus") { signingIn = SignInTarget(existing: nil) }
             }
         }
+        .sheet(isPresented: $choosingLook) { AppearanceView() }
         .sheet(item: $signingIn) { target in
             NavigationStack { SignInView(existing: target.existing) }
         }

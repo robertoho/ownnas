@@ -1,0 +1,48 @@
+package app.ownnas.android.ui.theme
+
+/**
+ * The web app's themes (web/app.css), with the same colours. Generated from the CSS: keep in step
+ * with THEMES in web/app.js. "Liquid Glass" is see-through on the web; here it is solid.
+ */
+data class WebTheme(
+    val id: String,
+    val name: String,
+    val dark: Boolean,
+    val bg: Long,
+    val bg2: Long,
+    val bg3: Long,
+    val line: Long,
+    val text: Long,
+    val muted: Long,
+    val accent: Long,
+    val accentInk: Long,
+    val danger: Long,
+)
+
+val webThemes = listOf(
+    WebTheme("ownnas", "OwnNAS", true, 0xFF12140F, 0xFF1B1E16, 0xFF262A1E, 0xFF3A4030, 0xFFF4F2E8, 0xFFA7AD9C, 0xFFDFF25A, 0xFF1C2400, 0xFFFF6D57),
+    WebTheme("tokyo-night", "Tokyo Night", true, 0xFF1A1B26, 0xFF24283B, 0xFF32344A, 0xFF444B6A, 0xFFC0CAF5, 0xFF787C99, 0xFF7AA2F7, 0xFF0F111A, 0xFFF7768E),
+    WebTheme("catppuccin", "Catppuccin", true, 0xFF1E1E2E, 0xFF313244, 0xFF45475A, 0xFF585B70, 0xFFCDD6F4, 0xFFA6ADC8, 0xFF89B4FA, 0xFF11111B, 0xFFF38BA8),
+    WebTheme("catppuccin-latte", "Catppuccin Latte", false, 0xFFEFF1F5, 0xFFE6E9EF, 0xFFDCE0E8, 0xFFBCC0CC, 0xFF4C4F69, 0xFF6C6F85, 0xFF1E66F5, 0xFFFFFFFF, 0xFFD20F39),
+    WebTheme("everforest", "Everforest", true, 0xFF2D353B, 0xFF374247, 0xFF475258, 0xFF5C6A72, 0xFFD3C6AA, 0xFF9DA9A0, 0xFF7FBBB3, 0xFF1E2326, 0xFFE67E80),
+    WebTheme("gruvbox", "Gruvbox", true, 0xFF282828, 0xFF3C3836, 0xFF504945, 0xFF665C54, 0xFFEBDBB2, 0xFFA89984, 0xFF7DAEA3, 0xFF1D2021, 0xFFEA6962),
+    WebTheme("kanagawa", "Kanagawa", true, 0xFF1F1F28, 0xFF2A2A37, 0xFF363646, 0xFF54546D, 0xFFDCD7BA, 0xFF727169, 0xFF7E9CD8, 0xFF090618, 0xFFE82424),
+    WebTheme("osaka-jade", "Osaka Jade", true, 0xFF111C18, 0xFF1A2A22, 0xFF23372B, 0xFF53685B, 0xFFC1C497, 0xFF8A9A80, 0xFF509475, 0xFF07110D, 0xFFFF5345),
+    WebTheme("matte-black", "Matte Black", true, 0xFF121212, 0xFF1C1C1C, 0xFF2A2A2A, 0xFF3D3D3D, 0xFFEAEAEA, 0xFF8A8A8D, 0xFFE68E0D, 0xFF121212, 0xFFD35F5F),
+    WebTheme("rose-pine", "Rose Pine Dawn", false, 0xFFFAF4ED, 0xFFFFFAF3, 0xFFF2E9E1, 0xFFDFDAD9, 0xFF575279, 0xFF9893A5, 0xFF56949F, 0xFFFAF4ED, 0xFFB4637A),
+    WebTheme("liquid-glass", "macOS Liquid Glass", false, 0xFFEEF1F8, 0xFFFFFFFF, 0xFFF4F6FB, 0xFFD6D9E2, 0xFF1D1D1F, 0xFF6E6E73, 0xFF007AFF, 0xFFFFFFFF, 0xFFFF3B30),
+    WebTheme("windows-11", "Windows 11", false, 0xFFF3F3F3, 0xFFFBFBFB, 0xFFFFFFFF, 0xFFE5E5E5, 0xFF1A1A1A, 0xFF5D5D5D, 0xFF005FB8, 0xFFFFFFFF, 0xFFC42B1C),
+    WebTheme("github-light", "GitHub Light", false, 0xFFFFFFFF, 0xFFF6F8FA, 0xFFEAEEF2, 0xFFD0D7DE, 0xFF1F2328, 0xFF59636E, 0xFF0969DA, 0xFFFFFFFF, 0xFFCF222E),
+    WebTheme("one-light", "One Light", false, 0xFFFAFAFA, 0xFFF0F0F1, 0xFFE5E5E6, 0xFFD4D4D6, 0xFF383A42, 0xFF696C77, 0xFF4078F2, 0xFFFFFFFF, 0xFFE45649),
+    WebTheme("solarized-light", "Solarized Light", false, 0xFFFDF6E3, 0xFFEEE8D5, 0xFFE4DDC8, 0xFFD3CBB7, 0xFF475B62, 0xFF657B83, 0xFF268BD2, 0xFFFDF6E3, 0xFFDC322F),
+    WebTheme("gruvbox-light", "Gruvbox Light", false, 0xFFFBF1C7, 0xFFF2E5BC, 0xFFEBDBB2, 0xFFD5C4A1, 0xFF3C3836, 0xFF7C6F64, 0xFF076678, 0xFFFBF1C7, 0xFF9D0006),
+    WebTheme("everforest-light", "Everforest Light", false, 0xFFFDF6E3, 0xFFF4F0D9, 0xFFEFEBD4, 0xFFE0DCC7, 0xFF5C6A72, 0xFF829181, 0xFF3A94C5, 0xFFFFFFFF, 0xFFF85552),
+    WebTheme("tokyo-night-day", "Tokyo Night Day", false, 0xFFE1E2E7, 0xFFE9E9ED, 0xFFD0D5E3, 0xFFC4C8DA, 0xFF3760BF, 0xFF6172B0, 0xFF2E7DE9, 0xFFFFFFFF, 0xFFF52A65),
+    WebTheme("kanagawa-lotus", "Kanagawa Lotus", false, 0xFFF2ECBC, 0xFFE7DBA0, 0xFFE4D794, 0xFFD5CEA3, 0xFF545464, 0xFF8A8980, 0xFF4D699B, 0xFFF2ECBC, 0xFFC84053),
+    WebTheme("nord-light", "Nord Light", false, 0xFFECEFF4, 0xFFE5E9F0, 0xFFD8DEE9, 0xFFC5CDD9, 0xFF2E3440, 0xFF4C566A, 0xFF5E81AC, 0xFFFFFFFF, 0xFFBF616A),
+    WebTheme("flexoki-light", "Flexoki Light", false, 0xFFFFFCF0, 0xFFF2F0E5, 0xFFE6E4D9, 0xFFDAD8CE, 0xFF100F0F, 0xFF6F6E69, 0xFF205EA6, 0xFFFFFCF0, 0xFFAF3029),
+    WebTheme("paper", "Paper", false, 0xFFF4ECD8, 0xFFEDE3CB, 0xFFE3D7BA, 0xFFD3C5A3, 0xFF3B3024, 0xFF7A6A55, 0xFFA0522D, 0xFFFFF8EC, 0xFFB23A2A),
+    WebTheme("nord", "Nord", true, 0xFF2E3440, 0xFF3B4252, 0xFF434C5E, 0xFF4C566A, 0xFFECEFF4, 0xFF9AA3B5, 0xFF88C0D0, 0xFF2E3440, 0xFFBF616A),
+    WebTheme("dracula", "Dracula", true, 0xFF282A36, 0xFF343746, 0xFF44475A, 0xFF565A6E, 0xFFF8F8F2, 0xFFA0A4B8, 0xFFBD93F9, 0xFF1E1F29, 0xFFFF5555),
+    WebTheme("solarized-dark", "Solarized Dark", true, 0xFF002B36, 0xFF073642, 0xFF0D4352, 0xFF1F5562, 0xFFC8D1CF, 0xFF839496, 0xFF268BD2, 0xFFFDF6E3, 0xFFDC322F),
+)

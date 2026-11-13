@@ -65,6 +65,9 @@ sealed interface Screen {
     /** Sorting a folder's files into folders by date, kind, and so on. */
     data class SortFolder(val serverId: String, val path: String) : Screen
 
+    /** The web app's themes, to pick one. */
+    data object Appearance : Screen
+
     /** What people did on the server lately. */
     data class Activity(val serverId: String) : Screen
 

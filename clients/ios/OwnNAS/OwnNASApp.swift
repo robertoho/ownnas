@@ -26,11 +26,31 @@ struct RootView: View {
     @EnvironmentObject private var hub: Hub
     @EnvironmentObject private var backup: PhotoBackup
     @Environment(\.scenePhase) private var scenePhase
+    @AppStorage("theme") private var themeID = systemThemeID
+
+    private var theme: WebTheme? { WebTheme.named(themeID) }
 
     var body: some View {
         NavigationStack(path: $hub.path) {
             ServersView()
+                .themedScreen()
                 .navigationDestination(for: Route.self) { route in
+                    destination(route).themedScreen()
+                }
+        }
+        .environment(\.webTheme, theme)
+        .tint(theme?.accentColor)
+        .preferredColorScheme(theme.map { $0.dark ? .dark : .light })
+        .onChange(of: scenePhase) {
+            switch scenePhase {
+            case .active: backup.appBecameActive()
+            case .background: backup.appWentToBackground()
+            default: break
+            }
+        }
+    }
+
+    @ViewBuilder private func destination(_ route: Route) -> some View {
                     switch route {
                     case let .browse(server, path): BrowserView(server: server, path: path)
                     case let .search(server, path): SearchView(server: server, path: path)
@@ -57,14 +77,5 @@ struct RootView: View {
                     case let .terminal(server, id): TerminalScreenView(server: server, id: id)
                     case .backup: BackupView()
                     }
-                }
-        }
-        .onChange(of: scenePhase) {
-            switch scenePhase {
-            case .active: backup.appBecameActive()
-            case .background: backup.appWentToBackground()
-            default: break
-            }
-        }
     }
 }

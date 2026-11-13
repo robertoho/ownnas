@@ -91,6 +91,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.toMutableStateList
+import androidx.compose.material.icons.outlined.ContentPasteGo
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -178,6 +179,8 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, startPath: String) {
     val revision by vm.revision.collectAsStateWithLifecycle()
     val uploads by vm.uploads.collectAsStateWithLifecycle()
     val clip by vm.clipboard.collectAsStateWithLifecycle()
+    // What a folder's menu offers while something is cut or copied on this server.
+    val pasteLabel = clip?.takeIf { it.serverId == serverId }?.let { "Paste ${describe(it.entries)} into it" }
     val showHidden by vm.showHidden.collectAsStateWithLifecycle()
     val layouts by vm.layouts.collectAsStateWithLifecycle()
     // Turning the phone or unfolding it changes this, and the layout with it.
@@ -422,13 +425,39 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, startPath: String) {
         }
     }
 
-    fun paste(items: Clip) {
+    /** Pastes what was cut (moves it) or copied (copies it) into `dest`, this folder by default. */
+    fun paste(items: Clip, dest: String = path) {
         if (items.cut) vm.clip(null)
+        val here = if (dest == path) "here" else "into ${specialFolderLabel(dest.substringAfterLast('/')).ifEmpty { server.name }}"
+        // A folder cannot go into itself or a folder inside it.
+        val fitting = items.entries.filter { item -> !(item.dir && (dest == item.path || dest.startsWith(item.path + "/"))) }
+        if (fitting.size < items.entries.size) report("A folder cannot go inside itself")
         if (items.cut) {
-            runBulk("Moving here", "Moved here:", items.entries) { vm.moveTo(serverId, it, path) }
+            runBulk("Moving $here", "Moved $here:", fitting) { vm.moveTo(serverId, it, dest) }
         } else {
-            runBulk("Copying here", "Copied here:", items.entries) { vm.copyTo(serverId, it, path) }
+            runBulk("Copying $here", "Copied $here:", fitting) { vm.copyTo(serverId, it, dest) }
         }
+    }
+
+    /** What was copied in other apps: files and photos are uploaded here, text saved as a file. */
+    fun pasteFromPhone() {
+        val board = context.getSystemService(android.content.ClipboardManager::class.java)
+        val items = board?.primaryClip?.let { clip -> (0 until clip.itemCount).map(clip::getItemAt) }.orEmpty()
+        val uris = items.mapNotNull { it.uri }.filter { it.scheme == "content" || it.scheme == "file" }
+        if (uris.isNotEmpty()) {
+            upload(uris)
+            return
+        }
+        val text = items.firstNotNullOfOrNull { item -> item.text?.toString()?.takeIf { it.isNotEmpty() } }
+        if (text == null) {
+            report("Nothing to paste: copy a photo, a file, or some text first")
+            return
+        }
+        val name = "Pasted text " + java.text.SimpleDateFormat("yyyy-MM-dd HH.mm.ss", java.util.Locale.ROOT).format(java.util.Date()) + ".txt"
+        val file = java.io.File(context.cacheDir, "pasted/$name").apply { parentFile?.mkdirs(); writeText(text) }
+        val descriptor = android.os.ParcelFileDescriptor.open(file, android.os.ParcelFileDescriptor.MODE_READ_ONLY)
+        file.delete()
+        vm.upload(listOf(PendingUpload(System.nanoTime(), serverId, path, name, text.toByteArray().size.toLong(), System.currentTimeMillis(), descriptor, "text/plain")))
     }
 
     /** Converts videos one at a time, following each conversion on the server. */
@@ -613,6 +642,21 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, startPath: String) {
                     Box {
                         IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "Folder actions") }
                         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                            val waiting = clip?.takeIf { it.serverId == serverId }
+                            if (writable && !inTrash(path) && waiting != null) {
+                                DropdownMenuItem(
+                                    text = { Text("Paste ${describe(waiting.entries)} here") },
+                                    leadingIcon = { Icon(Icons.Outlined.ContentPaste, contentDescription = null) },
+                                    onClick = { menu = false; paste(waiting) },
+                                )
+                            }
+                            if (writable && !inTrash(path)) {
+                                DropdownMenuItem(
+                                    text = { Text("Paste from the phone's clipboard") },
+                                    leadingIcon = { Icon(Icons.Outlined.ContentPasteGo, contentDescription = null) },
+                                    onClick = { menu = false; pasteFromPhone() },
+                                )
+                            }
                             if (writable && !inTrash(path)) {
                                 DropdownMenuItem(
                                     text = { Text("New file…") },
@@ -763,6 +807,8 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, startPath: String) {
                     wide = true,
                     serverName = server.name,
                     onBrowse = ::goTo,
+                    pasteInto = pasteLabel,
+                    onPasteInto = { entry -> clip?.let { paste(it, entry.path) } },
                 )
                 failure != null && shown == null -> Problem(failure, onRetry = { reload++ }, onSignIn = { vm.push(Screen.SignIn(server)) })
                 shown == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
@@ -793,6 +839,8 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, startPath: String) {
                     wide = wide,
                     serverName = server.name,
                     onBrowse = ::goTo,
+                    pasteInto = pasteLabel,
+                    onPasteInto = { entry -> clip?.let { paste(it, entry.path) } },
                 )
             }
         }
@@ -1102,8 +1150,10 @@ private fun Listing(
     wide: Boolean,
     serverName: String,
     onBrowse: (String) -> Unit,
+    pasteInto: String?,
+    onPasteInto: (Entry) -> Unit,
 ) {
-    val actions = EntryActions(vm, serverId, writable, terminalsOn, terminalsByPath, selected, onOpen, onSelect, onAction, onTerminal, agents, onAgent)
+    val actions = EntryActions(vm, serverId, writable, terminalsOn, terminalsByPath, selected, onOpen, onSelect, onAction, onTerminal, agents, onAgent, pasteInto, onPasteInto)
     FolderLayout(layout, tile, wide, folder, path, serverName, actions, onBrowse)
 }
 

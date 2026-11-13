@@ -1,5 +1,6 @@
 import PhotosUI
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// One folder on a server: open, share, upload, rename, and move to the Trash.
 struct BrowserView: View {
@@ -292,19 +293,23 @@ struct BrowserView: View {
         "Showing the first \(folder.entries.count) items. Open this folder in the browser to see the rest."
     }
 
-    private func listView(_ folder: Folder) -> some View {
+    /// `compact`: the Columns layout's current column, with smaller icons and rows.
+    private func listView(_ folder: Folder, compact: Bool = false) -> some View {
         List(selection: $selection) {
             if folder.entries.isEmpty {
                 Text(emptyText).foregroundStyle(.secondary).frame(maxWidth: .infinity).listRowBackground(Color.clear)
             }
             ForEach(sorted(folder.entries), id: \.path) { entry in
-                row(entry)
+                row(entry, compact: compact)
+                    .themedRow()
+                    .listRowInsets(compact ? EdgeInsets(top: 5, leading: 12, bottom: 5, trailing: 12) : nil)
             }
             if folder.truncated {
                 Text(truncatedText(folder)).font(.footnote).foregroundStyle(.secondary)
             }
         }
         .listStyle(.plain)
+        .environment(\.defaultMinListRowHeight, compact ? 36 : 44)
     }
 
     /// Icons (square tiles) or Masonry (photos keep their shape), more per row on wide screens.
@@ -391,8 +396,8 @@ struct BrowserView: View {
     private func columnsView(_ folder: Folder?) -> some View {
         let chain = ancestorPaths(path)
         return GeometryReader { geometry in
-            let narrow: CGFloat = 240
-            let current = max(320, geometry.size.width - narrow * CGFloat(min(chain.count, 2)))
+            let narrow: CGFloat = geometry.size.width < 900 ? 190 : 230
+            let current = max(300, geometry.size.width - narrow * CGFloat(min(chain.count, 2)))
             ScrollViewReader { scroller in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 0) {
@@ -409,7 +414,7 @@ struct BrowserView: View {
                         }
                         Group {
                             if let folder {
-                                listView(folder)
+                                listView(folder, compact: true)
                             } else {
                                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
                             }
@@ -423,15 +428,28 @@ struct BrowserView: View {
                 .onChange(of: path) { withAnimation { scroller.scrollTo("current", anchor: .trailing) } }
             }
         }
+        // In landscape the side away from the Dynamic Island has only a rounded corner:
+        // use it for columns instead of leaving a blank margin.
+        .ignoresSafeArea(.container, edges: openSide)
     }
 
-    private func row(_ entry: Entry) -> some View {
+    /// The landscape edge without the Dynamic Island, or none in portrait.
+    private var openSide: Edge.Set {
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        switch scene?.interfaceOrientation {
+        case .landscapeRight: return .trailing
+        case .landscapeLeft: return .leading
+        default: return []
+        }
+    }
+
+    private func row(_ entry: Entry, compact: Bool = false) -> some View {
         let here = entry.dir ? terminals.filter { $0.path == entry.path } : []
         return Button {
             open(entry)
         } label: {
-            HStack(spacing: 12) {
-                EntryIcon(server: server, entry: entry)
+            HStack(spacing: compact ? 10 : 12) {
+                EntryIcon(server: server, entry: entry, size: compact ? 32 : 44)
                     .overlay(alignment: .bottomTrailing) {
                         if !here.isEmpty {
                             Image(systemName: "terminal.fill").font(.system(size: 10)).padding(3)
@@ -439,9 +457,9 @@ struct BrowserView: View {
                                 .foregroundStyle(.white).offset(x: 4, y: 4)
                         }
                     }
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(specialFolderLabel(entry.name)).foregroundStyle(.primary).lineLimit(1)
-                    Text(details(entry, terminals: here)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                VStack(alignment: .leading, spacing: compact ? 0 : 2) {
+                    Text(specialFolderLabel(entry.name)).font(compact ? .subheadline : .body).foregroundStyle(.primary).lineLimit(1)
+                    Text(details(entry, terminals: here)).font(compact ? .caption2 : .caption).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
         }
@@ -462,6 +480,9 @@ struct BrowserView: View {
                 try? await Task.sleep(for: .milliseconds(350))
                 selection = [entry.path]
             }
+        }
+        if entry.dir, writable, !inTrash(entry.path), let clip = waiting {
+            Button("Paste \(describe(clip.entries)) into it", systemImage: "doc.on.clipboard") { paste(clip, into: entry.path) }
         }
         if entry.dir, account?.terminal == true, !inTrash(entry.path) {
             Button("Open terminal here", systemImage: "terminal") { openTerminal(entry.path) }
@@ -687,16 +708,72 @@ struct BrowserView: View {
         }
     }
 
-    private func paste(_ clip: Clip) {
+    /// What can be pasted on this server, if anything.
+    private var waiting: Clip? { hub.clipboard.flatMap { $0.server == server ? $0 : nil } }
+
+    /// Pastes what was cut (moves it) or copied (copies it) into `target`, this folder by default.
+    private func paste(_ clip: Clip, into target: String? = nil) {
         if clip.cut { hub.clipboard = nil }
-        let dest = path
+        let dest = target ?? path
+        let place = dest == path ? "here" : "into \(dest.isEmpty ? (saved?.name ?? "") : specialFolderLabel((dest as NSString).lastPathComponent))"
+        // A folder cannot go into itself or a folder inside it.
+        let fitting = clip.entries.filter { !($0.dir && (dest == $0.path || dest.hasPrefix($0.path + "/"))) }
+        if fitting.count < clip.entries.count { message = "A folder cannot go inside itself" }
         if clip.cut {
-            runner.run("Moving here", finished: "Moved here:", items: clip.entries, hub: hub) { [server] entry in
+            runner.run("Moving \(place)", finished: "Moved \(place):", items: fitting, hub: hub) { [server] entry in
                 _ = try await hub.call(server) { try $0.moveTo(path: entry.path, dest: dest) }
             }
         } else {
-            runner.run("Copying here", finished: "Copied here:", items: clip.entries, hub: hub) { [server] entry in
+            runner.run("Copying \(place)", finished: "Copied \(place):", items: fitting, hub: hub) { [server] entry in
                 _ = try await hub.call(server) { try $0.copyTo(path: entry.path, dest: dest) }
+            }
+        }
+    }
+
+    /// What was copied in other apps: photos and files are uploaded here, text saved as a file.
+    private func pasteFromPhone() {
+        let board = UIPasteboard.general
+        let providers = board.itemProviders
+        Task {
+            var files: [Uploader.Pending] = []
+            let folder = FileManager.default.temporaryDirectory.appendingPathComponent("uploads/\(UUID().uuidString)")
+            try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            for (index, provider) in providers.enumerated() {
+                // Text is saved below; everything else as the file it is.
+                guard let type = provider.registeredTypeIdentifiers.first(where: { id in
+                    guard let kind = UTType(id) else { return false }
+                    return !kind.conforms(to: .text) && (kind.conforms(to: .data) || kind.conforms(to: .image))
+                }) else { continue }
+                if let url = await copyOut(provider, type: type, into: folder, fallback: "Pasted \(index + 1)") {
+                    files.append(.init(name: url.lastPathComponent, file: url, temporary: true))
+                }
+            }
+            if files.isEmpty, let text = board.string, !text.isEmpty {
+                let stamp = Date().formatted(.verbatim("\(year: .defaultDigits)-\(month: .twoDigits)-\(day: .twoDigits) \(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)).\(minute: .twoDigits).\(second: .twoDigits)", timeZone: .current, calendar: .current))
+                let url = folder.appendingPathComponent("Pasted text \(stamp).txt")
+                if (try? text.write(to: url, atomically: true, encoding: .utf8)) != nil {
+                    files.append(.init(name: url.lastPathComponent, file: url, temporary: true))
+                }
+            }
+            if files.isEmpty {
+                message = "Nothing to paste: copy a photo, a file, or some text first"
+            } else {
+                uploader.upload(hub, server: server, dir: path, files: files)
+            }
+        }
+    }
+
+    /// One pasted item, written to a file in `folder` with its own name when it has one.
+    private func copyOut(_ provider: NSItemProvider, type: String, into folder: URL, fallback: String) async -> URL? {
+        await withCheckedContinuation { continuation in
+            provider.loadFileRepresentation(forTypeIdentifier: type) { url, _ in
+                guard let url else { continuation.resume(returning: nil); return }
+                let ext = UTType(type)?.preferredFilenameExtension ?? url.pathExtension
+                var name = provider.suggestedName ?? fallback
+                if !ext.isEmpty, (name as NSString).pathExtension.isEmpty { name += ".\(ext)" }
+                let copy = folder.appendingPathComponent(name)
+                try? FileManager.default.removeItem(at: copy)
+                continuation.resume(returning: (try? FileManager.default.copyItem(at: url, to: copy)) != nil ? copy : nil)
             }
         }
     }
@@ -731,7 +808,7 @@ struct BrowserView: View {
             ToolbarItemGroup(placement: .bottomBar) {
                 let items = selectedEntries
                 let actions = bulkActions(items, writable: writable)
-                let primary = [BulkAction.share, .moveTo, .copyTo, .restore, .trash].filter { actions.contains($0) }.prefix(4)
+                let primary = [BulkAction.share, .cut, .copy, .restore, .trash].filter { actions.contains($0) }.prefix(4)
                 ForEach(Array(primary), id: \.self) { action in
                     Button(action.label(items), systemImage: action.systemImage, role: action.destructive ? .destructive : nil) { perform(action, on: items) }
                         .disabled(items.isEmpty)
@@ -779,6 +856,12 @@ struct BrowserView: View {
             Menu {
                 if !(folder?.entries.isEmpty ?? true) {
                     Button("Select", systemImage: "checkmark.circle") { withAnimation { editMode = .active } }
+                }
+                if writable, !inTrash(path), let clip = waiting {
+                    Button("Paste \(describe(clip.entries)) here", systemImage: "doc.on.clipboard") { paste(clip) }
+                }
+                if writable, !inTrash(path) {
+                    Button("Paste from the clipboard", systemImage: "doc.on.clipboard.fill") { pasteFromPhone() }
                 }
                 if writable, !inTrash(path) {
                     Menu {

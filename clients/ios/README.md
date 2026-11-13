@@ -18,6 +18,8 @@ What works now:
     iPad, or a wider or folding iPhone), measured from the window rather than the model. The
     layout is remembered separately for narrow and wide windows, so turning the phone switches by
     itself. Selecting, menus, and actions work in each layout.
+- Themes: the web app's 25 themes (the palette button on the server list), or the system's light
+  or dark look. The choice is remembered on the phone.
   - Open a file in Quick Look, or share it, with download progress.
 - **Search:** names, tags, and the words inside documents, PDFs, and pictures, in a folder and
   below.
@@ -40,8 +42,11 @@ What works now:
   New folder with the selection. Move and copy pick the destination in a folder browser that
   can make new folders; when a name is taken there the server keeps both. A row's long-press
   menu has the same actions for that item alone.
-- **More actions, as in the web app:** Cut or Copy, then "Paste here" in another folder;
-  Protect from deletion and Allow deletion; Compress to ZIP, TAR.GZ, TAR.XZ, or TAR, and Extract
+- **Copy, cut and paste:** Cut and Copy are in the bottom bar; then "Paste … here" in the ⋯
+  menu, or "Paste … into it" in a folder's long-press menu. "Paste from the clipboard" uploads
+  files copied in another app, or saves copied text as a .txt file.
+- **More actions, as in the web app:** Protect from deletion and Allow deletion; Compress to
+  ZIP, TAR.GZ, TAR.XZ, or TAR, and Extract
   here; photos: Convert to (JPEG, PNG, WebP, GIF, BMP, TIFF) and Resize (Small to 4K, half,
   quarter; as copies or in place); PDFs: Join, Extract pages, Split into pages, Rotate pages;
   Versions (restore or delete an earlier version); Add to album. Inside the Trash, the ⋯ menu

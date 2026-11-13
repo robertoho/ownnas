@@ -162,6 +162,9 @@ class EntryActions(
     val onTerminal: (Entry) -> Unit,
     val agents: List<AgentLauncher>,
     val onAgent: (Entry, AgentLauncher) -> Unit,
+    /** "Paste 3 items into it" while something is cut or copied on this server. */
+    val pasteInto: String? = null,
+    val onPasteInto: (Entry) -> Unit = {},
 ) {
     val selecting get() = selected.isNotEmpty()
 }
@@ -248,6 +251,8 @@ private fun EntryMoreButton(entry: Entry, actions: EntryActions, modifier: Modif
             onAction = { actions.onAction(it, entry) },
             agents = actions.agents,
             onAgent = { actions.onAgent(entry, it) },
+            pasteInto = actions.pasteInto?.takeIf { entry.dir && !inTrash(entry.path) },
+            onPasteInto = { actions.onPasteInto(entry) },
         )
     }
 }

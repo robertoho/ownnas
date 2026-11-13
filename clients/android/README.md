@@ -14,6 +14,8 @@ What works now:
   phone on its side or a foldable unfolded. The layout is remembered separately for narrow and
   wide windows, so unfolding or turning the phone switches to the wide one by itself, and tiles
   fill the extra width. Selecting, the ⋮ menus, and every action work in each layout.
+- Themes: the web app's 25 themes (the palette button on the server list), or the phone's own
+  Material You colours from the wallpaper. The choice is remembered on the phone.
 - Search (the magnifier in a folder): names, tags, and the words inside documents, PDFs, and
   pictures in that folder and below, as the web app's search box finds them.
 - Open a file in the app that handles its type, or share it, with download progress.
@@ -35,10 +37,13 @@ What works now:
   archive), and New folder with the selection. Move and copy choose the destination in a
   folder picker that can make new folders; when a name is taken there the server keeps both.
   Each row's ⋮ menu has the same actions for that item alone.
-- More actions on selections, as in the web app: Cut or Copy, then "Paste here" in another
-  folder; Protect from deletion (for folders: the folder itself, or everything in it) and
-  Allow deletion; Compress to ZIP, TAR.GZ, TAR.XZ, or TAR, and Extract here; photos: Convert
-  to (JPEG, PNG, WebP, GIF, BMP, TIFF) and Resize (Small to 4K, half, quarter; as copies or in
+- Copy, cut and paste: Cut and Copy are in the selection bar; then "Paste … here" in the
+  folder's ⋮ menu, or "Paste … into it" in a folder's own ⋮ menu. "Paste from the phone's
+  clipboard" uploads files copied in another app, or saves copied text as a .txt file.
+- More actions on selections, as in the web app: Protect from deletion (for folders: the
+  folder itself, or everything in it) and Allow deletion; Compress to ZIP, TAR.GZ, TAR.XZ, or
+  TAR, and Extract here; photos: Convert to (JPEG, PNG, WebP, GIF, BMP, TIFF) and Resize
+  (Small to 4K, half, quarter; as copies or in
   place); PDFs: Join, Extract pages, Split into pages, Rotate pages; Versions (restore or
   delete an earlier version); Add to album. Inside the Trash, the folder menu empties it.
 - Convert video (format, size, speed, sound), followed on the server with progress and Stop.

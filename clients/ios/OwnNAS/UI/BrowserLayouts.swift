@@ -168,22 +168,24 @@ struct AboveColumn: View {
         VStack(alignment: .leading, spacing: 0) {
             Text(path.isEmpty ? serverName : specialFolderLabel((path as NSString).lastPathComponent))
                 .font(.caption.weight(.semibold)).foregroundStyle(.secondary).lineLimit(1)
-                .padding(.horizontal, 12).padding(.vertical, 8)
+                .padding(.horizontal, 12).padding(.top, 6).padding(.bottom, 2)
             if let entries {
                 ScrollViewReader { scroller in
                     List(entries, id: \.path) { entry in
                         Button { open(entry) } label: {
-                            HStack(spacing: 10) {
-                                EntryIcon(server: server, entry: entry, size: 32)
-                                Text(specialFolderLabel(entry.name)).lineLimit(1).foregroundStyle(.primary)
+                            HStack(spacing: 8) {
+                                EntryIcon(server: server, entry: entry, size: 24)
+                                Text(specialFolderLabel(entry.name)).font(.subheadline).lineLimit(1).foregroundStyle(.primary)
                                 Spacer(minLength: 0)
                                 if entry.dir { Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary) }
                             }
                         }
                         .listRowBackground(entry.path == next ? Color.accentColor.opacity(0.18) : Color.clear)
+                        .listRowInsets(EdgeInsets(top: 4, leading: 10, bottom: 4, trailing: 10))
                         .id(entry.path)
                     }
                     .listStyle(.plain)
+                    .environment(\.defaultMinListRowHeight, 32)
                     .onAppear { scroller.scrollTo(next, anchor: .center) }
                 }
             } else {

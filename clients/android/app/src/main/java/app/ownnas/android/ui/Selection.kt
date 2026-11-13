@@ -164,7 +164,7 @@ fun bulkActions(entries: List<Entry>, writable: Boolean): List<Bulk> {
 /** The bar under a selection: the most used actions, and the rest under More. */
 @Composable
 fun SelectionActions(actions: List<Bulk>, entries: List<Entry>, onAction: (Bulk) -> Unit) {
-    val primary = listOf(Bulk.Share, Bulk.MoveTo, Bulk.CopyTo, Bulk.Restore, Bulk.Trash).filter { it in actions }.take(4)
+    val primary = listOf(Bulk.Share, Bulk.Cut, Bulk.Copy, Bulk.Restore, Bulk.Trash).filter { it in actions }.take(4)
     val more = actions - primary.toSet()
     BottomAppBar {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {

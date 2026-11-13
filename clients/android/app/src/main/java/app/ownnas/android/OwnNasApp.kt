@@ -13,4 +13,9 @@ class OwnNasApp : Application() {
     val syncs: Syncs by lazy { Syncs(this, servers) }
     val shortcuts: Shortcuts by lazy { Shortcuts(this) }
     val backup: Backup by lazy { Backup(this) }
+
+    override fun onCreate() {
+        super.onCreate()
+        app.ownnas.android.ui.theme.ThemeChoice.load(this)
+    }
 }

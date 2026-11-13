@@ -16,6 +16,7 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CheckCircle
+import androidx.compose.material.icons.outlined.ContentPaste
 import androidx.compose.material.icons.outlined.CreateNewFolder
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.DocumentScanner
@@ -75,9 +76,13 @@ fun EntryMenu(
     onAction: (Bulk) -> Unit,
     agents: List<app.ownnas.core.AgentLauncher> = emptyList(),
     onAgent: (app.ownnas.core.AgentLauncher) -> Unit = {},
+    /** "Paste 3 items into it", for a folder while something is cut or copied. */
+    pasteInto: String? = null,
+    onPasteInto: () -> Unit = {},
 ) {
     DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
         MenuItem("Select", Icons.Outlined.CheckCircle) { onDismiss(); onSelect() }
+        if (entry.dir && pasteInto != null) MenuItem(pasteInto, Icons.Outlined.ContentPaste) { onDismiss(); onPasteInto() }
         // As in the web app's folder menu.
         if (entry.dir && terminals && !inTrash(entry.path)) {
             MenuItem("Open terminal here", Icons.Outlined.Terminal) { onDismiss(); onTerminal() }

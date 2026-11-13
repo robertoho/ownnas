@@ -87,6 +87,7 @@ private fun App(showBackup: Int, vm: AppViewModel = viewModel()) {
                 is Screen.Duplicates -> DuplicatesScreen(vm, target.serverId, target.path)
                 is Screen.SortFolder -> SortFolderScreen(vm, target.serverId, target.path)
                 is Screen.Activity -> ActivityScreen(vm, target.serverId)
+                Screen.Appearance -> app.ownnas.android.ui.AppearanceScreen(vm)
                 is Screen.Terminals -> TerminalsScreen(vm, target.serverId, target.path)
                 is Screen.Terminal -> TerminalScreen(vm, target.serverId, target.terminalId, target.startup)
                 Screen.Sync -> SyncScreen(vm)
