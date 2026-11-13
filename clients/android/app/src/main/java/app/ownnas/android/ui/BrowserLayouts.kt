@@ -175,13 +175,22 @@ fun FolderLayout(
     layout: BrowserLayout,
     tile: Int,
     wide: Boolean,
-    folder: Folder,
+    folder: Folder?,
+    path: String,
     serverName: String,
     actions: EntryActions,
     onBrowse: (String) -> Unit,
 ) {
-    val entries = remember(folder) { sortedEntries(folder) }
     val shown = if (layout == BrowserLayout.Columns && !wide) BrowserLayout.List else layout
+    if (shown == BrowserLayout.Columns) {
+        ColumnsView(path, folder, serverName, actions, onBrowse)
+        return
+    }
+    if (folder == null) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+        return
+    }
+    val entries = remember(folder) { sortedEntries(folder) }
     // Room under the last entries for the add button.
     val bottom = PaddingValues(bottom = 88.dp)
     when (shown) {
@@ -209,7 +218,7 @@ fun FolderLayout(
             items(entries.size, key = { entries[it].path }) { EntryTile(entries[it], actions, square = false) }
             if (folder.truncated) item(span = StaggeredGridItemSpan.FullLine) { Truncated(folder) }
         }
-        BrowserLayout.Columns -> ColumnsView(folder, entries, serverName, actions, onBrowse)
+        BrowserLayout.Columns -> {}
     }
 }
 
@@ -369,27 +378,40 @@ private fun ancestors(path: String): List<String> {
  * folder with selection and every action. Tapping a folder in any column opens it.
  */
 @Composable
-private fun ColumnsView(folder: Folder, entries: List<Entry>, serverName: String, actions: EntryActions, onBrowse: (String) -> Unit) {
-    val chain = remember(folder.path) { ancestors(folder.path) }
+private fun ColumnsView(path: String, folder: Folder?, serverName: String, actions: EntryActions, onBrowse: (String) -> Unit) {
+    val chain = remember(path) { ancestors(path) }
     val state = rememberLazyListState()
-    // Show this folder, with as many above it as fit.
-    LaunchedEffect(folder.path) { state.scrollToItem(chain.size) }
+    // Slide to the new column; the ones before it stay where they are.
+    LaunchedEffect(path) { state.animateScrollToItem(chain.size) }
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val narrow: Dp = 240.dp
         val current: Dp = maxOf(320.dp, maxWidth - narrow * minOf(chain.size, 2))
         LazyRow(state = state, modifier = Modifier.fillMaxSize()) {
             items(chain.size, key = { "column:${chain[it]}" }) { index ->
                 val above = chain[index]
-                val next = chain.getOrNull(index + 1) ?: folder.path
+                val next = chain.getOrNull(index + 1) ?: path
                 Row(Modifier.width(narrow).fillMaxHeight()) {
                     AboveColumn(actions, above, next, serverName, onBrowse, Modifier.weight(1f))
                     VerticalDivider()
                 }
             }
-            item(key = "column:${folder.path}") {
-                LazyColumn(Modifier.width(current).fillMaxHeight(), contentPadding = PaddingValues(bottom = 88.dp)) {
-                    items(entries, key = { it.path }) { EntryRow(it, actions) }
-                    if (folder.truncated) item { Truncated(folder) }
+            item(key = "column:$path") {
+                Box(Modifier.width(current).fillMaxHeight()) {
+                    when {
+                        folder == null -> CircularProgressIndicator(Modifier.align(Alignment.Center))
+                        folder.entries.isEmpty() -> Text(
+                            "This folder is empty",
+                            Modifier.align(Alignment.Center).padding(24.dp),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        else -> {
+                            val entries = remember(folder) { sortedEntries(folder) }
+                            LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 88.dp)) {
+                                items(entries, key = { it.path }) { EntryRow(it, actions) }
+                                if (folder.truncated) item { Truncated(folder) }
+                            }
+                        }
+                    }
                 }
             }
         }

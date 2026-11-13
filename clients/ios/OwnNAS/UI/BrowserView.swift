@@ -5,7 +5,15 @@ import SwiftUI
 struct BrowserView: View {
     @EnvironmentObject private var hub: Hub
     let server: String
-    let path: String
+    /// The folder shown. Columns change it in place, as the web app does, instead of opening a
+    /// new view per folder; `trail` is where Back goes, folder by folder.
+    @State private var path: String
+    @State private var trail: [String] = []
+
+    init(server: String, path: String) {
+        self.server = server
+        _path = State(initialValue: path)
+    }
 
     @State private var folder: Folder?
     @State private var problem: Error?
@@ -92,9 +100,10 @@ struct BrowserView: View {
             .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { toolbar }
-            .navigationBarBackButtonHidden(selecting)
+            .navigationBarBackButtonHidden(selecting || !trail.isEmpty)
             .refreshable { await load() }
-            .task(id: "\(hub.revision) \(showHidden)") { await load() }
+            .task(id: "\(hub.revision) \(showHidden) \(path)") { await load() }
+            .onChange(of: path) { selection = [] }
             .task(id: path) { bookmarked = try? await hub.call(server) { [path] in try $0.bookmarks().contains(path) } }
             .task(id: account?.terminal) { await followTerminals() }
             .task(id: account?.terminal) {
@@ -249,13 +258,18 @@ struct BrowserView: View {
         if wide { wideLayout = layout.rawValue } else { narrowLayout = layout.rawValue }
     }
 
+    /// The listing of the folder shown, once it has arrived (not the one before it).
+    private var current: Folder? { folder.flatMap { $0.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == path.trimmingCharacters(in: CharacterSet(charactersIn: "/")) ? $0 : nil } }
+
     @ViewBuilder private var content: some View {
-        if let folder {
+        if shownLayout == .columns && problem == nil {
+            // The columns stay while a folder tapped in them loads.
+            columnsView(current)
+        } else if let folder = current {
             switch shownLayout {
-            case .list: listView(folder)
+            case .list, .columns: listView(folder)
             case .grid: tilesView(folder, masonry: false)
             case .masonry: tilesView(folder, masonry: true)
-            case .columns: columnsView(folder)
             }
         } else if let problem {
             ContentUnavailableView {
@@ -349,12 +363,32 @@ struct BrowserView: View {
     }
 
     private func open(_ entry: Entry) {
-        if entry.dir { hub.path.append(.browse(server: server, path: entry.path)) } else { opener.open(hub, server: server, entry: entry) }
+        if entry.dir && shownLayout == .columns {
+            goTo(entry.path)
+        } else if entry.dir {
+            hub.path.append(.browse(server: server, path: entry.path))
+        } else {
+            opener.open(hub, server: server, entry: entry)
+        }
+    }
+
+    /// Shows `target` in place: the columns stay, and only the new one loads.
+    private func goTo(_ target: String) {
+        guard target != path else { return }
+        trail.append(path)
+        path = target
+        problem = nil
+    }
+
+    private func goBack() {
+        guard let previous = trail.popLast() else { return }
+        path = previous
+        problem = nil
     }
 
     /// Miller columns, as the web app's column view: the folders above, narrow, then this
     /// folder as the list (selection, swipes, and menus as usual).
-    private func columnsView(_ folder: Folder) -> some View {
+    private func columnsView(_ folder: Folder?) -> some View {
         let chain = ancestorPaths(path)
         return GeometryReader { geometry in
             let narrow: CGFloat = 240
@@ -373,11 +407,20 @@ struct BrowserView: View {
                             .frame(width: narrow)
                             Divider()
                         }
-                        listView(folder).frame(width: current).id("current")
+                        Group {
+                            if let folder {
+                                listView(folder)
+                            } else {
+                                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+                            }
+                        }
+                        .frame(width: current)
+                        .id("current")
                     }
                     .frame(height: geometry.size.height)
                 }
                 .onAppear { scroller.scrollTo("current", anchor: .trailing) }
+                .onChange(of: path) { withAnimation { scroller.scrollTo("current", anchor: .trailing) } }
             }
         }
     }
@@ -711,6 +754,12 @@ struct BrowserView: View {
     }
 
     @ToolbarContentBuilder private var normalToolbar: some ToolbarContent {
+        if !trail.isEmpty {
+            ToolbarItem(placement: .topBarLeading) {
+                Button { goBack() } label: { Image(systemName: "chevron.backward") }
+                    .accessibilityLabel("Back")
+            }
+        }
         ToolbarItemGroup(placement: .primaryAction) {
             LayoutMenu(chosen: chosenLayout, wide: wide, tile: $tile, choose: chooseLayout)
             if writable {
@@ -782,12 +831,16 @@ struct BrowserView: View {
     }
 
     private func load() async {
+        let target = path
         do {
             if account == nil { account = try? await hub.account(server) }
-            folder = try await hub.call(server) { [path, showHidden] in try $0.listWithHidden(path: path, hidden: showHidden) }
+            let listed = try await hub.call(server) { [showHidden] in try $0.listWithHidden(path: target, hidden: showHidden) }
+            // A tap on another folder while this one loaded wins.
+            guard target == path else { return }
+            folder = listed
             problem = nil
         } catch {
-            problem = error
+            if target == path { problem = error }
         }
     }
 

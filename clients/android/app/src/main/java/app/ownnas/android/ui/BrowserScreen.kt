@@ -87,6 +87,10 @@ import androidx.compose.material.icons.outlined.FileCopy
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.automirrored.outlined.DriveFileMove
 import androidx.compose.material.icons.outlined.SmartToy
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.listSaver
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.toMutableStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -150,11 +154,17 @@ private class Fetch(val entry: Entry, val share: Boolean) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
+fun BrowserScreen(vm: AppViewModel, serverId: String, startPath: String) {
     val server = vm.server(serverId) ?: return
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
+    // The folder shown. Columns change it in place, as the web app does, instead of opening a
+    // new screen per folder; `trail` is where Back goes, folder by folder.
+    var path by rememberSaveable(serverId, startPath) { mutableStateOf(startPath) }
+    val trail = rememberSaveable(serverId, startPath, saver = listSaver<MutableList<String>, String>({ it.toList() }, { it.toMutableStateList() })) {
+        mutableStateListOf()
+    }
     var folder by remember { mutableStateOf(vm.cachedFolder(serverId, path)) }
     var error by remember { mutableStateOf<Throwable?>(null) }
     var refreshing by remember { mutableStateOf(false) }
@@ -201,10 +211,13 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
     }
     val terminalsByPath = remember(terminals) { terminals.groupBy { it.path } }
 
-    LaunchedEffect(reload, revision, showHidden) {
+    LaunchedEffect(path, reload, revision, showHidden) {
         refreshing = true
         try {
-            folder = vm.list(serverId, path)
+            val target = path
+            val listed = vm.list(serverId, target)
+            // A tap on another folder while this one loaded wins.
+            if (target == path) folder = listed
             error = null
         } catch (err: Exception) {
             error = err
@@ -221,6 +234,22 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
     val selecting = selected.isNotEmpty()
     val selectedEntries = folder?.entries.orEmpty().filter { it.path in selected }
     androidx.activity.compose.BackHandler(enabled = selecting) { selected = emptySet() }
+    // Back after moving through columns goes back up the way you came.
+    androidx.activity.compose.BackHandler(enabled = !selecting && trail.isNotEmpty()) {
+        path = trail.removeAt(trail.lastIndex)
+        folder = vm.cachedFolder(serverId, path)
+        error = null
+    }
+    val columns = wide && (if (wide) layouts.wide else layouts.narrow) == BrowserLayout.Columns
+
+    /** Shows `target` in place: the columns stay, and only the new one loads. */
+    fun goTo(target: String) {
+        if (target == path) return
+        trail.add(path)
+        path = target
+        folder = vm.cachedFolder(serverId, target)
+        error = null
+    }
 
     // Keyed on a plain flag: clearing the finished status must not restart this and cancel the message.
     val uploading = uploads?.active == true
@@ -277,7 +306,11 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
     }
 
     fun open(entry: Entry) {
-        if (entry.dir) vm.push(Screen.Browse(serverId, entry.path)) else fetch(entry, share = false)
+        when {
+            entry.dir && columns -> goTo(entry.path)
+            entry.dir -> vm.push(Screen.Browse(serverId, entry.path))
+            else -> fetch(entry, share = false)
+        }
     }
 
     fun act(action: suspend () -> String?) {
@@ -699,9 +732,38 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
             onRefresh = { reload++ },
             modifier = Modifier.padding(padding).fillMaxSize(),
         ) {
-            val shown = folder
+            // Until the folder tapped in a column arrives, its column shows a spinner and the
+            // columns to its left stay as they are.
+            val shown = folder?.takeIf { it.path.trim('/') == path.trim('/') }
             val failure = error
             when {
+                columns && failure == null -> Listing(
+                    vm = vm,
+                    serverId = serverId,
+                    folder = shown,
+                    path = path,
+                    writable = writable,
+                    terminalsOn = terminalsOn,
+                    terminalsByPath = terminalsByPath,
+                    selected = selected,
+                    onOpen = { entry ->
+                        when {
+                            !selecting -> open(entry)
+                            entry.path in selected -> selected = selected - entry.path
+                            else -> selected = selected + entry.path
+                        }
+                    },
+                    onSelect = { entry -> selected = if (entry.path in selected) selected - entry.path else selected + entry.path },
+                    onAction = { action, entry -> onBulk(action, listOf(entry)) },
+                    onTerminal = { entry -> openTerminalIn(entry.path) },
+                    agents = agents,
+                    onAgent = { entry, agent -> openTerminalIn(entry.path, agent) },
+                    layout = BrowserLayout.Columns,
+                    tile = layouts.tile,
+                    wide = true,
+                    serverName = server.name,
+                    onBrowse = ::goTo,
+                )
                 failure != null && shown == null -> Problem(failure, onRetry = { reload++ }, onSignIn = { vm.push(Screen.SignIn(server)) })
                 shown == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
                 shown.entries.isEmpty() -> Message(if (writable) "This folder is empty. Tap + to add files." else "This folder is empty")
@@ -709,6 +771,7 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
                     vm = vm,
                     serverId = serverId,
                     folder = shown,
+                    path = path,
                     writable = writable,
                     terminalsOn = terminalsOn,
                     terminalsByPath = terminalsByPath,
@@ -729,7 +792,7 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
                     tile = layouts.tile,
                     wide = wide,
                     serverName = server.name,
-                    onBrowse = { target -> vm.push(Screen.Browse(serverId, target)) },
+                    onBrowse = ::goTo,
                 )
             }
         }
@@ -1022,7 +1085,8 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
 private fun Listing(
     vm: AppViewModel,
     serverId: String,
-    folder: Folder,
+    folder: Folder?,
+    path: String,
     writable: Boolean,
     terminalsOn: Boolean,
     terminalsByPath: Map<String, List<TerminalInfo>>,
@@ -1040,7 +1104,7 @@ private fun Listing(
     onBrowse: (String) -> Unit,
 ) {
     val actions = EntryActions(vm, serverId, writable, terminalsOn, terminalsByPath, selected, onOpen, onSelect, onAction, onTerminal, agents, onAgent)
-    FolderLayout(layout, tile, wide, folder, serverName, actions, onBrowse)
+    FolderLayout(layout, tile, wide, folder, path, serverName, actions, onBrowse)
 }
 
 /**
