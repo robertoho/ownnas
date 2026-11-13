@@ -522,6 +522,8 @@ fn index_schema(conn: &Connection) -> Result<(), String> {
         );
         CREATE INDEX IF NOT EXISTS idx.file_index_parent ON file_index(parent);
         CREATE INDEX IF NOT EXISTS idx.file_index_size ON file_index(size);
+        -- Folder sizes add up a whole subtree: a range of paths, read from this index alone.
+        CREATE INDEX IF NOT EXISTS idx.file_index_tree ON file_index(path, dir, size);
         CREATE TABLE IF NOT EXISTS idx.content_text (
             path TEXT NOT NULL UNIQUE,
             size INTEGER NOT NULL,

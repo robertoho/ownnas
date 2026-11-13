@@ -1584,31 +1584,11 @@ async fn list(
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not list the folder"))?
         .map_err(ApiError::from)?;
     let paths: Vec<String> = listing.entries.iter().map(|entry| entry.path.clone()).collect();
-    // Folder sizes from the index, which counts every level: those it cannot answer (not
-    // indexed yet, or photo-library packages) fall back to the sizes measured before.
-    let mut from_index = std::collections::HashSet::new();
-    if state.file_index.ready() {
-        let dirs: Vec<(usize, String)> = listing.entries.iter().enumerate().filter(|(_, entry)| entry.dir).map(|(index, entry)| (index, entry.path.clone())).collect();
-        let found = tokio::task::spawn_blocking({
-            let state = state.clone();
-            move || -> Vec<(usize, u64)> {
-                let Ok(conn) = own_connection(&state) else { return Vec::new() };
-                dirs.into_iter()
-                    .filter_map(|(index, path)| match crate::file_index::folder_total(&conn, &path) {
-                        Ok(Some((bytes, _, packages))) if packages.is_empty() => Some((index, bytes)),
-                        _ => None,
-                    })
-                    .collect()
-            }
-        })
-        .await
-        .unwrap_or_default();
-        for (index, bytes) in found {
-            listing.entries[index].measured_size = Some(bytes);
-            listing.entries[index].measured_truncated = Some(false);
-            from_index.insert(index);
-        }
-    }
+    // With the index ready, folder sizes come from it afterwards (/api/usage, which the page asks
+    // for each folder in the background): adding up big subtrees here would hold the listing,
+    // and the sizes measured before miss changes deeper down. Before it is ready, those
+    // measured sizes are shown.
+    let sizes_later = state.file_index.ready();
     if !paths.is_empty() {
         // The sizes measured before, kept only for folders unchanged since: reading the folders
         // to tell happens after, without holding the database.
@@ -1622,7 +1602,7 @@ async fn list(
                     }
                 }
             }
-            for (index, entry) in listing.entries.iter().enumerate().filter(|(index, entry)| entry.dir && !from_index.contains(index)) {
+            for (index, entry) in listing.entries.iter().enumerate().filter(|(_, entry)| entry.dir && !sizes_later) {
                 if let Ok(Some(row)) = db::get_folder_size(&conn, &entry.path) {
                     sizes.push((index, entry.path.clone(), row));
                 }

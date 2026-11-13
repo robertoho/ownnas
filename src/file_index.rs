@@ -414,24 +414,34 @@ pub fn folder_total(conn: &Connection, rel: &str) -> Result<Option<(u64, u64, Ve
             return Ok(None);
         }
     }
-    // Paths below `rel` sort between "rel/" and "rel0" ('0' follows '/').
+    // Paths below `rel` sort between "rel/" and "rel0" ('0' follows '/'). The whole library is
+    // its own query: an `OR` for it would keep SQLite from reading just the range from an
+    // index, so every folder would read the whole index.
+    let (range, args): (&str, Vec<String>) = if rel.is_empty() {
+        ("1 = 1", Vec::new())
+    } else {
+        ("path >= ?1 AND path < ?2", vec![format!("{rel}/"), format!("{rel}0")])
+    };
     let (bytes, files): (i64, i64) = conn
         .query_row(
-            "SELECT COALESCE(SUM(size), 0), COUNT(*) FROM file_index
-             WHERE dir = 0 AND (?1 = '' OR (path >= ?1 || '/' AND path < ?1 || '0'))",
-            [rel],
+            &format!("SELECT COALESCE(SUM(size), 0), COUNT(*) FROM file_index WHERE {range} AND dir = 0"),
+            rusqlite::params_from_iter(args.iter()),
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(sql)?;
     let mut stmt = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT path FROM file_index
-             WHERE dir = 1 AND (?1 = '' OR (path >= ?1 || '/' AND path < ?1 || '0'))
+             WHERE {range} AND dir = 1
                AND (lower(path) LIKE '%.photoslibrary' OR lower(path) LIKE '%.photolibrary'
-                    OR lower(path) LIKE '%.aplibrary' OR lower(path) LIKE '%.migratedphotolibrary')",
-        )
+                    OR lower(path) LIKE '%.aplibrary' OR lower(path) LIKE '%.migratedphotolibrary')"
+        ))
         .map_err(sql)?;
-    let packages = stmt.query_map([rel], |row| row.get::<_, String>(0)).map_err(sql)?.filter_map(Result::ok).collect();
+    let packages = stmt
+        .query_map(rusqlite::params_from_iter(args.iter()), |row| row.get::<_, String>(0))
+        .map_err(sql)?
+        .filter_map(Result::ok)
+        .collect();
     Ok(Some((bytes.max(0) as u64, files.max(0) as u64, packages)))
 }
 
@@ -525,6 +535,25 @@ mod tests {
         fs::remove_dir_all(lib.join("docs")).unwrap();
         scan_all(&library, "", false);
         assert_eq!(names(&library, "notes", ""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn folder_totals_count_every_level() {
+        let library = library();
+        let lib = library.root.join("lib");
+        fs::create_dir_all(lib.join("Fotos/2016/2016-09-26")).unwrap();
+        fs::create_dir_all(lib.join("Fotos2")).unwrap();
+        fs::create_dir_all(lib.join("Fotos/Photos.photoslibrary")).unwrap();
+        fs::write(lib.join("Fotos/a.jpg"), b"12").unwrap();
+        fs::write(lib.join("Fotos/2016/2016-09-26/b.jpg"), b"345").unwrap();
+        fs::write(lib.join("Fotos2/c.jpg"), b"6789").unwrap();
+        scan_all(&library, "", false);
+        let (bytes, files, packages) = folder_total(&library.conn, "Fotos").unwrap().unwrap();
+        assert_eq!((bytes, files), (5, 2), "both levels, not Fotos2");
+        assert_eq!(packages, ["Fotos/Photos.photoslibrary"]);
+        assert_eq!(folder_total(&library.conn, "Fotos/2016").unwrap().map(|t| (t.0, t.1)), Some((3, 1)));
+        assert_eq!(folder_total(&library.conn, "").unwrap().map(|t| (t.0, t.1)), Some((9, 3)));
+        assert_eq!(folder_total(&library.conn, "Nope").unwrap(), None, "not indexed");
     }
 
     #[test]
