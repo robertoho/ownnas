@@ -65,6 +65,9 @@ impl Changes {
             let Some(feed) = feed.upgrade() else { return };
             match result {
                 Ok(event) if event.need_rescan() => feed.expire(),
+                // Reading is not changing: Linux reports every open (OwnNAS listing a folder or
+                // sending a file), which would have clients list again after each of their reads.
+                Ok(event) if !changes_something(&event.kind) => {}
                 Ok(event) => {
                     for path in &event.paths {
                         if let Some(rel) = bases.iter().flatten().find_map(|base| relative(base, path)) {
@@ -175,8 +178,30 @@ fn relative(root: &Path, path: &Path) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
+/// Whether a watcher event is a change (not an open, a read, or a close after reading).
+fn changes_something(kind: &notify::EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode};
+    match kind {
+        notify::EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        notify::EventKind::Access(_) => false,
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reads_are_not_changes() {
+        use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind};
+        use notify::EventKind;
+        assert!(!super::changes_something(&EventKind::Access(AccessKind::Open(AccessMode::Any))));
+        assert!(!super::changes_something(&EventKind::Access(AccessKind::Close(AccessMode::Read))));
+        assert!(!super::changes_something(&EventKind::Access(AccessKind::Read)));
+        assert!(super::changes_something(&EventKind::Access(AccessKind::Close(AccessMode::Write))));
+        assert!(super::changes_something(&EventKind::Create(CreateKind::File)));
+        assert!(super::changes_something(&EventKind::Modify(ModifyKind::Any)));
+    }
+
     use super::*;
 
     #[test]

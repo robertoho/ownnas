@@ -748,6 +748,25 @@ input, select, textarea {
   scrollbar-width: none;
 }
 .crumbs::-webkit-scrollbar { display: none; }
+/* The empty space after the last folder turns the path into text to edit, as in file explorers. */
+.crumbs { cursor: text; }
+.crumbs > * { cursor: default; }
+.crumbs button { cursor: pointer; }
+.crumbs .crumbs-edit { display: flex; align-items: center; justify-content: center; color: var(--muted); opacity: 0.7; }
+.crumbs .crumbs-edit:hover, .crumbs .crumbs-edit:focus-visible { opacity: 1; color: var(--text); }
+.crumbs.is-editing { overflow: visible; }
+.crumbs-input {
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+  font: inherit;
+  padding: 0.3rem 0.55rem;
+  border-radius: 8px;
+  border: 1px solid var(--accent);
+  background: var(--bg-2);
+  color: var(--text);
+  outline: none;
+}
 .crumbs button {
   border-radius: 8px;
   background: transparent;
@@ -4794,3 +4813,7 @@ body.is-remotes .app > .explorer-status-bar { display: none; }
 .agent-launcher input:not([type="checkbox"]) { width: min(16rem, 45%); font-family: var(--mono); font-size: 0.85rem; }
 .agent-launcher.is-missing { opacity: 0.6; }
 .agent-launcher-actions { display: flex; gap: 0.5rem; margin-top: 0.75rem; }
+
+/* The Refresh button turns while the folder is listed again. */
+#refresh-btn.is-spinning svg { animation: refresh-spin 0.7s linear infinite; }
+@keyframes refresh-spin { to { transform: rotate(360deg); } }

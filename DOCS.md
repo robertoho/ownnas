@@ -59,7 +59,14 @@ Helper scripts in the repo (`build.sh` / `build.bat`, `serve.sh` / `serve.bat`) 
 
 After sign-in you get a file manager over `--root`:
 
-- **Breadcrumbs** for the current path; click a segment to jump.
+- **Live updates:** the folder shown updates by itself when files in it change, whether through
+  OwnNAS (from another device or tab) or on the server's disk directly; what is selected stays
+  selected. **Refresh** (the circular arrow in the toolbar) lists it again at once.
+- **Breadcrumbs** for the current path; click a segment to jump. Click the pencil, the empty
+  space after the path, or press Ctrl/Cmd+L to see the path as text: copy it, or type or paste
+  a path (such as `Fotos/library/admin/2016/2016-09-26/`) and press Enter to go there. Either
+  slash works, the leading and trailing ones are optional, and a file's path opens its folder
+  with the file selected.
 - **OwnNAS** in the header jumps to the library root.
 - **Filter** by file name or tag (current folder only).
 - **Sort** by name, date, or size (ascending / descending).
@@ -358,6 +365,7 @@ Generate signing keys once: `ownnas update keygen --out releases/keys`.
 | Delete | Trash / delete selection |
 | Enter | Open selection |
 | Arrows (+ Shift) | Move / extend selection |
+| Ctrl/Cmd+L | Type or paste a path to go to |
 | Escape | Close overlays; clear selection |
 
 ---

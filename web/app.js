@@ -680,7 +680,120 @@ function renderCrumbs() {
     const current = index === parts.length - 1 ? ' aria-current="page"' : "";
     html += `<span class="muted">/</span><button type="button" data-go="${esc(walked)}" title="${esc(specialFolderLabel(part))}"${current}>${esc(specialFolderLabel(part))}</button>`;
   });
+  html += `<button type="button" class="crumbs-edit" data-edit-path title="Type or paste a path (${commandLabel("L")})" aria-label="Type or paste a path">${PATH_EDIT_ICON}</button>`;
   nav.innerHTML = html;
+}
+
+const PATH_EDIT_ICON = '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.5 2.5l3 3L6 13H3v-3z"/><path d="M9 4l3 3"/></svg>';
+
+/// The path as text, as in a file explorer's address bar: select it to copy, or type or paste a
+/// path ("Fotos/library/2016/") and press Enter to go there.
+function editPath() {
+  const nav = $("crumbs");
+  if (nav.querySelector(".crumbs-input")) return;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "crumbs-input";
+  input.spellcheck = false;
+  input.autocomplete = "off";
+  input.setAttribute("autocapitalize", "off");
+  input.setAttribute("aria-label", "Folder path");
+  input.placeholder = "Type or paste a path, such as Photos/2016/";
+  const shown = location.hash.startsWith("#/") || !location.hash ? state.path : "";
+  input.value = shown ? `${shown}/` : "";
+  nav.replaceChildren(input);
+  nav.classList.add("is-editing");
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    nav.classList.remove("is-editing");
+    renderCrumbs();
+  };
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      finish();
+      $("files").focus({ preventScroll: true });
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      const typed = input.value;
+      input.disabled = true;
+      goToTypedPath(typed)
+        .then((ok) => {
+          if (ok) finish();
+          else {
+            input.disabled = false;
+            input.focus();
+          }
+        })
+        .catch((err) => {
+          input.disabled = false;
+          input.focus();
+          toast(err.message, true);
+        });
+    }
+  });
+  input.addEventListener("blur", () => {
+    if (!input.disabled) finish();
+  });
+}
+
+/// A typed or pasted path as a library path: slashes either way, with or without the leading
+/// or trailing one, "." and "..", the library's name in front, or a link to an OwnNAS folder.
+function typedPathCandidates(text) {
+  let value = String(text || "").trim().replace(/^["'](.*)["']$/, "$1").trim();
+  if (/^https?:\/\//i.test(value)) {
+    try {
+      value = new URL(value).hash || "";
+    } catch {}
+  }
+  if (value.startsWith("#")) {
+    value = value.slice(1);
+    try {
+      value = value.split("/").map(decodeURIComponent).join("/");
+    } catch {}
+  }
+  const parts = [];
+  for (const part of value.replace(/\\/g, "/").split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") parts.pop();
+    else parts.push(part);
+  }
+  const path = parts.join("/");
+  const candidates = [path];
+  const root = state.me.rootName || "Library";
+  if (parts.length && parts[0] === root) candidates.push(parts.slice(1).join("/"));
+  return candidates;
+}
+
+/// Opens the folder at a typed path; for a file, its folder with the file selected.
+async function goToTypedPath(text) {
+  const hidden = state.hidden ? "&hidden=1" : "";
+  for (const path of typedPathCandidates(text)) {
+    try {
+      await api(`/api/list?path=${encodeURIComponent(path)}${hidden}`);
+      await go(path);
+      return true;
+    } catch {}
+    if (!path) continue;
+    const parent = parentPath(path);
+    const name = path.slice(parent ? parent.length + 1 : 0);
+    try {
+      const data = await api(`/api/list?path=${encodeURIComponent(parent)}&hidden=1`);
+      const entry = (data.entries || []).find((item) => item.name === name);
+      if (entry) {
+        state.reveal = entry.path;
+        if (parent === state.path) await load(parent);
+        else await go(parent);
+        return true;
+      }
+    } catch {}
+  }
+  toast(`There is no folder or file at "${String(text).trim()}"`, true);
+  return false;
 }
 
 function specialFolderLabel(name) {
@@ -842,9 +955,17 @@ async function load(path, options = {}) {
   state.truncated = !!data.truncated;
   state.total = data.total || state.entries.length;
   if (data.rootName) state.me.rootName = data.rootName;
-  state.selected = new Set();
-  state.anchor = "";
-  state.focus = "";
+  if (options.keepSelection && !changedFolder) {
+    // A refresh: what is still there stays selected.
+    const present = new Set(state.entries.map((entry) => entry.path));
+    state.selected = new Set([...state.selected].filter((path) => present.has(path)));
+    if (!present.has(state.anchor)) state.anchor = "";
+    if (!present.has(state.focus)) state.focus = "";
+  } else {
+    state.selected = new Set();
+    state.anchor = "";
+    state.focus = "";
+  }
   if (!options.keepPreview) closePreview(true);
   renderCrumbs();
   syncUndo();
@@ -5787,6 +5908,63 @@ function refreshWorkspaceCount() {
   api("/api/workspaces").then((data) => { state.workspaceCount = data.workspaces.length; }).catch(() => {});
 }
 
+/// Lists the folder shown again, keeping the selection, the scroll position, and the preview.
+function refreshFolder() {
+  if (!state.me || !state.listed || !(location.hash.startsWith("#/") || !location.hash)) return Promise.resolve();
+  return load(state.path, { keepPreview: true, keepSelection: true });
+}
+
+// Live updates: the server's change feed (its watcher sees changes made through OwnNAS and made
+// on the disk directly) says when something in the folder shown changed; it is then listed again.
+let liveCursor = "";
+let liveFollowing = false;
+let liveTimer = 0;
+let liveWaiting = false;
+
+function liveRefreshSoon() {
+  clearTimeout(liveTimer);
+  liveTimer = setTimeout(() => {
+    // Not while the tab is hidden, or while typing a name or dragging in the files.
+    const busy = marquee || internalDragPaths.length || document.querySelector("#files input, #files [contenteditable=\"true\"]");
+    if (document.hidden) liveWaiting = true;
+    else if (busy) liveRefreshSoon();
+    else refreshFolder().catch(() => {});
+  }, 700);
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && liveWaiting) {
+    liveWaiting = false;
+    liveRefreshSoon();
+  }
+});
+
+async function followChanges() {
+  if (liveFollowing) return;
+  liveFollowing = true;
+  const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  while (state.me) {
+    const folder = state.path;
+    try {
+      const wait = liveCursor ? 50 : 0;
+      const data = await api(`/api/sync/changes?cursor=${encodeURIComponent(liveCursor)}&wait=${wait}&path=${encodeURIComponent(folder)}`);
+      const first = !liveCursor;
+      liveCursor = data.cursor || "";
+      if (first) continue;
+      // Against the folder shown now: it may have changed while the request waited.
+      const shown = state.path;
+      const here = (data.changes || []).some((change) => change.path === shown || parentPath(change.path) === shown);
+      if (here || data.expired) liveRefreshSoon();
+      // Without a watcher the feed only hears about OwnNAS's own changes: fine, just slower to ask.
+      if (data.watching === false) await pause(5000);
+    } catch {
+      liveCursor = "";
+      await pause(10_000);
+    }
+  }
+  liveFollowing = false;
+}
+
 async function boot() {
   try {
     state.me = await api("/api/me", { allow401: true });
@@ -5799,6 +5977,7 @@ async function boot() {
     return;
   }
   showApp();
+  followChanges();
   if (state.me.admin && state.me.updatesConfigured) {
     pollUpdateNotice();
     // The server checks once a day; looking every few hours is enough to notice.
@@ -6197,6 +6376,11 @@ $("password-form").addEventListener("submit", async (event) => {
 });
 
 $("crumbs").addEventListener("click", (event) => {
+  // The pencil, or the empty space after the last folder, as in a file explorer.
+  if (event.target.closest("[data-edit-path]") || event.target === $("crumbs")) {
+    editPath();
+    return;
+  }
   const button = event.target.closest("[data-go]");
   if (!button) return;
   go(button.dataset.go).catch((err) => toast(err.message, true));
@@ -6225,6 +6409,14 @@ $("preview-add-album").addEventListener("click", () => {
     .then((api) => api.pickAlbum([path]))
     .then(() => (state.current && state.current.path === path ? loadAnnotations(path) : null))
     .catch((err) => toast(err.message, true));
+});
+
+$("refresh-btn").addEventListener("click", () => {
+  const button = $("refresh-btn");
+  button.classList.add("is-spinning");
+  Promise.all([refreshFolder(), refreshStorage(true).catch(() => {})])
+    .catch((err) => toast(err.message, true))
+    .finally(() => button.classList.remove("is-spinning"));
 });
 
 $("brand-home").addEventListener("click", () => {
@@ -7556,6 +7748,13 @@ window.addEventListener("keydown", (event) => {
       imageStep(event.key === "ArrowLeft" ? -1 : 1);
       return;
     }
+  }
+  // ⌘L / Ctrl+L: type or paste a path, as in a file explorer's address bar.
+  if ((IS_MAC ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey) && !event.shiftKey && !event.altKey && event.code === "KeyL"
+    && !event.target.closest?.("input, textarea, select, [contenteditable]:not([contenteditable=\"false\"])") && !document.querySelector("dialog[open]")) {
+    event.preventDefault();
+    editPath();
+    return;
   }
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
     if (state.editor && state.me && !state.me.readonly && !$("preview").hidden) {
