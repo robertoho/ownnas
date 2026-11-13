@@ -1117,6 +1117,7 @@ function positionMenuSub(anchorButton) {
   sub.style.left = "0";
   sub.style.top = "0";
   sub.hidden = false;
+  sub.scrollTop = 0;
   const menuRect = menu.getBoundingClientRect();
   const anchorRect = anchorButton.getBoundingClientRect();
   const subRect = sub.getBoundingClientRect();
@@ -1639,6 +1640,7 @@ function openSelectionMenu(x, y, pasteInto) {
   menu.innerHTML = buttons.join("");
   decorateMenu(menu);
   menu.hidden = false;
+  menu.scrollTop = 0;
   const rect = menu.getBoundingClientRect();
   menu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - rect.width - 8))}px`;
   menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - rect.height - 8))}px`;
@@ -6728,6 +6730,8 @@ function runMenuAction(button, entries, pasteInto) {
   }
 }
 
+// A submenu sits beside its button; once the menu scrolls, that button has moved away.
+$("menu").addEventListener("scroll", () => closeMenuSub(), { passive: true });
 $("menu").addEventListener("click", (event) => {
   const button = event.target.closest("[data-menu]");
   if (!button) return;

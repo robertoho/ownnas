@@ -1482,6 +1482,11 @@ input, select, textarea {
   display: grid;
   min-width: 10rem;
   box-shadow: var(--shadow);
+  /* A long menu on a short window scrolls inside itself instead of running off the screen. */
+  grid-auto-rows: max-content;
+  max-height: calc(100dvh - 16px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .menu button {
   border: 0;
