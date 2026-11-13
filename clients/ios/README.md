@@ -12,6 +12,12 @@ What works now:
   `ownnas tls generate`.
 - **Folders:**
   - Folders with thumbnails, pull to refresh, and badges on folders with open terminals.
+  - Layouts, as in the web app (the view button in the toolbar): List, Icons (square tiles, small
+    to large), Masonry (photos keep their shape), and Columns (the folders above as columns
+    beside this one). Columns need a window at least 600 points wide (any iPhone on its side, an
+    iPad, or a wider or folding iPhone), measured from the window rather than the model. The
+    layout is remembered separately for narrow and wide windows, so turning the phone switches by
+    itself. Selecting, menus, and actions work in each layout.
   - Open a file in Quick Look, or share it, with download progress.
 - **Search:** names, tags, and the words inside documents, PDFs, and pictures, in a folder and
   below.

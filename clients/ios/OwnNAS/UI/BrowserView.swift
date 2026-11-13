@@ -33,6 +33,12 @@ struct BrowserView: View {
     @State private var bookmarked: Bool?
     @State private var showingBookmarks = false
     @AppStorage("showHidden") private var showHidden = false
+    /// Layouts remembered apart for narrow windows (portrait, folded) and wide ones (landscape,
+    /// unfolded, iPad), so turning or unfolding switches by itself.
+    @AppStorage("layout.narrow") private var narrowLayout = BrowserLayout.list.rawValue
+    @AppStorage("layout.wide") private var wideLayout = BrowserLayout.columns.rawValue
+    @AppStorage("layout.tile") private var tile = 1
+    @State private var width: CGFloat = 0
     /// Coding agents an administrator enabled, offered as "Open … here".
     @State private var agents: [AgentLauncher] = []
     @State private var pickedPhotos: [PhotosPickerItem] = []
@@ -226,6 +232,7 @@ struct BrowserView: View {
                 }
             }
             .environment(\.editMode, $editMode)
+            .onGeometryChange(for: CGFloat.self, of: { $0.size.width }) { width = $0 }
             .onChange(of: folder?.entries.map(\.path)) {
                 let present = Set(folder?.entries.map(\.path) ?? [])
                 selection.formIntersection(present)
@@ -233,22 +240,23 @@ struct BrowserView: View {
             .alert(message ?? "", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) { Button("OK", role: .cancel) {} }
     }
 
+    private var wide: Bool { width >= wideScreenWidth }
+    private var chosenLayout: BrowserLayout { BrowserLayout(rawValue: wide ? wideLayout : narrowLayout) ?? .list }
+    /// Columns fall back to the list while the window is narrow.
+    private var shownLayout: BrowserLayout { chosenLayout == .columns && !wide ? .list : chosenLayout }
+
+    private func chooseLayout(_ layout: BrowserLayout) {
+        if wide { wideLayout = layout.rawValue } else { narrowLayout = layout.rawValue }
+    }
+
     @ViewBuilder private var content: some View {
         if let folder {
-            List(selection: $selection) {
-                if folder.entries.isEmpty {
-                    Text(writable ? "This folder is empty. Tap + to add files." : "This folder is empty")
-                        .foregroundStyle(.secondary).frame(maxWidth: .infinity).listRowBackground(Color.clear)
-                }
-                ForEach(sorted(folder.entries), id: \.path) { entry in
-                    row(entry)
-                }
-                if folder.truncated {
-                    Text("Showing the first \(folder.entries.count) items. Open this folder in the browser to see the rest.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
+            switch shownLayout {
+            case .list: listView(folder)
+            case .grid: tilesView(folder, masonry: false)
+            case .masonry: tilesView(folder, masonry: true)
+            case .columns: columnsView(folder)
             }
-            .listStyle(.plain)
         } else if let problem {
             ContentUnavailableView {
                 Label(userMessage(problem), systemImage: "exclamationmark.triangle")
@@ -264,10 +272,120 @@ struct BrowserView: View {
         }
     }
 
+    private var emptyText: String { writable ? "This folder is empty. Tap + to add files." : "This folder is empty" }
+
+    private func truncatedText(_ folder: Folder) -> String {
+        "Showing the first \(folder.entries.count) items. Open this folder in the browser to see the rest."
+    }
+
+    private func listView(_ folder: Folder) -> some View {
+        List(selection: $selection) {
+            if folder.entries.isEmpty {
+                Text(emptyText).foregroundStyle(.secondary).frame(maxWidth: .infinity).listRowBackground(Color.clear)
+            }
+            ForEach(sorted(folder.entries), id: \.path) { entry in
+                row(entry)
+            }
+            if folder.truncated {
+                Text(truncatedText(folder)).font(.footnote).foregroundStyle(.secondary)
+            }
+        }
+        .listStyle(.plain)
+    }
+
+    /// Icons (square tiles) or Masonry (photos keep their shape), more per row on wide screens.
+    private func tilesView(_ folder: Folder, masonry: Bool) -> some View {
+        let entries = sorted(folder.entries)
+        let size = tileWidths[min(max(tile, 0), tileWidths.count - 1)]
+        return ScrollView {
+            if entries.isEmpty {
+                Text(emptyText).foregroundStyle(.secondary).padding(32)
+            }
+            if masonry {
+                let count = max(1, Int((width - 8) / (size + 8)))
+                HStack(alignment: .top, spacing: 8) {
+                    ForEach(Array(masonryColumns(entries, count: count).enumerated()), id: \.offset) { _, column in
+                        LazyVStack(spacing: 8) {
+                            ForEach(column, id: \.path) { tile($0, natural: true) }
+                        }
+                    }
+                }
+                .padding(8)
+            } else {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: size), spacing: 8)], spacing: 8) {
+                    ForEach(entries, id: \.path) { tile($0, natural: false) }
+                }
+                .padding(8)
+            }
+            if folder.truncated {
+                Text(truncatedText(folder)).font(.footnote).foregroundStyle(.secondary).padding()
+            }
+        }
+    }
+
+    private func tile(_ entry: Entry, natural: Bool) -> some View {
+        let here = entry.dir ? terminals.filter { $0.path == entry.path } : []
+        let mark: Color? = here.isEmpty ? nil : (here.contains { $0.agent.attention != nil } ? .orange : .accentColor)
+        return EntryTile(
+            server: server,
+            entry: entry,
+            natural: natural,
+            chosen: selection.contains(entry.path),
+            selecting: selecting,
+            details: details(entry, terminals: here),
+            terminalMark: mark
+        )
+        .onTapGesture { activate(entry) }
+        .contextMenu { if !selecting { menu(entry) } }
+    }
+
+    /// A tap: opens, or while selecting, ticks or unticks.
+    private func activate(_ entry: Entry) {
+        if selecting {
+            if selection.contains(entry.path) { selection.remove(entry.path) } else { selection.insert(entry.path) }
+        } else {
+            open(entry)
+        }
+    }
+
+    private func open(_ entry: Entry) {
+        if entry.dir { hub.path.append(.browse(server: server, path: entry.path)) } else { opener.open(hub, server: server, entry: entry) }
+    }
+
+    /// Miller columns, as the web app's column view: the folders above, narrow, then this
+    /// folder as the list (selection, swipes, and menus as usual).
+    private func columnsView(_ folder: Folder) -> some View {
+        let chain = ancestorPaths(path)
+        return GeometryReader { geometry in
+            let narrow: CGFloat = 240
+            let current = max(320, geometry.size.width - narrow * CGFloat(min(chain.count, 2)))
+            ScrollViewReader { scroller in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 0) {
+                        ForEach(Array(chain.enumerated()), id: \.element) { index, above in
+                            AboveColumn(
+                                server: server,
+                                serverName: saved?.name ?? "",
+                                path: above,
+                                next: index + 1 < chain.count ? chain[index + 1] : path,
+                                open: { open($0) }
+                            )
+                            .frame(width: narrow)
+                            Divider()
+                        }
+                        listView(folder).frame(width: current).id("current")
+                    }
+                    .frame(height: geometry.size.height)
+                }
+                .onAppear { scroller.scrollTo("current", anchor: .trailing) }
+            }
+        }
+    }
+
     private func row(_ entry: Entry) -> some View {
         let here = entry.dir ? terminals.filter { $0.path == entry.path } : []
         return Button {
-            if entry.dir { hub.path.append(.browse(server: server, path: entry.path)) } else { opener.open(hub, server: server, entry: entry) }
+            open(entry)
         } label: {
             HStack(spacing: 12) {
                 EntryIcon(server: server, entry: entry)
@@ -594,6 +712,7 @@ struct BrowserView: View {
 
     @ToolbarContentBuilder private var normalToolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
+            LayoutMenu(chosen: chosenLayout, wide: wide, tile: $tile, choose: chooseLayout)
             if writable {
                 Menu {
                     Button("Photos and videos", systemImage: "photo.on.rectangle") { choosingPhotos = true }

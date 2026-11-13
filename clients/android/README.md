@@ -8,7 +8,12 @@ and, later, sync run in Rust: `crates/ownnas-core` is the client library shared 
 What works now:
 
 - Several servers, each signed in with a token encrypted by an Android Keystore key.
-- Folders with thumbnails and pull to refresh.
+- Folders with thumbnails and pull to refresh, shown as the web app's layouts (the view button
+  in the top bar): List, Icons (square tiles, small to large), Masonry (photos keep their shape),
+  and Columns (the folders above as columns beside this one), which needs a wide window: the
+  phone on its side or a foldable unfolded. The layout is remembered separately for narrow and
+  wide windows, so unfolding or turning the phone switches to the wide one by itself, and tiles
+  fill the extra width. Selecting, the ⋮ menus, and every action work in each layout.
 - Search (the magnifier in a folder): names, tags, and the words inside documents, PDFs, and
   pictures in that folder and below, as the web app's search box finds them.
 - Open a file in the app that handles its type, or share it, with download progress.

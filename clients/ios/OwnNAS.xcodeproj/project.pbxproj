@@ -16,6 +16,7 @@
 		1C6ADCBA7CE70C94B1FA9822 /* PhotoBackup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 332778DE06875D48DCAE3B4A /* PhotoBackup.swift */; };
 		25C16A926C20F2924D9908E1 /* OwnNASFiles.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = EB0BD4B1B50C206BAA75C117 /* OwnNASFiles.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		29FFB641EB60AB0293104049 /* BackupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D6DDB83F02A6DAC193CBE3D /* BackupView.swift */; };
+		2BEA86A173304E364F7F44DF /* BrowserLayouts.swift in Sources */ = {isa = PBXBuildFile; fileRef = B315A56DACD5335943963F57 /* BrowserLayouts.swift */; };
 		3A26F86B21AEC0F6DFE42145 /* BrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0DB9F497AB77453B1F38215 /* BrowserView.swift */; };
 		4E93334FBFB3A696D4697698 /* ServerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5508D5AC36EC35D02EDB36A2 /* ServerStore.swift */; };
 		5070C8488EC0955B5B70CBCD /* ownnas_ffi.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04AA69F933C6090E0AE462DC /* ownnas_ffi.swift */; };
@@ -92,6 +93,7 @@
 		93EB9DB33C50051205E95F57 /* FileActions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileActions.swift; sourceTree = "<group>"; };
 		99FA15E75C16B38D27AA20AF /* OwnNASUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = OwnNASUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		B031F36731800352F9D3B2A5 /* ItemIds.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ItemIds.swift; sourceTree = "<group>"; };
+		B315A56DACD5335943963F57 /* BrowserLayouts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrowserLayouts.swift; sourceTree = "<group>"; };
 		B78C6CABDFDE4B44556FD3FF /* FilesDomains.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilesDomains.swift; sourceTree = "<group>"; };
 		BAEAF5CDE1B66B842C0689A0 /* OwnNASApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OwnNASApp.swift; sourceTree = "<group>"; };
 		C0E576D1B1F3CAA686EE9C22 /* Scanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Scanner.swift; sourceTree = "<group>"; };
@@ -130,6 +132,7 @@
 			isa = PBXGroup;
 			children = (
 				2D6DDB83F02A6DAC193CBE3D /* BackupView.swift */,
+				B315A56DACD5335943963F57 /* BrowserLayouts.swift */,
 				F0DB9F497AB77453B1F38215 /* BrowserView.swift */,
 				93EB9DB33C50051205E95F57 /* FileActions.swift */,
 				C0E576D1B1F3CAA686EE9C22 /* Scanner.swift */,
@@ -387,6 +390,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				29FFB641EB60AB0293104049 /* BackupView.swift in Sources */,
+				2BEA86A173304E364F7F44DF /* BrowserLayouts.swift in Sources */,
 				3A26F86B21AEC0F6DFE42145 /* BrowserView.swift in Sources */,
 				E927421CAD40A0CF870D01F0 /* FileActions.swift in Sources */,
 				EA32EDA3843BF71EFB36C4BC /* FilesDomains.swift in Sources */,

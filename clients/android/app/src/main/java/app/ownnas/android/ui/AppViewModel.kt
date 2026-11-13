@@ -488,6 +488,27 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         hiddenState.value = show
     }
 
+    private val layoutState = MutableStateFlow(
+        BrowserLayouts(
+            narrow = BrowserLayout.from(browserPrefs.getString("layout.narrow", null), BrowserLayout.List),
+            wide = BrowserLayout.from(browserPrefs.getString("layout.wide", null), BrowserLayout.Columns),
+            tile = browserPrefs.getInt("layout.tile", 1).coerceIn(0, 2),
+        ),
+    )
+    /** How folders are shown, remembered apart for narrow screens (a folded phone, portrait)
+     *  and wide ones (unfolded, landscape), so unfolding switches by itself. */
+    val layouts: StateFlow<BrowserLayouts> = layoutState.asStateFlow()
+
+    fun setLayout(wide: Boolean, layout: BrowserLayout) {
+        browserPrefs.edit().putString(if (wide) "layout.wide" else "layout.narrow", layout.name).apply()
+        layoutState.update { if (wide) it.copy(wide = layout) else it.copy(narrow = layout) }
+    }
+
+    fun setTileSize(size: Int) {
+        browserPrefs.edit().putInt("layout.tile", size.coerceIn(0, 2)).apply()
+        layoutState.update { it.copy(tile = size.coerceIn(0, 2)) }
+    }
+
     /** Tells open folders (and the Files app) that `dir` changed. */
     fun changedFolder(id: String, dir: String) = hub.changed(id, dir)
 

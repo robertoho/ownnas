@@ -169,6 +169,9 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
     val uploads by vm.uploads.collectAsStateWithLifecycle()
     val clip by vm.clipboard.collectAsStateWithLifecycle()
     val showHidden by vm.showHidden.collectAsStateWithLifecycle()
+    val layouts by vm.layouts.collectAsStateWithLifecycle()
+    // Turning the phone or unfolding it changes this, and the layout with it.
+    val wide = isWideWindow()
     var bookmarked by remember(serverId, path) { mutableStateOf<Boolean?>(null) }
     LaunchedEffect(serverId, path) {
         bookmarked = runCatching { path in vm.bookmarks(serverId) }.getOrNull()
@@ -553,6 +556,7 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
                     }
                 },
                 actions = {
+                    LayoutButton(layouts, wide, onLayout = { vm.setLayout(wide, it) }, onTile = vm::setTileSize)
                     IconButton(onClick = { vm.push(Screen.Search(serverId, path)) }) {
                         Icon(Icons.Filled.Search, contentDescription = "Search")
                     }
@@ -721,6 +725,11 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
                     onTerminal = { entry -> openTerminalIn(entry.path) },
                     agents = agents,
                     onAgent = { entry, agent -> openTerminalIn(entry.path, agent) },
+                    layout = if (wide) layouts.wide else layouts.narrow,
+                    tile = layouts.tile,
+                    wide = wide,
+                    serverName = server.name,
+                    onBrowse = { target -> vm.push(Screen.Browse(serverId, target)) },
                 )
             }
         }
@@ -1008,7 +1017,7 @@ fun BrowserScreen(vm: AppViewModel, serverId: String, path: String) {
     }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
+/** The folder's entries in the chosen layout (see BrowserLayouts.kt). */
 @Composable
 private fun Listing(
     vm: AppViewModel,
@@ -1024,76 +1033,14 @@ private fun Listing(
     onTerminal: (Entry) -> Unit,
     agents: List<app.ownnas.core.AgentLauncher>,
     onAgent: (Entry, app.ownnas.core.AgentLauncher) -> Unit,
+    layout: BrowserLayout,
+    tile: Int,
+    wide: Boolean,
+    serverName: String,
+    onBrowse: (String) -> Unit,
 ) {
-    val context = LocalContext.current
-    val selecting = selected.isNotEmpty()
-    val entries = remember(folder) {
-        folder.entries.sortedWith(compareBy<Entry> { !it.dir }.thenBy(String.CASE_INSENSITIVE_ORDER) { it.name })
-    }
-    // Room under the last row for the add button.
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 88.dp)) {
-        items(entries, key = { it.path }) { entry ->
-            var menu by remember { mutableStateOf(false) }
-            val here = if (entry.dir) terminalsByPath[entry.path].orEmpty() else emptyList()
-            val chosen = entry.path in selected
-            ListItem(
-                modifier = Modifier.combinedClickable(onClick = { onOpen(entry) }, onLongClick = { onSelect(entry) }),
-                colors = if (chosen) ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.secondaryContainer) else ListItemDefaults.colors(),
-                leadingContent = {
-                    Box {
-                        Thumbnail(vm, serverId, entry)
-                        if (chosen) {
-                            Icon(
-                                Icons.Filled.CheckCircle,
-                                contentDescription = "Selected",
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.align(Alignment.TopStart).offset(x = (-6).dp, y = (-6).dp).size(22.dp)
-                                    .background(MaterialTheme.colorScheme.surface, CircleShape),
-                            )
-                        }
-                        if (here.isNotEmpty()) TerminalMark(here, Modifier.align(Alignment.BottomEnd).offset(x = 4.dp, y = 4.dp))
-                    }
-                },
-                headlineContent = { Text(specialFolderLabel(entry.name), maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                supportingContent = {
-                    val running = here.filter { it.running }
-                    val status = running.firstNotNullOfOrNull { info -> agentStatus(info)?.first }
-                    val terminalNote = when {
-                        status != null -> " · $status"
-                        running.size == 1 -> " · terminal open"
-                        running.size > 1 -> " · ${running.size} terminals open"
-                        here.isNotEmpty() -> " · terminal ${endedText(here.first()).lowercase()}"
-                        else -> ""
-                    }
-                    Text(details(context, entry) + terminalNote, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                },
-                trailingContent = if (selecting) {
-                    null
-                } else {
-                    {
-                        Box {
-                            IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "Actions for ${entry.name}") }
-                            EntryMenu(
-                                entry = entry,
-                                actions = bulkActions(listOf(entry), writable),
-                                terminals = terminalsOn,
-                                expanded = menu,
-                                onDismiss = { menu = false },
-                                onSelect = { onSelect(entry) },
-                                onTerminal = { onTerminal(entry) },
-                                onAction = { onAction(it, entry) },
-                                agents = agents,
-                                onAgent = { onAgent(entry, it) },
-                            )
-                        }
-                    }
-                },
-            )
-        }
-        if (folder.truncated) {
-            item { Message("Showing the first ${folder.entries.size} items. Open this folder in the browser to see the rest.") }
-        }
-    }
+    val actions = EntryActions(vm, serverId, writable, terminalsOn, terminalsByPath, selected, onOpen, onSelect, onAction, onTerminal, agents, onAgent)
+    FolderLayout(layout, tile, wide, folder, serverName, actions, onBrowse)
 }
 
 /**
@@ -1101,7 +1048,7 @@ private fun Listing(
  * otherwise the agent's status color, or neutral for a plain shell.
  */
 @Composable
-private fun TerminalMark(terminals: List<TerminalInfo>, modifier: Modifier) {
+internal fun TerminalMark(terminals: List<TerminalInfo>, modifier: Modifier) {
     val running = terminals.filter { it.running }
     // Only ended terminals here: show that they stopped, and how.
     if (running.isEmpty()) {
@@ -1123,7 +1070,7 @@ private fun TerminalMark(terminals: List<TerminalInfo>, modifier: Modifier) {
 }
 
 @Composable
-private fun Thumbnail(vm: AppViewModel, serverId: String, entry: Entry) {
+internal fun Thumbnail(vm: AppViewModel, serverId: String, entry: Entry) {
     val modifier = Modifier.size(44.dp).clip(RoundedCornerShape(8.dp))
     val key = "$serverId:${entry.path}:${entry.modified}"
     val image by produceState(vm.cachedThumbnail(key), key) {
@@ -1176,7 +1123,7 @@ fun specialFolderLabel(name: String) = when (name) {
 fun inTrash(path: String) =
     path == ".ownnas-trash" || path.startsWith(".ownnas-trash/") || path == "Trash" || path.startsWith("Trash/")
 
-private fun iconFor(entry: Entry): ImageVector = when {
+internal fun iconFor(entry: Entry): ImageVector = when {
     entry.kind == "trash-folder" || entry.path == ".ownnas-trash" -> Icons.Outlined.Delete
     entry.kind == "archive-folder" || entry.path == ".ownnas-archive" -> Icons.Outlined.Inventory2
     entry.dir -> Icons.Filled.Folder
@@ -1191,7 +1138,7 @@ private fun iconFor(entry: Entry): ImageVector = when {
     }
 }
 
-private fun details(context: Context, entry: Entry): String {
+internal fun details(context: Context, entry: Entry): String {
     val now = System.currentTimeMillis()
     val modified = if (now - entry.modified in 0 until DateUtils.MINUTE_IN_MILLIS) {
         "Just now"
