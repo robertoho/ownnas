@@ -200,6 +200,9 @@ async fn write_file(state: &Arc<AppState>, key: &AgentKey, path: &str, text: &st
     if name.is_empty() || name.starts_with('.') || name == ".." {
         return failed("Give the file a name that does not start with a dot.");
     }
+    if !key.allows_name(name) {
+        return failed("This key can only make files with certain extensions.");
+    }
     let folder = allowed(state, key, parent).await?;
     if !folder.full.is_dir() {
         return failed("Its folder is not there. Make it first with create_folder.");
@@ -323,6 +326,12 @@ async fn copy(state: &Arc<AppState>, key: &AgentKey, path: &str, to: &str) -> Re
     let dest = allowed(state, key, to).await?;
     if !dest.full.is_dir() {
         return failed("Copy it into a folder.");
+    }
+    if found.full.is_dir() && key.extensions.is_some() {
+        let (scope, full) = (key.scope(), found.full.clone());
+        if !blocking(move || Ok(scope.folder_fits(&full))).await? {
+            return failed("That folder holds files of kinds this key cannot use, so it cannot copy it.");
+        }
     }
     let (root, from, into) = (state.root.clone(), found.rel.clone(), dest.rel.clone());
     let made = blocking(move || files::copy_entry(&root, &from, &into).map_err(file_error)).await?;
@@ -496,6 +505,9 @@ async fn upload_file(state: &Arc<AppState>, key: &AgentKey, folder: &str, name: 
     let name = name.trim();
     if name.is_empty() || name.starts_with('.') || name.contains('/') || name.contains('\\') {
         return failed("Give the file a name that does not start with a dot.");
+    }
+    if !key.allows_name(name) {
+        return failed("This key can only make files with certain extensions.");
     }
     if encoded.len() > MOST_UPLOAD / 3 * 4 + 8 {
         return failed("That file is too large to upload here (25 MB at most).");

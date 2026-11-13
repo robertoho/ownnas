@@ -843,6 +843,12 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         )
         .map_err(|_| "Could not update the agent keys".to_string())?;
     }
+    let has_extensions: bool = conn.prepare("SELECT 1 FROM pragma_table_info('agent_keys') WHERE name = 'extensions'").and_then(|mut stmt| stmt.exists([])).unwrap_or(false);
+    if !has_extensions {
+        // Per key: the only file extensions it may see and use (JSON list; NULL for all).
+        conn.execute("ALTER TABLE agent_keys ADD COLUMN extensions TEXT", [])
+            .map_err(|_| "Could not update the agent keys".to_string())?;
+    }
     let has_approve: bool = conn.prepare("SELECT 1 FROM pragma_table_info('agent_keys') WHERE name = 'approve'").and_then(|mut stmt| stmt.exists([])).unwrap_or(false);
     if !has_approve {
         // Organising keys can wait for a person to approve each change.

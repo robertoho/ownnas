@@ -94,7 +94,7 @@ async fn recent_files(state: &Arc<AppState>, key: &AgentKey, path: &str, since: 
         vec![found.rel]
     };
     let limit = limit.clamp(1, RECENT_MOST) as usize;
-    let (worker, root, folders) = (state.clone(), state.root.clone(), key.folders.clone());
+    let (worker, root, folders) = (state.clone(), state.root.clone(), key.scope());
     blocking(move || {
         let fail = |_| Stop::Failed("Could not read the file index.".to_string());
         let mut rows: Vec<(String, i64, i64, String)> = Vec::new();
@@ -135,7 +135,7 @@ async fn folder_usage(state: &Arc<AppState>, key: &AgentKey, path: &str) -> Resu
     if !found.full.is_dir() {
         return failed("That is a file, not a folder.");
     }
-    let (worker, root, folders, rel) = (state.clone(), state.root.clone(), key.folders.clone(), found.rel.clone());
+    let (worker, root, folders, rel) = (state.clone(), state.root.clone(), key.scope(), found.rel.clone());
     blocking(move || {
         let fail = |_| Stop::Failed("Could not read the file index.".to_string());
         let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
@@ -189,7 +189,7 @@ async fn find_duplicates(state: &Arc<AppState>, key: &AgentKey, path: &str, limi
             cancel.cancel();
         })
     };
-    let (root, folders, rel, limit) = (state.root.clone(), key.folders.clone(), found.rel.clone(), limit.clamp(1, DUPLICATES_MOST) as usize);
+    let (root, folders, rel, limit) = (state.root.clone(), key.scope(), found.rel.clone(), limit.clamp(1, DUPLICATES_MOST) as usize);
     let answer = blocking(move || {
         let report = crate::duplicates::find(&conn, &root, &rel, &cancel).map_err(|err| match err {
             crate::files::FileError::Cancelled => Stop::Failed("That took too long. Try a smaller folder; what was read so far is kept, so asking again goes faster.".to_string()),

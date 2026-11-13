@@ -1918,7 +1918,8 @@ $("backup-off").addEventListener("click", async () => {
 /// A dialog to pick a folder in the library: browse into folders, go back up with the path at
 /// the top, or make a new one. Resolves with the folder's path ("" for the library itself), or
 /// null when cancelled.
-function pickFolder({ title = "Choose a folder", ok = "Choose", start = "" } = {}) {
+/// Asks for a folder (or, with `files`, a folder or a single file: clicking a file picks it).
+function pickFolder({ title = "Choose a folder", ok = "Choose", start = "", files = false } = {}) {
   return new Promise((resolve) => {
     const dialog = document.createElement("dialog");
     dialog.className = "folder-picker";
@@ -1962,10 +1963,14 @@ function pickFolder({ title = "Choose a folder", ok = "Choose", start = "" } = {
         return `<span class="muted">/</span><button type="button" data-go="${esc(walked)}">${esc(part)}</button>`;
       }).join("");
       const folders = (data.entries || []).filter((entry) => entry.dir && !inTrashPath(entry.path) && !entry.name.startsWith("."));
-      list.innerHTML = folders.length
+      const plain = files ? (data.entries || []).filter((entry) => !entry.dir && !entry.name.startsWith(".")) : [];
+      list.innerHTML = folders.length || plain.length
         ? folders.map((entry) => `<button type="button" class="folder-picker-row" data-go="${esc(entry.path)}">
             <svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><path d="M1.5 4.5h4l1.2 1.5H14.5v7.5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-8a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
             <span>${esc(entry.name)}</span><span class="folder-picker-open" aria-hidden="true">›</span></button>`).join("")
+          + plain.map((entry) => `<button type="button" class="folder-picker-row" data-file="${esc(entry.path)}" title="Choose this file">
+            <svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><path d="M4 1.5h5.5L13 5v9.5H4z M9.5 1.5V5H13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+            <span>${esc(entry.name)}</span></button>`).join("")
         : `<p class="muted">No folders in here. Choose this one, or make a new one.</p>`;
       dialog.querySelector('[data-picker="ok"]').title = current ? `Use “${current}”` : "Use the library itself";
     }
@@ -1974,6 +1979,12 @@ function pickFolder({ title = "Choose a folder", ok = "Choose", start = "" } = {
       const go = event.target.closest("[data-go]");
       if (go) {
         open(go.dataset.go);
+        return;
+      }
+      const file = event.target.closest("[data-file]");
+      if (file) {
+        result = file.dataset.file;
+        dialog.close();
         return;
       }
       const action = event.target.closest("[data-picker]")?.dataset.picker;

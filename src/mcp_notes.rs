@@ -67,7 +67,7 @@ fn labels(note: &crate::notes::Note, tags: &[String]) -> Vec<String> {
 /// Every note the key may see, with its labels.
 async fn all_notes(state: &Arc<AppState>, key: &AgentKey) -> Result<Vec<(crate::notes::Note, Vec<String>)>, Stop> {
     let place = notes_place(state, key).await?;
-    let (root, folders) = (state.root.clone(), key.folders.clone());
+    let (root, folders) = (state.root.clone(), key.scope());
     let notes = blocking(move || {
         let notes = crate::notes::list(&place.full, &place.rel);
         Ok(notes.into_iter().filter(|note| agent_keys::check(&root, &folders, &note.path).is_some()).collect::<Vec<_>>())

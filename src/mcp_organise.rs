@@ -259,7 +259,7 @@ async fn writable(state: &Arc<AppState>, key: &AgentKey, name: &str, args: &Args
     let (root, key) = (state.root.clone(), key.clone());
     blocking(move || {
         for (path, inside) in places {
-            let found = agent_keys::check(&root, &key.folders, path.trim().trim_start_matches('/')).ok_or(Stop::Refused)?;
+            let found = agent_keys::check(&root, &key.scope(), path.trim().trim_start_matches('/')).ok_or(Stop::Refused)?;
             let rel = match inside.as_deref().map(str::trim).filter(|name| !name.is_empty()) {
                 Some(name) if !found.rel.is_empty() => format!("{}/{name}", found.rel),
                 Some(name) => name.to_string(),
@@ -322,9 +322,13 @@ async fn ask(state: &Arc<AppState>, key: &AgentKey, name: &str, args: &Args<'_>,
     // A file to be written may not be there yet: its folder must be.
     if name == "write_file" {
         let path = args.path();
+        let file_name = path.rsplit('/').next().unwrap_or_default().trim().to_string();
+        if !key.allows_name(&file_name) {
+            return Err(Stop::Refused);
+        }
         paths = vec![path.rsplit_once('/').map_or(String::new(), |(parent, _)| parent.to_string())];
     }
-    let (root, folders) = (state.root.clone(), key.folders.clone());
+    let (root, folders) = (state.root.clone(), key.scope());
     blocking(move || {
         for path in paths {
             agent_keys::check(&root, &folders, path.trim().trim_start_matches('/')).ok_or(Stop::Refused)?;
@@ -531,6 +535,12 @@ async fn changeable(state: &Arc<AppState>, key: &AgentKey, path: &str) -> Result
     if found.rel.is_empty() || key.folders.contains(&found.rel) {
         return failed("That is one of the folders this key was given; it cannot be renamed, moved or put in the Trash.");
     }
+    if found.full.is_dir() && key.extensions.is_some() {
+        let (scope, full) = (key.scope(), found.full.clone());
+        if !blocking(move || Ok(scope.folder_fits(&full))).await? {
+            return failed("That folder holds files of kinds this key cannot use, so it cannot rename, move or put it in the Trash.");
+        }
+    }
     Ok(found)
 }
 
@@ -542,7 +552,7 @@ async fn all_allowed(state: &Arc<AppState>, key: &AgentKey, args: &Args<'_>) -> 
     if paths.len() > MOST_PATHS {
         return failed(&format!("Give at most {MOST_PATHS} paths at a time."));
     }
-    let (root, folders) = (state.root.clone(), key.folders.clone());
+    let (root, folders) = (state.root.clone(), key.scope());
     blocking(move || {
         let mut found = Vec::new();
         for path in paths {
@@ -607,6 +617,9 @@ async fn rename(state: &Arc<AppState>, key: &AgentKey, path: &str, name: &str) -
     if name.trim().is_empty() || name.contains('/') {
         return failed("Give a new name, without /.");
     }
+    if !found.full.is_dir() && !key.allows_name(name.trim()) {
+        return failed("This key can only use files with certain extensions; keep the file's extension one of them.");
+    }
     let (root, from, to_name) = (state.root.clone(), found.rel.clone(), name.trim().to_string());
     let to = blocking(move || files::rename_entry(&root, &from, &to_name).map_err(file_error)).await?;
     crate::http::rewrite_meta(state, &found.rel, &to);
@@ -666,7 +679,7 @@ async fn sort_plan(state: &Arc<AppState>, key: &AgentKey, args: &Args<'_>) -> Re
     };
     let recursive = args.raw().get("recursive").and_then(Value::as_bool).unwrap_or(false);
     let taken = crate::http::taken_dates(state, &found.rel);
-    let (root, rel, folders) = (state.root.clone(), found.rel.clone(), key.folders.clone());
+    let (root, rel, folders) = (state.root.clone(), found.rel.clone(), key.scope());
     blocking(move || {
         let months: Vec<String> = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"].map(String::from).to_vec();
         let mut plan = crate::sort_folder::plan(&root, &rel, &pattern, from, recursive, &months, &taken).map_err(file_error)?;

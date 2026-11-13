@@ -35,6 +35,85 @@ pub struct AgentKey {
     pub tools: Option<Vec<String>>,
     pub calls_per_minute: u32,
     pub daily_changes: i64,
+    /// The only file extensions it may see and use (lowercase, without the dot); `None` for all.
+    pub extensions: Option<Vec<String>>,
+}
+
+/// Where a key may look: its folders (or files), and which file extensions count there.
+#[derive(Clone, Debug, Default)]
+pub struct Scope {
+    pub folders: Vec<String>,
+    /// Lowercase, without the dot; `None` for every file.
+    pub extensions: Option<Vec<String>>,
+}
+
+/// Past this many entries, a folder is not looked through for files of other kinds, and is
+/// treated as holding some (so it is not moved or put in the Trash by a limited key).
+const FOLDER_LOOK_MOST: usize = 20_000;
+
+impl Scope {
+    /// Everything in the library (for checking where a key may be given).
+    fn everything() -> Self {
+        Scope { folders: vec![String::new()], extensions: None }
+    }
+
+    /// Whether a file of this name fits the key's extensions.
+    pub fn allows_name(&self, name: &str) -> bool {
+        let Some(extensions) = &self.extensions else { return true };
+        name.rsplit_once('.')
+            .filter(|(stem, _)| !stem.is_empty())
+            .is_some_and(|(_, ext)| extensions.iter().any(|allowed| allowed.eq_ignore_ascii_case(ext)))
+    }
+
+    /// Whether every file in a folder (and the folders in it) fits the extensions, so a
+    /// limited key may move, copy, or put it in the Trash without touching files it cannot see.
+    pub fn folder_fits(&self, full: &Path) -> bool {
+        if self.extensions.is_none() {
+            return true;
+        }
+        let mut pending = vec![full.to_path_buf()];
+        let mut looked = 0;
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { return false };
+            for entry in entries.flatten() {
+                looked += 1;
+                if looked > FOLDER_LOOK_MOST {
+                    return false;
+                }
+                // Hidden files are out of every key's reach already, and folders holding them
+                // could always be moved; the extensions do not change that.
+                if entry.file_name().to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                let Ok(kind) = entry.file_type() else { return false };
+                if kind.is_dir() {
+                    pending.push(entry.path());
+                } else if !self.allows_name(&entry.file_name().to_string_lossy()) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Cleans extensions as given (".MD", " txt ") into what is stored ("md", "txt").
+pub fn clean_extensions(list: &[String]) -> Result<Option<Vec<String>>, String> {
+    let mut clean: Vec<String> = Vec::new();
+    for item in list {
+        let ext = item.trim().trim_start_matches('*').trim_start_matches('.').to_ascii_lowercase();
+        if ext.is_empty() {
+            continue;
+        }
+        if ext.len() > 20 || !ext.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_') {
+            return Err(format!("“{}” is not a file extension", item.trim()));
+        }
+        if !clean.contains(&ext) {
+            clean.push(ext);
+        }
+    }
+    clean.sort();
+    Ok((!clean.is_empty()).then_some(clean))
 }
 
 /// The limits a key has unless it is given its own.
@@ -42,6 +121,16 @@ pub const CALLS_PER_MINUTE: u32 = 300;
 pub const DAILY_CHANGES: i64 = 500;
 
 impl AgentKey {
+    /// Where it may look: its folders and extensions, for `check`.
+    pub fn scope(&self) -> Scope {
+        Scope { folders: self.folders.clone(), extensions: self.extensions.clone() }
+    }
+
+    /// Whether a file of this name fits its extensions (all do without a limit).
+    pub fn allows_name(&self, name: &str) -> bool {
+        self.scope().allows_name(name)
+    }
+
     /// Whether it may use a tool (its level is checked by the tool).
     pub fn may_use(&self, tool: &str) -> bool {
         self.tools.as_ref().is_none_or(|tools| tools.iter().any(|allowed| allowed == tool))
@@ -79,6 +168,7 @@ pub struct KeyInfo {
     pub tools: Option<Vec<String>>,
     pub calls_per_minute: Option<u32>,
     pub daily_changes: Option<i64>,
+    pub extensions: Option<Vec<String>>,
     pub created_by: String,
     pub created_at: i64,
     pub expires_at: Option<i64>,
@@ -116,10 +206,14 @@ fn concealed(root: &Path, rel: &Path) -> bool {
     })
 }
 
-/// Where `rel` really is, if `folders` allow it. Everything is compared after following links,
-/// so a link inside an allowed folder cannot reach outside it. `None` both for a path that is
-/// not allowed and one that does not exist, so a key cannot learn what exists elsewhere.
-pub fn check(root: &Path, folders: &[String], rel: &str) -> Option<Allowed> {
+/// Where `rel` really is, if the scope allows it: inside one of its folders (or one of its
+/// files), and, for a file, with one of its extensions (folders always count, so they can be
+/// browsed). Everything is compared after following links, so a link inside an allowed folder
+/// cannot reach outside it, and a link named `notes.md` to `id_rsa` does not pass as Markdown.
+/// `None` both for a path that is not allowed and one that does not exist, so a key cannot
+/// learn what exists elsewhere.
+pub fn check(root: &Path, scope: &Scope, rel: &str) -> Option<Allowed> {
+    let folders = &scope.folders;
     let root = root.canonicalize().ok()?;
     let full = files::resolve(&root, rel).ok()?.full;
     let inside = full.strip_prefix(&root).ok()?;
@@ -128,22 +222,61 @@ pub fn check(root: &Path, folders: &[String], rel: &str) -> Option<Allowed> {
     }
     // `starts_with` compares whole path parts: "docs" does not allow "docs2".
     let allowed = folders.iter().any(|folder| files::resolve(&root, folder).is_ok_and(|folder| full.starts_with(&folder.full)));
-    allowed.then(|| Allowed {
+    if !allowed {
+        return None;
+    }
+    if scope.extensions.is_some() && !full.is_dir() {
+        let name = full.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default();
+        if !scope.allows_name(&name) {
+            return None;
+        }
+    }
+    Some(Allowed {
         rel: inside.components().map(|part| part.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/"),
         full: full.clone(),
     })
 }
 
-/// A folder as given when making a key, as the library path to store.
+/// A folder (or a single file) as given for a key, as the library path to store.
 fn folder_to_store(root: &Path, folder: &str) -> Result<String, String> {
     let rel = folder.trim().trim_matches('/');
-    let refused = || format!("\"{}\" is not a folder an agent can be given", folder.trim());
-    let everything = [String::new()];
-    let found = check(root, &everything, rel).ok_or_else(refused)?;
-    if !found.full.is_dir() {
+    let refused = || format!("\"{}\" is not a folder or file an agent can be given", folder.trim());
+    let found = check(root, &Scope::everything(), rel).ok_or_else(refused)?;
+    if !found.full.is_dir() && !found.full.is_file() {
         return Err(refused());
     }
     Ok(found.rel)
+}
+
+/// Gives a key other folders (or files). Folders it keeps stay read-only if they were.
+pub fn set_folders(conn: &mut Connection, root: &Path, id: i64, folders: &[String]) -> Result<bool, String> {
+    if folders.is_empty() {
+        return Err("Leave the key at least one folder".into());
+    }
+    let mut stored = folders.iter().map(|folder| folder_to_store(root, folder)).collect::<Result<Vec<_>, _>>()?;
+    stored.sort();
+    stored.dedup();
+    let fail = |_| "Could not change the key".to_string();
+    let exists: bool = conn
+        .query_row("SELECT 1 FROM agent_keys WHERE id = ?1 AND revoked_at IS NULL", [id], |_| Ok(true))
+        .optional()
+        .map_err(fail)?
+        .unwrap_or(false);
+    if !exists {
+        return Ok(false);
+    }
+    let read_only = read_only_of(conn, id)?;
+    let tx = conn.transaction().map_err(fail)?;
+    tx.execute("DELETE FROM agent_key_folders WHERE key_id = ?1", [id]).map_err(fail)?;
+    for folder in &stored {
+        tx.execute(
+            "INSERT INTO agent_key_folders(key_id, path, read_only) VALUES (?1, ?2, ?3)",
+            params![id, folder, read_only.contains(folder)],
+        )
+        .map_err(fail)?;
+    }
+    tx.commit().map_err(fail)?;
+    Ok(true)
 }
 
 /// Makes a key and returns it with its secret, which is never available again.
@@ -206,6 +339,8 @@ pub struct KeySettings {
     pub calls_per_minute: Option<u32>,
     pub daily_changes: Option<i64>,
     pub read_only: Vec<String>,
+    /// The only file extensions it may use; `None` for all.
+    pub extensions: Option<Vec<String>>,
 }
 
 pub fn set_settings(conn: &Connection, id: i64, settings: &KeySettings) -> Result<bool, String> {
@@ -224,10 +359,11 @@ pub fn set_settings(conn: &Connection, id: i64, settings: &KeySettings) -> Resul
         return Err(format!("“{stray}” is not one of the key's folders"));
     }
     let tools = settings.tools.as_ref().map(|tools| serde_json::to_string(tools).unwrap_or_default());
+    let extensions = settings.extensions.as_ref().map(|list| serde_json::to_string(list).unwrap_or_default());
     let changed = conn
         .execute(
-            "UPDATE agent_keys SET tools = ?2, calls_per_minute = ?3, daily_changes = ?4 WHERE id = ?1",
-            params![id, tools, settings.calls_per_minute, settings.daily_changes],
+            "UPDATE agent_keys SET tools = ?2, calls_per_minute = ?3, daily_changes = ?4, extensions = ?5 WHERE id = ?1",
+            params![id, tools, settings.calls_per_minute, settings.daily_changes, extensions],
         )
         .map_err(fail)?;
     for folder in &folders {
@@ -259,20 +395,20 @@ fn find(conn: &Connection, which: &str, value: &str, now: i64) -> Result<Option<
     let found = conn
         .query_row(
             &format!(
-                "SELECT k.id, k.name, k.level, k.approve, k.tools, k.calls_per_minute, k.daily_changes FROM agent_keys k JOIN users u ON u.id = k.user_id
+                "SELECT k.id, k.name, k.level, k.approve, k.tools, k.calls_per_minute, k.daily_changes, k.extensions FROM agent_keys k JOIN users u ON u.id = k.user_id
                  WHERE {which} AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at > ?2) AND u.is_admin = 1"
             ),
             params![value, now],
             |row| {
                 Ok((
                     (row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, bool>(3)?),
-                    (row.get::<_, Option<String>>(4)?, row.get::<_, Option<u32>>(5)?, row.get::<_, Option<i64>>(6)?),
+                    (row.get::<_, Option<String>>(4)?, row.get::<_, Option<u32>>(5)?, row.get::<_, Option<i64>>(6)?, row.get::<_, Option<String>>(7)?),
                 ))
             },
         )
         .optional()
         .map_err(fail)?;
-    let Some(((id, name, level, approve), (tools, calls, changes))) = found else { return Ok(None) };
+    let Some(((id, name, level, approve), (tools, calls, changes, extensions))) = found else { return Ok(None) };
     Ok(Some(AgentKey {
         id,
         name,
@@ -283,6 +419,7 @@ fn find(conn: &Connection, which: &str, value: &str, now: i64) -> Result<Option<
         tools: tools_from(tools),
         calls_per_minute: calls.unwrap_or(CALLS_PER_MINUTE),
         daily_changes: changes.unwrap_or(DAILY_CHANGES),
+        extensions: tools_from(extensions),
     }))
 }
 
@@ -312,7 +449,7 @@ pub fn list(conn: &Connection) -> Result<Vec<KeyInfo>, String> {
     let mut statement = conn
         .prepare(
             "SELECT k.id, k.name, k.level, u.username, k.created_at, k.expires_at, k.revoked_at, k.last_used_at, k.approve,
-                    k.tools, k.calls_per_minute, k.daily_changes
+                    k.tools, k.calls_per_minute, k.daily_changes, k.extensions
              FROM agent_keys k JOIN users u ON u.id = k.user_id ORDER BY k.id DESC",
         )
         .map_err(fail)?;
@@ -332,6 +469,7 @@ pub fn list(conn: &Connection) -> Result<Vec<KeyInfo>, String> {
                 tools: tools_from(row.get(9)?),
                 calls_per_minute: row.get(10)?,
                 daily_changes: row.get(11)?,
+                extensions: tools_from(row.get(12)?),
                 read_only: Vec::new(),
             })
         })
@@ -578,6 +716,42 @@ mod tests {
         list.iter().map(|s| s.to_string()).collect()
     }
 
+    fn in_scope(folders: &[String]) -> Scope {
+        Scope { folders: folders.to_vec(), extensions: None }
+    }
+
+    #[test]
+    fn extensions_limit_files_but_not_folders() {
+        let f = fixture();
+        let scope = Scope { folders: folders(&["docs"]), extensions: clean_extensions(&[".TXT".into(), " md ".into()]).unwrap() };
+        assert_eq!(scope.extensions, Some(vec!["md".to_string(), "txt".to_string()]));
+        assert!(check(&f.root, &scope, "docs/a.txt").is_some());
+        assert!(check(&f.root, &scope, "docs/deep").is_some(), "folders can still be browsed");
+        fs::write(f.root.join("docs/notes.pdf"), "x").unwrap();
+        assert!(check(&f.root, &scope, "docs/notes.pdf").is_none());
+        assert!(scope.allows_name("Report.MD") && !scope.allows_name("run.sh") && !scope.allows_name("md") && !scope.allows_name(".txt"));
+        assert!(!scope.folder_fits(&f.root.join("docs")), "a folder holding a PDF does not fit .md and .txt");
+        fs::remove_file(f.root.join("docs/notes.pdf")).unwrap();
+        assert!(scope.folder_fits(&f.root.join("docs")));
+        assert!(clean_extensions(&["sh;rm".into()]).is_err());
+        assert_eq!(clean_extensions(&["".into(), " ".into()]).unwrap(), None);
+    }
+
+    #[test]
+    fn a_key_can_be_given_other_folders_and_files() {
+        let mut f = fixture();
+        let token = make(&mut f, &["docs"]);
+        let id = authenticate(&f.conn, &token, NOW).unwrap().unwrap().id;
+        let root = f.root.clone();
+        assert!(set_folders(&mut f.conn, &root, id, &folders(&["docs/deep", "top.txt"])).unwrap());
+        let key = authenticate(&f.conn, &token, NOW).unwrap().unwrap();
+        assert_eq!(key.folders, folders(&["docs/deep", "top.txt"]), "the secret keeps working with the new folders");
+        assert!(check(&f.root, &key.scope(), "top.txt").is_some());
+        assert!(check(&f.root, &key.scope(), "docs/a.txt").is_none());
+        assert!(set_folders(&mut f.conn, &root, id, &[]).is_err());
+        assert!(set_folders(&mut f.conn, &root, id, &folders(&["secret/../.ssh"])).is_err());
+    }
+
     fn make(f: &mut Fixture, list: &[&str]) -> String {
         let root = f.root.clone();
         let user = f.user;
@@ -596,6 +770,7 @@ mod tests {
             tools: Some(vec!["read_text".into()]),
             calls_per_minute: CALLS_PER_MINUTE,
             daily_changes: DAILY_CHANGES,
+            extensions: None,
         };
         assert!(!key.may_change("Archive/old.txt"));
         assert!(!key.may_change("Archive"));
@@ -610,11 +785,11 @@ mod tests {
     fn only_the_given_folders_are_allowed() {
         let f = fixture();
         let docs = folders(&["docs"]);
-        assert_eq!(check(&f.root, &docs, "docs/a.txt").unwrap().rel, "docs/a.txt");
-        assert_eq!(check(&f.root, &docs, "docs/deep/b.txt").unwrap().rel, "docs/deep/b.txt");
-        assert!(check(&f.root, &docs, "docs").is_some());
+        assert_eq!(check(&f.root, &in_scope(&docs), "docs/a.txt").unwrap().rel, "docs/a.txt");
+        assert_eq!(check(&f.root, &in_scope(&docs), "docs/deep/b.txt").unwrap().rel, "docs/deep/b.txt");
+        assert!(check(&f.root, &in_scope(&docs), "docs").is_some());
         for refused in ["", "top.txt", "secret/s.txt", "docs2/c.txt", "docs2", "docs/../secret/s.txt", "../outside/o.txt", "docs/../../outside/o.txt", "/etc/passwd", "docs/missing.txt"] {
-            assert!(check(&f.root, &docs, refused).is_none(), "{refused} should be refused");
+            assert!(check(&f.root, &in_scope(&docs), refused).is_none(), "{refused} should be refused");
         }
     }
 
@@ -622,9 +797,9 @@ mod tests {
     fn hidden_files_and_the_trash_are_refused_even_for_the_whole_library() {
         let f = fixture();
         let all = folders(&[""]);
-        assert!(check(&f.root, &all, "top.txt").is_some());
+        assert!(check(&f.root, &in_scope(&all), "top.txt").is_some());
         for refused in ["docs/.env", "docs/.hidden/h.txt", ".ssh/id", ".ssh", ".ownnas-trash", ".ownnas-trash/old/t.txt"] {
-            assert!(check(&f.root, &all, refused).is_none(), "{refused} should be refused");
+            assert!(check(&f.root, &in_scope(&all), refused).is_none(), "{refused} should be refused");
         }
     }
 
@@ -640,9 +815,9 @@ mod tests {
         symlink(f.root.join("docs/a.txt"), f.root.join("docs/a-link.txt")).unwrap();
         let docs = folders(&["docs"]);
         for refused in ["docs/to-secret", "docs/to-secret/s.txt", "docs/s-link.txt", "docs/key-link", "docs/to-outside/o.txt"] {
-            assert!(check(&f.root, &docs, refused).is_none(), "{refused} should be refused");
+            assert!(check(&f.root, &in_scope(&docs), refused).is_none(), "{refused} should be refused");
         }
-        assert_eq!(check(&f.root, &docs, "docs/a-link.txt").unwrap().rel, "docs/a.txt");
+        assert_eq!(check(&f.root, &in_scope(&docs), "docs/a-link.txt").unwrap().rel, "docs/a.txt");
         // Nor can a folder be given through a link to somewhere refused.
         assert!(folder_to_store(&f.root, "docs/key-link").is_err());
         assert_eq!(folder_to_store(&f.root, "docs/to-secret").unwrap(), "secret");
@@ -701,7 +876,7 @@ mod tests {
         assert!(try_make("writer", "write", &["docs"]).is_ok());
         assert!(try_make("tidy", "organise", &["docs"]).is_ok());
         assert!(try_make("none", "read", &[]).is_err());
-        assert!(try_make("file", "read", &["top.txt"]).is_err());
+        assert!(try_make("file", "read", &["top.txt"]).is_ok(), "a key can be given a single file");
         assert!(try_make("missing", "read", &["nope"]).is_err());
         assert!(try_make("up", "read", &["../outside"]).is_err());
         assert!(try_make("hidden", "read", &[".ssh"]).is_err());
@@ -720,7 +895,7 @@ mod tests {
         db::rewrite_path_meta(&f.conn, "papers/deep", ".ownnas-trash/deep").unwrap();
         assert_eq!(folders_now(&f), [".ownnas-trash/deep"]);
         fs::create_dir_all(f.root.join(".ownnas-trash/deep")).unwrap();
-        assert!(check(&f.root, &folders_now(&f), ".ownnas-trash/deep").is_none(), "in the Trash it is out of reach");
+        assert!(check(&f.root, &in_scope(&folders_now(&f)), ".ownnas-trash/deep").is_none(), "in the Trash it is out of reach");
         db::rewrite_path_meta(&f.conn, ".ownnas-trash/deep", "docs/deep").unwrap();
         assert_eq!(folders_now(&f), ["docs/deep"]);
         // A name that merely starts the same is left alone.

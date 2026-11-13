@@ -336,6 +336,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/agent-keys/log", get(agent_key_log))
         .route("/api/agent-keys/approval", post(set_agent_key_approval))
         .route("/api/agent-keys/settings", post(set_agent_key_settings))
+        .route("/api/agent-keys/folders", post(set_agent_key_folders))
         .route("/api/agent-keys/tools", get(agent_key_tools))
         .route("/api/agent-keys/usage", get(agent_key_usage))
         .route("/api/agent-keys/attention", get(agent_key_attention))
@@ -9863,6 +9864,37 @@ struct AgentKeySettingsBody {
     daily_changes: Option<i64>,
     #[serde(default)]
     read_only: Vec<String>,
+    /// The only file extensions the key may use ("md", ".txt"…); empty or left out for all.
+    #[serde(default)]
+    extensions: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct AgentKeyFoldersBody {
+    id: i64,
+    folders: Vec<String>,
+}
+
+/// Gives an existing key other folders (or single files), keeping its secret, so the agent
+/// using it does not need setting up again.
+async fn set_agent_key_folders(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AgentKeyFoldersBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let changed = {
+        let mut conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::agent_keys::set_folders(&mut conn, &state.root, body.id, &body.folders).map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?
+    };
+    if !changed {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "That key is no longer there"));
+    }
+    let shown: Vec<&str> = body.folders.iter().map(|folder| if folder.trim().trim_matches('/').is_empty() { "/" } else { folder.trim() }).collect();
+    record(&state, &user, "agent-key-folders", &format!("{}: {}", body.id, shown.join(", ")));
+    Ok(Json(json!({ "ok": true })))
 }
 
 /// A key's tools, limits, and folders it may only read.
@@ -9881,7 +9913,8 @@ async fn set_agent_key_settings(
             return Err(ApiError::new(StatusCode::BAD_REQUEST, format!("There is no tool called {stray}")));
         }
     }
-    let settings = crate::agent_keys::KeySettings { tools: body.tools, calls_per_minute: body.calls_per_minute, daily_changes: body.daily_changes, read_only: body.read_only };
+    let extensions = crate::agent_keys::clean_extensions(&body.extensions).map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    let settings = crate::agent_keys::KeySettings { tools: body.tools, calls_per_minute: body.calls_per_minute, daily_changes: body.daily_changes, read_only: body.read_only, extensions };
     let changed = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
         crate::agent_keys::set_settings(&conn, body.id, &settings).map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?

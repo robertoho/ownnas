@@ -119,20 +119,20 @@ fn under(folders: &[String], path: &str) -> bool {
 }
 
 /// The items the key may see, in their order.
-fn visible(root: &Path, folders: &[String], items: Vec<MediaItem>) -> Vec<MediaItem> {
-    items.into_iter().filter(|item| under(folders, &item.path) && agent_keys::check(root, folders, &item.path).is_some()).collect()
+fn visible(root: &Path, scope: &agent_keys::Scope, items: Vec<MediaItem>) -> Vec<MediaItem> {
+    items.into_iter().filter(|item| under(&scope.folders, &item.path) && agent_keys::check(root, scope, &item.path).is_some()).collect()
 }
 
 /// The folders to look in: the key's, or one of them when `path` is given.
-async fn places(state: &Arc<AppState>, key: &AgentKey, path: &str) -> Result<Vec<String>, Stop> {
+async fn places(state: &Arc<AppState>, key: &AgentKey, path: &str) -> Result<agent_keys::Scope, Stop> {
     if path.is_empty() {
-        return Ok(key.folders.clone());
+        return Ok(key.scope());
     }
     let found = allowed(state, key, path).await?;
     if !found.full.is_dir() {
         return failed("That is a file, not a folder.");
     }
-    Ok(vec![found.rel])
+    Ok(agent_keys::Scope { folders: vec![found.rel], extensions: key.extensions.clone() })
 }
 
 pub fn photo_json(item: &MediaItem) -> Value {
@@ -159,7 +159,7 @@ fn media_items(state: &AppState, paths: &[String]) -> Vec<MediaItem> {
 }
 
 /// Photos for (path, score) pairs, best first, with the score.
-fn scored(state: &AppState, root: &Path, folders: &[String], found: Vec<(String, f32)>) -> Vec<Value> {
+fn scored(state: &AppState, root: &Path, folders: &agent_keys::Scope, found: Vec<(String, f32)>) -> Vec<Value> {
     let paths: Vec<String> = found.iter().map(|(path, _)| path.clone()).collect();
     let scores: std::collections::HashMap<String, f32> = found.into_iter().collect();
     visible(root, folders, media_items(state, &paths))
@@ -204,7 +204,7 @@ async fn photo_search(state: &Arc<AppState>, key: &AgentKey, query: &str, path: 
             let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
             worker.media.descriptions.get(&conn).map_err(fail)?
         };
-        let keep = |path: &str| under(&folders, path);
+        let keep = |path: &str| under(&folders.folders, path);
         let found = crate::smart::matching_text_where(&descriptions, &vector, &neutral, page.0 + page.1 + 1, &keep);
         Ok(page_of(scored(&worker, &root, &folders, found), page, json!({ "query": text })))
     })
@@ -217,7 +217,7 @@ async fn similar_photos(state: &Arc<AppState>, key: &AgentKey, path: &str, page:
     if !crate::http::smart_search_on(state) {
         return failed(SEARCH_OFF);
     }
-    let (worker, root, folders) = (state.clone(), state.root.clone(), key.folders.clone());
+    let (worker, root, folders) = (state.clone(), state.root.clone(), key.scope());
     blocking(move || {
         let stored = {
             let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
@@ -234,7 +234,7 @@ async fn similar_photos(state: &Arc<AppState>, key: &AgentKey, path: &str, page:
             let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
             worker.media.descriptions.get(&conn).map_err(|_| Stop::Failed("The search could not be finished.".to_string()))?
         };
-        let keep = |candidate: &str| candidate != sample.rel && under(&folders, candidate);
+        let keep = |candidate: &str| candidate != sample.rel && under(&folders.folders, candidate);
         let found: Vec<_> = crate::smart::nearest_where(&descriptions, &vector, page.0 + page.1 + 1, &keep).into_iter().filter(|(_, score)| *score >= 0.6).collect();
         Ok(page_of(scored(&worker, &root, &folders, found), page, json!({ "like": sample.rel })))
     })
@@ -261,7 +261,7 @@ async fn photos_taken(state: &Arc<AppState>, key: &AgentKey, from: &str, to: &st
             let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
             crate::albums::taken_between(&conn, start, end + 86_399, TAKEN_SCAN, None).map_err(|_| Stop::Failed("Could not list the photos.".to_string()))?
         };
-        let items: Vec<MediaItem> = items.into_iter().filter(|item| under(&folders, &item.path)).collect();
+        let items: Vec<MediaItem> = items.into_iter().filter(|item| under(&folders.folders, &item.path)).collect();
         // Checking every photo is slow for a large range: only the ones on this page.
         let wanted = page.0 + page.1 + 1;
         let shown = visible(&root, &folders, items.into_iter().take(wanted * 2).collect());
@@ -319,9 +319,9 @@ pub(crate) fn album_seen(state: &AppState, folders: &[String], id: i64) -> Resul
 
 async fn album_photos(state: &Arc<AppState>, key: &AgentKey, album: Option<i64>, page: (usize, usize)) -> Result<Vec<Value>, Stop> {
     let Some(id) = album else { return failed("Give the album's id, from list_albums.") };
-    let (worker, root, folders) = (state.clone(), state.root.clone(), key.folders.clone());
+    let (worker, root, folders) = (state.clone(), state.root.clone(), key.scope());
     blocking(move || {
-        let items = album_seen(&worker, &folders, id)?.ok_or(Stop::Refused)?;
+        let items = album_seen(&worker, &folders.folders, id)?.ok_or(Stop::Refused)?;
         let shown = visible(&root, &folders, items);
         Ok(page_of(shown.iter().map(photo_json).collect(), page, json!({ "album": id, "name": album_name(&worker, id) })))
     })
@@ -355,9 +355,9 @@ async fn list_people(state: &Arc<AppState>, key: &AgentKey) -> Result<Vec<Value>
 
 async fn person_photos(state: &Arc<AppState>, key: &AgentKey, person: Option<i64>, page: (usize, usize)) -> Result<Vec<Value>, Stop> {
     let Some(id) = person else { return failed("Give the person's id, from list_people.") };
-    let (worker, root, folders) = (state.clone(), state.root.clone(), key.folders.clone());
+    let (worker, root, folders) = (state.clone(), state.root.clone(), key.scope());
     blocking(move || {
-        let items = person_seen(&worker, &folders, id)?;
+        let items = person_seen(&worker, &folders.folders, id)?;
         if items.is_empty() {
             return Err(Stop::Refused);
         }

@@ -110,6 +110,12 @@ restores that version. A file or copy the agent made goes to the Trash on Undo.
 
 - [x] Tools chosen one by one per key, in Settings → Agents → **Limits & tools…**: unchosen
   tools are not listed to the agent and refuse if called anyway.
+- [x] A key's folders (or single files) can be changed after it is made, keeping its secret:
+  Settings → Agents → **Folders & files…** (`POST /api/agent-keys/folders`).
+- [x] File extensions per key (Limits & tools): only files ending in them can be seen, read,
+  changed or made; folders stay browsable; folders holding other kinds are not moved, copied
+  or put in the Trash. Enforced in `agent_keys::check` (the key's `Scope`), so every tool
+  follows it.
 - [x] Read-only folders inside an organise or write key. The most specific of the key's
   folders decides, so a folder of its own inside a read-only one stays writable. This is
   checked when a change is asked for and again when it is made (approved changes too).

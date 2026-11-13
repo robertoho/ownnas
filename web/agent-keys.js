@@ -239,6 +239,7 @@ async function settingsDialog(key) {
     const box = el("input", { type: "checkbox", value: folder, checked: (key.readOnly || []).includes(folder) });
     return { box, node: el("label", { class: "agent-scope-choice" }, box, el("span", {}, "Only read ", el("strong", {}, folderLabel(folder)))) };
   });
+  const extensions = el("input", { type: "text", spellcheck: "false", autocomplete: "off", value: (key.extensions || []).join(", "), placeholder: "Every file", "aria-label": "Only these file extensions" });
   const number = (value, fallback) => el("input", { type: "number", min: "0", step: "1", value: value ?? "", placeholder: String(fallback) });
   const calls = number(key.callsPerMinute, catalog.defaults.callsPerMinute);
   const changes = number(key.dailyChanges, catalog.defaults.dailyChanges);
@@ -250,6 +251,8 @@ async function settingsDialog(key) {
     readOnly.length ? el("fieldset", { class: "agent-scope" }, el("legend", {}, "Folders it may only read"),
       el("p", { class: "muted" }, "It can still look in them, but not change anything there. A folder of its own inside one stays writable."),
       readOnly.map((item) => item.node)) : null,
+    el("label", { class: "agent-field" }, el("span", {}, "Only these file extensions"), extensions),
+    el("p", { class: "muted" }, "Such as md, txt, pdf. It then sees and changes only files ending in them (folders can still be browsed), makes only such files, and leaves alone folders holding other kinds. Empty: every file."),
     el("label", { class: "agent-field" }, el("span", {}, "Requests a minute"), calls),
     key.level === "read" ? null : el("label", { class: "agent-field" }, el("span", {}, "Changes a day before it asks"), changes),
     el("div", { class: "dialog-actions" }, el("span", { class: "spacer" }), el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"), save));
@@ -263,6 +266,7 @@ async function settingsDialog(key) {
       callsPerMinute: calls.value === "" ? null : Number(calls.value),
       dailyChanges: changes.value === "" ? null : Number(changes.value),
       readOnly: readOnly.filter((item) => item.box.checked).map((item) => item.box.value),
+      extensions: extensions.value.split(/[\s,;]+/).map((ext) => ext.trim()).filter(Boolean),
     };
     save.disabled = true;
     try {
@@ -276,6 +280,62 @@ async function settingsDialog(key) {
       save.disabled = false;
     }
   });
+  document.body.append(dialog);
+  dialog.showModal();
+}
+
+/// The folders (or single files) a key may use, changed without a new secret.
+function scopeDialog(key) {
+  let whole = key.folders.includes(WHOLE_LIBRARY);
+  let chosen = whole ? [] : key.folders.slice();
+  const list = el("div", { class: "agent-folders" });
+  const addFolder = el("button", { type: "button" }, "Add folder…");
+  const addFile = el("button", { type: "button" }, "Add file…");
+  const wholeBox = el("input", { type: "checkbox", checked: whole });
+  const save = el("button", { type: "button", class: "primary" }, "Save");
+  const paint = () => {
+    list.replaceChildren(...chosen.map((path) => el("span", { class: "tag-chip agent-chip" },
+      path,
+      el("button", { type: "button", class: "agent-chip-remove", "aria-label": `Remove ${path}`, title: "Remove", onclick: () => { chosen = chosen.filter((item) => item !== path); paint(); } }, "×"))));
+    if (!chosen.length && !whole) list.append(el("p", { class: "muted" }, "Nothing chosen yet."));
+    list.hidden = whole;
+    addFolder.hidden = whole;
+    addFile.hidden = whole;
+  };
+  const add = async (files) => {
+    const path = await ctx.pickFolder({ title: files ? "Folder or file the agent can use" : "Folder the agent can use", ok: "Add this folder", files });
+    if (path === null || path === undefined) return;
+    if (path === WHOLE_LIBRARY) return ctx.toast('That is the whole library: tick "The whole library" to give all of it', true);
+    if (!chosen.includes(path)) chosen.push(path);
+    paint();
+  };
+  addFolder.addEventListener("click", () => add(false));
+  addFile.addEventListener("click", () => add(true));
+  wholeBox.addEventListener("change", () => { whole = wholeBox.checked; paint(); });
+  const dialog = el("dialog", { class: "workspace-editor agent-settings" },
+    el("h3", {}, `Folders & files: ${key.name}`),
+    el("p", { class: "muted" }, "Where this key may look. The agent keeps using the same key; the change applies from its next request."),
+    el("label", { class: "agent-scope-choice" }, wholeBox, el("span", {}, "The whole library", el("span", { class: "muted" }, " — every file, including folders added later"))),
+    list,
+    el("div", { class: "agent-actions" }, addFolder, addFile),
+    el("div", { class: "dialog-actions" }, el("span", { class: "spacer" }), el("button", { type: "button", onclick: () => dialog.close() }, "Cancel"), save));
+  dialog.addEventListener("close", () => dialog.remove());
+  save.addEventListener("click", async () => {
+    const folders = whole ? [WHOLE_LIBRARY] : chosen;
+    if (!folders.length) return ctx.toast("Add at least one folder or file, or choose the whole library", true);
+    save.disabled = true;
+    try {
+      await ctx.api("/api/agent-keys/folders", { method: "POST", json: { id: key.id, folders } });
+      dialog.close();
+      ctx.toast("Saved. It applies from the agent's next request.");
+      await render({ open: key.id });
+    } catch (err) {
+      ctx.toast(err.message, true);
+    } finally {
+      save.disabled = false;
+    }
+  });
+  paint();
   document.body.append(dialog);
   dialog.showModal();
 }
@@ -392,7 +452,10 @@ function keyCard(key, now, waiting, open, probing) {
     el("div", { class: "agent-folders" }, scope),
     el("p", { class: "muted" }, `${LEVELS[key.level] || key.level}${organises ? (key.approve ? ", asks first" : ", without asking") : ""}${key.tools ? ` · ${key.tools.length} chosen tools` : ""} · ${keyStatus(key, now)} · Made by ${key.createdBy} on ${date(key.createdAt)} · ${key.lastUsedAt ? `Last used ${dateTime(key.lastUsedAt)}` : "Never used"}`),
     probing ? el("p", { class: "backup-card agent-waiting agent-probing", role: "status" }, `Refused ${probing.refused} times in the last hour: it may be trying to reach files it wasn't given. Look at its Activity, and revoke it if that's not expected.`) : null,
-    el("div", { class: "agent-actions" }, showLog, showUsage, showChanges, approval, active && el("button", { type: "button", onclick: () => settingsDialog(key) }, "Limits & tools…"), revoke),
+    key.extensions ? el("p", { class: "muted" }, `Only ${key.extensions.map((ext) => `.${ext}`).join(", ")} files`) : null,
+    el("div", { class: "agent-actions" }, showLog, showUsage, showChanges, approval,
+      active && el("button", { type: "button", onclick: () => scopeDialog(key) }, "Folders & files…"),
+      active && el("button", { type: "button", onclick: () => settingsDialog(key) }, "Limits & tools…"), revoke),
     logHost,
     usageHost,
     changesHost);
