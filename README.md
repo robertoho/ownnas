@@ -175,6 +175,9 @@ files. It is off by default: turn it on in **Settings → Terminal**.
 - Terminals keep running when you close the tab or lose the connection. Reopen them from
   the right-click menu (**Terminals**) on any device; recent output (up to 2 MB) is replayed.
   **Pop out** opens one in its own browser tab, and phones get a row of Esc/Tab/Ctrl/arrow keys.
+- **Copy** and **Paste** on each terminal's title bar (and in the phones' key row) copy the
+  selected text and paste the clipboard. Browsers only allow the Paste button on HTTPS or
+  localhost; elsewhere use ⌘V or Ctrl+V.
 - Right-click (or long-press) a terminal tab to rename, duplicate, or close it, or to show its
   current folder in the file browser (**Show folder** does the same).
 - The panel sits beside the files, with every terminal tiled in a grid; drag the edge between

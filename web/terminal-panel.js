@@ -562,6 +562,22 @@ function tileFor(id) {
       activate(id);
       frames.get(id)?.querySelector("iframe")?.contentWindow?.postMessage({ type: "ownnas-terminal-insert-file" }, location.origin);
     });
+  // The page's own clipboard: the click happened here, not inside the terminal's frame.
+  const inFrame = () => frames.get(id)?.querySelector("iframe")?.contentWindow?.ownnasTerminal;
+  const copy = tool("copy", "Copy the selected text",
+    '<rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/>',
+    async () => {
+      await inFrame()?.copy(document);
+      focusTerminal(id);
+    });
+  const paste = tool("paste", "Paste from the clipboard",
+    '<path d="M5.5 3H4a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V4a1 1 0 0 0-1-1h-1.5"/><rect x="5.5" y="1.75" width="5" height="2.5" rx="0.75"/>',
+    async () => {
+      setView("terminal");
+      activate(id);
+      await inFrame()?.paste(navigator.clipboard);
+      focusTerminal(id);
+    });
   const popout = tool("popout", "Pop out: open this terminal in its own browser tab",
     '<path d="M9.5 2.5h4v4M13.5 2.5 8 8M12 9.5v3a1 1 0 0 1-1 1H3.5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h3"/>',
     () => window.open(`/terminal?id=${encodeURIComponent(id)}`, "_blank", "noopener"));
@@ -575,7 +591,7 @@ function tileFor(id) {
     "aria-label": "Hide this terminal",
   }, "✕");
   close.addEventListener("click", () => stashTerminal(id));
-  head.append(title, changes, folder, insert, popout, expand, close);
+  head.append(title, copy, paste, changes, folder, insert, popout, expand, close);
   const frame = el("iframe", { src: `/terminal?id=${encodeURIComponent(id)}`, title: "Terminal", class: "terminals-frame is-loading", "data-id": id });
   // A page is white until its styles load; show the panel's background meanwhile.
   frame.addEventListener("load", () => {

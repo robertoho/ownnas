@@ -540,6 +540,71 @@ textView.addEventListener("click", async (event) => {
   }
 });
 
+/// Puts `text` on the clipboard, through the older copy command where the browser refuses the
+/// clipboard API (as some embedded browsers and plain-HTTP pages do).
+async function writeClipboard(text, doc = document) {
+  try {
+    await doc.defaultView.navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    const area = doc.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0";
+    doc.body.append(area);
+    area.select();
+    let copied = false;
+    try {
+      copied = doc.execCommand("copy");
+    } catch {}
+    area.remove();
+    return copied;
+  }
+}
+
+/// Copies the text selected in the terminal. `doc` is the page's own when a terminal window's
+/// title bar asks: browsers only allow copying in the page that got the click.
+async function copySelection(doc = document) {
+  const text = term.getSelection();
+  if (!text) {
+    flash(window.matchMedia("(pointer: coarse)").matches ? "Nothing is selected. Use Select to pick text to copy." : "Nothing is selected. Drag across the text to copy first.");
+  } else if (await writeClipboard(text, doc)) {
+    flash("Copied");
+  } else {
+    flash("The browser did not allow copying here. Use the keyboard's copy instead.");
+  }
+  if (doc === document) term.focus();
+}
+
+/// Pastes the clipboard into the terminal: text as typed, or an image (such as a screenshot)
+/// uploaded like a pasted file.
+async function pasteFromClipboard(clipboard = navigator.clipboard) {
+  try {
+    if (clipboard.read) {
+      for (const item of await clipboard.read()) {
+        const type = item.types.find((kind) => kind.startsWith("image/"));
+        if (type) {
+          const blob = await item.getType(type);
+          await pasteFiles([new File([blob], `pasted.${type.split("/")[1]}`, { type })]);
+          term.focus();
+          return;
+        }
+      }
+    }
+    const text = await clipboard.readText();
+    if (text) term.paste(text);
+  } catch {
+    const keys = /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘V" : "Ctrl+V";
+    flash(window.isSecureContext
+      ? `The browser did not allow pasting here. Use ${keys} instead.`
+      : `Browsers only let this button paste on HTTPS. Use ${keys} instead.`);
+  }
+  term.focus();
+}
+
+// For the terminal panel's title bars (same origin).
+window.ownnasTerminal = { copy: copySelection, paste: pasteFromClipboard };
+
 keys.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-key]");
   if (!button) return;
@@ -561,25 +626,11 @@ keys.addEventListener("click", async (event) => {
     armAlt(!altArmed);
   } else if (key === "file") {
     openPicker();
+  } else if (key === "copy") {
+    await copySelection();
+    return;
   } else if (key === "paste") {
-    try {
-      // An image on the clipboard (such as a screenshot) is uploaded like a pasted file.
-      if (navigator.clipboard.read) {
-        for (const item of await navigator.clipboard.read()) {
-          const type = item.types.find((kind) => kind.startsWith("image/"));
-          if (type) {
-            const blob = await item.getType(type);
-            await pasteFiles([new File([blob], `pasted.${type.split("/")[1]}`, { type })]);
-            term.focus();
-            return;
-          }
-        }
-      }
-      const text = await navigator.clipboard.readText();
-      if (text) term.paste(text);
-    } catch {
-      flash("The browser did not allow pasting here. Use the keyboard's paste instead.");
-    }
+    await pasteFromClipboard();
   } else if (KEYS[key]) {
     sendText(withModifiers(KEYS[key]));
   }
