@@ -1363,7 +1363,7 @@ function paintSelection() {
     const selected = state.selected.has(card.dataset.path || card.dataset.columnEntry);
     card.classList.toggle("selected", selected);
     card.setAttribute("aria-selected", selected ? "true" : "false");
-    const cut = state.clipboard && state.clipboard.mode === "cut" && state.clipboard.items.some((item) => item.path === card.dataset.path);
+    const cut = state.clipboard && state.clipboard.mode === "cut" && state.clipboard.items.some((item) => item.path === (card.dataset.path || card.dataset.columnEntry));
     card.classList.toggle("cut", !!cut);
   });
   updateSelectionSummary();
@@ -6654,19 +6654,21 @@ $("files").addEventListener("dblclick", (event) => {
 $("files").addEventListener("contextmenu", (event) => {
   if (!state.me) return;
   // Ctrl+click is multi-select (Explorer style), not a context menu shortcut.
+  // An item in any layout: a card (icons, masonry), a row (details), or an entry in the columns
+  // view, so every layout gets the same menu.
+  const card = event.target.closest("[data-path], [data-column-entry]");
+  const cardPath = card && (card.dataset.path || card.dataset.columnEntry);
   if (event.ctrlKey) {
     event.preventDefault();
-    const card = event.target.closest("[data-path]");
     if (card) {
-      toggleSelected(card.dataset.path);
+      toggleSelected(cardPath);
       skipNextClick = true;
     }
     return;
   }
   event.preventDefault();
-  const card = event.target.closest("[data-path]");
   if (card) {
-    const path = card.dataset.path;
+    const path = cardPath;
     if (!state.selected.has(path)) selectOnly(path);
     const entry = findEntry(path);
     const pasteInto = state.selected.size === 1 && entry && entry.dir ? entry.path : state.path;
