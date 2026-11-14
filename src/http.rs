@@ -9056,21 +9056,17 @@ pub(crate) async fn search_hits(state: &std::sync::Arc<AppState>, rel: String, r
             let listed = db::open(&db_path).map_err(|_| FileError::Rejected("Could not open the search index")).and_then(|conn| {
                 let names = crate::file_index::search_names(&conn, &start.rel, &lower, 100)
                     .map_err(|_| FileError::Rejected("Could not read the search index"))?;
-                // Words read ahead of time, then the files not read yet, looked in as the search goes.
+                // Only words read ahead of time: files the reader has not reached yet are not opened
+                // here, since reading them (OCR above all) would keep every search waiting.
                 let words = crate::text_index::search(&conn, &start.rel, &lower, 100).unwrap_or_default();
-                let contents = crate::text_index::unread(&conn, &start.rel, &["text", "pdf"], 8_000);
-                let images = if ocr { crate::text_index::unread(&conn, &start.rel, &["image"], 8_000) } else { Vec::new() };
-                Ok((names, words, contents, images))
+                Ok((names, words))
             });
-            let (names, words, contents, images) = listed?;
+            let (names, words) = listed?;
             files::search_listed(
                 &root,
                 &needle,
                 names.into_iter().map(|hit| (hit.path, hit.dir)).collect(),
                 words.into_iter().map(|hit| (hit.path, hit.snippet)).collect(),
-                contents,
-                images,
-                &options,
             )
         })
             .await

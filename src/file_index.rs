@@ -511,7 +511,6 @@ mod tests {
         assert_eq!(names(&library, "photo cache", ""), ["iPod/iPod Photo Cache", "docs/old/photo cache notes.txt"]);
         assert_eq!(names(&library, "photoslibrary", ""), ["Photos Library.photoslibrary"]);
         assert_eq!(names(&library, "cache", "docs"), ["docs/old/photo cache notes.txt"]);
-        assert_eq!(crate::text_index::unread(&library.conn, "", &["text"], 10), ["docs/old/photo cache notes.txt"]);
 
         // Nothing changed: only the folders' times are looked at.
         let (folders, read) = scan_all(&library, "", false);

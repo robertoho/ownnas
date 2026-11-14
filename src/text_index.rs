@@ -341,21 +341,6 @@ fn glob(text: &str) -> String {
     out
 }
 
-/// Files under `rel` of these kinds whose words are not (or no longer) in the index, which a
-/// search still has to read itself.
-pub fn unread(conn: &Connection, rel: &str, kinds: &[&str], limit: usize) -> Vec<String> {
-    let marks = kinds.iter().map(|kind| format!("'{kind}'")).collect::<Vec<_>>().join(", ");
-    let sql = format!(
-        "SELECT f.path FROM file_index f LEFT JOIN content_text c ON c.path = f.path AND c.size = f.size AND c.mtime = f.mtime
-         WHERE f.dir = 0 AND f.kind IN ({marks}) AND c.path IS NULL
-           AND (?1 = '' OR (f.path >= ?1 || '/' AND f.path < ?1 || '0'))
-         ORDER BY length(f.path) - length(replace(f.path, '/', '')), f.path
-         LIMIT ?2"
-    );
-    let Ok(mut stmt) = conn.prepare(&sql) else { return Vec::new() };
-    stmt.query_map(params![rel, limit as i64], |row| row.get(0)).map(|rows| rows.filter_map(Result::ok).collect()).unwrap_or_default()
-}
-
 /// Whether the index has any words at all.
 #[cfg(test)]
 fn has_any(conn: &Connection) -> bool {
