@@ -327,6 +327,9 @@ async fn copy(state: &Arc<AppState>, key: &AgentKey, path: &str, to: &str) -> Re
     if !dest.full.is_dir() {
         return failed("Copy it into a folder.");
     }
+    if found.full.is_dir() && key.scope().holds_excluded(&found.rel) {
+        return failed("That folder holds something this key may not reach, so it cannot copy it.");
+    }
     if found.full.is_dir() && key.extensions.is_some() {
         let (scope, full) = (key.scope(), found.full.clone());
         if !blocking(move || Ok(scope.folder_fits(&full))).await? {

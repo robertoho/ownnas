@@ -535,6 +535,9 @@ async fn changeable(state: &Arc<AppState>, key: &AgentKey, path: &str) -> Result
     if found.rel.is_empty() || key.folders.contains(&found.rel) {
         return failed("That is one of the folders this key was given; it cannot be renamed, moved or put in the Trash.");
     }
+    if found.full.is_dir() && key.scope().holds_excluded(&found.rel) {
+        return failed("That folder holds something this key may not reach, so it cannot rename, move or put it in the Trash.");
+    }
     if found.full.is_dir() && key.extensions.is_some() {
         let (scope, full) = (key.scope(), found.full.clone());
         if !blocking(move || Ok(scope.folder_fits(&full))).await? {
@@ -748,7 +751,7 @@ async fn rename_many(state: &Arc<AppState>, key: &AgentKey, args: &Args<'_>) -> 
 /// An album the key may change: one with photos in its folders, or an empty one (such as one
 /// it just made). Others answer as if they did not exist.
 fn album_usable(state: &AppState, key: &AgentKey, id: i64) -> Result<(), Stop> {
-    if mcp_photos::album_seen(state, &key.folders, id)?.is_some() {
+    if mcp_photos::album_seen(state, &key.scope(), id)?.is_some() {
         return Ok(());
     }
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());

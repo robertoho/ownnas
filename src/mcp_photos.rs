@@ -113,14 +113,14 @@ pub(crate) async fn call(state: &Arc<AppState>, key: &AgentKey, name: &str, args
 
 /// Whether a library path is under one of `folders`, by name only. A quick first pass:
 /// `agent_keys::check` has the last word on anything that is returned.
-fn under(folders: &[String], path: &str) -> bool {
+fn under(scope: &agent_keys::Scope, path: &str) -> bool {
     let shown = !path.split('/').any(|part| part.starts_with('.'));
-    shown && folders.iter().any(|folder| folder.is_empty() || path == folder || path.strip_prefix(folder.as_str()).is_some_and(|rest| rest.starts_with('/')))
+    shown && scope.holds_name(path)
 }
 
 /// The items the key may see, in their order.
 fn visible(root: &Path, scope: &agent_keys::Scope, items: Vec<MediaItem>) -> Vec<MediaItem> {
-    items.into_iter().filter(|item| under(&scope.folders, &item.path) && agent_keys::check(root, scope, &item.path).is_some()).collect()
+    items.into_iter().filter(|item| under(scope, &item.path) && agent_keys::check(root, scope, &item.path).is_some()).collect()
 }
 
 /// The folders to look in: the key's, or one of them when `path` is given.
@@ -132,7 +132,7 @@ async fn places(state: &Arc<AppState>, key: &AgentKey, path: &str) -> Result<age
     if !found.full.is_dir() {
         return failed("That is a file, not a folder.");
     }
-    Ok(agent_keys::Scope { folders: vec![found.rel], extensions: key.extensions.clone() })
+    Ok(agent_keys::Scope { folders: vec![found.rel], ..key.scope() })
 }
 
 pub fn photo_json(item: &MediaItem) -> Value {
@@ -204,7 +204,7 @@ async fn photo_search(state: &Arc<AppState>, key: &AgentKey, query: &str, path: 
             let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
             worker.media.descriptions.get(&conn).map_err(fail)?
         };
-        let keep = |path: &str| under(&folders.folders, path);
+        let keep = |path: &str| under(&folders, path);
         let found = crate::smart::matching_text_where(&descriptions, &vector, &neutral, page.0 + page.1 + 1, &keep);
         Ok(page_of(scored(&worker, &root, &folders, found), page, json!({ "query": text })))
     })
@@ -234,7 +234,7 @@ async fn similar_photos(state: &Arc<AppState>, key: &AgentKey, path: &str, page:
             let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
             worker.media.descriptions.get(&conn).map_err(|_| Stop::Failed("The search could not be finished.".to_string()))?
         };
-        let keep = |candidate: &str| candidate != sample.rel && under(&folders.folders, candidate);
+        let keep = |candidate: &str| candidate != sample.rel && under(&folders, candidate);
         let found: Vec<_> = crate::smart::nearest_where(&descriptions, &vector, page.0 + page.1 + 1, &keep).into_iter().filter(|(_, score)| *score >= 0.6).collect();
         Ok(page_of(scored(&worker, &root, &folders, found), page, json!({ "like": sample.rel })))
     })
@@ -261,7 +261,7 @@ async fn photos_taken(state: &Arc<AppState>, key: &AgentKey, from: &str, to: &st
             let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
             crate::albums::taken_between(&conn, start, end + 86_399, TAKEN_SCAN, None).map_err(|_| Stop::Failed("Could not list the photos.".to_string()))?
         };
-        let items: Vec<MediaItem> = items.into_iter().filter(|item| under(&folders.folders, &item.path)).collect();
+        let items: Vec<MediaItem> = items.into_iter().filter(|item| under(&folders, &item.path)).collect();
         // Checking every photo is slow for a large range: only the ones on this page.
         let wanted = page.0 + page.1 + 1;
         let shown = visible(&root, &folders, items.into_iter().take(wanted * 2).collect());
@@ -275,7 +275,7 @@ fn from_text(seconds: i64) -> String {
 }
 
 /// The albums' photos that the key may see, by album id, for the albums that have any.
-fn albums_seen(state: &AppState, folders: &[String]) -> Result<Vec<(crate::albums::Album, Vec<MediaItem>)>, Stop> {
+fn albums_seen(state: &AppState, folders: &agent_keys::Scope) -> Result<Vec<(crate::albums::Album, Vec<MediaItem>)>, Stop> {
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     let fail = |_| Stop::Failed("Could not list the albums.".to_string());
     let mut seen = Vec::new();
@@ -295,7 +295,7 @@ fn album_name(state: &AppState, id: i64) -> String {
 }
 
 async fn list_albums(state: &Arc<AppState>, key: &AgentKey) -> Result<Vec<Value>, Stop> {
-    let (worker, folders) = (state.clone(), key.folders.clone());
+    let (worker, folders) = (state.clone(), key.scope());
     blocking(move || {
         let albums: Vec<Value> = albums_seen(&worker, &folders)?
             .into_iter()
@@ -308,7 +308,7 @@ async fn list_albums(state: &Arc<AppState>, key: &AgentKey) -> Result<Vec<Value>
 
 /// An album the key may use: one with photos in its folders. `None` for any other, as for
 /// one that does not exist.
-pub(crate) fn album_seen(state: &AppState, folders: &[String], id: i64) -> Result<Option<Vec<MediaItem>>, Stop> {
+pub(crate) fn album_seen(state: &AppState, folders: &agent_keys::Scope, id: i64) -> Result<Option<Vec<MediaItem>>, Stop> {
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     if crate::albums::get(&conn, id).is_err() {
         return Ok(None);
@@ -321,21 +321,21 @@ async fn album_photos(state: &Arc<AppState>, key: &AgentKey, album: Option<i64>,
     let Some(id) = album else { return failed("Give the album's id, from list_albums.") };
     let (worker, root, folders) = (state.clone(), state.root.clone(), key.scope());
     blocking(move || {
-        let items = album_seen(&worker, &folders.folders, id)?.ok_or(Stop::Refused)?;
+        let items = album_seen(&worker, &folders, id)?.ok_or(Stop::Refused)?;
         let shown = visible(&root, &folders, items);
         Ok(page_of(shown.iter().map(photo_json).collect(), page, json!({ "album": id, "name": album_name(&worker, id) })))
     })
     .await
 }
 
-fn person_seen(state: &AppState, folders: &[String], id: i64) -> Result<Vec<MediaItem>, Stop> {
+fn person_seen(state: &AppState, folders: &agent_keys::Scope, id: i64) -> Result<Vec<MediaItem>, Stop> {
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     let photos = crate::smart::person_photos(&conn, id).map_err(|_| Stop::Failed("Could not read the people.".to_string()))?;
     Ok(photos.into_iter().map(|(item, _)| item).filter(|item| under(folders, &item.path)).collect())
 }
 
 async fn list_people(state: &Arc<AppState>, key: &AgentKey) -> Result<Vec<Value>, Stop> {
-    let (worker, folders) = (state.clone(), key.folders.clone());
+    let (worker, folders) = (state.clone(), key.scope());
     blocking(move || {
         let people = {
             let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
@@ -357,7 +357,7 @@ async fn person_photos(state: &Arc<AppState>, key: &AgentKey, person: Option<i64
     let Some(id) = person else { return failed("Give the person's id, from list_people.") };
     let (worker, root, folders) = (state.clone(), state.root.clone(), key.scope());
     blocking(move || {
-        let items = person_seen(&worker, &folders.folders, id)?;
+        let items = person_seen(&worker, &folders, id)?;
         if items.is_empty() {
             return Err(Stop::Refused);
         }
@@ -377,14 +377,23 @@ mod tests {
 
     #[test]
     fn under_compares_whole_folder_names_and_skips_hidden_ones() {
-        let folders = vec!["Photos".to_string()];
+        let scope = |folders: &[&str], excluded: &[&str]| agent_keys::Scope {
+            folders: folders.iter().map(|s| s.to_string()).collect(),
+            excluded: excluded.iter().map(|s| s.to_string()).collect(),
+            extensions: None,
+        };
+        let folders = scope(&["Photos"], &[]);
         assert!(under(&folders, "Photos/a.jpg"));
         assert!(under(&folders, "Photos"));
         assert!(!under(&folders, "Photos2/a.jpg"));
         assert!(!under(&folders, "Other/a.jpg"));
         assert!(!under(&folders, "Photos/.private/a.jpg"));
-        assert!(under(&[String::new()], "Anything/a.jpg"));
-        assert!(!under(&[String::new()], ".ownnas-trash/a.jpg"));
+        assert!(under(&scope(&[""], &[]), "Anything/a.jpg"));
+        assert!(!under(&scope(&[""], &[]), ".ownnas-trash/a.jpg"));
+        let some_out = scope(&["Photos"], &["Photos/Private", "Photos/me.jpg"]);
+        assert!(!under(&some_out, "Photos/Private/a.jpg"), "excluded folders are skipped");
+        assert!(!under(&some_out, "Photos/me.jpg"));
+        assert!(under(&some_out, "Photos/Private2/a.jpg"));
     }
 
     #[test]

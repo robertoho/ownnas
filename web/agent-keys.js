@@ -1,7 +1,9 @@
 // Settings → AI agents: the keys that let an AI agent use the library over MCP, what each one
 // can reach (the whole library or chosen folders) and do there (read, or also organise), what
 // each one has done, and the changes organising keys made or are waiting to have approved, with
-// Undo. Loaded on demand by app.js.
+// Undo. Also the file explorer's "Share with AI agent…" dialog (who has access, and a key for
+// just the items chosen) and "AI agent access…" dialog (allow or exclude for every key or some).
+// Loaded on demand by app.js.
 
 let ctx = null;
 let section = null;
@@ -380,6 +382,11 @@ function keyCard(key, now, waiting, open, probing) {
   const scope = key.folders.length
     ? key.folders.map((folder) => el("span", { class: `tag-chip mini agent-chip${folder === WHOLE_LIBRARY ? " agent-chip-whole" : ""}` }, folderLabel(folder), (key.readOnly || []).includes(folder) ? " (read only)" : ""))
     : el("span", { class: "muted" }, "Its folders are gone, so it can read nothing.");
+  const excluded = (key.excluded || []).length
+    ? el("div", { class: "agent-folders agent-excluded" }, el("span", { class: "muted" }, "Excluded:"),
+      key.excluded.map((path) => el("span", { class: "tag-chip mini agent-chip agent-chip-excluded" }, folderLabel(path),
+        active && el("button", { type: "button", class: "agent-chip-remove", "aria-label": `Stop excluding ${path}`, title: "Stop excluding", onclick: () => unexclude(path, [key.id]) }, "×"))))
+    : null;
   const showLog = el("button", { type: "button" }, "Activity");
   showLog.addEventListener("click", async () => {
     if (!logHost.hidden) {
@@ -450,6 +457,7 @@ function keyCard(key, now, waiting, open, probing) {
   return el("div", { class: `backup-card agent-key${active ? "" : " agent-key-inactive"}` },
     el("p", { class: "backup-headline agent-key-name" }, key.name),
     el("div", { class: "agent-folders" }, scope),
+    excluded,
     el("p", { class: "muted" }, `${LEVELS[key.level] || key.level}${organises ? (key.approve ? ", asks first" : ", without asking") : ""}${key.tools ? ` · ${key.tools.length} chosen tools` : ""} · ${keyStatus(key, now)} · Made by ${key.createdBy} on ${date(key.createdAt)} · ${key.lastUsedAt ? `Last used ${dateTime(key.lastUsedAt)}` : "Never used"}`),
     probing ? el("p", { class: "backup-card agent-waiting agent-probing", role: "status" }, `Refused ${probing.refused} times in the last hour: it may be trying to reach files it wasn't given. Look at its Activity, and revoke it if that's not expected.`) : null,
     key.extensions ? el("p", { class: "muted" }, `Only ${key.extensions.map((ext) => `.${ext}`).join(", ")} files`) : null,
@@ -461,11 +469,25 @@ function keyCard(key, now, waiting, open, probing) {
     changesHost);
 }
 
+/// Lifts an exclusion set on exactly `path`: for the keys given, or (`null`) the one for every key.
+async function unexclude(path, keys) {
+  try {
+    await ctx.api("/api/agent-keys/rules", { method: "POST", json: { paths: [path], keys, rule: "unexclude" } });
+    ctx.toast(`No longer excluded: ${folderLabel(path)}`);
+    if (ctx.onAgentAccessChange) ctx.onAgentAccessChange();
+    await render({ open: keys && keys[0] });
+  } catch (err) {
+    ctx.toast(err.message, true);
+  }
+}
+
 async function render({ open } = {}) {
-  const [{ keys, pending = {} }, attention] = await Promise.all([ctx.api("/api/agent-keys"), ctx.api("/api/agent-keys/attention").catch(() => ({ probing: [] }))]);
+  if (!section || !section.isConnected) return;
+  const [{ keys, pending = {}, excludedForEveryKey = [] }, attention] = await Promise.all([ctx.api("/api/agent-keys"), ctx.api("/api/agent-keys/attention").catch(() => ({ probing: [] }))]);
   const waiting = Object.values(pending).reduce((sum, count) => sum + count, 0);
   const now = Math.floor(Date.now() / 1000);
-  section.replaceChildren(
+  // replaceChildren would show a null as the text "null".
+  section.replaceChildren(...[
     el("h3", {}, "AI agents"),
     el("p", { class: "muted" }, "A key lets an AI agent search and read the library over MCP, and, if you allow it, organise it. You choose what each key can reach. Agents never delete anything for good, and never see hidden files or the Trash."),
     waiting ? el("p", { class: "backup-card agent-waiting", role: "status" }, `${waiting} change${waiting === 1 ? "" : "s"} waiting for your approval: open Changes on the key below.`) : null,
@@ -474,10 +496,301 @@ async function render({ open } = {}) {
     el("h3", {}, "New key"),
     createForm(),
     el("h3", {}, "Keys"),
-    ...(keys.length ? keys.map((key) => keyCard(key, now, pending[key.id] || 0, open === key.id || (pending[key.id] || 0) > 0, attention.probing.find((entry) => entry.id === key.id))) : [el("p", { class: "muted" }, "No keys yet, so no agent can connect.")]));
+    excludedForEveryKey.length ? el("div", { class: "backup-card agent-every-excluded" },
+      el("p", { class: "backup-headline" }, "Excluded for every key"),
+      el("p", { class: "muted" }, "No key reaches these, even inside its folders, including keys made later. Set from the file explorer: right-click → AI agent access…"),
+      el("div", { class: "agent-folders" }, excludedForEveryKey.map((path) => el("span", { class: "tag-chip mini agent-chip agent-chip-excluded" }, folderLabel(path),
+        el("button", { type: "button", class: "agent-chip-remove", "aria-label": `Stop excluding ${path}`, title: "Stop excluding", onclick: () => unexclude(path, null) }, "×"))))) : null,
+    ...(keys.length ? keys.map((key) => keyCard(key, now, pending[key.id] || 0, open === key.id || (pending[key.id] || 0) > 0, attention.probing.find((entry) => entry.id === key.id))) : [el("p", { class: "muted" }, "No keys yet, so no agent can connect.")])].filter(Boolean));
 }
 
 export async function renderSettings(host) {
   section = host;
   await render();
+}
+
+const REACH = {
+  allowed: "Shared",
+  inside: "Shared",
+  excluded: "Excluded",
+  excludedInside: "Excluded",
+  none: "Not shared",
+};
+
+/// One key's reach of one item, in words: "Shared (in Docs)", "Excluded for every key"…
+function reachText(reach) {
+  const base = REACH[reach.state] || reach.state;
+  if (reach.state === "inside") return `${base} (in ${folderLabel(reach.by)})`;
+  if (reach.state === "allowed") return `${base} (given)`;
+  if (reach.state === "excluded" || reach.state === "excludedInside") {
+    const where = reach.state === "excludedInside" ? ` (in ${folderLabel(reach.by)})` : "";
+    return `${base}${reach.everyKey ? " for every key" : ""}${where}`;
+  }
+  return base;
+}
+
+const shared = (state) => state === "allowed" || state === "inside";
+const keptOut = (state) => state === "excluded" || state === "excludedInside";
+
+/// The file explorer's dialog: how each key reaches the chosen folders and files, and buttons
+/// to allow or exclude them for every key or the ones ticked.
+export async function accessDialog(paths, title) {
+  if (!paths.length) return;
+  let keys = [];
+  let items = [];
+  const whoEvery = el("input", { type: "radio", name: "agent-access-who", value: "every", checked: true });
+  const whoChosen = el("input", { type: "radio", name: "agent-access-who", value: "chosen" });
+  const ticked = new Set();
+  const table = el("div", { class: "agent-access-keys" }, el("p", { class: "muted" }, "Loading…"));
+  const summary = el("div", { class: "agent-access-summary" });
+  const notes = el("div", { class: "agent-access-notes", role: "status" });
+  const allow = el("button", { type: "button", class: "primary", title: "Give these to the keys, and lift an exclusion of exactly these" }, "Allow");
+  const exclude = el("button", { type: "button", class: "danger", title: "Keep these out of the keys' reach, even inside folders they were given" }, "Exclude");
+  const clear = el("button", { type: "button", title: "Take away what was set on exactly these items, either way" }, "Remove rules");
+  const count = paths.length === 1 ? "this item" : `these ${paths.length} items`;
+
+  const paint = () => {
+    const chosenMode = whoChosen.checked;
+    const everyOut = items.filter((item) => item.excludedForEveryKey).length;
+    summary.replaceChildren(...[
+      everyOut ? el("p", { class: "agent-access-warning" }, items.length === 1 ? "Excluded for every key, including keys made later." : `${everyOut} of ${items.length} excluded for every key, including keys made later.`) : null,
+      items.length < paths.length ? el("p", { class: "muted" }, `${paths.length - items.length} of the items can never be given to an agent (hidden, or in the Trash).`) : null,
+    ].filter(Boolean));
+    if (!keys.length) {
+      table.replaceChildren(el("p", { class: "muted" }, "No keys work right now. Excluding for every key still holds for keys made later. Make keys in Settings → AI agents."));
+      return;
+    }
+    table.replaceChildren(...keys.map((key) => {
+      const reaches = items.map((item) => ({ path: item.path, reach: item.keys.find((reach) => reach.keyId === key.id) })).filter((entry) => entry.reach);
+      const sharedCount = reaches.filter((entry) => shared(entry.reach.state)).length;
+      const outCount = reaches.filter((entry) => keptOut(entry.reach.state)).length;
+      let status;
+      let tone = "none";
+      if (reaches.length === 1) {
+        status = reachText(reaches[0].reach);
+        tone = shared(reaches[0].reach.state) ? "shared" : keptOut(reaches[0].reach.state) ? "excluded" : "none";
+      } else if (sharedCount === reaches.length) {
+        status = `All ${reaches.length} shared`;
+        tone = "shared";
+      } else if (outCount === reaches.length) {
+        status = `All ${reaches.length} excluded`;
+        tone = "excluded";
+      } else if (!sharedCount && !outCount) {
+        status = "Not shared";
+      } else {
+        status = [sharedCount && `${sharedCount} shared`, outCount && `${outCount} excluded`, reaches.length - sharedCount - outCount && `${reaches.length - sharedCount - outCount} not shared`].filter(Boolean).join(", ");
+        tone = "mixed";
+      }
+      const box = el("input", { type: "checkbox", checked: ticked.has(key.id), disabled: !chosenMode, "aria-label": `Choose ${key.name}` });
+      box.addEventListener("change", () => { if (box.checked) ticked.add(key.id); else ticked.delete(key.id); });
+      const details = reaches.length > 1 ? el("details", { class: "agent-access-details" }, el("summary", {}, "Each item"),
+        el("ul", {}, reaches.map((entry) => el("li", {}, el("code", {}, folderLabel(entry.path)), " ", reachText(entry.reach))))) : null;
+      return el("div", { class: "agent-access-key" },
+        el("label", { class: "agent-scope-choice" }, box, el("span", {}, el("strong", {}, key.name), el("span", { class: "muted" }, ` · ${LEVELS[key.level] || key.level}`))),
+        el("span", { class: `agent-access-state agent-access-${tone}` }, status),
+        details);
+    }));
+  };
+
+  const load = async () => {
+    const [listed, access] = await Promise.all([ctx.api("/api/agent-keys"), ctx.api("/api/agent-keys/access", { method: "POST", json: { paths } })]);
+    const now = Math.floor(Date.now() / 1000);
+    keys = listed.keys.filter((key) => !key.revokedAt && !(key.expiresAt && key.expiresAt <= now));
+    items = access.items;
+    for (const id of [...ticked]) if (!keys.some((key) => key.id === id)) ticked.delete(id);
+    paint();
+  };
+
+  const act = async (rule, button) => {
+    const every = whoEvery.checked;
+    if (!every && !ticked.size) return ctx.toast("Tick at least one key, or choose every key", true);
+    if (rule === "exclude" && every && !(await ctx.askConfirm(`Exclude ${count} for every AI agent key, including keys made later?`, "Exclude"))) return;
+    button.disabled = true;
+    try {
+      const result = await ctx.api("/api/agent-keys/rules", { method: "POST", json: { paths, keys: every ? null : [...ticked], rule } });
+      notes.replaceChildren(...(result.notes || []).map((note) => el("p", { class: "agent-access-warning" }, note)));
+      ctx.toast(rule === "allow" ? "Allowed. It applies from each agent's next request." : rule === "exclude" ? "Excluded. It applies from each agent's next request." : "Rules removed");
+      await load();
+      if (ctx.onAgentAccessChange) ctx.onAgentAccessChange();
+      render().catch(() => {});
+    } catch (err) {
+      ctx.toast(err.message, true);
+    } finally {
+      button.disabled = false;
+    }
+  };
+  allow.addEventListener("click", () => act("allow", allow));
+  exclude.addEventListener("click", () => act("exclude", exclude));
+  clear.addEventListener("click", () => act("clear", clear));
+  whoEvery.addEventListener("change", paint);
+  whoChosen.addEventListener("change", paint);
+
+  const dialog = el("dialog", { class: "workspace-editor agent-settings agent-access" },
+    el("h3", {}, `AI agent access: ${title}`),
+    el("p", { class: "muted" }, "Which MCP keys may reach ", count, ". An exclusion always wins: an excluded item stays out of reach even inside a folder a key was given."),
+    summary,
+    el("fieldset", { class: "agent-scope" }, el("legend", {}, "For"),
+      el("label", { class: "agent-scope-choice" }, whoEvery, el("span", {}, "Every key", el("span", { class: "muted" }, " — an exclusion also holds for keys made later"))),
+      el("label", { class: "agent-scope-choice" }, whoChosen, el("span", {}, "The keys ticked below"))),
+    table,
+    notes,
+    el("div", { class: "dialog-actions" }, clear, el("span", { class: "spacer" }), el("button", { type: "button", onclick: () => dialog.close() }, "Close"), exclude, allow));
+  dialog.addEventListener("close", () => dialog.remove());
+  document.body.append(dialog);
+  dialog.showModal();
+  try {
+    await load();
+  } catch (err) {
+    dialog.close();
+    throw err;
+  }
+}
+
+const SHARE_EXPIRY = [["", "Never"], ["7", "In 7 days"], ["30", "In 30 days"], ["90", "In 90 days"]];
+
+/// "Share with AI agent…" from the file explorer, like sharing a folder in a cloud drive: who
+/// has access now (with Remove), sharing with a key that exists, or a new key for just these
+/// items, whose secret and MCP settings are shown once to copy.
+export async function shareDialog(paths, title) {
+  if (!paths.length) return;
+  let keys = [];
+  let items = [];
+  const count = paths.length === 1 ? "this item" : `these ${paths.length} items`;
+  const people = el("div", { class: "agent-access-keys" }, el("p", { class: "muted" }, "Loading…"));
+  const existing = el("select", { "aria-label": "Key to share with" });
+  const shareExisting = el("button", { type: "button" }, "Share");
+  const existingRow = el("div", { class: "agent-share-row" }, existing, shareExisting);
+  const name = el("input", { type: "text", maxlength: "80", value: `${title}`.slice(0, 80), "aria-label": "Name of the new key" });
+  const level = el("select", { "aria-label": "What the agent can do" },
+    el("option", { value: "read" }, "Can read"),
+    el("option", { value: "organise" }, "Can read and organise"),
+    el("option", { value: "write" }, "Can read, organise and write"));
+  const expires = el("select", { "aria-label": "Key expires" }, SHARE_EXPIRY.map(([value, label]) => el("option", { value, selected: value === "30" }, label)));
+  const create = el("button", { type: "button", class: "primary" }, "Create key");
+  const secretHost = el("div");
+  const changed = () => {
+    if (ctx.onAgentAccessChange) ctx.onAgentAccessChange();
+    render().catch(() => {});
+  };
+
+  const paint = () => {
+    const withAccess = keys.map((key) => {
+      const reaches = items.map((item) => ({ path: item.path, reach: item.keys.find((reach) => reach.keyId === key.id) })).filter((entry) => entry.reach && shared(entry.reach.state));
+      return { key, reaches };
+    }).filter((entry) => entry.reaches.length);
+    people.replaceChildren(...(withAccess.length ? withAccess.map(({ key, reaches }) => {
+      const how = reaches.length === items.length && reaches.every((entry) => entry.reach.state === "allowed")
+        ? "Shared directly"
+        : reaches.length === 1 && items.length === 1
+          ? `Through ${folderLabel(reaches[0].reach.by)}`
+          : `${reaches.length} of ${items.length} items`;
+      const remove = el("button", { type: "button", class: "agent-share-remove" }, "Remove");
+      remove.addEventListener("click", () => removeAccess(key, reaches, remove));
+      return el("div", { class: "agent-access-key" },
+        el("span", {}, el("strong", {}, key.name), el("span", { class: "muted" }, ` · ${LEVELS[key.level] || key.level}`), el("br"), el("span", { class: "muted agent-share-how" }, how)),
+        remove);
+    }) : [el("p", { class: "muted" }, `No AI agent can reach ${count} yet.`)]));
+    const others = keys.filter((key) => !withAccess.some((entry) => entry.key.id === key.id && entry.reaches.length === items.length));
+    existing.replaceChildren(...others.map((key) => el("option", { value: String(key.id) }, `${key.name} · ${LEVELS[key.level] || key.level}`)));
+    existingRow.hidden = !others.length;
+  };
+
+  const load = async () => {
+    const [listed, access] = await Promise.all([ctx.api("/api/agent-keys"), ctx.api("/api/agent-keys/access", { method: "POST", json: { paths } })]);
+    const now = Math.floor(Date.now() / 1000);
+    keys = listed.keys.filter((key) => !key.revokedAt && !(key.expiresAt && key.expiresAt <= now));
+    items = access.items;
+    paint();
+  };
+
+  /// Takes these items away from a key: an item given directly loses its entry, one reached
+  /// through a folder is excluded. A key left with nothing else is revoked instead.
+  const removeAccess = async (key, reaches, button) => {
+    const direct = reaches.filter((entry) => entry.reach.state === "allowed").map((entry) => entry.path);
+    const through = reaches.filter((entry) => entry.reach.state === "inside").map((entry) => entry.path);
+    const onlyThese = key.folders.length && key.folders.every((folder) => direct.includes(folder));
+    button.disabled = true;
+    try {
+      if (onlyThese) {
+        if (!(await ctx.askConfirm(`“${key.name}” can reach nothing else. Revoke the key? Agents using it lose access at once.`, "Revoke"))) return;
+        await ctx.api("/api/agent-keys/revoke", { method: "POST", json: { id: key.id } });
+        ctx.toast(`Revoked “${key.name}”`);
+      } else {
+        if (direct.length) await ctx.api("/api/agent-keys/rules", { method: "POST", json: { paths: direct, keys: [key.id], rule: "clear" } });
+        if (through.length) await ctx.api("/api/agent-keys/rules", { method: "POST", json: { paths: through, keys: [key.id], rule: "exclude" } });
+        ctx.toast(through.length ? `Removed for “${key.name}”: excluded inside its folder` : `Removed for “${key.name}”`);
+      }
+      await load();
+      changed();
+    } catch (err) {
+      ctx.toast(err.message, true);
+    } finally {
+      button.disabled = false;
+    }
+  };
+
+  shareExisting.addEventListener("click", async () => {
+    const id = Number(existing.value);
+    if (!id) return;
+    shareExisting.disabled = true;
+    try {
+      const result = await ctx.api("/api/agent-keys/rules", { method: "POST", json: { paths, keys: [id], rule: "allow" } });
+      for (const note of result.notes || []) ctx.toast(note, true);
+      if (!(result.notes || []).length) ctx.toast("Shared. It applies from the agent's next request.");
+      await load();
+      changed();
+    } catch (err) {
+      ctx.toast(err.message, true);
+    } finally {
+      shareExisting.disabled = false;
+    }
+  });
+
+  create.addEventListener("click", async () => {
+    if (!name.value.trim()) return ctx.toast("Give the key a name", true);
+    create.disabled = true;
+    try {
+      const body = { name: name.value.trim(), level: level.value, approve: level.value !== "read", folders: paths };
+      if (expires.value) body.expiresAt = Math.floor(Date.now() / 1000) + Number(expires.value) * DAY;
+      const made = await ctx.api("/api/agent-keys", { method: "POST", json: body });
+      secretHost.replaceChildren(secretCard(body.name, made.token));
+      secretHost.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      await load();
+      changed();
+    } catch (err) {
+      ctx.toast(err.message, true);
+    } finally {
+      create.disabled = false;
+    }
+  });
+
+  const advanced = el("button", { type: "button", title: "Allow or exclude for every key or chosen ones" }, "Allow or exclude…");
+  const dialog = el("dialog", { class: "workspace-editor agent-settings agent-access agent-share" },
+    el("h3", {}, `Share with AI agents: ${title}`),
+    el("p", { class: "muted" }, "An AI agent such as Claude can use what you share here over MCP, with a key. Hidden files and the Trash are never shared."),
+    el("h3", {}, "Who has access"),
+    people,
+    existingRow,
+    el("h3", {}, "New key for ", count),
+    el("p", { class: "muted" }, "It reaches only ", count, ". Changes by an organising key wait for your approval."),
+    el("div", { class: "agent-share-new" },
+      el("label", { class: "agent-field" }, el("span", {}, "Name"), name),
+      el("label", { class: "agent-field" }, el("span", {}, "Access"), level),
+      el("label", { class: "agent-field" }, el("span", {}, "Expires"), expires)),
+    el("div", { class: "agent-actions" }, create),
+    secretHost,
+    el("div", { class: "dialog-actions" }, advanced, el("span", { class: "spacer" }), el("button", { type: "button", onclick: () => dialog.close() }, "Done")));
+  advanced.addEventListener("click", () => {
+    dialog.close();
+    accessDialog(paths, title).catch((err) => ctx.toast(err.message, true));
+  });
+  dialog.addEventListener("close", () => dialog.remove());
+  document.body.append(dialog);
+  dialog.showModal();
+  try {
+    await load();
+  } catch (err) {
+    dialog.close();
+    throw err;
+  }
 }

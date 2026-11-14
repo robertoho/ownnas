@@ -3226,6 +3226,10 @@ dialog { color: var(--text); }
 .files.list .detail-name .name { font-size: 0.83rem; }
 .protected-mark { flex: none; display: inline-block; vertical-align: -1px; margin-right: 0.3rem; color: var(--muted); }
 .detail-name .protected-mark { margin: 0 0 0 -0.3rem; }
+.agent-mark { flex: none; display: inline-block; vertical-align: -1px; margin-right: 0.3rem; }
+.agent-mark-shared { color: var(--accent); }
+.agent-mark-excluded { color: var(--danger); }
+.detail-name .agent-mark { margin: 0 0 0 0.3rem; }
 .detail-cell, .files.list .detail-size {
   padding: 0.3rem 0.65rem;
   font-size: 0.78rem;
@@ -4670,6 +4674,28 @@ a.archive-entry-name:hover { text-decoration: underline; }
 .agent-key-inactive { opacity: 0.6; }
 .agent-key-name::before { background: #22c55e; }
 .agent-key-inactive .agent-key-name::before { background: var(--muted); }
+.agent-chip-excluded { text-decoration: line-through; text-decoration-color: var(--danger); }
+.agent-excluded { margin-top: 0.35rem; }
+.agent-access { max-width: 34rem; }
+.agent-access-keys { display: grid; gap: 0.25rem; margin: 0.6rem 0; }
+.agent-access-key { display: grid; grid-template-columns: 1fr auto; gap: 0.2rem 0.75rem; align-items: center; padding: 0.45rem 0; border-top: 1px solid var(--line); }
+.agent-access-key .agent-scope-choice { min-width: 0; overflow-wrap: anywhere; }
+.agent-access-state { font-size: 0.9em; text-align: right; color: var(--muted); }
+.agent-access-shared { color: #16a34a; }
+.agent-access-excluded { color: var(--danger); }
+.agent-access-mixed { color: var(--text); }
+.agent-access-details { grid-column: 1 / -1; margin-left: 1.5rem; font-size: 0.9em; }
+.agent-access-details ul { margin: 0.3rem 0 0; padding-left: 1.1rem; }
+.agent-access-details code { overflow-wrap: anywhere; }
+.agent-access-warning { margin: 0.3rem 0; color: var(--danger); }
+.agent-access-summary p, .agent-access-notes p { margin: 0.3rem 0; }
+.agent-share h3 { font-size: 1rem; }
+.agent-share-row { display: flex; gap: 0.5rem; align-items: center; margin: 0.4rem 0; }
+.agent-share-row[hidden] { display: none; }
+.agent-share-row select { flex: 1; min-width: 0; }
+.agent-share-new { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: 0.6rem; margin-bottom: 0.6rem; }
+.agent-share-new .agent-field { max-width: none; }
+.agent-share-how { font-size: 0.9em; }
 .agent-token { display: block; padding: 0.5rem 0.6rem; border: 1px solid var(--line); border-radius: 8px; user-select: all; }
 .agent-log-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.25rem; font-size: 0.85rem; max-height: 16rem; overflow: auto; }
 .agent-changes { max-height: 22rem; }

@@ -29,6 +29,9 @@ pub struct AgentKey {
     /// Organising changes wait for a person to approve them.
     pub approve: bool,
     pub folders: Vec<String>,
+    /// Folders and files it may not reach even inside `folders`: its own and those excluded for
+    /// every key. An exclusion always beats an allowance.
+    pub excluded: Vec<String>,
     /// Of `folders`, the ones it may only read (a key that can change things).
     pub read_only: Vec<String>,
     /// The tools it may use; `None` for all its level allows.
@@ -43,6 +46,8 @@ pub struct AgentKey {
 #[derive(Clone, Debug, Default)]
 pub struct Scope {
     pub folders: Vec<String>,
+    /// Folders and files out of reach even inside `folders`.
+    pub excluded: Vec<String>,
     /// Lowercase, without the dot; `None` for every file.
     pub extensions: Option<Vec<String>>,
 }
@@ -54,7 +59,19 @@ const FOLDER_LOOK_MOST: usize = 20_000;
 impl Scope {
     /// Everything in the library (for checking where a key may be given).
     fn everything() -> Self {
-        Scope { folders: vec![String::new()], extensions: None }
+        Scope { folders: vec![String::new()], excluded: Vec::new(), extensions: None }
+    }
+
+    /// Whether a library path is inside its folders and not excluded, by name only: a quick
+    /// first pass for long lists; `check` has the last word.
+    pub fn holds_name(&self, path: &str) -> bool {
+        self.folders.iter().any(|folder| within(folder, path)) && !self.excluded.iter().any(|out| within(out, path))
+    }
+
+    /// Whether something excluded is at or inside `rel` (a library path as `check` gives it), so
+    /// a key may not move, copy, or put it in the Trash and take what it cannot reach along.
+    pub fn holds_excluded(&self, rel: &str) -> bool {
+        self.excluded.iter().any(|out| within(rel, out))
     }
 
     /// Whether a file of this name fits the key's extensions.
@@ -97,6 +114,11 @@ impl Scope {
     }
 }
 
+/// Whether library path `path` is `folder` or inside it ("" is the whole library).
+pub fn within(folder: &str, path: &str) -> bool {
+    folder.is_empty() || path == folder || path.strip_prefix(folder).is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// Cleans extensions as given (".MD", " txt ") into what is stored ("md", "txt").
 pub fn clean_extensions(list: &[String]) -> Result<Option<Vec<String>>, String> {
     let mut clean: Vec<String> = Vec::new();
@@ -123,7 +145,7 @@ pub const DAILY_CHANGES: i64 = 500;
 impl AgentKey {
     /// Where it may look: its folders and extensions, for `check`.
     pub fn scope(&self) -> Scope {
-        Scope { folders: self.folders.clone(), extensions: self.extensions.clone() }
+        Scope { folders: self.folders.clone(), excluded: self.excluded.clone(), extensions: self.extensions.clone() }
     }
 
     /// Whether a file of this name fits its extensions (all do without a limit).
@@ -139,8 +161,7 @@ impl AgentKey {
     /// Whether it may change `rel` (a library path, as `check` gives it): the most specific of
     /// its folders holding it decides.
     pub fn may_change(&self, rel: &str) -> bool {
-        let holds = |folder: &String| folder.is_empty() || rel == folder || rel.strip_prefix(folder.as_str()).is_some_and(|rest| rest.starts_with('/'));
-        let closest = self.folders.iter().filter(|folder| holds(folder)).max_by_key(|folder| folder.len());
+        let closest = self.folders.iter().filter(|folder| within(folder, rel)).max_by_key(|folder| folder.len());
         closest.is_some_and(|folder| !self.read_only.contains(folder))
     }
 
@@ -164,6 +185,8 @@ pub struct KeyInfo {
     pub level: String,
     pub approve: bool,
     pub folders: Vec<String>,
+    /// Its own exclusions (those for every key are listed apart).
+    pub excluded: Vec<String>,
     pub read_only: Vec<String>,
     pub tools: Option<Vec<String>>,
     pub calls_per_minute: Option<u32>,
@@ -223,6 +246,11 @@ pub fn check(root: &Path, scope: &Scope, rel: &str) -> Option<Allowed> {
     // `starts_with` compares whole path parts: "docs" does not allow "docs2".
     let allowed = folders.iter().any(|folder| files::resolve(&root, folder).is_ok_and(|folder| full.starts_with(&folder.full)));
     if !allowed {
+        return None;
+    }
+    // An exclusion beats every allowance, however close. Compared after following links too, so
+    // an excluded file cannot be reached through a link to it.
+    if scope.excluded.iter().any(|out| files::resolve(&root, out).is_ok_and(|out| full.starts_with(&out.full))) {
         return None;
     }
     if scope.extensions.is_some() && !full.is_dir() {
@@ -328,6 +356,282 @@ fn folders_with_modes(conn: &Connection, id: i64) -> Result<Vec<(String, bool)>,
     rows.collect::<Result<_, _>>().map_err(fail)
 }
 
+/// A key's exclusions, with or without those for every key (`EVERY_KEY` for only those).
+fn excluded_of(conn: &Connection, id: i64, with_every_key: bool) -> Result<Vec<String>, String> {
+    let fail = |_| "Could not read the key".to_string();
+    let mut statement = conn
+        .prepare("SELECT DISTINCT path FROM agent_key_excludes WHERE key_id = ?1 OR (?2 AND key_id = 0) ORDER BY path")
+        .map_err(fail)?;
+    let rows = statement.query_map(params![id, with_every_key], |row| row.get(0)).map_err(fail)?;
+    rows.collect::<Result<_, _>>().map_err(fail)
+}
+
+/// The key id exclusions for every key are stored under (no key has it).
+pub const EVERY_KEY: i64 = 0;
+
+/// Folders and files excluded for every key.
+pub fn excluded_for_every_key(conn: &Connection) -> Result<Vec<String>, String> {
+    excluded_of(conn, EVERY_KEY, false)
+}
+
+/// What a person can do about a key's reach of some items from the file explorer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Rule {
+    /// Give it to the keys (as one of their folders or files), lifting an exclusion of it.
+    Allow,
+    /// Keep it out of their reach, even inside their folders.
+    Exclude,
+    /// Take away what was set on exactly these items, either way.
+    Clear,
+    /// Lift only an exclusion of exactly these items: for every key, the one for every key.
+    Unexclude,
+}
+
+/// Which keys a rule is for: every key (an exclusion then also holds for keys made later), or
+/// the ones chosen.
+pub enum Keys {
+    Every,
+    Chosen(Vec<i64>),
+}
+
+/// Sets a rule on folders or files for keys. Returns notes on what could not be done as asked
+/// (such as an item that stays excluded because a folder holding it is).
+pub fn set_rule(conn: &mut Connection, root: &Path, paths: &[String], keys: &Keys, rule: Rule) -> Result<Vec<String>, String> {
+    if paths.is_empty() {
+        return Err("Choose at least one folder or file".into());
+    }
+    let mut stored = paths.iter().map(|path| folder_to_store(root, path)).collect::<Result<Vec<_>, _>>()?;
+    stored.sort();
+    stored.dedup();
+    let fail = |_| "Could not change the keys".to_string();
+    let active: Vec<(i64, String)> = {
+        let mut statement = conn.prepare("SELECT id, name FROM agent_keys WHERE revoked_at IS NULL ORDER BY id").map_err(fail)?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?))).map_err(fail)?;
+        rows.collect::<Result<_, _>>().map_err(fail)?
+    };
+    let chosen: Vec<(i64, String)> = match keys {
+        Keys::Every => active.clone(),
+        Keys::Chosen(ids) => {
+            if ids.is_empty() {
+                return Err("Choose at least one key".into());
+            }
+            if let Some(stray) = ids.iter().find(|id| !active.iter().any(|(active, _)| active == *id)) {
+                return Err(format!("Key {stray} is no longer there"));
+            }
+            active.iter().filter(|(id, _)| ids.contains(id)).cloned().collect()
+        }
+    };
+    let every = matches!(keys, Keys::Every);
+    let mut notes = Vec::new();
+    let tx = conn.transaction().map_err(fail)?;
+    let count_folders = |tx: &rusqlite::Transaction, id: i64| -> Result<i64, String> {
+        tx.query_row("SELECT count(*) FROM agent_key_folders WHERE key_id = ?1", [id], |row| row.get(0)).map_err(fail)
+    };
+    for path in &stored {
+        let shown = if path.is_empty() { "/".to_string() } else { path.clone() };
+        match rule {
+            Rule::Allow => {
+                // An exclusion of it for every key stays for the keys not chosen.
+                let for_every: bool = tx
+                    .query_row("SELECT 1 FROM agent_key_excludes WHERE key_id = 0 AND path = ?1", [path], |_| Ok(true))
+                    .optional()
+                    .map_err(fail)?
+                    .unwrap_or(false);
+                if for_every {
+                    tx.execute("DELETE FROM agent_key_excludes WHERE key_id = 0 AND path = ?1", [path]).map_err(fail)?;
+                    for (id, _) in active.iter().filter(|key| !chosen.contains(key)) {
+                        tx.execute("INSERT OR IGNORE INTO agent_key_excludes(key_id, path) VALUES (?1, ?2)", params![id, path]).map_err(fail)?;
+                    }
+                }
+                for (id, name) in &chosen {
+                    tx.execute("DELETE FROM agent_key_excludes WHERE key_id = ?1 AND path = ?2", params![id, path]).map_err(fail)?;
+                    // Inside one of its folders already, it needs no entry of its own.
+                    let inside: bool = tx
+                        .query_row(
+                            "SELECT 1 FROM agent_key_folders WHERE key_id = ?1 AND path <> ?2 AND (path = '' OR substr(?2, 1, length(path) + 1) = path || '/')",
+                            params![id, path],
+                            |_| Ok(true),
+                        )
+                        .optional()
+                        .map_err(fail)?
+                        .unwrap_or(false);
+                    if !inside {
+                        tx.execute("INSERT OR IGNORE INTO agent_key_folders(key_id, path) VALUES (?1, ?2)", params![id, path]).map_err(fail)?;
+                    }
+                    let above: Option<String> = tx
+                        .query_row(
+                            "SELECT path FROM agent_key_excludes WHERE (key_id = ?1 OR key_id = 0) AND path <> ?2 AND (path = '' OR substr(?2, 1, length(path) + 1) = path || '/') ORDER BY length(path) LIMIT 1",
+                            params![id, path],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(fail)?;
+                    if let Some(above) = above {
+                        notes.push(format!("“{shown}” stays out of reach of “{name}”: “{}” is excluded, and an exclusion wins", if above.is_empty() { "/" } else { &above }));
+                    }
+                }
+            }
+            Rule::Exclude => {
+                let owners: Vec<i64> = if every { vec![EVERY_KEY] } else { chosen.iter().map(|(id, _)| *id).collect() };
+                for id in owners {
+                    tx.execute("INSERT OR IGNORE INTO agent_key_excludes(key_id, path) VALUES (?1, ?2)", params![id, path]).map_err(fail)?;
+                }
+                if every {
+                    // Its own exclusions are covered now.
+                    tx.execute("DELETE FROM agent_key_excludes WHERE key_id <> 0 AND path = ?1", [path]).map_err(fail)?;
+                }
+                // Given exactly this, a key would keep a folder it cannot reach: take it away,
+                // unless it is the key's last one.
+                for (id, name) in &chosen {
+                    let given: bool = tx
+                        .query_row("SELECT 1 FROM agent_key_folders WHERE key_id = ?1 AND path = ?2", params![id, path], |_| Ok(true))
+                        .optional()
+                        .map_err(fail)?
+                        .unwrap_or(false);
+                    if given {
+                        if count_folders(&tx, *id)? > 1 {
+                            tx.execute("DELETE FROM agent_key_folders WHERE key_id = ?1 AND path = ?2", params![id, path]).map_err(fail)?;
+                        } else {
+                            notes.push(format!("“{shown}” is the only folder of “{name}”, which now reaches nothing"));
+                        }
+                    }
+                }
+            }
+            Rule::Unexclude => {
+                let owners: Vec<i64> = if every { vec![EVERY_KEY] } else { chosen.iter().map(|(id, _)| *id).collect() };
+                for id in owners {
+                    tx.execute("DELETE FROM agent_key_excludes WHERE key_id = ?1 AND path = ?2", params![id, path]).map_err(fail)?;
+                }
+            }
+            Rule::Clear => {
+                if every {
+                    tx.execute("DELETE FROM agent_key_excludes WHERE path = ?1", [path]).map_err(fail)?;
+                }
+                for (id, name) in &chosen {
+                    tx.execute("DELETE FROM agent_key_excludes WHERE key_id = ?1 AND path = ?2", params![id, path]).map_err(fail)?;
+                    let given: bool = tx
+                        .query_row("SELECT 1 FROM agent_key_folders WHERE key_id = ?1 AND path = ?2", params![id, path], |_| Ok(true))
+                        .optional()
+                        .map_err(fail)?
+                        .unwrap_or(false);
+                    if given {
+                        if count_folders(&tx, *id)? > 1 {
+                            tx.execute("DELETE FROM agent_key_folders WHERE key_id = ?1 AND path = ?2", params![id, path]).map_err(fail)?;
+                        } else {
+                            notes.push(format!("“{shown}” is the only folder of “{name}”, so it keeps it"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    tx.commit().map_err(fail)?;
+    Ok(notes)
+}
+
+/// How one key reaches an item, for showing it: "allowed" (given exactly), "inside" (in a folder
+/// it was given), "excluded" (excluded exactly), "excludedInside" (in an excluded folder), or
+/// "none".
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Reach {
+    pub key_id: i64,
+    pub state: &'static str,
+    /// The rule that decides it (the folder given, or the exclusion), if any.
+    pub by: Option<String>,
+    /// Whether that exclusion is for every key.
+    pub every_key: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemAccess {
+    pub path: String,
+    pub keys: Vec<Reach>,
+    /// Whether it (or a folder holding it) is excluded for every key.
+    pub excluded_for_every_key: bool,
+}
+
+/// How each key that still works reaches each of these items (library paths). Items that no
+/// key may ever be given (hidden ones, the Trash) are left out.
+pub fn access(conn: &Connection, root: &Path, paths: &[String]) -> Result<Vec<ItemAccess>, String> {
+    let fail = |_| "Could not read the keys".to_string();
+    let ids: Vec<i64> = {
+        let mut statement = conn.prepare("SELECT id FROM agent_keys WHERE revoked_at IS NULL ORDER BY id DESC").map_err(fail)?;
+        let rows = statement.query_map([], |row| row.get(0)).map_err(fail)?;
+        rows.collect::<Result<_, _>>().map_err(fail)?
+    };
+    let every = excluded_for_every_key(conn)?;
+    let keys: Vec<(i64, Vec<String>, Vec<String>)> =
+        ids.into_iter().map(|id| Ok((id, folders_of(conn, id)?, excluded_of(conn, id, false)?))).collect::<Result<_, String>>()?;
+    let closest = |list: &[String], path: &str| list.iter().filter(|out| within(out, path)).max_by_key(|out| out.len()).cloned();
+    let mut items = Vec::new();
+    for path in paths {
+        let Ok(rel) = folder_to_store(root, path) else { continue };
+        let every_out = closest(&every, &rel);
+        let reach = keys
+            .iter()
+            .map(|(id, folders, excluded)| {
+                let own_out = closest(excluded, &rel);
+                // The exclusion that decides is the outermost; either one wins over any allowance.
+                let out = match (&own_out, &every_out) {
+                    (Some(own), Some(all)) => Some(if all.len() <= own.len() { (all.clone(), true) } else { (own.clone(), false) }),
+                    (Some(own), None) => Some((own.clone(), false)),
+                    (None, Some(all)) => Some((all.clone(), true)),
+                    (None, None) => None,
+                };
+                if let Some((by, every_key)) = out {
+                    let state = if by == rel { "excluded" } else { "excludedInside" };
+                    return Reach { key_id: *id, state, by: Some(by), every_key };
+                }
+                match closest(folders, &rel) {
+                    Some(by) => Reach { key_id: *id, state: if by == rel { "allowed" } else { "inside" }, by: Some(by), every_key: false },
+                    None => Reach { key_id: *id, state: "none", by: None, every_key: false },
+                }
+            })
+            .collect();
+        items.push(ItemAccess { path: rel, keys: reach, excluded_for_every_key: every_out.is_some() });
+    }
+    Ok(items)
+}
+
+/// What the file explorer marks: each folder or file given to a key that still works, with the
+/// keys' names, and each one excluded, with the keys' names (or none for every key).
+#[derive(Serialize, Default, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Marks {
+    pub shared: std::collections::BTreeMap<String, Vec<String>>,
+    pub excluded: std::collections::BTreeMap<String, Vec<String>>,
+    /// Paths excluded for every key.
+    pub excluded_for_every_key: Vec<String>,
+}
+
+pub fn marks(conn: &Connection, now: i64) -> Result<Marks, String> {
+    let fail = |_| "Could not read the keys".to_string();
+    let mut marks = Marks::default();
+    let working = "k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at > ?1)";
+    {
+        let mut statement = conn
+            .prepare(&format!("SELECT f.path, k.name FROM agent_key_folders f JOIN agent_keys k ON k.id = f.key_id WHERE {working} ORDER BY k.name"))
+            .map_err(fail)?;
+        let rows = statement.query_map([now], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).map_err(fail)?;
+        for (path, name) in rows.filter_map(Result::ok) {
+            marks.shared.entry(path).or_default().push(name);
+        }
+    }
+    {
+        let mut statement = conn
+            .prepare(&format!("SELECT e.path, k.name FROM agent_key_excludes e JOIN agent_keys k ON k.id = e.key_id WHERE {working} ORDER BY k.name"))
+            .map_err(fail)?;
+        let rows = statement.query_map([now], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).map_err(fail)?;
+        for (path, name) in rows.filter_map(Result::ok) {
+            marks.excluded.entry(path).or_default().push(name);
+        }
+    }
+    marks.excluded_for_every_key = excluded_for_every_key(conn)?;
+    Ok(marks)
+}
+
 fn tools_from(text: Option<String>) -> Option<Vec<String>> {
     text.and_then(|text| serde_json::from_str(&text).ok())
 }
@@ -415,6 +719,7 @@ fn find(conn: &Connection, which: &str, value: &str, now: i64) -> Result<Option<
         level,
         approve,
         folders: folders_of(conn, id)?,
+        excluded: excluded_of(conn, id, true)?,
         read_only: read_only_of(conn, id)?,
         tools: tools_from(tools),
         calls_per_minute: calls.unwrap_or(CALLS_PER_MINUTE),
@@ -460,6 +765,7 @@ pub fn list(conn: &Connection) -> Result<Vec<KeyInfo>, String> {
                 name: row.get(1)?,
                 level: row.get(2)?,
                 folders: Vec::new(),
+                excluded: Vec::new(),
                 created_by: row.get(3)?,
                 created_at: row.get(4)?,
                 expires_at: row.get(5)?,
@@ -477,6 +783,7 @@ pub fn list(conn: &Connection) -> Result<Vec<KeyInfo>, String> {
     let mut keys = rows.collect::<Result<Vec<_>, _>>().map_err(fail)?;
     for key in &mut keys {
         key.folders = folders_of(conn, key.id)?;
+        key.excluded = excluded_of(conn, key.id, false)?;
         key.read_only = read_only_of(conn, key.id)?;
     }
     Ok(keys)
@@ -717,13 +1024,13 @@ mod tests {
     }
 
     fn in_scope(folders: &[String]) -> Scope {
-        Scope { folders: folders.to_vec(), extensions: None }
+        Scope { folders: folders.to_vec(), excluded: Vec::new(), extensions: None }
     }
 
     #[test]
     fn extensions_limit_files_but_not_folders() {
         let f = fixture();
-        let scope = Scope { folders: folders(&["docs"]), extensions: clean_extensions(&[".TXT".into(), " md ".into()]).unwrap() };
+        let scope = Scope { folders: folders(&["docs"]), excluded: Vec::new(), extensions: clean_extensions(&[".TXT".into(), " md ".into()]).unwrap() };
         assert_eq!(scope.extensions, Some(vec!["md".to_string(), "txt".to_string()]));
         assert!(check(&f.root, &scope, "docs/a.txt").is_some());
         assert!(check(&f.root, &scope, "docs/deep").is_some(), "folders can still be browsed");
@@ -766,6 +1073,7 @@ mod tests {
             level: WRITE.into(),
             approve: false,
             folders: vec!["Archive".into(), "Archive/Inbox".into(), "Work".into()],
+            excluded: Vec::new(),
             read_only: vec!["Archive".into()],
             tools: Some(vec!["read_text".into()]),
             calls_per_minute: CALLS_PER_MINUTE,
@@ -923,5 +1231,110 @@ mod tests {
         assert_eq!(listed[0].created_by, "admin");
         assert_eq!(listed[0].last_used_at, Some(NOW));
         assert_eq!(listed[0].revoked_at, Some(NOW + 2));
+    }
+
+    #[test]
+    fn an_exclusion_beats_an_allowance_inside_an_allowed_folder() {
+        let f = fixture();
+        fs::create_dir_all(f.root.join("docs/private/inner")).unwrap();
+        fs::write(f.root.join("docs/private/inner/p.txt"), "x").unwrap();
+        let scope = Scope { folders: folders(&["docs", "docs/private/inner"]), excluded: folders(&["docs/private", "docs/a.txt"]), extensions: None };
+        assert!(check(&f.root, &scope, "docs/deep/b.txt").is_some(), "the rest of the folder is still allowed");
+        assert!(check(&f.root, &scope, "docs").is_some());
+        for refused in ["docs/a.txt", "docs/private", "docs/private/inner", "docs/private/inner/p.txt"] {
+            assert!(check(&f.root, &scope, refused).is_none(), "{refused} should be refused: an exclusion wins, even over a folder given inside it");
+        }
+        assert!(scope.holds_excluded("docs") && scope.holds_excluded("docs/private") && !scope.holds_excluded("docs/deep"));
+        assert!(!scope.holds_name("docs/private/x") && scope.holds_name("docs/privately") && !scope.holds_name("docs/a.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_excluded_file_cannot_be_reached_through_a_link() {
+        use std::os::unix::fs::symlink;
+        let f = fixture();
+        symlink(f.root.join("docs/a.txt"), f.root.join("docs/deep/a-link.txt")).unwrap();
+        let scope = Scope { folders: folders(&["docs"]), excluded: folders(&["docs/a.txt"]), extensions: None };
+        assert!(check(&f.root, &scope, "docs/deep/a-link.txt").is_none());
+    }
+
+    fn reach(f: &Fixture, path: &str, id: i64) -> (&'static str, Option<String>, bool) {
+        let items = access(&f.conn, &f.root, &[path.to_string()]).unwrap();
+        let found = items[0].keys.iter().find(|reach| reach.key_id == id).unwrap();
+        (found.state, found.by.clone(), found.every_key)
+    }
+
+    #[test]
+    fn rules_set_from_the_file_explorer_decide_what_keys_reach() {
+        let mut f = fixture();
+        let (root, user) = (f.root.clone(), f.user);
+        let (one, t1) = create(&mut f.conn, &root, user, "one", "read", false, &folders(&["docs"]), None, NOW).unwrap();
+        let (two, t2) = create(&mut f.conn, &root, user, "two", "read", false, &folders(&["docs2"]), None, NOW).unwrap();
+        let scope_of = |f: &Fixture, token: &str| authenticate(&f.conn, token, NOW).unwrap().unwrap().scope();
+
+        // Excluding for one key.
+        set_rule(&mut f.conn, &root, &folders(&["docs/deep"]), &Keys::Chosen(vec![one]), Rule::Exclude).unwrap();
+        assert!(check(&f.root, &scope_of(&f, &t1), "docs/deep/b.txt").is_none());
+        assert!(check(&f.root, &scope_of(&f, &t1), "docs/a.txt").is_some());
+        assert_eq!(reach(&f, "docs/deep/b.txt", one), ("excludedInside", Some("docs/deep".into()), false));
+        assert_eq!(reach(&f, "docs/a.txt", one), ("inside", Some("docs".into()), false));
+        assert_eq!(reach(&f, "docs/a.txt", two).0, "none");
+
+        // Allowing for every key gives the item to each, and lifts its exact exclusion.
+        set_rule(&mut f.conn, &root, &folders(&["top.txt", "docs/deep"]), &Keys::Every, Rule::Allow).unwrap();
+        assert!(check(&f.root, &scope_of(&f, &t2), "top.txt").is_some());
+        assert!(check(&f.root, &scope_of(&f, &t1), "docs/deep/b.txt").is_some());
+        assert_eq!(reach(&f, "top.txt", two), ("allowed", Some("top.txt".into()), false));
+        assert_eq!(authenticate(&f.conn, &t1, NOW).unwrap().unwrap().folders, folders(&["docs", "top.txt"]), "docs/deep was in docs already");
+
+        // Excluding for every key holds for keys made later too, and beats their folders.
+        set_rule(&mut f.conn, &root, &folders(&["docs/a.txt"]), &Keys::Every, Rule::Exclude).unwrap();
+        let (_, t3) = create(&mut f.conn, &root, user, "later", "read", false, &folders(&["docs"]), None, NOW).unwrap();
+        assert!(check(&f.root, &scope_of(&f, &t3), "docs/a.txt").is_none());
+        assert!(check(&f.root, &scope_of(&f, &t1), "docs/a.txt").is_none());
+        assert_eq!(reach(&f, "docs/a.txt", one), ("excluded", Some("docs/a.txt".into()), true));
+        assert_eq!(excluded_for_every_key(&f.conn).unwrap(), folders(&["docs/a.txt"]));
+
+        // Allowing it again for one key keeps it excluded for the others.
+        set_rule(&mut f.conn, &root, &folders(&["docs/a.txt"]), &Keys::Chosen(vec![one]), Rule::Allow).unwrap();
+        assert!(check(&f.root, &scope_of(&f, &t1), "docs/a.txt").is_some());
+        assert!(check(&f.root, &scope_of(&f, &t3), "docs/a.txt").is_none());
+        assert!(excluded_for_every_key(&f.conn).unwrap().is_empty());
+
+        // An exclusion of a folder holding it still wins, and the person is told so.
+        set_rule(&mut f.conn, &root, &folders(&["docs"]), &Keys::Chosen(vec![two]), Rule::Exclude).unwrap();
+        let notes = set_rule(&mut f.conn, &root, &folders(&["docs/a.txt"]), &Keys::Chosen(vec![two]), Rule::Allow).unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(check(&f.root, &scope_of(&f, &t2), "docs/a.txt").is_none());
+
+        // Clearing takes away what was set on exactly those items, but not a key's last folder.
+        set_rule(&mut f.conn, &root, &folders(&["docs", "docs/a.txt"]), &Keys::Chosen(vec![two]), Rule::Clear).unwrap();
+        assert_eq!(reach(&f, "docs/a.txt", two).0, "none");
+        assert!(check(&f.root, &scope_of(&f, &t2), "top.txt").is_some(), "other rules stay");
+        let notes = set_rule(&mut f.conn, &root, &folders(&["docs"]), &Keys::Chosen(vec![one, 3]), Rule::Clear).unwrap();
+        assert!(notes.iter().any(|note| note.contains("later")), "{notes:?}");
+        set_rule(&mut f.conn, &root, &folders(&["docs/deep"]), &Keys::Every, Rule::Exclude).unwrap();
+        set_rule(&mut f.conn, &root, &folders(&["docs/deep"]), &Keys::Chosen(vec![one]), Rule::Exclude).unwrap();
+        set_rule(&mut f.conn, &root, &folders(&["docs/deep"]), &Keys::Every, Rule::Unexclude).unwrap();
+        assert!(excluded_for_every_key(&f.conn).unwrap().is_empty());
+        assert_eq!(reach(&f, "docs/deep", one).0, "excluded", "a key's own exclusion stays");
+        let shown = marks(&f.conn, NOW).unwrap();
+        assert_eq!(shown.shared.get("top.txt"), Some(&folders(&["one", "two"])));
+        assert_eq!(shown.excluded.get("docs/deep"), Some(&folders(&["one"])));
+        assert!(set_rule(&mut f.conn, &root, &folders(&[".ssh"]), &Keys::Every, Rule::Exclude).is_err(), "hidden things are out of reach already");
+        assert!(set_rule(&mut f.conn, &root, &folders(&["docs"]), &Keys::Chosen(vec![99]), Rule::Allow).is_err());
+    }
+
+    #[test]
+    fn exclusions_follow_moves_and_go_with_what_is_deleted() {
+        let mut f = fixture();
+        let token = make(&mut f, &["docs"]);
+        let root = f.root.clone();
+        set_rule(&mut f.conn, &root, &folders(&["docs/deep"]), &Keys::Every, Rule::Exclude).unwrap();
+        db::rewrite_path_meta(&f.conn, "docs", "papers").unwrap();
+        let key = authenticate(&f.conn, &token, NOW).unwrap().unwrap();
+        assert_eq!(key.excluded, ["papers/deep"]);
+        db::delete_path_meta(&f.conn, "papers/deep").unwrap();
+        assert!(authenticate(&f.conn, &token, NOW).unwrap().unwrap().excluded.is_empty());
     }
 }

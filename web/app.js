@@ -876,6 +876,7 @@ function renderFiles() {
     const lock = entry.protected
       ? `<svg class="protected-mark" viewBox="0 0 16 16" width="12" height="12" role="img" aria-label="Protected from deletion"><title>${entry.protected === "inside" ? "In a folder protected from deletion" : "Protected from deletion"}</title><path d="${ICON_LOCK}" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`
       : "";
+    const lockAndShare = lock + agentMark(entry);
     const tags = entry.tags || [];
     const shownTags = tags.slice(0, 3);
     const tagStack = shownTags.length
@@ -886,7 +887,7 @@ function renderFiles() {
       : "";
     if (state.view === "list") {
       return `<article class="card details-row${selected ? " selected" : ""}${cut ? " cut" : ""}" role="row" data-path="${esc(entry.path)}" data-dir="${entry.dir ? "1" : "0"}" aria-selected="${selected ? "true" : "false"}">
-        <div class="detail-name" role="cell"><div class="thumb">${thumb}</div><span class="name" title="${esc(entry.path)}">${esc(displayName)}</span>${lock}</div>
+        <div class="detail-name" role="cell"><div class="thumb">${thumb}</div><span class="name" title="${esc(entry.path)}">${esc(displayName)}</span>${lockAndShare}</div>
         <div class="sub detail-size" role="cell">${sub}</div>
         <div class="detail-cell" role="cell">${esc(fileTypeLabel(entry))}</div>
         <div class="detail-cell" role="cell" title="${esc(formatDate(entry.modified))}">${esc(modifiedLabel || "—")}</div>
@@ -897,7 +898,7 @@ function renderFiles() {
     return `<article class="card${selected ? " selected" : ""}${cut ? " cut" : ""}${archiveFolder ? " archive-folder" : ""}${trashFolder ? " trash-folder" : ""}${mediaCard ? " media-card" : ""}" data-path="${esc(entry.path)}" data-dir="${entry.dir ? "1" : "0"}" aria-selected="${selected ? "true" : "false"}">
       <div class="thumb">${thumb}${badge}${tagStack}</div>
       <div class="card-body">
-        <div class="name" title="${esc(entry.path)}">${lock}${esc(displayName)}</div>
+        <div class="name" title="${esc(entry.path)}">${lockAndShare}${esc(displayName)}</div>
         <div class="sub" title="${entry.original ? esc(entry.original) : ""}">${sub}</div>
         ${dates}
       </div>
@@ -971,6 +972,7 @@ async function load(path, options = {}) {
   syncUndo();
   renderFiles();
   refreshStorage().catch(() => {});
+  refreshAgentMarks().catch(() => {});
   if (changedFolder) document.querySelector(".explorer-content").scrollTop = 0;
   $("zip-link").href = `/api/zip?path=${encodeURIComponent(state.path)}`;
   syncBookmarkBtn();
@@ -1162,6 +1164,8 @@ const MENU_ICONS = {
   folderAppearance: "M8 2a6 6 0 1 0 0 12c1 0 1.5-.6 1.5-1.4 0-.9-.8-1.1-.8-2 0-.8.7-1.3 1.6-1.3H12a2.5 2.5 0 0 0 2.5-2.5C14.5 4.3 11.6 2 8 2z M5 7.5h.01 M7 4.75h.01 M10 5h.01",
   protect: ICON_LOCK,
   protectMenu: ICON_LOCK,
+  agentShare: "M11.5 2.5a2 2 0 1 1 0 4a2 2 0 1 1 0-4z M4.5 6a2 2 0 1 1 0 4a2 2 0 1 1 0-4z M11.5 9.5a2 2 0 1 1 0 4a2 2 0 1 1 0-4z M6.3 7.1l3.4-1.7 M6.3 8.9l3.4 1.7",
+  agentAccess: "M8 1.75 13.5 4v4c0 3-2.4 5.3-5.5 6.25C4.9 13.3 2.5 11 2.5 8V4z M6 8l1.5 1.5L10.5 6.5",
   unprotect: "M4.75 7V5.25a3.25 3.25 0 0 1 6.3-1.1 M3.5 7h9v7h-9z M8 9.75v1.5",
   search: "M7 2.75a4.25 4.25 0 1 1 0 8.5a4.25 4.25 0 1 1 0-8.5z M10.25 10.25 13.5 13.5",
   library: "M2.5 2.5h3v11h-3z M6.5 2.5h3v11h-3z M10.5 3.5l3 1v9l-3-1z",
@@ -1618,6 +1622,10 @@ function openSelectionMenu(x, y, pasteInto) {
       buttons.push(`<button type="button" data-menu="duplicates" title="Files with the same contents in it and its folders">Find duplicates in this folder…</button>`);
       buttons.push(`<button type="button" data-menu="nearDuplicates" title="Burst shots, resized or re-saved copies">Find photos that look alike…</button>`);
       buttons.push(`<button type="button" data-menu="tidy" title="Largest files, empty folders, photo dates, comparing with another folder">Tidy up…</button>`);
+    }
+    if (state.me && state.me.admin && entries.length && !allInTrash) {
+      buttons.push(`<button type="button" data-menu="agentShare" title="Let an AI agent such as Claude use these over MCP">Share with AI agent…</button>`);
+      buttons.push(`<button type="button" data-menu="agentAccess" title="Allow or exclude for every MCP key or chosen ones">AI agent access…</button>`);
     }
     if (state.me && state.me.admin && state.workspaceCount && !allInTrash && entries.length && entries.every((entry) => entry.dir)) {
       buttons.push(`<button type="button" data-menu="showFolderInWorkspace" title="Every photo and video in it, including ones added later">Show in workspace…</button>`);
@@ -2250,11 +2258,38 @@ async function music() {
 
 let agentKeys = null;
 
+// For administrators: which items are shared with AI agent keys or excluded from them, by path,
+// with the keys' names, for marks beside their names (in `state.agentMarks`).
+
+async function refreshAgentMarks() {
+  if (!(state.me && state.me.admin)) {
+    state.agentMarks = null;
+    return;
+  }
+  const marks = await api("/api/agent-keys/marks");
+  const before = JSON.stringify(state.agentMarks);
+  state.agentMarks = { shared: marks.shared || {}, excluded: marks.excluded || {}, every: marks.excludedForEveryKey || [] };
+  if (JSON.stringify(state.agentMarks) !== before) renderFiles();
+}
+
+/// The mark beside an item shared with AI agent keys, or excluded from them.
+function agentMark(entry) {
+  if (!state.agentMarks) return "";
+  const icon = (path, cls, label) => `<svg class="agent-mark ${cls}" viewBox="0 0 16 16" width="12" height="12" role="img" aria-label="${esc(label)}"><title>${esc(label)}</title><path d="${path}" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+  const forEvery = state.agentMarks.every.includes(entry.path);
+  const out = forEvery ? ["every key"] : state.agentMarks.excluded[entry.path];
+  const shared = !forEvery && state.agentMarks.shared[entry.path];
+  // Shared with some keys and excluded from others: shown as shared, with both in the tooltip.
+  if (shared) return icon(MENU_ICONS.agentShare, "agent-mark-shared", `Shared with AI agents: ${shared.join(", ")}${out ? `. Excluded from: ${out.join(", ")}` : ""}`);
+  if (out) return icon(MENU_ICONS.agentAccess.replace(/ M6 8.*$/, " M5.5 5.5l5 5 M10.5 5.5l-5 5"), "agent-mark-excluded", `Excluded from AI agents: ${out.join(", ")}`);
+  return "";
+}
+
 /// Loads Settings → AI agents on first use.
 async function agentKeysModule() {
   if (!agentKeys) {
     agentKeys = await import("/assets/agent-keys.js");
-    agentKeys.init({ api, toast, askConfirm, pickFolder });
+    agentKeys.init({ api, toast, askConfirm, pickFolder, onAgentAccessChange: () => refreshAgentMarks().catch(() => {}) });
   }
   return agentKeys;
 }
@@ -6716,6 +6751,12 @@ function runMenuAction(button, entries, pasteInto) {
   if (action === "findSimilar" && one) findSimilar(one.path).catch((err) => toast(err.message, true));
   if (action === "versions" && one) openVersions(one.path).catch((err) => toast(err.message, true));
   if (action === "activity") $("activity-btn").click();
+  if (action === "agentShare") {
+    agentKeysModule().then((module) => module.shareDialog(entries.map((entry) => entry.path), one ? one.name : `${entries.length} items`)).catch((err) => toast(err.message, true));
+  }
+  if (action === "agentAccess") {
+    agentKeysModule().then((module) => module.accessDialog(entries.map((entry) => entry.path), one ? one.name : `${entries.length} items`)).catch((err) => toast(err.message, true));
+  }
   if (action === "bulkTag") bulkTagEntries(entries).catch((err) => toast(err.message, true));
   if (action === "emptyTrash") $("empty-trash-btn").click();
   if (action === "terminal") openTerminalAt(one && one.dir ? one.path : state.path);

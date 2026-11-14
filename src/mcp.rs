@@ -246,6 +246,9 @@ fn initialize(key: &AgentKey, params: &Value) -> Value {
         Some(list) => format!(" Only files ending in {} are available (folders can be browsed), and only such files can be made.", list.iter().map(|ext| format!(".{ext}")).collect::<Vec<_>>().join(", ")),
         None => String::new(),
     };
+    // Which ones is not said: that would tell the agent where to look elsewhere.
+    let kept_out = if key.excluded.is_empty() { "" } else { " Some folders and files inside them are kept out of reach." };
+    let only = format!("{kept_out}{only}");
     let level = if key.can_write() {
         "It can also organise them (tag, make folders, rename, move, move to the Trash, arrange albums) and write: make text files, change passages, add rows to tables, and copy. What a file held is kept in its history before each change. Only change things the user asked you to."
     } else if key.can_organise() {

@@ -86,7 +86,7 @@ After sign-in you get a file manager over `--root`:
 ### Context menus
 
 - **Right-click empty space**: New folder, New file, Paste (when clipboard has items).
-- **Right-click selection / ··· menu**: Open, Download, Copy/Cut, Paste, Duplicate, Move, Tag, Rename (optional pattern tokens), PDF tools (extract / split / join / rotate), Trash/Delete, Restore (in Trash).
+- **Right-click selection / ··· menu**: Open, Download, Copy/Cut, Paste, Duplicate, Move, Tag, Rename (optional pattern tokens), PDF tools (extract / split / join / rotate), Trash/Delete, Restore (in Trash). Administrators also get **AI agent access…** (see [AI agent access](#ai-agent-access)).
 - **New folder with selection** (2+ items): creates a folder in the current directory and moves the selected items into it.
 
 ### Clipboard strip
@@ -403,3 +403,63 @@ can send `POST /api/folder-appearance` with `{paths: ["folder"], color: "#a855f7
 icon: "star"}` and the standard `X-OwnNAS: 1` header. Colors are empty (default) or
 six-digit hexadecimal; icons use a fixed allowlist. A batch contains at most 200
 folders and is validated before any metadata is changed.
+
+## AI agent access
+
+Agent keys (Settings → AI agents; see the README's *AI agents (MCP)*) let AI agents reach the
+library over MCP. Each key has its **folders and files** it may use and, apart from those,
+**exclusions**: folders and files it may not reach even inside its folders.
+
+### Share with AI agent
+
+Right-click one or more folders or files and choose **Share with AI agent…** (administrators
+only), like sharing in a cloud drive:
+
+- **Who has access** lists each working key that reaches the items: *Shared directly*,
+  *Through Docs*, or *2 of 3 items*. **Remove** takes an item given directly off the key, and
+  excludes for that key an item it reaches through a folder. If the key would reach nothing
+  else, it offers to revoke the key instead.
+- A key that exists can be picked and **Share**d with.
+- **New key for these items**: a name (the item's by default), *Can read*, *Can read and
+  organise*, or *Can read, organise and write* (changes wait for approval), and an expiry (30 days
+  by default). **Create key** shows the secret and the MCP settings once, to copy.
+- **Allow or exclude…** opens the dialog below.
+
+For administrators the explorer marks items given to a key with a share icon and excluded items
+with a red shield (excluded for every key, or for some keys and shared with none); the tooltip
+names the keys. The marks come from `GET /api/agent-keys/marks`.
+
+### Allow or exclude
+
+Right-click one or more folders or files and choose **AI agent access…** (administrators only).
+The dialog lists every key that still works with how it reaches the selection: *Shared (given)*,
+*Shared (in Docs)*, *Excluded*, *Excluded for every key*, or *Not shared*, with a per-item list
+when several items are selected. Choose **Every key** or **The keys ticked below**, then:
+
+- **Allow** gives the items to those keys (an item already inside one of a key's folders needs
+  no entry of its own) and lifts an exclusion of exactly these items. Allowing for some keys an
+  item excluded for every key keeps it excluded for the others. An item inside an excluded
+  folder stays out of reach, and the dialog says so.
+- **Exclude** keeps the items out of the keys' reach. For **Every key** it also holds for keys
+  made later. If a key was given exactly that item, the entry is removed (unless it is the key's
+  only one).
+- **Remove rules** takes away what was set on exactly these items, either way (never a key's
+  last folder).
+
+An exclusion always beats an allowance, however close the allowed folder: the check compares
+real paths after following links, so a link to an excluded file is refused too. A key cannot
+move, copy, rename, or put in the Trash a folder holding something excluded. Hidden files and
+the Trash are out of every key's reach anyway and cannot be given or excluded. Exclusions are
+stored in `agent_key_excludes` (key id 0 for every key) and follow renames and moves like
+other path metadata; deleting the item removes them.
+
+In Settings → AI agents each key's card lists its exclusions, and those for every key are
+listed above the keys; × lifts one. The agent is told only that some items are kept out of
+reach, never which.
+
+The API (administrators, with the `X-OwnNAS: 1` header): `POST /api/agent-keys/access` with
+`{paths}` returns each item's reach per key; `POST /api/agent-keys/rules` with
+`{paths, keys, rule}` sets one, where `keys` is a list of key ids or `null` for every key, and
+`rule` is `allow`, `exclude`, `clear`, or `unexclude` (lifts only exclusions). It answers with
+`notes` on what could not be done as asked. `GET /api/agent-keys` includes each key's
+`excluded` and the list `excludedForEveryKey`.

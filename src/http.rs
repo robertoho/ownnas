@@ -354,6 +354,9 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/agent-keys/approval", post(set_agent_key_approval))
         .route("/api/agent-keys/settings", post(set_agent_key_settings))
         .route("/api/agent-keys/folders", post(set_agent_key_folders))
+        .route("/api/agent-keys/access", post(agent_key_access))
+        .route("/api/agent-keys/rules", post(set_agent_key_rule))
+        .route("/api/agent-keys/marks", get(agent_key_marks))
         .route("/api/agent-keys/tools", get(agent_key_tools))
         .route("/api/agent-keys/usage", get(agent_key_usage))
         .route("/api/agent-keys/attention", get(agent_key_attention))
@@ -9893,7 +9896,84 @@ async fn list_agent_keys(State(state): State<std::sync::Arc<AppState>>, headers:
     for change in &pending {
         *waiting.entry(change.key_id).or_default() += 1;
     }
-    Ok(Json(json!({ "keys": keys, "pending": waiting })))
+    let excluded = crate::agent_keys::excluded_for_every_key(&conn).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(Json(json!({ "keys": keys, "pending": waiting, "excludedForEveryKey": excluded })))
+}
+
+#[derive(Deserialize)]
+struct AgentKeyAccessBody {
+    paths: Vec<String>,
+}
+
+/// How each key that still works reaches some folders and files, for the file explorer.
+async fn agent_key_access(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AgentKeyAccessBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    if body.paths.len() > 1000 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose fewer items"));
+    }
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let items = crate::agent_keys::access(&conn, &state.root, &body.paths).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(Json(json!({ "items": items })))
+}
+
+/// Which folders and files are shared with or excluded from keys, for marks in the file explorer.
+async fn agent_key_marks(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let marks = crate::agent_keys::marks(&conn, chrono::Utc::now().timestamp()).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(Json(marks))
+}
+
+#[derive(Deserialize)]
+struct AgentKeyRuleBody {
+    paths: Vec<String>,
+    /// The keys it is for; left out (or null) for every key.
+    keys: Option<Vec<i64>>,
+    /// "allow", "exclude", "clear" (both, on exactly these items) or "unexclude" (only exclusions).
+    rule: String,
+}
+
+/// Allows or excludes folders and files for every key or chosen ones, from the file explorer.
+async fn set_agent_key_rule(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AgentKeyRuleBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    use crate::agent_keys::{Keys, Rule};
+    let rule = match body.rule.as_str() {
+        "allow" => Rule::Allow,
+        "exclude" => Rule::Exclude,
+        "clear" => Rule::Clear,
+        "unexclude" => Rule::Unexclude,
+        _ => return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose allow, exclude, clear or unexclude")),
+    };
+    if body.paths.len() > 1000 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose fewer items"));
+    }
+    let keys = match &body.keys {
+        Some(ids) => Keys::Chosen(ids.clone()),
+        None => Keys::Every,
+    };
+    let notes = {
+        let mut conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::agent_keys::set_rule(&mut conn, &state.root, &body.paths, &keys, rule).map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?
+    };
+    let whom = match &body.keys {
+        Some(ids) => ids.iter().map(i64::to_string).collect::<Vec<_>>().join(", "),
+        None => "every key".to_string(),
+    };
+    record(&state, &user, "agent-key-rule", &format!("{} for {whom}: {}", body.rule, body.paths.join(", ")));
+    Ok(Json(json!({ "ok": true, "notes": notes })))
 }
 
 #[derive(Deserialize)]

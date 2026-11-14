@@ -668,6 +668,14 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             PRIMARY KEY (key_id, path)
         );
         CREATE INDEX IF NOT EXISTS agent_key_folders_path ON agent_key_folders(path);
+        -- Folders and files a key may not reach even inside its folders; key_id 0 is every key,
+        -- including ones made later.
+        CREATE TABLE IF NOT EXISTS agent_key_excludes (
+            key_id INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            PRIMARY KEY (key_id, path)
+        );
+        CREATE INDEX IF NOT EXISTS agent_key_excludes_path ON agent_key_excludes(path);
         CREATE TABLE IF NOT EXISTS agent_key_log (
             id INTEGER PRIMARY KEY,
             key_id INTEGER NOT NULL,
@@ -1607,6 +1615,11 @@ pub fn rewrite_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), 
         params![from, to],
     ).map_err(|_| "Could not move an agent key's folder".to_string())?;
     conn.execute(
+        "UPDATE agent_key_excludes SET path = CASE WHEN path = ?1 THEN ?2 ELSE ?2 || substr(path, length(?1) + 1) END
+         WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![from, to],
+    ).map_err(|_| "Could not move an agent key's exclusion".to_string())?;
+    conn.execute(
         "UPDATE protected_paths SET path = CASE WHEN path = ?1 THEN ?2 ELSE ?2 || substr(path, length(?1) + 1) END
          WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
         params![from, to],
@@ -1949,6 +1962,10 @@ pub fn delete_path_meta(conn: &Connection, path: &str) -> Result<(), String> {
         "DELETE FROM agent_key_folders WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
         params![path],
     ).map_err(|_| "Could not remove an agent key's folder".to_string())?;
+    conn.execute(
+        "DELETE FROM agent_key_excludes WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![path],
+    ).map_err(|_| "Could not remove an agent key's exclusion".to_string())?;
     conn.execute(
         "DELETE FROM protected_paths WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
         params![path],
