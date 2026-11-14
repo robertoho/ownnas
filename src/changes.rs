@@ -31,7 +31,11 @@ pub struct Changes {
     watching: std::sync::atomic::AtomicBool,
     /// Kept alive for as long as the feed is.
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
+    /// Told of each change too (`None`: changes were missed).
+    listener: Mutex<Option<Listener>>,
 }
+
+type Listener = Box<dyn Fn(Option<&str>) + Send + Sync>;
 
 /// What a client asking for changes gets.
 #[derive(Debug, PartialEq, Eq)]
@@ -52,6 +56,7 @@ impl Changes {
             wake: tokio::sync::Notify::new(),
             watching: std::sync::atomic::AtomicBool::new(false),
             watcher: Mutex::new(None),
+            listener: Mutex::new(None),
         })
     }
 
@@ -90,6 +95,17 @@ impl Changes {
         }
     }
 
+    /// Has `listener` told of every change from now on, as the feed hears of it.
+    pub fn on_change(&self, listener: impl Fn(Option<&str>) + Send + Sync + 'static) {
+        *self.listener.lock().unwrap_or_else(|err| err.into_inner()) = Some(Box::new(listener));
+    }
+
+    fn tell(&self, rel: Option<&str>) {
+        if let Some(listener) = self.listener.lock().unwrap_or_else(|err| err.into_inner()).as_ref() {
+            listener(rel);
+        }
+    }
+
     pub fn watching(&self) -> bool {
         self.watching.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -108,11 +124,12 @@ impl Changes {
             }
             let seq = journal.next;
             journal.next += 1;
-            journal.events.push_back((seq, rel));
+            journal.events.push_back((seq, rel.clone()));
             if journal.events.len() > KEEP {
                 journal.events.pop_front();
             }
         }
+        self.tell(Some(&rel));
         self.wake.notify_waiters();
     }
 
@@ -123,6 +140,7 @@ impl Changes {
             journal.epoch += 1;
             journal.events.clear();
         }
+        self.tell(None);
         self.wake.notify_waiters();
     }
 
@@ -190,6 +208,17 @@ fn changes_something(kind: &notify::EventKind) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_listener_hears_each_change_and_when_changes_were_missed() {
+        let feed = super::Changes::new();
+        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = heard.clone();
+        feed.on_change(move |rel| log.lock().unwrap().push(rel.map(str::to_string)));
+        feed.record("Fotos/a.jpg".into());
+        feed.expire();
+        assert_eq!(*heard.lock().unwrap(), [Some("Fotos/a.jpg".to_string()), None]);
+    }
+
     #[test]
     fn reads_are_not_changes() {
         use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind};

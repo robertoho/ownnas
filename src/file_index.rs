@@ -2,9 +2,11 @@
 //! kind, kept in OwnNAS's database so a search does not have to walk the disk. It is a cache:
 //! folders whose modified time has not changed since the last scan are not read again (adding,
 //! removing, or renaming something inside a folder changes its time), so a scan of an unchanged
-//! library costs one look per folder. Changes made through OwnNAS are picked up within seconds,
-//! ones made outside it at the next scan (every few minutes), and any folder can be read again
-//! in full on request.
+//! library costs one look per folder. Changes are picked up within seconds: ones made through
+//! OwnNAS, and ones made outside it (a terminal, a network share, another program) that the
+//! watcher on the shared folder sees, by looking through only the folders they were in. A scan
+//! every few minutes catches what the watcher missed, and any folder can be read again in full
+//! on request.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -22,8 +24,10 @@ use crate::media_index::Speed;
 pub(crate) const SETTING_COMPLETE: &str = "file_index_complete";
 /// How often the library is looked through for changes made outside OwnNAS.
 const RESCAN_EVERY: Duration = Duration::from_secs(5 * 60);
-/// How long to wait after a change made through OwnNAS, so a burst of uploads is one scan.
+/// How long to wait after a change, so a burst of uploads or copies is one scan.
 const SETTLE: Duration = Duration::from_secs(3);
+/// Past this many changed folders waiting to be looked at, the whole library is looked at instead.
+const MANY_FOLDERS: usize = 64;
 
 /// Photo libraries kept as one package (Apple Photos, Aperture) hold hundreds of thousands of
 /// files of their own. Their own name is indexed, what is inside them is not.
@@ -69,6 +73,8 @@ pub struct FileIndex {
     queue: Mutex<Vec<Job>>,
     signal: Condvar,
     settling: AtomicBool,
+    /// Folders changed since the last look, waiting for things to settle ("" is the library).
+    pending: Mutex<Vec<String>>,
     stop: AtomicBool,
 }
 
@@ -79,6 +85,7 @@ impl Default for FileIndex {
             queue: Mutex::new(Vec::new()),
             signal: Condvar::new(),
             settling: AtomicBool::new(false),
+            pending: Mutex::new(Vec::new()),
             stop: AtomicBool::new(false),
         }
     }
@@ -110,6 +117,27 @@ impl FileIndex {
 
     /// Looks for changes a moment from now: after a change made through OwnNAS.
     pub fn changed(self: &Arc<Self>) {
+        self.changed_in("");
+    }
+
+    /// Looks for changes a moment from now in the folder that holds `rel`, which changed on disk
+    /// (`None`: changes were missed, so anywhere).
+    pub fn changed_on_disk(self: &Arc<Self>, rel: Option<&str>) {
+        let folder = rel.map_or("", |rel| rel.rsplit_once('/').map_or("", |(parent, _)| parent));
+        self.changed_in(folder);
+    }
+
+    fn changed_in(self: &Arc<Self>, folder: &str) {
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|err| err.into_inner());
+            if !pending.iter().any(|waiting| covers(waiting, folder)) {
+                pending.retain(|waiting| !covers(folder, waiting));
+                pending.push(folder.to_string());
+                if pending.len() > MANY_FOLDERS {
+                    *pending = vec![String::new()];
+                }
+            }
+        }
         if self.settling.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -117,7 +145,10 @@ impl FileIndex {
         std::thread::spawn(move || {
             std::thread::sleep(SETTLE);
             index.settling.store(false, Ordering::SeqCst);
-            index.push(Job { rel: String::new(), full: false });
+            let folders = std::mem::take(&mut *index.pending.lock().unwrap_or_else(|err| err.into_inner()));
+            for rel in folders {
+                index.push(Job { rel, full: false });
+            }
         });
     }
 
@@ -187,7 +218,13 @@ impl FileIndex {
             }
         };
         let result = open(db_path).and_then(|conn| {
-            let finished = scan(&conn, root, &job.rel, job.full, &progress, &pace, &|| self.stop.load(Ordering::SeqCst))?;
+            // A folder new to the index is looked at from the nearest one it has, which then
+            // adds it as one of its own.
+            let mut from = job.rel.as_str();
+            while !from.is_empty() && !indexed_folder(&conn, from) {
+                from = from.rsplit_once('/').map_or("", |(parent, _)| parent);
+            }
+            let finished = scan(&conn, root, from, job.full, &progress, &pace, &|| self.stop.load(Ordering::SeqCst))?;
             if finished && job.rel.is_empty() {
                 crate::db::set_setting(&conn, SETTING_COMPLETE, Some("1"))?;
             }
@@ -211,6 +248,11 @@ impl FileIndex {
             }
         }
     }
+}
+
+/// Whether the index has the folder `rel`.
+fn indexed_folder(conn: &Connection, rel: &str) -> bool {
+    conn.query_row("SELECT 1 FROM file_index WHERE path = ?1 AND dir = 1", [rel], |_| Ok(())).optional().ok().flatten().is_some()
 }
 
 /// Whether a scan from `scope` takes in `rel`.
@@ -534,6 +576,42 @@ mod tests {
         fs::remove_dir_all(lib.join("docs")).unwrap();
         scan_all(&library, "", false);
         assert_eq!(names(&library, "notes", ""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn changes_on_disk_wait_as_the_folders_they_were_in() {
+        let index = Arc::new(FileIndex::default());
+        let pending = || index.pending.lock().unwrap().clone();
+        index.changed_on_disk(Some("Fotos/2016/IMG_1.jpg"));
+        index.changed_on_disk(Some("Fotos/2016/IMG_2.jpg"));
+        index.changed_on_disk(Some("Docs/a/b.txt"));
+        assert_eq!(pending(), ["Fotos/2016", "Docs/a"]);
+        // A folder takes in the changes inside it.
+        index.changed_on_disk(Some("Fotos/new"));
+        assert_eq!(pending(), ["Docs/a", "Fotos"]);
+        index.changed_on_disk(Some("Fotos/2016/x/y.jpg"));
+        assert_eq!(pending(), ["Docs/a", "Fotos"]);
+        // Missed changes, or a change at the top, mean the whole library.
+        index.changed_on_disk(None);
+        assert_eq!(pending(), [""]);
+        index.changed_on_disk(Some("Docs/c.txt"));
+        assert_eq!(pending(), [""]);
+    }
+
+    #[test]
+    fn a_look_at_a_new_folder_starts_from_the_nearest_indexed_one() {
+        let library = library();
+        let lib = library.root.join("lib");
+        fs::create_dir_all(lib.join("Fotos")).unwrap();
+        scan_all(&library, "", false);
+        // Made outside OwnNAS: a folder and the folders inside it, all new.
+        fs::create_dir_all(lib.join("Fotos/2026/trip")).unwrap();
+        fs::write(lib.join("Fotos/2026/trip/beach.jpg"), b"jpg").unwrap();
+        let index = FileIndex::default();
+        let job = Job { rel: "Fotos/2026/trip".into(), full: false };
+        assert!(index.run(&library.root.join("ownnas.db"), &lib, &job, &|| Speed::Fast));
+        assert_eq!(names(&library, "beach", ""), ["Fotos/2026/trip/beach.jpg"]);
+        assert_eq!(names(&library, "2026", ""), ["Fotos/2026"]);
     }
 
     #[test]

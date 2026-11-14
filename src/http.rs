@@ -154,6 +154,23 @@ impl AppState {
         // Search's name index works at the same speed.
         let media = self.media.clone();
         self.file_index.start(self.db_path.clone(), self.root.clone(), move || media.speed());
+        // Changes made on disk outside OwnNAS reach the index as the watcher sees them. The data
+        // folder (should it be inside the shared one) changes as the indexes write: not those.
+        let index = std::sync::Arc::downgrade(&self.file_index);
+        let data = self.data_dir();
+        let own = [Some(self.root.clone()), std::fs::canonicalize(&self.root).ok()]
+            .into_iter()
+            .flatten()
+            .find_map(|root| data.strip_prefix(&root).ok().map(|rel| rel.to_string_lossy().replace('\\', "/")))
+            .filter(|rel| !rel.is_empty());
+        self.changes.on_change(move |rel| {
+            if rel.is_some_and(|rel| own.as_deref().is_some_and(|own| rel == own || rel.starts_with(&format!("{own}/")))) {
+                return;
+            }
+            if let Some(index) = index.upgrade() {
+                index.changed_on_disk(rel);
+            }
+        });
         // And so does reading the words inside files, after each scan of the names.
         let media = self.media.clone();
         self.text_index.start(
