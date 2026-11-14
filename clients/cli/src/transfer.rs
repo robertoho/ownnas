@@ -4,13 +4,15 @@ use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ownnas_core::api::{Api, ApiError};
 use ownnas_core::local;
 use ownnas_core::model::{Node, Stamp};
+
+use crate::progress::{self, Meter};
 
 /// Downloads at least this large keep their partial file when cut off, to go on from it later.
 const RESUME_MIN: u64 = 8 * 1024 * 1024;
@@ -234,35 +236,37 @@ pub fn differing(api: &Api, way: &Way, paths: Vec<String>, parallel: usize) -> V
     let (root, remote) = match way {
         Way::Up { local, remote } | Way::Down { remote, local } => (local, remote),
     };
+    let meter = Meter::new("files compared", paths.len(), None);
     let queue = Mutex::new(paths.into_iter().collect::<VecDeque<_>>());
     let found = Mutex::new(Vec::new());
-    std::thread::scope(|scope| {
+    meter.run(|| std::thread::scope(|scope| {
         for _ in 0..parallel.clamp(1, 64) {
             scope.spawn(|| loop {
                 let Some(path) = queue.lock().unwrap_or_else(|poison| poison.into_inner()).pop_front() else { break };
-                let same = match (local::sha256(&local::full_path(root, &path)), api.sha256(&join(remote, &path))) {
+                let file = local::full_path(root, &path);
+                let size = fs::metadata(&file).map_or(0, |meta| meta.len());
+                let slot = meter.begin(&path, size, "hashing");
+                let here = local::sha256_counting(&file, &|read| slot.moved.store(read, Ordering::Relaxed));
+                slot.doing("asking the server for its checksum of");
+                let same = match (here, api.sha256(&join(remote, &path))) {
                     (Ok(here), Ok(there)) => here.eq_ignore_ascii_case(&there),
                     _ => false,
                 };
+                meter.end(&slot, false);
                 if !same {
+                    progress::event(format!("differs: {path}"));
                     found.lock().unwrap_or_else(|poison| poison.into_inner()).push(path);
                 }
             });
         }
-    });
+    }));
     found.into_inner().unwrap_or_else(|poison| poison.into_inner())
-}
-
-fn human_rate(bytes: u64, took: Duration) -> String {
-    format!("{}/s", crate::human_size((bytes as f64 / took.as_secs_f64().max(0.001)) as u64))
 }
 
 /// Carries out a plan. Nothing is removed if anything failed to copy.
 pub fn run(api: &Api, way: &Way, plan: &Plan, source: &Listing, dest: &Listing, options: &Options) -> Report {
     let started = Instant::now();
-    let moved = AtomicU64::new(0);
     let finished = AtomicU64::new(0);
-    let done = AtomicBool::new(false);
     let failed = Mutex::new(Vec::new());
     let queue = Mutex::new(plan.copy.iter().collect::<VecDeque<_>>());
     let downloaded = Mutex::new(Vec::new());
@@ -270,6 +274,13 @@ pub fn run(api: &Api, way: &Way, plan: &Plan, source: &Listing, dest: &Listing, 
     let total_bytes: u64 = plan.copy.iter().filter_map(|path| source.get(path)).map(|node| node.stamp.size).sum();
     let fail = |path: &str, err: ApiError| failed.lock().unwrap_or_else(|poison| poison.into_inner()).push((path.to_string(), crate::say(&err)));
 
+    let (sending, sent) = match way {
+        Way::Up { .. } => ("sending", "sent"),
+        Way::Down { .. } => ("fetching", "fetched"),
+    };
+    if !plan.mkdir.is_empty() {
+        progress::phase(format!("Making {} empty folders…", plan.mkdir.len()));
+    }
     for dir in &plan.mkdir {
         let made = match way {
             Way::Up { remote, .. } => with_retries(|| api.mkdir(&join(remote, dir))),
@@ -280,56 +291,47 @@ pub fn run(api: &Api, way: &Way, plan: &Plan, source: &Listing, dest: &Listing, 
         }
     }
 
-    std::thread::scope(|scope| {
-        if std::io::IsTerminal::is_terminal(&io::stderr()) {
-            scope.spawn(|| {
-                while !done.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(250));
-                    let bytes = moved.load(Ordering::Relaxed);
-                    eprint!(
-                        "\r\x1b[K{}/{} files, {} of {}, {}",
-                        finished.load(Ordering::Relaxed),
-                        plan.copy.len(),
-                        crate::human_size(bytes),
-                        crate::human_size(total_bytes),
-                        human_rate(bytes, started.elapsed())
-                    );
-                    let _ = io::stderr().flush();
-                }
-                eprint!("\r\x1b[K");
-            });
-        }
+    let meter = Meter::new("files", plan.copy.len(), Some(total_bytes));
+    meter.run(|| std::thread::scope(|scope| {
         let workers: Vec<_> = (0..options.parallel.clamp(1, 64))
             .map(|_| {
                 scope.spawn(|| loop {
                     let Some(path) = queue.lock().unwrap_or_else(|poison| poison.into_inner()).pop_front() else { break };
                     let stamp = source[path].stamp;
                     let base = dest.get(path).filter(|node| !node.dir).map(|node| node.stamp);
+                    if !options.verbose {
+                        progress::event(format!("{sending} {path} ({})", crate::human_size(stamp.size)));
+                    }
+                    let slot = meter.begin(path, stamp.size, sending);
                     let copied = match way {
                         Way::Up { local: root, remote } => {
-                            upload_one(api, &local::full_path(root, path), &join(remote, path), stamp, base, true, &moved).map(|()| None)
+                            upload_one(api, &local::full_path(root, path), &join(remote, path), stamp, base, true, &slot.moved).map(|()| None)
                         }
                         Way::Down { remote, local: root } => {
                             let target = local::full_path(root, path);
-                            let got = download_one(api, &join(remote, path), &target, stamp, true, &moved);
+                            let got = download_one(api, &join(remote, path), &target, stamp, true, &slot.moved);
                             if got.is_ok() {
                                 downloaded.lock().unwrap_or_else(|poison| poison.into_inner()).push(target);
                             }
                             got
                         }
                     };
+                    meter.end(&slot, copied.is_ok());
                     match copied {
                         Ok(resumed) => {
                             finished.fetch_add(1, Ordering::Relaxed);
                             done_paths.lock().unwrap_or_else(|poison| poison.into_inner()).push(path.clone());
+                            let went_on = resumed.map_or(String::new(), |from| format!(" (went on from {})", crate::human_size(from)));
                             if options.verbose {
-                                match resumed {
-                                    Some(from) => println!("copied {path} (went on from {})", crate::human_size(from)),
-                                    None => println!("copied {path}"),
-                                }
+                                outln!("copied {path}{went_on}");
+                            } else {
+                                progress::event(format!("{sent} {path}{went_on}"));
                             }
                         }
-                        Err(err) => fail(path, err),
+                        Err(err) => {
+                            progress::event(format!("could not {} {path}: {}", sending.trim_end_matches("ing"), crate::say(&err)));
+                            fail(path, err);
+                        }
                     }
                 })
             })
@@ -337,16 +339,18 @@ pub fn run(api: &Api, way: &Way, plan: &Plan, source: &Listing, dest: &Listing, 
         for worker in workers {
             let _ = worker.join();
         }
-        done.store(true, Ordering::Relaxed);
-    });
+    }));
 
     let mut failed = failed.into_inner().unwrap_or_else(|poison| poison.into_inner());
     let mut done_paths = done_paths.into_inner().unwrap_or_else(|poison| poison.into_inner());
     // Only now is it safe to call them copied, and to remove anything because of them.
     if finished.load(Ordering::Relaxed) > 0 {
         let flushed = match way {
-            Way::Up { .. } => with_retries(|| api.flush()),
-            Way::Down { .. } => local::flush_files(&downloaded.into_inner().unwrap_or_else(|poison| poison.into_inner())).map_err(io_failure),
+            Way::Up { .. } => progress::waiting("Asking the server to make sure they are safely on its disk", || with_retries(|| api.flush())),
+            Way::Down { .. } => {
+                let files = downloaded.into_inner().unwrap_or_else(|poison| poison.into_inner());
+                progress::waiting("Making sure they are safely on this disk", || local::flush_files(&files).map_err(io_failure))
+            }
         };
         if let Err(err) = flushed {
             done_paths.clear();
@@ -360,6 +364,9 @@ pub fn run(api: &Api, way: &Way, plan: &Plan, source: &Listing, dest: &Listing, 
 
     if failed.is_empty() {
         let session = format!("ownnascli-{}", std::time::SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |time| time.as_secs()));
+        if !plan.remove.is_empty() {
+            progress::phase(format!("Removing {} that the source does not have…", plan.remove.len()));
+        }
         for path in &plan.remove {
             let node = dest[path];
             let removed = match way {
@@ -369,15 +376,21 @@ pub fn run(api: &Api, way: &Way, plan: &Plan, source: &Listing, dest: &Listing, 
             match removed {
                 Ok(()) => {
                     report.removed += 1;
+                    let place = match way {
+                        Way::Up { .. } => "to the Trash on the server",
+                        Way::Down { .. } => "to .ownnas-sync/deleted",
+                    };
                     if options.verbose {
-                        println!("removed {path}");
+                        outln!("removed {path}");
+                    } else {
+                        progress::event(format!("removed {path} ({place})"));
                     }
                 }
                 Err(err) => failed.push((path.clone(), crate::say(&err))),
             }
         }
     } else if !plan.remove.is_empty() {
-        eprintln!("Removed nothing, because some files failed to copy.");
+        errln!("Removed nothing, because some files failed to copy.");
     }
     report.failed = failed;
     report.took = started.elapsed();

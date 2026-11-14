@@ -89,12 +89,27 @@ try {
   fs.mkdirSync(path.join(up, 'blank/inner'), { recursive: true });
   assert.match(ok('cp', up, 'ownnas:Backup', '--dry-run'), /would copy many\/f0\.txt/);
   assert.ok(!exists(library, 'Backup'), 'a dry run changes nothing');
-  assert.match(ok('cp', up, 'ownnas:Backup', '-p', '8'), /^62 copied/);
+  // What is going on is told on stderr as it happens, leaving stdout to the results.
+  let run = cli('cp', up, 'ownnas:Backup', '-p', '8');
+  assert.equal(run.code, 0, run.err);
+  assert.match(run.out, /^62 copied/);
+  assert.doesNotMatch(run.out, /sending|Looking through/, 'progress stays off stdout');
+  for (const told of [/Asking the server what is in ownnas:Backup/, /ownnas:Backup is not on the server yet/, /Looking through .*up…\n/, /has 62 files \(.*\) and 4 folders/, /To send: 62 files/, /^sending many\/f0\.txt \(6 B\)$/m, /^sent many\/f0\.txt$/m, /make sure they are safely on its disk/]) {
+    assert.match(run.err, told);
+  }
   assert.equal(read(library, 'Backup/many/f59.txt'), 'file 59');
   assert.equal(read(library, 'Backup/one word/naïve & odd#name?.txt'), 'odd');
   assert.ok(fs.statSync(path.join(library, 'Backup/blank/inner')).isDirectory(), 'empty folders are made');
   assert.equal(fs.statSync(path.join(library, 'Backup/many/f1.txt')).mtimeMs | 0, fs.statSync(path.join(up, 'many/f1.txt')).mtimeMs | 0, 'modification times travel');
-  assert.match(ok('cp', up, 'ownnas:Backup'), /^0 copied .*62 already there/);
+  run = cli('cp', up, 'ownnas:Backup');
+  assert.match(run.out, /^0 copied .*62 already there/);
+  assert.match(run.err, /^skipped many\/f0\.txt: already there, with the same size and date$/m);
+  for (const quiet of ['-q', '--quiet']) {
+    run = cli(quiet, 'cp', up, 'ownnas:Backup');
+    assert.equal(run.code, 0);
+    assert.match(run.out, /^0 copied/);
+    assert.equal(run.err, '', '--quiet tells only results and failures');
+  }
 
   // Only what changed goes again, and cp removes nothing.
   write(up, 'many/f1.txt', 'changed');
@@ -113,7 +128,11 @@ try {
   assert.match(ok('cp', up, 'ownnas:Backup'), /^0 copied/, 'without it, the damage goes unseen');
   assert.equal(read(library, 'Backup/many/f3.txt'), 'FILE 3');
   assert.match(ok('cp', up, 'ownnas:Backup', '--checksum', '-n'), /would copy many\/f3\.txt/);
-  assert.match(ok('cp', up, 'ownnas:Backup', '--checksum'), /^1 copied/);
+  run = cli('cp', up, 'ownnas:Backup', '--checksum');
+  assert.match(run.out, /^1 copied/);
+  assert.match(run.err, /Comparing the checksums of 61 files/);
+  assert.doesNotMatch(run.err, /skipped many\/f3\.txt/, 'one found to differ is sent, not skipped');
+  assert.match(run.err, /^differs: many\/f3\.txt$/m);
   assert.equal(read(library, 'Backup/many/f3.txt'), 'file 3');
 
   // Sync removes to the Trash, and refuses to empty a destination from an empty source.
@@ -129,7 +148,11 @@ try {
 
   // Down, with times kept, so a second run has nothing to do.
   const down = path.join(here, 'down');
-  assert.match(ok('cp', 'ownnas:Backup', down), /^61 copied/);
+  run = cli('cp', 'ownnas:Backup', down);
+  assert.match(run.out, /^61 copied/);
+  assert.match(run.err, /^fetching many\/f1\.txt \(7 B\)$/m);
+  assert.match(run.err, /^fetched many\/f1\.txt$/m);
+  assert.match(run.err, /safely on this disk/);
   assert.equal(read(down, 'many/f1.txt'), 'changed');
   assert.equal(read(down, 'one word/naïve & odd#name?.txt'), 'odd');
   assert.match(ok('cp', 'ownnas:Backup', down), /^0 copied .*61 already there/);
@@ -239,7 +262,13 @@ try {
   let told = ok('photos', shots, '--workspace', 'family', '--dry-run');
   assert.match(told, /^3 to upload, 3 already there, 1 not photos or videos, of 6/m, told);
   assert.ok(!there('Family/new.jpg'), 'a dry run sends nothing');
-  told = ok('photos', shots, '--workspace', 'family');
+  run = cli('photos', shots, '--workspace', 'family');
+  assert.equal(run.code, 0, run.err);
+  told = run.out;
+  for (const step of [/Asking the server about its Gallery workspaces/, /Looking through .*shots…/, /Found 6 photos and videos \(.*\), and 1 other file, which are left out/, /^looking at .*new\.jpg \(\d+ B\)$/m, /^sending .*new\.jpg/m, /Asking the Gallery to look for them/]) {
+    assert.match(run.err, step);
+  }
+  assert.doesNotMatch(told, /looking at|sending/, 'progress stays off stdout');
   assert.match(told, /already there: .*copy-of-here\.jpg is ownnas:Family\/here\.jpg\n/, told);
   assert.match(told, /already there: .*copy-of-there\.jpg is ownnas:Work\/there\.jpg \(outside this workspace\)/, told);
   assert.match(told, /in this upload/, told);

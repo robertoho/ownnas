@@ -59,6 +59,11 @@ pub fn stat(root: &Path, rel: &str) -> Option<Node> {
 
 /// Walks the synced folder. Symlinks and ignored names are skipped.
 pub fn scan(root: &Path) -> Result<BTreeMap<String, Node>, String> {
+    scan_counting(root, &mut |_| {})
+}
+
+/// [`scan`], telling `found` how many files and folders it has found so far, as it goes.
+pub fn scan_counting(root: &Path, found: &mut dyn FnMut(usize)) -> Result<BTreeMap<String, Node>, String> {
     let mut out = BTreeMap::new();
     let mut stack = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, rel)) = stack.pop() {
@@ -83,12 +88,19 @@ pub fn scan(root: &Path) -> Result<BTreeMap<String, Node>, String> {
                 out.insert(path, node_of(&meta));
             }
         }
+        found(out.len());
     }
     Ok(out)
 }
 
 pub fn sha256(path: &Path) -> io::Result<String> {
+    sha256_counting(path, &|_| {})
+}
+
+/// [`sha256`], telling `read` how many bytes it has read so far, as it goes.
+pub fn sha256_counting(path: &Path, read_so_far: &dyn Fn(u64)) -> io::Result<String> {
     let mut file = fs::File::open(path)?;
+    let mut done = 0u64;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 256 * 1024];
     loop {
@@ -97,6 +109,8 @@ pub fn sha256(path: &Path) -> io::Result<String> {
             break;
         }
         hasher.update(&buf[..read]);
+        done += read as u64;
+        read_so_far(done);
     }
     Ok(hex::encode(hasher.finalize()))
 }

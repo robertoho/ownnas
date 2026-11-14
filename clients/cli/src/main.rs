@@ -1,12 +1,22 @@
 //! `ownnascli`: copies files to and from an OwnNAS server from the command line.
+
+/// A result, on stdout, kept clear of the progress line.
+macro_rules! outln {
+    ($($arg:tt)*) => { $crate::progress::out(format!($($arg)*)) };
+}
+/// A failure, on stderr, kept clear of the progress line.
+macro_rules! errln {
+    ($($arg:tt)*) => { $crate::progress::error(format!($($arg)*)) };
+}
+
 mod delete;
 mod photos;
+mod progress;
 mod transfer;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::AtomicU64;
 
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -23,10 +33,13 @@ use transfer::{join, plan, Listing, Options, Plan, Report, Way};
 pub(crate) const REMOTE_PREFIX: &str = "ownnas:";
 
 #[derive(Parser)]
-#[command(name = "ownnascli", version, about = "Fast file transfer with an OwnNAS server", after_help = "Paths on the server start with ownnas: (ownnas:Photos). ownnas: alone is the top of the library.")]
+#[command(name = "ownnascli", version, about = "Fast file transfer with an OwnNAS server", after_help = "Paths on the server start with ownnas: (ownnas:Photos). ownnas: alone is the top of the library.\n\nWhat is going on (each step, each file, and how large files are getting on) is told on stderr, on one line rewritten in place on a terminal; results and the summary go to stdout. --quiet leaves only results and failures.")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Tell only results and failures, without what is going on (which goes to stderr).
+    #[arg(short, long, global = true)]
+    quiet: bool,
 }
 
 #[derive(Subcommand)]
@@ -119,7 +132,7 @@ struct Flags {
     /// Show what would change without changing anything.
     #[arg(short = 'n', long)]
     dry_run: bool,
-    /// Print each file.
+    /// Print each file copied or removed on stdout, instead of with the progress on stderr.
     #[arg(short, long)]
     verbose: bool,
     /// Also compare the contents of files with the same size and date, by their checksums.
@@ -230,11 +243,41 @@ fn parent_and_name(path: &str) -> (&str, &str) {
 
 /// A remote listing, or an empty one for a folder that does not exist yet.
 fn remote_listing(api: &Api, folder: &str) -> Result<(bool, Listing), String> {
-    match api.tree(folder) {
-        Ok(tree) => Ok((tree.readonly, tree.nodes.into_iter().filter(|(path, _)| !local::ignored_path(path)).collect())),
-        Err(ApiError::NotFound) => Ok((false, BTreeMap::new())),
+    match progress::waiting(&format!("Asking the server what is in {REMOTE_PREFIX}{folder}"), || api.tree(folder)) {
+        Ok(tree) => {
+            let listing: Listing = tree.nodes.into_iter().filter(|(path, _)| !local::ignored_path(path)).collect();
+            progress::event(format!("{REMOTE_PREFIX}{folder} has {}", counted(&listing)));
+            Ok((tree.readonly, listing))
+        }
+        Err(ApiError::NotFound) => {
+            progress::event(format!("{REMOTE_PREFIX}{folder} is not on the server yet"));
+            Ok((false, BTreeMap::new()))
+        }
         Err(err) => Err(format!("Could not list {REMOTE_PREFIX}{folder}: {}", say(&err))),
     }
+}
+
+/// "12 files and 3 folders"
+fn counted(listing: &Listing) -> String {
+    let folders = listing.values().filter(|node| node.dir).count();
+    let files = listing.len() - folders;
+    let size: u64 = listing.values().filter(|node| !node.dir).map(|node| node.stamp.size).sum();
+    format!("{} ({}) and {}", plural(files, "file"), human_size(size), plural(folders, "folder"))
+}
+
+/// "1 file", "2 files"
+pub(crate) fn plural(count: usize, noun: &str) -> String {
+    format!("{count} {noun}{}", if count == 1 { "" } else { "s" })
+}
+
+/// A local folder's files, told as they are found.
+fn scan_here(folder: &Path) -> Result<Listing, String> {
+    let shown = folder.display();
+    progress::phase(format!("Looking through {shown}…"));
+    let listing = local::scan_counting(folder, &mut |found| progress::status(format!("Looking through {shown}… {found} found")))?;
+    progress::clear();
+    progress::event(format!("{shown} has {}", counted(&listing)));
+    Ok(listing)
 }
 
 fn is_remote_folder(api: &Api, path: &str) -> Result<Option<bool>, String> {
@@ -265,9 +308,9 @@ fn summarize(report: &Report, unchanged: u64) -> Result<(), String> {
     if report.removed > 0 {
         line.push_str(&format!(", {} removed", report.removed));
     }
-    println!("{line}, in {:.1} s", report.took.as_secs_f64());
+    outln!("{line}, in {:.1} s", report.took.as_secs_f64());
     for (path, why) in &report.failed {
-        eprintln!("failed: {path}: {why}");
+        errln!("failed: {path}: {why}");
     }
     if report.failed.is_empty() {
         Ok(())
@@ -278,15 +321,15 @@ fn summarize(report: &Report, unchanged: u64) -> Result<(), String> {
 
 fn show_plan(plan: &Plan, source: &Listing) {
     for path in &plan.mkdir {
-        println!("would make {path}/");
+        outln!("would make {path}/");
     }
     for path in &plan.copy {
-        println!("would copy {path} ({})", human_size(source[path].stamp.size));
+        outln!("would copy {path} ({})", human_size(source[path].stamp.size));
     }
     for path in &plan.remove {
-        println!("would remove {path}");
+        outln!("would remove {path}");
     }
-    println!("{} to copy, {} to remove, {} already there", plan.copy.len(), plan.remove.len(), plan.unchanged);
+    outln!("{} to copy, {} to remove, {} already there", plan.copy.len(), plan.remove.len(), plan.unchanged);
 }
 
 fn folder_transfer(api: &Api, way: Way, source: &Listing, dest: &Listing, delete: bool, after: After, flags: &Flags) -> Result<(), String> {
@@ -299,14 +342,32 @@ fn folder_transfer(api: &Api, way: Way, source: &Listing, dest: &Listing, delete
     if flags.checksum || after.deletes_there() {
         same = source.iter().filter(|(path, node)| !node.dir && dest.get(*path) == Some(node)).map(|(path, _)| path.clone()).collect();
     }
+    let (send, sent) = match way {
+        Way::Up { .. } => ("send", "sent"),
+        Way::Down { .. } => ("fetch", "fetched"),
+    };
     if flags.checksum {
+        progress::phase(format!("Comparing the checksums of {} files with the same size and date on both sides…", same.len()));
         let changed = transfer::differing(api, &way, same.clone(), flags.parallel);
+        progress::event(format!("{} of them differ, and will be {sent} again", changed.len()));
         same.retain(|path| !changed.contains(path));
         work.unchanged -= changed.len() as u64;
         work.copy.extend(changed);
         work.copy.sort();
     }
     let (Way::Up { local: root, remote } | Way::Down { remote, local: root }) = &way;
+    let sending: std::collections::BTreeSet<&String> = work.copy.iter().collect();
+    let unchanged = source.iter().filter(|(path, node)| !node.dir && dest.get(*path) == Some(node) && !sending.contains(path));
+    let why = if flags.checksum { "already there, with the same contents" } else { "already there, with the same size and date" };
+    for (path, _) in unchanged {
+        progress::event(format!("skipped {path}: {why}"));
+    }
+    let to_send: u64 = work.copy.iter().map(|path| source[path].stamp.size).sum();
+    let mut line = format!("To {send}: {} ({}); already there: {}", plural(work.copy.len(), "file"), human_size(to_send), work.unchanged);
+    if delete {
+        line.push_str(&format!("; to remove: {}", work.remove.len()));
+    }
+    progress::event(line);
     let item = |path: &String| (local::full_path(root, path), Some(source[path].stamp), join(remote, path));
     let there: Vec<_> = if after.deletes_there() { same.iter().map(item).collect() } else { Vec::new() };
     if flags.dry_run {
@@ -317,7 +378,7 @@ fn folder_transfer(api: &Api, way: Way, source: &Listing, dest: &Listing, delete
                 tally.planned(&local::full_path(root, path));
             }
             tally.settle_all(api, there, flags.parallel);
-            println!("{}", tally.summary().trim_start_matches(", "));
+            outln!("{}", tally.summary().trim_start_matches(", "));
             return tally.result();
         }
         return Ok(());
@@ -329,19 +390,19 @@ fn folder_transfer(api: &Api, way: Way, source: &Listing, dest: &Listing, delete
     }
     let tally = Tally::new(false);
     if report.copied > 0 && report.done.is_empty() {
-        eprintln!("Deleted nothing here, because the server could not make sure the files are on its disk.");
+        errln!("Deleted nothing here, because the server could not make sure the files are on its disk.");
     } else {
         let mut items: Vec<_> = report.done.iter().map(item).collect();
         items.extend(there);
         tally.settle_all(api, items, flags.parallel);
-        println!("{}", tally.summary().trim_start_matches(", "));
+        outln!("{}", tally.summary().trim_start_matches(", "));
     }
     copied.and(tally.result())
 }
 
 fn local_listing(folder: &Path) -> Result<Listing, String> {
     if folder.exists() {
-        local::scan(folder)
+        scan_here(folder)
     } else {
         Ok(BTreeMap::new())
     }
@@ -349,7 +410,7 @@ fn local_listing(folder: &Path) -> Result<Listing, String> {
 
 fn single_file_note(flags: &Flags, what: &str) -> bool {
     if flags.dry_run {
-        println!("would copy {what}");
+        outln!("would copy {what}");
     }
     flags.dry_run
 }
@@ -361,38 +422,45 @@ fn upload(api: &Api, source: &Path, remote: String, delete: bool, after: After, 
         if readonly {
             return Err("This server is read-only.".into());
         }
-        let listing = local::scan(source)?;
+        let listing = scan_here(source)?;
         return folder_transfer(api, Way::Up { local: source.to_path_buf(), remote }, &listing, &dest, delete, after, flags);
     }
     if delete {
         return Err("sync works on folders. Use cp for one file.".into());
     }
     let name = source.file_name().and_then(|name| name.to_str()).ok_or("The file's name is not valid Unicode")?;
-    let target = if is_remote_folder(api, &remote)? == Some(true) { join(&remote, name) } else { remote };
+    let target = progress::waiting(&format!("Asking the server about {REMOTE_PREFIX}{remote}"), || is_remote_folder(api, &remote))?;
+    let target = if target == Some(true) { join(&remote, name) } else { remote };
     if single_file_note(flags, &format!("{} to {REMOTE_PREFIX}{target}", source.display())) && !after.deletes() {
         return Ok(());
     }
     let Node { stamp, .. } = local::node_of(&meta);
-    let base = remote_stamp(api, &target)?;
+    let base = progress::waiting(&format!("Looking up {REMOTE_PREFIX}{target} on the server"), || remote_stamp(api, &target))?;
     let tally = Tally::new(flags.dry_run);
     if flags.dry_run {
         match (base == Some(stamp), after.deletes_there()) {
             (false, _) => tally.planned(source),
-            (true, false) => println!("would keep {} here: it is already there, so it is not uploaded", source.display()),
+            (true, false) => outln!("would keep {} here: it is already there, so it is not uploaded", source.display()),
             (true, true) => tally.settle(source, Some(stamp), transfer::with_retries(|| api.sha256(&target)).map_err(|err| say(&err))),
         }
         return tally.result();
     }
-    let settle = || tally.settle(source, Some(stamp), transfer::with_retries(|| api.sha256(&target)).map_err(|err| say(&err)));
+    let settle = || {
+        let theirs = progress::waiting(&format!("Asking the server for its checksum of {REMOTE_PREFIX}{target}"), || transfer::with_retries(|| api.sha256(&target)));
+        tally.settle(source, Some(stamp), theirs.map_err(|err| say(&err)));
+    };
     if base == Some(stamp) {
-        println!("Already there.");
+        outln!("Already there.");
         if after.deletes_there() {
             settle();
         }
         return tally.result();
     }
-    transfer::upload_one(api, source, &target, stamp, base, false, &AtomicU64::new(0)).map_err(|err| say(&err))?;
-    println!("Copied to {REMOTE_PREFIX}{target} ({})", human_size(stamp.size));
+    progress::event(format!("sending {} ({})", source.display(), human_size(stamp.size)));
+    let meter = progress::Meter::new("files", 1, Some(stamp.size));
+    let slot = meter.begin(name, stamp.size, "sending");
+    meter.run(|| transfer::upload_one(api, source, &target, stamp, base, false, &slot.moved)).map_err(|err| say(&err))?;
+    outln!("Copied to {REMOTE_PREFIX}{target} ({})", human_size(stamp.size));
     if after.deletes() {
         settle();
     }
@@ -400,7 +468,7 @@ fn upload(api: &Api, source: &Path, remote: String, delete: bool, after: After, 
 }
 
 fn download(api: &Api, remote: String, dest: &Path, delete: bool, flags: &Flags) -> Result<(), String> {
-    match is_remote_folder(api, &remote)? {
+    match progress::waiting(&format!("Asking the server about {REMOTE_PREFIX}{remote}"), || is_remote_folder(api, &remote))? {
         None => return Err(format!("{REMOTE_PREFIX}{remote} is not on the server.")),
         Some(true) => {
             let (_, source) = remote_listing(api, &remote)?;
@@ -417,14 +485,17 @@ fn download(api: &Api, remote: String, dest: &Path, delete: bool, flags: &Flags)
     if single_file_note(flags, &format!("{REMOTE_PREFIX}{remote} to {}", target.display())) {
         return Ok(());
     }
-    let stamp = remote_stamp(api, &remote)?.ok_or_else(|| format!("{REMOTE_PREFIX}{remote} is not on the server."))?;
+    let stamp = progress::waiting(&format!("Looking up {REMOTE_PREFIX}{remote} on the server"), || remote_stamp(api, &remote))?.ok_or_else(|| format!("{REMOTE_PREFIX}{remote} is not on the server."))?;
     if std::fs::metadata(&target).is_ok_and(|meta| local::node_of(&meta).stamp == stamp) {
-        println!("Already there.");
+        outln!("Already there.");
         return Ok(());
     }
-    let resumed = transfer::download_one(api, &remote, &target, stamp, false, &AtomicU64::new(0)).map_err(|err| say(&err))?;
+    progress::event(format!("fetching {REMOTE_PREFIX}{remote} ({})", human_size(stamp.size)));
+    let meter = progress::Meter::new("files", 1, Some(stamp.size));
+    let slot = meter.begin(name, stamp.size, "fetching");
+    let resumed = meter.run(|| transfer::download_one(api, &remote, &target, stamp, false, &slot.moved)).map_err(|err| say(&err))?;
     let from = resumed.map_or(String::new(), |from| format!(", went on from {}", human_size(from)));
-    println!("Copied to {} ({}{from})", target.display(), human_size(stamp.size));
+    outln!("Copied to {} ({}{from})", target.display(), human_size(stamp.size));
     Ok(())
 }
 
@@ -470,7 +541,7 @@ fn login(server: String, username: Option<String>, ca_cert: Option<PathBuf>, fin
         Err(err) => return Err(format!("Sign-in failed: {err}")),
     };
     save_profile(&Profile { server: server.clone(), username: username.clone(), token, ca_cert, pinned })?;
-    println!("Signed in to {server} as {username}.");
+    outln!("Signed in to {server} as {username}.");
     Ok(())
 }
 
@@ -478,11 +549,11 @@ fn logout() -> Result<(), String> {
     let mut profile = load_profile()?;
     let api = api_for(&profile.server, Some(profile.token.clone()), profile.ca_cert.as_deref(), &profile.pinned)?;
     if let Err(err) = api.logout() {
-        eprintln!("Could not reach the server to sign out ({err}); forgetting the sign-in here.");
+        errln!("Could not reach the server to sign out ({err}); forgetting the sign-in here.");
     }
     profile.token.clear();
     save_profile(&profile)?;
-    println!("Signed out.");
+    outln!("Signed out.");
     Ok(())
 }
 
@@ -490,7 +561,7 @@ fn status() -> Result<(), String> {
     let profile = load_profile()?;
     let api = api_for(&profile.server, Some(profile.token.clone()), profile.ca_cert.as_deref(), &profile.pinned)?;
     let account = api.account().map_err(|err| say(&err))?;
-    println!("{} as {} (server version {}{})", profile.server, account.username, account.version, if account.readonly { ", read-only" } else { "" });
+    outln!("{} as {} (server version {}{})", profile.server, account.username, account.version, if account.readonly { ", read-only" } else { "" });
     Ok(())
 }
 
@@ -499,10 +570,10 @@ fn list(path: &str) -> Result<(), String> {
     let folder = signed_in()?.list(&path).map_err(|err| format!("Could not list {REMOTE_PREFIX}{path}: {}", say(&err)))?;
     for entry in &folder.entries {
         let size = if entry.dir { "-".to_string() } else { human_size(entry.size) };
-        println!("{size:>10}  {}{}", entry.name, if entry.dir { "/" } else { "" });
+        outln!("{size:>10}  {}{}", entry.name, if entry.dir { "/" } else { "" });
     }
     if folder.truncated {
-        eprintln!("The server stopped listing at its limit, so this is not everything.");
+        errln!("The server stopped listing at its limit, so this is not everything.");
     }
     Ok(())
 }
@@ -528,7 +599,7 @@ fn move_item(source: &str, destination: &str) -> Result<(), String> {
         }
     };
     let at = moved.map_err(|err| format!("Could not move {REMOTE_PREFIX}{source}: {}", say(&err)))?;
-    println!("Moved to {REMOTE_PREFIX}{at}");
+    outln!("Moved to {REMOTE_PREFIX}{at}");
     Ok(())
 }
 
@@ -549,12 +620,13 @@ fn remove(path: &str, recursive: bool) -> Result<(), String> {
         _ => {}
     }
     api.trash(&path).map_err(|err| format!("Could not remove {REMOTE_PREFIX}{path}: {}", say(&err)))?;
-    println!("Moved {REMOTE_PREFIX}{path} to the Trash.");
+    outln!("Moved {REMOTE_PREFIX}{path} to the Trash.");
     Ok(())
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    progress::init(cli.quiet);
     let result = match cli.command {
         Command::Login { server, username, ca_cert, fingerprint } => login(server, username, ca_cert, fingerprint),
         Command::Logout => logout(),
@@ -573,7 +645,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("{err}");
+            errln!("{err}");
             ExitCode::FAILURE
         }
     }

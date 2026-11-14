@@ -14,3 +14,6 @@ ownnas-core = { path = "../../crates/ownnas-core" }
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

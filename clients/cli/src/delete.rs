@@ -9,6 +9,7 @@ use ownnas_core::api::Api;
 use ownnas_core::local;
 use ownnas_core::model::Stamp;
 
+use crate::progress::{self, Meter};
 use crate::transfer::with_retries;
 
 /// What to delete here, after an upload.
@@ -98,26 +99,26 @@ impl Tally {
 
     fn deleted(&self, file: &Path) {
         if self.dry_run {
-            println!("would delete here: {}", file.display());
+            outln!("would delete here: {}", file.display());
         } else {
-            println!("deleted here: {}", file.display());
+            outln!("deleted here: {}", file.display());
         }
         self.deleted.lock().unwrap_or_else(|poison| poison.into_inner()).push(file.to_path_buf());
     }
 
     pub fn keep(&self, file: &Path, why: &str) {
-        println!("kept here: {}: {why}", file.display());
+        outln!("kept here: {}: {why}", file.display());
         *self.kept.lock().unwrap_or_else(|poison| poison.into_inner()) += 1;
     }
 
     /// In a dry run: one that would be deleted once uploaded, which cannot be checked before.
     pub fn planned(&self, file: &Path) {
-        println!("would delete here once uploaded and checked: {}", file.display());
+        outln!("would delete here once uploaded and checked: {}", file.display());
         self.deleted.lock().unwrap_or_else(|poison| poison.into_inner()).push(file.to_path_buf());
     }
 
     pub fn fail(&self, file: &Path, why: &str) {
-        eprintln!("not deleted: {}: {why}", file.display());
+        errln!("not deleted: {}: {why}", file.display());
         *self.failed.lock().unwrap_or_else(|poison| poison.into_inner()) += 1;
     }
 
@@ -144,14 +145,25 @@ impl Tally {
 
     /// Settles each (file here, its version when listed, its path on the server), several at once.
     pub fn settle_all(&self, api: &Api, items: Vec<(PathBuf, Option<Stamp>, String)>, parallel: usize) {
+        if items.is_empty() {
+            return;
+        }
+        progress::phase(format!("Checking {} files against the server's checksums before deleting them here…", items.len()));
+        let meter = Meter::new("files checked", items.len(), None);
         let queue = Mutex::new(items.into_iter().collect::<VecDeque<_>>());
-        std::thread::scope(|scope| {
-            for _ in 0..parallel.clamp(1, 64) {
-                scope.spawn(|| loop {
-                    let Some((file, stamp, remote)) = queue.lock().unwrap_or_else(|poison| poison.into_inner()).pop_front() else { break };
-                    self.settle(&file, stamp, with_retries(|| api.sha256(&remote)).map_err(|err| crate::say(&err)));
-                });
-            }
+        meter.run(|| {
+            std::thread::scope(|scope| {
+                for _ in 0..parallel.clamp(1, 64) {
+                    scope.spawn(|| loop {
+                        let Some((file, stamp, remote)) = queue.lock().unwrap_or_else(|poison| poison.into_inner()).pop_front() else { break };
+                        let slot = meter.begin(&remote, stamp.map_or(0, |stamp| stamp.size), "asking the server for the checksum of");
+                        let theirs = with_retries(|| api.sha256(&remote)).map_err(|err| crate::say(&err));
+                        slot.doing("checking");
+                        self.settle(&file, stamp, theirs);
+                        meter.end(&slot, false);
+                    });
+                }
+            })
         });
     }
 

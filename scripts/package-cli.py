@@ -35,6 +35,8 @@ def main() -> None:
         "--delete-after-upload (on cp to the server, and photos) deletes each file here once the server\n"
         "has it and its SHA-256 matches; --delete-after-upload-or-duplicate also deletes those the server\n"
         "already has. Deleted for good, not to a Trash: try --dry-run first.\n\n"
+        "Each step and each file is told as it happens on stderr, with how large files are getting on;\n"
+        "results and the summary go to stdout. --quiet leaves only results and failures.\n\n"
         "ownnascli --help tells the rest. It needs a server of the same version or later.\n"
     )
     root = f"ownnascli-{version}-{args.target}"
