@@ -1,6 +1,6 @@
 //! Uploading to the Gallery: each file is hashed here and looked for in the library first, so
 //! what is already there is told and not sent.
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -8,7 +8,9 @@ use std::sync::Mutex;
 use ownnas_core::api::{Api, ApiError};
 use ownnas_core::local;
 use ownnas_core::manage::{Conflict, Uploaded};
+use ownnas_core::model::Stamp;
 
+use crate::delete::{After, Tally};
 use crate::transfer::{io_failure, with_retries};
 use crate::{human_size, say, REMOTE_PREFIX};
 
@@ -16,6 +18,7 @@ pub struct Options {
     pub force: bool,
     pub parallel: usize,
     pub dry_run: bool,
+    pub after: After,
 }
 
 /// What the Gallery shows, by file name.
@@ -33,6 +36,12 @@ struct Photo {
     name: String,
     size: u64,
     mtime: i64,
+}
+
+impl Photo {
+    fn stamp(&self) -> Option<Stamp> {
+        Some(Stamp { size: self.size, mtime: self.mtime })
+    }
 }
 
 /// The photos and videos in these files and folders, and how many other files were left out.
@@ -123,6 +132,13 @@ pub fn run(api: &Api, paths: &[PathBuf], workspace: Option<&str>, to: Option<&st
     // Which file of this run has which contents; one that failed gives its place up.
     let claimed: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
     let counts = Counts::default();
+    let tally = Tally::new(options.dry_run);
+    // The contents the server is known to have, by SHA-256: uploaded and read back, or a copy
+    // whose checksum the server gave.
+    let confirmed: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+    let confirm = |sha256: &str| confirmed.lock().unwrap_or_else(|poison| poison.into_inner()).insert(sha256.to_string());
+    // Files with the same contents as another of this run, settled once that one is.
+    let twins: Mutex<Vec<(PathBuf, Option<Stamp>, String)>> = Mutex::new(Vec::new());
 
     let handle = |photo: &Photo| -> Result<(), ApiError> {
         let sha256 = local::sha256(&photo.full).map_err(io_failure)?;
@@ -132,6 +148,9 @@ pub fn run(api: &Api, paths: &[PathBuf], workspace: Option<&str>, to: Option<&st
                 if let Some(first) = claims.get(&sha256) {
                     counts.there.fetch_add(1, Ordering::Relaxed);
                     println!("already there: {} is the same as {first}, in this upload", photo.full.display());
+                    if options.after.deletes_there() {
+                        twins.lock().unwrap_or_else(|poison| poison.into_inner()).push((photo.full.clone(), photo.stamp(), sha256));
+                    }
                     return Ok(());
                 }
                 claims.insert(sha256.clone(), photo.full.display().to_string());
@@ -141,22 +160,40 @@ pub fn run(api: &Api, paths: &[PathBuf], workspace: Option<&str>, to: Option<&st
                 counts.there.fetch_add(1, Ordering::Relaxed);
                 let outside = if workspace_id.is_some() && !check.in_workspace { " (outside this workspace)" } else { "" };
                 println!("already there: {} is {REMOTE_PREFIX}{copy}{outside}", photo.full.display());
+                if options.after.deletes_there() {
+                    // The server found it by its checksum; its own, taken now, has the last word.
+                    let theirs = with_retries(|| api.sha256(&copy)).map_err(|err| say(&err));
+                    if theirs.as_deref().is_ok_and(|theirs| theirs.eq_ignore_ascii_case(&sha256)) {
+                        confirm(&sha256);
+                    }
+                    tally.settle(&photo.full, photo.stamp(), theirs);
+                }
                 return Ok(());
             }
             if let Some(smaller) = check.resized {
                 counts.there.fetch_add(1, Ordering::Relaxed);
                 println!("already there: {} has a smaller copy, {REMOTE_PREFIX}{smaller}", photo.full.display());
+                if options.after.deletes_there() {
+                    tally.keep(&photo.full, "the server has only a smaller copy of it");
+                }
                 return Ok(());
             }
             if check.blocked {
                 counts.skipped.fetch_add(1, Ordering::Relaxed);
                 println!("skipped: {} was deleted, and kept from being backed up again", photo.full.display());
+                if options.after.deletes_there() {
+                    tally.keep(&photo.full, "the server does not have it");
+                }
                 return Ok(());
             }
         }
         if options.dry_run {
             counts.uploaded.fetch_add(1, Ordering::Relaxed);
             println!("would upload: {}", photo.full.display());
+            if options.after.deletes() {
+                confirm(&sha256);
+                tally.planned(&photo.full);
+            }
             return Ok(());
         }
         match send(api, photo, &folder, &sha256) {
@@ -164,6 +201,11 @@ pub fn run(api: &Api, paths: &[PathBuf], workspace: Option<&str>, to: Option<&st
                 counts.uploaded.fetch_add(1, Ordering::Relaxed);
                 counts.bytes.fetch_add(photo.size, Ordering::Relaxed);
                 println!("uploaded: {} to {REMOTE_PREFIX}{path}", photo.full.display());
+                // `send` had the server read it back, and its SHA-256 matched this one's.
+                confirm(&sha256);
+                if options.after.deletes() {
+                    tally.settle(&photo.full, photo.stamp(), Ok(sha256));
+                }
                 Ok(())
             }
             Err(err) => {
@@ -185,6 +227,16 @@ pub fn run(api: &Api, paths: &[PathBuf], workspace: Option<&str>, to: Option<&st
         }
     });
 
+    // A twin goes only if the server has its contents, now that every first one is settled.
+    let confirmed = confirmed.into_inner().unwrap_or_else(|poison| poison.into_inner());
+    for (file, stamp, sha256) in twins.into_inner().unwrap_or_else(|poison| poison.into_inner()) {
+        if confirmed.contains(&sha256) {
+            tally.settle(&file, stamp, Ok(sha256));
+        } else {
+            tally.keep(&file, "the file it is the same as did not reach the server");
+        }
+    }
+
     let get = |count: &AtomicU64| count.load(Ordering::Relaxed);
     let uploaded = get(&counts.uploaded);
     let verb = if options.dry_run { "to upload" } else { "uploaded" };
@@ -199,6 +251,9 @@ pub fn run(api: &Api, paths: &[PathBuf], workspace: Option<&str>, to: Option<&st
     if others > 0 {
         line.push_str(&format!(", {others} not photos or videos"));
     }
+    if options.after.deletes() {
+        line.push_str(&tally.summary());
+    }
     println!("{line}, of {total}, in {:.1} s", started.elapsed().as_secs_f64());
     // Their dates and thumbnails come from the scan, which then shows them in the Gallery.
     if uploaded > 0 && !options.dry_run {
@@ -207,7 +262,7 @@ pub fn run(api: &Api, paths: &[PathBuf], workspace: Option<&str>, to: Option<&st
         }
     }
     match get(&counts.failed) {
-        0 => Ok(()),
+        0 => tally.result(),
         failed => Err(format!("{failed} failed.")),
     }
 }

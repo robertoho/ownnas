@@ -69,6 +69,8 @@ pub struct Report {
     pub copied: u64,
     pub bytes: u64,
     pub removed: u64,
+    /// The files copied, once they are safely on the disk: empty if that could not be made sure of.
+    pub done: Vec<String>,
     pub failed: Vec<(String, String)>,
     pub took: Duration,
 }
@@ -264,6 +266,7 @@ pub fn run(api: &Api, way: &Way, plan: &Plan, source: &Listing, dest: &Listing, 
     let failed = Mutex::new(Vec::new());
     let queue = Mutex::new(plan.copy.iter().collect::<VecDeque<_>>());
     let downloaded = Mutex::new(Vec::new());
+    let done_paths = Mutex::new(Vec::new());
     let total_bytes: u64 = plan.copy.iter().filter_map(|path| source.get(path)).map(|node| node.stamp.size).sum();
     let fail = |path: &str, err: ApiError| failed.lock().unwrap_or_else(|poison| poison.into_inner()).push((path.to_string(), crate::say(&err)));
 
@@ -318,6 +321,7 @@ pub fn run(api: &Api, way: &Way, plan: &Plan, source: &Listing, dest: &Listing, 
                     match copied {
                         Ok(resumed) => {
                             finished.fetch_add(1, Ordering::Relaxed);
+                            done_paths.lock().unwrap_or_else(|poison| poison.into_inner()).push(path.clone());
                             if options.verbose {
                                 match resumed {
                                     Some(from) => println!("copied {path} (went on from {})", crate::human_size(from)),
@@ -337,6 +341,7 @@ pub fn run(api: &Api, way: &Way, plan: &Plan, source: &Listing, dest: &Listing, 
     });
 
     let mut failed = failed.into_inner().unwrap_or_else(|poison| poison.into_inner());
+    let mut done_paths = done_paths.into_inner().unwrap_or_else(|poison| poison.into_inner());
     // Only now is it safe to call them copied, and to remove anything because of them.
     if finished.load(Ordering::Relaxed) > 0 {
         let flushed = match way {
@@ -344,12 +349,14 @@ pub fn run(api: &Api, way: &Way, plan: &Plan, source: &Listing, dest: &Listing, 
             Way::Down { .. } => local::flush_files(&downloaded.into_inner().unwrap_or_else(|poison| poison.into_inner())).map_err(io_failure),
         };
         if let Err(err) = flushed {
+            done_paths.clear();
             failed.push(("(all files)".to_string(), format!("Could not make sure they are safely on the disk: {}", crate::say(&err))));
         }
     }
     let failed_paths: BTreeSet<&String> = failed.iter().map(|(path, _)| path).collect();
     let bytes = plan.copy.iter().filter(|path| !failed_paths.contains(path)).filter_map(|path| source.get(path)).map(|node| node.stamp.size).sum();
-    let mut report = Report { copied: finished.load(Ordering::Relaxed), bytes, ..Report::default() };
+    done_paths.sort();
+    let mut report = Report { copied: finished.load(Ordering::Relaxed), bytes, done: done_paths, ..Report::default() };
 
     if failed.is_empty() {
         let session = format!("ownnascli-{}", std::time::SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |time| time.as_secs()));

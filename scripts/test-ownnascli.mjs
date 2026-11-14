@@ -255,6 +255,92 @@ try {
   ok('photos', path.join(shots, 'copy-of-here.jpg'), '--to', 'ownnas:Work', '--force');
   assert.ok(there('Work/copy-of-here.jpg'));
 
+  // Deleting here after uploading: only what the server has, by its checksum.
+  refused(/cannot be used with/, 'cp', up, 'ownnas:Backup', '--delete-after-upload', '--delete-after-upload-or-duplicate');
+  refused(/only for copying to the server/, 'cp', 'ownnas:Backup', down, '--delete-after-upload');
+  const leave = path.join(here, 'leave');
+  write(leave, 'a.txt', 'a');
+  write(leave, 'sub/b.txt', 'b');
+  write(leave, 'kept.txt', 'was there');
+  write(leave, 'lookalike.txt', 'mine');
+  ok('mkdir', 'ownnas:Leave');
+  ok('cp', path.join(leave, 'kept.txt'), 'ownnas:Leave');
+  ok('cp', path.join(leave, 'lookalike.txt'), 'ownnas:Leave');
+  // On the server, the same name, size and date with other contents.
+  // (Whole seconds, which come back exactly.)
+  fs.writeFileSync(path.join(library, 'Leave/lookalike.txt'), 'MINE');
+  for (const file of [path.join(leave, 'lookalike.txt'), path.join(library, 'Leave/lookalike.txt')]) fs.utimesSync(file, 1_700_000_000, 1_700_000_000);
+  told = ok('cp', leave, 'ownnas:Leave', '--delete-after-upload', '--dry-run');
+  assert.match(told, /would delete here once uploaded and checked: .*a\.txt/, told);
+  assert.match(told, /^2 to delete here/m, told);
+  assert.ok(exists(leave, 'a.txt') && !there('Leave/a.txt'), 'a dry run deletes and sends nothing');
+  told = ok('cp', leave, 'ownnas:Leave', '--delete-after-upload');
+  assert.match(told, /^2 copied/m, told);
+  assert.match(told, /^2 deleted here/m, told);
+  assert.ok(!exists(leave, 'a.txt') && !exists(leave, 'sub/b.txt'), 'the uploaded files are deleted here');
+  assert.ok(fs.statSync(path.join(leave, 'sub')).isDirectory(), 'folders stay');
+  assert.equal(read(library, 'Leave/sub/b.txt'), 'b');
+  assert.ok(exists(leave, 'kept.txt'), 'one already there stays without -or-duplicate');
+  told = ok('cp', leave, 'ownnas:Leave', '--delete-after-upload-or-duplicate', '-n');
+  assert.match(told, /would delete here: .*kept\.txt/, told);
+  assert.match(told, /kept here: .*lookalike\.txt: its contents differ/, told);
+  assert.ok(exists(leave, 'kept.txt'));
+  told = ok('cp', leave, 'ownnas:Leave', '--delete-after-upload-or-duplicate');
+  assert.match(told, /^1 deleted here, 1 kept here/m, told);
+  assert.ok(!exists(leave, 'kept.txt') && there('Leave/kept.txt'));
+  assert.equal(read(leave, 'lookalike.txt'), 'mine', 'a match by name, size and date alone is not enough');
+  // An upload that fails deletes nothing of its own; the others still go.
+  write(library, 'Clash/taken.txt/inside.txt', 'a folder on the server where a file goes');
+  const clash = path.join(here, 'clash');
+  write(clash, 'taken.txt', 'cannot land');
+  write(clash, 'fine.txt', 'lands');
+  const failedRun = cli('cp', clash, 'ownnas:Clash', '--delete-after-upload');
+  assert.notEqual(failedRun.code, 0, failedRun.out);
+  assert.ok(exists(clash, 'taken.txt'), 'a failed upload keeps its file');
+  assert.ok(!exists(clash, 'fine.txt') && read(library, 'Clash/fine.txt') === 'lands');
+  // One file, uploaded, then one already there.
+  write(here, 'lone.txt', 'lone');
+  assert.match(ok('cp', path.join(here, 'lone.txt'), 'ownnas:Leave', '--delete-after-upload'), /deleted here: .*lone\.txt/);
+  assert.ok(!exists(here, 'lone.txt') && read(library, 'Leave/lone.txt') === 'lone');
+  write(here, 'again.txt', 'again');
+  ok('cp', path.join(here, 'again.txt'), 'ownnas:Leave');
+  assert.match(ok('cp', path.join(here, 'again.txt'), 'ownnas:Leave', '--delete-after-upload', '-n'), /would keep .*already there/);
+  assert.match(ok('cp', path.join(here, 'again.txt'), 'ownnas:Leave', '--delete-after-upload-or-duplicate'), /Already there\.\ndeleted here/);
+  assert.ok(!exists(here, 'again.txt'));
+
+  // Photos: uploaded ones go, then those the library has, twins in one run included.
+  const roll = path.join(here, 'roll');
+  fs.mkdirSync(path.join(roll, 'trip'), { recursive: true });
+  fs.writeFileSync(path.join(roll, 'family-again.jpg'), JPEG('in family'));
+  fs.writeFileSync(path.join(roll, 'fresh.jpg'), JPEG('fresh'));
+  fs.writeFileSync(path.join(roll, 'trip/fresh-twin.jpg'), JPEG('fresh'));
+  fs.writeFileSync(path.join(roll, 'notes.txt'), 'not a photo');
+  told = ok('photos', roll, '--workspace', 'Family', '--delete-after-upload-or-duplicate', '-n', '-p', '1');
+  assert.match(told, /would delete here: .*family-again\.jpg/, told);
+  assert.match(told, /3 to delete here/, told);
+  assert.ok(exists(roll, 'fresh.jpg') && exists(roll, 'family-again.jpg'), 'a dry run deletes nothing');
+  told = ok('photos', roll, '--workspace', 'Family', '--delete-after-upload', '-p', '1');
+  assert.match(told, /^1 uploaded .*, 2 already there, 1 not photos or videos, 1 deleted here, of 3/m, told);
+  assert.ok(!exists(roll, 'fresh.jpg'), 'the uploaded one is deleted');
+  assert.ok(exists(roll, 'family-again.jpg') && exists(roll, 'trip/fresh-twin.jpg'), 'those not sent stay without -or-duplicate');
+  // Found by its contents once the Gallery has seen it.
+  for (let i = 0; i < 100; i++) {
+    const page = await call('GET', '/api/gallery/timeline?limit=200');
+    if (page.items.some((item) => item.path === 'Family/fresh.jpg')) break;
+    await new Promise((done) => setTimeout(done, 100));
+  }
+  told = ok('photos', roll, '--workspace', 'Family', '--delete-after-upload-or-duplicate');
+  assert.match(told, /^0 uploaded .*, 2 already there, 1 not photos or videos, 2 deleted here, of 2/m, told);
+  assert.ok(!exists(roll, 'family-again.jpg') && !exists(roll, 'trip/fresh-twin.jpg'));
+  assert.ok(exists(roll, 'notes.txt'), 'what is not a photo stays');
+  const twins = path.join(here, 'twins');
+  fs.mkdirSync(twins);
+  fs.writeFileSync(path.join(twins, 'one.jpg'), JPEG('twins'));
+  fs.writeFileSync(path.join(twins, 'two.jpg'), JPEG('twins'));
+  told = ok('photos', twins, '--to', 'ownnas:Work', '--delete-after-upload-or-duplicate');
+  assert.match(told, /^1 uploaded .*1 already there, 2 deleted here/m, told);
+  assert.deepEqual(fs.readdirSync(twins), []);
+
   ok('logout');
   refused(/Not signed in/, 'ls');
   console.log('ownnascli tests passed.');

@@ -1,4 +1,5 @@
 //! `ownnascli`: copies files to and from an OwnNAS server from the command line.
+mod delete;
 mod photos;
 mod transfer;
 
@@ -16,6 +17,7 @@ use ownnas_core::local;
 use ownnas_core::model::{Node, Stamp};
 use ownnas_core::trust::{server_fingerprint, Trust};
 
+use delete::{After, Tally};
 use transfer::{join, plan, Listing, Options, Plan, Report, Way};
 
 pub(crate) const REMOTE_PREFIX: &str = "ownnas:";
@@ -54,12 +56,15 @@ enum Command {
     /// Make a folder on the server, with any folders above it.
     Mkdir { path: String },
     /// Copy a file, or what is inside a folder, to or from the server. Skips files with the same
-    /// size and modification time, and replaces those that differ. Removes nothing.
+    /// size and modification time, and replaces those that differ. Removes nothing on the
+    /// server. When uploading, --delete-after-upload deletes the files here that the server has.
     Cp {
         source: String,
         destination: String,
         #[command(flatten)]
         flags: Flags,
+        #[command(flatten)]
+        delete: delete::Flags,
     },
     /// Make a destination folder match a source folder, removing what the source does not have.
     /// Removed files go to the Trash on the server, or to .ownnas-sync/deleted on this computer.
@@ -71,7 +76,8 @@ enum Command {
     },
     /// Upload photos and videos to the Gallery, telling and skipping those already in the
     /// library, whatever they are called and wherever they are. Everything goes straight into the
-    /// destination folder, and a name already taken gets a number.
+    /// destination folder, and a name already taken gets a number. --delete-after-upload deletes
+    /// the files here that the server has.
     Photos {
         /// Files, or folders to look through.
         #[arg(required = true)]
@@ -88,9 +94,11 @@ enum Command {
         /// How many files to handle at once.
         #[arg(short, long, default_value_t = 4)]
         parallel: usize,
-        /// Say what would happen, without uploading anything.
+        /// Say what would happen, without uploading or deleting anything.
         #[arg(short = 'n', long)]
         dry_run: bool,
+        #[command(flatten)]
+        delete: delete::Flags,
     },
     /// Move or rename a file or folder on the server.
     Mv { source: String, destination: String },
@@ -281,24 +289,54 @@ fn show_plan(plan: &Plan, source: &Listing) {
     println!("{} to copy, {} to remove, {} already there", plan.copy.len(), plan.remove.len(), plan.unchanged);
 }
 
-fn folder_transfer(api: &Api, way: Way, source: &Listing, dest: &Listing, delete: bool, flags: &Flags) -> Result<(), String> {
+fn folder_transfer(api: &Api, way: Way, source: &Listing, dest: &Listing, delete: bool, after: After, flags: &Flags) -> Result<(), String> {
     if delete && !dest.is_empty() && !source.values().any(|node| !node.dir) {
         return Err("The source has no files, so this would remove everything in the destination. Nothing was changed.".into());
     }
     let mut work = plan(source, dest, delete);
+    // Those with the same size and date on the server, which are not sent.
+    let mut same: Vec<String> = Vec::new();
+    if flags.checksum || after.deletes_there() {
+        same = source.iter().filter(|(path, node)| !node.dir && dest.get(*path) == Some(node)).map(|(path, _)| path.clone()).collect();
+    }
     if flags.checksum {
-        let same: Vec<String> = source.iter().filter(|(path, node)| !node.dir && dest.get(*path) == Some(node)).map(|(path, _)| path.clone()).collect();
-        let changed = transfer::differing(api, &way, same, flags.parallel);
+        let changed = transfer::differing(api, &way, same.clone(), flags.parallel);
+        same.retain(|path| !changed.contains(path));
         work.unchanged -= changed.len() as u64;
         work.copy.extend(changed);
         work.copy.sort();
     }
+    let (Way::Up { local: root, remote } | Way::Down { remote, local: root }) = &way;
+    let item = |path: &String| (local::full_path(root, path), Some(source[path].stamp), join(remote, path));
+    let there: Vec<_> = if after.deletes_there() { same.iter().map(item).collect() } else { Vec::new() };
     if flags.dry_run {
         show_plan(&work, source);
+        if after.deletes() {
+            let tally = Tally::new(true);
+            for path in &work.copy {
+                tally.planned(&local::full_path(root, path));
+            }
+            tally.settle_all(api, there, flags.parallel);
+            println!("{}", tally.summary().trim_start_matches(", "));
+            return tally.result();
+        }
         return Ok(());
     }
     let report = transfer::run(api, &way, &work, source, dest, &Options { parallel: flags.parallel, verbose: flags.verbose });
-    summarize(&report, work.unchanged)
+    let copied = summarize(&report, work.unchanged);
+    if !after.deletes() {
+        return copied;
+    }
+    let tally = Tally::new(false);
+    if report.copied > 0 && report.done.is_empty() {
+        eprintln!("Deleted nothing here, because the server could not make sure the files are on its disk.");
+    } else {
+        let mut items: Vec<_> = report.done.iter().map(item).collect();
+        items.extend(there);
+        tally.settle_all(api, items, flags.parallel);
+        println!("{}", tally.summary().trim_start_matches(", "));
+    }
+    copied.and(tally.result())
 }
 
 fn local_listing(folder: &Path) -> Result<Listing, String> {
@@ -316,7 +354,7 @@ fn single_file_note(flags: &Flags, what: &str) -> bool {
     flags.dry_run
 }
 
-fn upload(api: &Api, source: &Path, remote: String, delete: bool, flags: &Flags) -> Result<(), String> {
+fn upload(api: &Api, source: &Path, remote: String, delete: bool, after: After, flags: &Flags) -> Result<(), String> {
     let meta = std::fs::metadata(source).map_err(|err| format!("Could not open {}: {err}", source.display()))?;
     if meta.is_dir() {
         let (readonly, dest) = remote_listing(api, &remote)?;
@@ -324,25 +362,41 @@ fn upload(api: &Api, source: &Path, remote: String, delete: bool, flags: &Flags)
             return Err("This server is read-only.".into());
         }
         let listing = local::scan(source)?;
-        return folder_transfer(api, Way::Up { local: source.to_path_buf(), remote }, &listing, &dest, delete, flags);
+        return folder_transfer(api, Way::Up { local: source.to_path_buf(), remote }, &listing, &dest, delete, after, flags);
     }
     if delete {
         return Err("sync works on folders. Use cp for one file.".into());
     }
     let name = source.file_name().and_then(|name| name.to_str()).ok_or("The file's name is not valid Unicode")?;
     let target = if is_remote_folder(api, &remote)? == Some(true) { join(&remote, name) } else { remote };
-    if single_file_note(flags, &format!("{} to {REMOTE_PREFIX}{target}", source.display())) {
+    if single_file_note(flags, &format!("{} to {REMOTE_PREFIX}{target}", source.display())) && !after.deletes() {
         return Ok(());
     }
     let Node { stamp, .. } = local::node_of(&meta);
     let base = remote_stamp(api, &target)?;
+    let tally = Tally::new(flags.dry_run);
+    if flags.dry_run {
+        match (base == Some(stamp), after.deletes_there()) {
+            (false, _) => tally.planned(source),
+            (true, false) => println!("would keep {} here: it is already there, so it is not uploaded", source.display()),
+            (true, true) => tally.settle(source, Some(stamp), transfer::with_retries(|| api.sha256(&target)).map_err(|err| say(&err))),
+        }
+        return tally.result();
+    }
+    let settle = || tally.settle(source, Some(stamp), transfer::with_retries(|| api.sha256(&target)).map_err(|err| say(&err)));
     if base == Some(stamp) {
         println!("Already there.");
-        return Ok(());
+        if after.deletes_there() {
+            settle();
+        }
+        return tally.result();
     }
     transfer::upload_one(api, source, &target, stamp, base, false, &AtomicU64::new(0)).map_err(|err| say(&err))?;
     println!("Copied to {REMOTE_PREFIX}{target} ({})", human_size(stamp.size));
-    Ok(())
+    if after.deletes() {
+        settle();
+    }
+    tally.result()
 }
 
 fn download(api: &Api, remote: String, dest: &Path, delete: bool, flags: &Flags) -> Result<(), String> {
@@ -351,7 +405,7 @@ fn download(api: &Api, remote: String, dest: &Path, delete: bool, flags: &Flags)
         Some(true) => {
             let (_, source) = remote_listing(api, &remote)?;
             let existing = local_listing(dest)?;
-            return folder_transfer(api, Way::Down { remote, local: dest.to_path_buf() }, &source, &existing, delete, flags);
+            return folder_transfer(api, Way::Down { remote, local: dest.to_path_buf() }, &source, &existing, delete, After::Keep, flags);
         }
         Some(false) => {}
     }
@@ -374,11 +428,12 @@ fn download(api: &Api, remote: String, dest: &Path, delete: bool, flags: &Flags)
     Ok(())
 }
 
-fn copy(source: &str, destination: &str, delete: bool, flags: &Flags) -> Result<(), String> {
+fn copy(source: &str, destination: &str, delete: bool, after: After, flags: &Flags) -> Result<(), String> {
     match (remote_of(source), remote_of(destination)) {
         (Some(_), Some(_)) => Err("Both paths are on the server. Use mv, or copy through this computer.".into()),
         (None, None) => Err(format!("One of the paths has to be on the server, starting with {REMOTE_PREFIX}")),
-        (None, Some(remote)) => upload(&signed_in()?, Path::new(source), remote, delete, flags),
+        (None, Some(remote)) => upload(&signed_in()?, Path::new(source), remote, delete, after, flags),
+        (Some(_), None) if after.deletes() => Err("--delete-after-upload deletes what was uploaded, so it is only for copying to the server.".into()),
         (Some(remote), None) => download(&signed_in()?, remote, Path::new(destination), delete, flags),
     }
 }
@@ -506,10 +561,11 @@ fn main() -> ExitCode {
         Command::Status => status(),
         Command::Ls { path } => list(&path),
         Command::Mkdir { path } => signed_in().and_then(|api| api.mkdir(&on_server(&path)).map_err(|err| say(&err))),
-        Command::Cp { source, destination, flags } => copy(&source, &destination, false, &flags),
-        Command::Sync { source, destination, flags } => copy(&source, &destination, true, &flags),
-        Command::Photos { paths, workspace, to, force, parallel, dry_run } => signed_in().and_then(|api| {
-            photos::run(&api, &paths, workspace.as_deref(), to.as_deref().map(on_server).as_deref(), &photos::Options { force, parallel, dry_run })
+        Command::Cp { source, destination, flags, delete } => copy(&source, &destination, false, delete.after(), &flags),
+        Command::Sync { source, destination, flags } => copy(&source, &destination, true, After::Keep, &flags),
+        Command::Photos { paths, workspace, to, force, parallel, dry_run, delete } => signed_in().and_then(|api| {
+            let options = photos::Options { force, parallel, dry_run, after: delete.after() };
+            photos::run(&api, &paths, workspace.as_deref(), to.as_deref().map(on_server).as_deref(), &options)
         }),
         Command::Mv { source, destination } => move_item(&source, &destination),
         Command::Rm { path, recursive } => remove(&path, recursive),

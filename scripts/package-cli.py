@@ -30,7 +30,11 @@ def main() -> None:
         "  ownnascli ls ownnas:Photos\n"
         "  ownnascli cp ~/Documents ownnas:Documents\n"
         "  ownnascli sync ~/Documents ownnas:Documents --dry-run\n"
-        "  ownnascli photos ~/Pictures --workspace Family\n\n"
+        "  ownnascli photos ~/Pictures --workspace Family\n"
+        "  ownnascli photos ~/DCIM --workspace Family --delete-after-upload-or-duplicate --dry-run\n\n"
+        "--delete-after-upload (on cp to the server, and photos) deletes each file here once the server\n"
+        "has it and its SHA-256 matches; --delete-after-upload-or-duplicate also deletes those the server\n"
+        "already has. Deleted for good, not to a Trash: try --dry-run first.\n\n"
         "ownnascli --help tells the rest. It needs a server of the same version or later.\n"
     )
     root = f"ownnascli-{version}-{args.target}"
