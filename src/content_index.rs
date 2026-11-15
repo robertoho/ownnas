@@ -169,6 +169,11 @@ fn truncate_text(mut text: String, max: usize) -> String {
     text
 }
 
+/// A PDF's text (`None` when it cannot be read).
+pub fn pdf_text(path: &Path) -> Option<String> {
+    extract_pdf_text(path, &fs::metadata(path).ok()?)
+}
+
 fn extract_pdf_text(path: &Path, meta: &fs::Metadata) -> Option<String> {
     if meta.len() > MAX_PDF_BYTES {
         return None;

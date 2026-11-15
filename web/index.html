@@ -838,6 +838,24 @@
     </form>
   </dialog>
 
+  <dialog id="compare-dialog" class="compare-dialog" aria-labelledby="compare-title">
+    <h3 id="compare-title">What changed</h3>
+    <div class="compare-bar">
+      <label>From <select id="compare-from"></select></label>
+      <label>to <select id="compare-to"></select></label>
+      <div class="compare-layout" role="group" aria-label="Layout">
+        <button type="button" data-compare-layout="unified" aria-pressed="true">One column</button>
+        <button type="button" data-compare-layout="split" aria-pressed="false">Side by side</button>
+      </div>
+    </div>
+    <p id="compare-summary" class="muted compare-summary" aria-live="polite"></p>
+    <div id="compare-body" class="compare-body"></div>
+    <form method="dialog" class="dialog-actions">
+      <button type="button" id="compare-back">Back to versions</button>
+      <button value="cancel" type="submit">Close</button>
+    </form>
+  </dialog>
+
   <dialog id="shortcuts-dialog" aria-labelledby="shortcuts-title">
     <h3 id="shortcuts-title">Keyboard shortcuts</h3>
     <div id="shortcuts-list" class="shortcuts-list"></div>

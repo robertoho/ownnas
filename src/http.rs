@@ -492,6 +492,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/system/database/compact", post(database_compact))
         .route("/api/duplicates/trash", post(trash_duplicates))
         .route("/api/versions/file", get(version_file))
+        .route("/api/versions/compare", get(compare_versions))
         .route("/api/versions/restore", post(restore_version))
         .route("/api/versions/delete", post(delete_version))
         .route("/api/index/reindex", post(reindex))
@@ -8675,6 +8676,49 @@ async fn version_file(
         name
     };
     send_file(&headers, &crate::versions::file(&state.versions, version.id), &name, download).await
+}
+
+#[derive(Deserialize)]
+struct VersionCompareQuery {
+    /// The older version.
+    id: i64,
+    /// The newer one: another version's id, or "current" for the file as it is now.
+    with: String,
+}
+
+/// What changed between a version and a later one (or the file now), line by line.
+async fn compare_versions(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<VersionCompareQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_user(&state, &headers)?;
+    let conn = own_connection(&state)?;
+    let gone = || ApiError::new(StatusCode::NOT_FOUND, "That version is gone");
+    let older = crate::versions::get(&conn, query.id).ok_or_else(gone)?;
+    let name = older.path.rsplit('/').next().unwrap_or("file").to_string();
+    let newer = if query.with == "current" {
+        let found = files::resolve(&state.root, &older.path).map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "The file is not there any more"))?;
+        if !found.full.is_file() {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "The file is not there any more"));
+        }
+        found.full
+    } else {
+        let id: i64 = query.with.parse().map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Choose what to compare with"))?;
+        let version = crate::versions::get(&conn, id).ok_or_else(gone)?;
+        crate::versions::file(&state.versions, version.id)
+    };
+    let old_path = crate::versions::file(&state.versions, older.id);
+    let scratch = state.data_dir().join("compare-tmp");
+    let diff = tokio::task::spawn_blocking(move || -> Result<crate::text_diff::Diff, String> {
+        let old = crate::text_diff::text_of(&old_path, &name, &scratch)?;
+        let new = crate::text_diff::text_of(&newer, &name, &scratch)?;
+        Ok(crate::text_diff::diff(&old, &new))
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not compare the versions"))?
+    .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err))?;
+    Ok(Json(diff))
 }
 
 /// "2026-10-19 12.30 UTC" for a time in seconds.

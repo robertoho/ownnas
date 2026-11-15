@@ -8941,6 +8941,21 @@ async function renameEntries(entries) {
 
 const VERSION_REASONS = { edit: "Before an edit", upload: "Before an upload replaced it", sync: "Before a sync replaced it", restore: "Before a version was restored" };
 let versionsPath = "";
+/// The versions listed, newest first, for comparing them.
+let versionsShown = [];
+
+/// Files whose versions can be compared: text, and the words of documents.
+const COMPARABLE_ICONS = new Set(["word", "spreadsheet", "csv", "presentation", "markdown", "text", "html", "css", "javascript", "json", "config", "script", "code", "email", "calendar", "subtitle", "log", "key"]);
+const NOT_COMPARABLE = new Set(["pages", "numbers", "key", "keynote", "db", "sqlite", "sqlite3", "db3", "mdb", "p12", "pfx"]);
+
+function isComparable(path) {
+  const name = path.split("/").pop();
+  const dot = name.lastIndexOf(".");
+  if (dot <= 0) return true;
+  const extension = name.slice(dot + 1).toLowerCase();
+  if (NOT_COMPARABLE.has(extension)) return false;
+  return extension === "pdf" || extension === "svg" || extension === "epub" || COMPARABLE_ICONS.has(ICON_BY_EXTENSION.get(extension));
+}
 
 async function openVersions(path) {
   versionsPath = path;
@@ -8952,10 +8967,12 @@ async function openVersions(path) {
   const data = await api(`/api/versions?path=${encodeURIComponent(path)}`);
   const write = state.me && !state.me.readonly;
   const versions = data.versions || [];
+  versionsShown = versions;
+  const comparable = isComparable(path);
   $("versions-status").textContent = versions.length
     ? `${versions.length} earlier version${versions.length === 1 ? "" : "s"}, newest first.`
     : "No earlier versions yet. One is kept each time OwnNAS saves over this file: an editor saving it, or an upload or a sync replacing it.";
-  $("versions-list").replaceChildren(...versions.map((version) => {
+  $("versions-list").replaceChildren(...versions.map((version, index) => {
     const item = document.createElement("li");
     item.className = "version";
     const info = document.createElement("div");
@@ -8977,6 +8994,16 @@ async function openVersions(path) {
       anchor.rel = "noopener";
       return anchor;
     };
+    if (comparable) {
+      // What the change after this version did: to the next newer version, or the file now.
+      const changes = document.createElement("button");
+      changes.type = "button";
+      changes.textContent = "Changes";
+      changes.title = index === 0 ? "What changed from this version to the file as it is now" : "What changed from this version to the next one";
+      changes.dataset.versionCompare = version.id;
+      changes.dataset.versionWith = index === 0 ? "current" : versions[index - 1].id;
+      actions.append(changes);
+    }
     actions.append(link("Open", false), link("Download", true));
     if (write) {
       const restore = document.createElement("button");
@@ -9002,8 +9029,12 @@ async function openVersions(path) {
 $("versions-list").addEventListener("click", async (event) => {
   const restore = event.target.closest("[data-version-restore]");
   const remove = event.target.closest("[data-version-delete]");
+  const compare = event.target.closest("[data-version-compare]");
   try {
-    if (restore) {
+    if (compare) {
+      $("versions-dialog").close();
+      await openCompare(Number(compare.dataset.versionCompare), compare.dataset.versionWith);
+    } else if (restore) {
       $("versions-dialog").close();
       const ok = await askConfirm(`Put back the version from ${restore.dataset.versionWhen}? The file as it is now is kept as a version too.`, "Restore");
       if (ok) {
@@ -9025,6 +9056,173 @@ $("versions-list").addEventListener("click", async (event) => {
     toast(err.message, true);
   }
 });
+
+// ---- Comparing versions: what changed, line by line, with the changed words marked ----
+
+let compareLayout = "unified";
+try {
+  if (localStorage.getItem("ownnas-compare-layout") === "split") compareLayout = "split";
+} catch {}
+let compareShown = null;
+
+async function openCompare(from, to) {
+  const name = versionsPath.split("/").pop();
+  $("compare-title").textContent = `What changed in “${name}”`;
+  const option = (value, label) => {
+    const element = document.createElement("option");
+    element.value = String(value);
+    element.textContent = label;
+    return element;
+  };
+  // Oldest first, as a change reads.
+  const oldestFirst = [...versionsShown].reverse();
+  $("compare-from").replaceChildren(...oldestFirst.map((v) => option(v.id, formatDate(v.savedAt))));
+  $("compare-to").replaceChildren(...oldestFirst.map((v) => option(v.id, formatDate(v.savedAt))), option("current", "Now"));
+  $("compare-from").value = String(from);
+  $("compare-to").value = String(to);
+  syncCompareLayout();
+  if (!$("compare-dialog").open) $("compare-dialog").showModal();
+  await showCompare();
+}
+
+function syncCompareLayout() {
+  for (const button of document.querySelectorAll("[data-compare-layout]")) button.setAttribute("aria-pressed", String(button.dataset.compareLayout === compareLayout));
+}
+
+async function showCompare() {
+  const from = $("compare-from").value;
+  const to = $("compare-to").value;
+  const summary = $("compare-summary");
+  const body = $("compare-body");
+  if (from === to) {
+    summary.textContent = "Choose two different versions.";
+    body.replaceChildren();
+    return;
+  }
+  summary.textContent = "Comparing…";
+  body.replaceChildren();
+  compareDiff = null;
+  const asked = `${from}:${to}`;
+  compareShown = asked;
+  try {
+    const diff = await api(`/api/versions/compare?id=${encodeURIComponent(from)}&with=${encodeURIComponent(to)}`);
+    if (compareShown !== asked) return;
+    renderCompare(diff);
+  } catch (err) {
+    if (compareShown === asked) summary.textContent = err.message;
+  }
+}
+
+function renderCompare(diff) {
+  compareDiff = diff;
+  // A phone has no room for two columns.
+  const layout = window.matchMedia("(max-width: 700px)").matches ? "unified" : compareLayout;
+  const summary = $("compare-summary");
+  const body = $("compare-body");
+  if (diff.identical) {
+    summary.textContent = diff.note || "No changes: the text is the same.";
+    body.replaceChildren();
+    return;
+  }
+  const document_ = isDocumentName(versionsPath);
+  const unit = document_ ? ["paragraph", "paragraphs"] : ["line", "lines"];
+  const count = (n) => `${n.toLocaleString()} ${n === 1 ? unit[0] : unit[1]}`;
+  const added = Object.assign(document.createElement("span"), { className: "added", textContent: `${count(diff.added)} added` });
+  const removed = Object.assign(document.createElement("span"), { className: "removed", textContent: `${count(diff.removed)} removed` });
+  summary.replaceChildren(added, ", ", removed, diff.truncated ? ". Only the first changes are shown." : ".", document_ ? " Documents are compared by their words, a paragraph to a line." : "");
+  const table = document.createElement("table");
+  table.className = `diff-table${layout === "split" ? " is-split" : ""}${document_ ? " is-document" : ""}`;
+  // Fixed widths: with a fixed layout, the first row (a heading across them all) would set them.
+  const columns = document.createElement("colgroup");
+  for (const kind of layout === "split" ? ["num", "sign", "text", "num", "sign", "text"] : ["num", "num", "sign", "text"]) {
+    columns.append(Object.assign(document.createElement("col"), { className: kind }));
+  }
+  table.append(columns);
+  const tbody = document.createElement("tbody");
+  const text = (line) => {
+    const cell = document.createElement("td");
+    cell.className = "text";
+    if (!line) return cell;
+    for (const [changed, piece] of line.parts) {
+      if (changed) cell.append(Object.assign(document.createElement("mark"), { textContent: piece }));
+      else cell.append(piece);
+    }
+    if (!line.parts.length) cell.append("\u200b");
+    return cell;
+  };
+  const num = (value) => Object.assign(document.createElement("td"), { className: "num", textContent: value ?? "" });
+  const sign = (kind) => Object.assign(document.createElement("td"), { className: "sign", textContent: kind === "add" ? "+" : kind === "del" ? "−" : "" });
+  for (const hunk of diff.hunks) {
+    const head = document.createElement("tr");
+    head.className = "hunk";
+    const label = Object.assign(document.createElement("td"), { colSpan: layout === "split" ? 6 : 4, textContent: `${document_ ? "Paragraph" : "Line"} ${hunk.newStart.toLocaleString()}` });
+    head.append(label);
+    tbody.append(head);
+    if (layout === "unified") {
+      for (const line of hunk.lines) {
+        const row = document.createElement("tr");
+        if (line.kind !== "same") row.className = line.kind;
+        row.append(num(line.old), num(line.new), sign(line.kind), text(line));
+        tbody.append(row);
+      }
+      continue;
+    }
+    // Side by side: what went beside what came in its place.
+    let i = 0;
+    const lines = hunk.lines;
+    while (i < lines.length) {
+      if (lines[i].kind === "same") {
+        const row = document.createElement("tr");
+        row.append(num(lines[i].old), sign(""), text(lines[i]), num(lines[i].new), sign(""), text(lines[i]));
+        tbody.append(row);
+        i += 1;
+        continue;
+      }
+      const dels = [];
+      const adds = [];
+      while (i < lines.length && lines[i].kind === "del") dels.push(lines[i++]);
+      while (i < lines.length && lines[i].kind === "add") adds.push(lines[i++]);
+      for (let k = 0; k < Math.max(dels.length, adds.length); k++) {
+        const left = dels[k];
+        const right = adds[k];
+        const row = document.createElement("tr");
+        const cells = [num(left?.old), sign(left ? "del" : ""), text(left), num(right?.new), sign(right ? "add" : ""), text(right)];
+        for (const cell of cells.slice(0, 3)) cell.classList.add(left ? "del" : "empty");
+        for (const cell of cells.slice(3)) cell.classList.add(right ? "add" : "empty");
+        row.append(...cells);
+        tbody.append(row);
+      }
+    }
+  }
+  table.append(tbody);
+  body.replaceChildren(table);
+  body.scrollTop = 0;
+}
+
+/// The last comparison shown, drawn again when the layout changes.
+let compareDiff = null;
+
+function isDocumentName(path) {
+  const extension = path.split(".").pop().toLowerCase();
+  return extension === "pdf" || extension === "epub" || ["word", "spreadsheet", "presentation", "email"].includes(ICON_BY_EXTENSION.get(extension));
+}
+
+$("compare-from").addEventListener("change", () => showCompare());
+$("compare-to").addEventListener("change", () => showCompare());
+$("compare-back").addEventListener("click", () => {
+  $("compare-dialog").close();
+  openVersions(versionsPath).catch((err) => toast(err.message, true));
+});
+for (const button of document.querySelectorAll("[data-compare-layout]")) {
+  button.addEventListener("click", () => {
+    compareLayout = button.dataset.compareLayout;
+    try {
+      localStorage.setItem("ownnas-compare-layout", compareLayout);
+    } catch {}
+    syncCompareLayout();
+    if (compareDiff && !compareDiff.identical) renderCompare(compareDiff);
+  });
+}
 
 let duplicateGroups = [];
 

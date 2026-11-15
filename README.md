@@ -327,6 +327,12 @@ Thumbnails are small JPEGs (PNG for pictures with transparency) kept in the data
 
 Put OwnNAS behind HTTPS and pass `--secure-cookie` if you terminate TLS with a reverse proxy. The login is the application boundary; the VPN is the network boundary.
 
+## Earlier versions
+
+When OwnNAS saves over a file (an editor saving it, or an upload or a sync replacing it), it keeps the file as it was, in its data folder and not in the library. A burst of saves within 10 minutes keeps one version, from before it. Each file keeps up to 20 versions for 90 days. Files over 1 GB are not versioned, and all versions together take at most 20 GB, the oldest going first. **Versions…** in a file's menu lists them, to open, download, restore, or delete.
+
+**Changes** on a version shows what changed from it to the next version (or to the file now): the lines that went and came, with the changed words marked, in one column or side by side. Pick any two versions to compare them. It works for text files (notes, code, CSV…) and for the words of documents, spreadsheets, presentations, PDFs, ebooks, and emails, which are compared a paragraph to a line.
+
 ## Sort into folders
 
 Right-click a folder, or the empty space inside one, and choose **Sort into folders…** to move its files into sub-folders by a pattern: by date (`{YYYY}/{MM}`, `{YYYY}-{MM}`, `{YYYY}/{MM}/{DD}`, or with the month's name, `{MMMM}`), by kind (Pictures, Videos, Music, Documents…), by extension, by first letter, or your own mix ("Photos {YYYY}"). The date is when a photo or video was taken (from the file's own data), or otherwise when the file last changed; it can also be when it was changed or created. You can include the files in the folders inside it. The dialog shows what will move before anything does, nothing is overwritten, hidden files stay, and **Undo** puts everything back and removes the folders it made.

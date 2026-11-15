@@ -24,6 +24,7 @@ pub mod files;
 pub mod font_info;
 pub mod helper_tools;
 pub mod text_index;
+pub mod text_diff;
 pub mod versions;
 pub mod duplicates;
 pub mod video_meta;

@@ -4356,6 +4356,38 @@ body.is-notes .app > .explorer-status-bar { display: none; }
 .version-info .muted { font-size: 0.85em; overflow-wrap: anywhere; }
 .version-actions { display: flex; gap: 0.35rem; flex-wrap: wrap; }
 .versions-note { font-size: 0.85em; }
+.compare-dialog { width: min(72rem, calc(100vw - 2rem)); }
+.compare-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.9rem; }
+.compare-bar label { display: inline-flex; align-items: center; gap: 0.35rem; }
+.compare-bar select { max-width: 16rem; }
+.compare-layout { display: inline-flex; margin-left: auto; }
+.compare-layout button { border-radius: 0; }
+.compare-layout button:first-child { border-radius: 8px 0 0 8px; }
+.compare-layout button:last-child { border-radius: 0 8px 8px 0; margin-left: -1px; }
+.compare-layout button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.compare-summary { margin: 0.5rem 0; }
+.compare-summary .added { color: #2ea043; font-weight: 600; }
+.compare-summary .removed { color: var(--danger); font-weight: 600; }
+.compare-body { max-height: min(65vh, 44rem); overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+.compare-body:empty { display: none; }
+.diff-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-family: var(--mono); font-size: 0.82rem; line-height: 1.45; }
+.diff-table.is-document { font-family: var(--sans); font-size: 0.9rem; }
+.diff-table td { padding: 0 0.5rem; vertical-align: top; white-space: pre-wrap; overflow-wrap: anywhere; }
+.diff-table col.num { width: 3.2rem; }
+.diff-table col.sign { width: 1.2rem; }
+.diff-table td.num { color: var(--muted); text-align: right; user-select: none; padding-right: 0.4rem; font-family: var(--mono); font-size: 0.78rem; }
+.diff-table td.sign { color: var(--muted); user-select: none; padding: 0; text-align: center; }
+.diff-table .del { background: color-mix(in srgb, var(--danger) 14%, transparent); }
+.diff-table .add { background: color-mix(in srgb, #2ea043 16%, transparent); }
+.diff-table .del mark { background: color-mix(in srgb, var(--danger) 40%, transparent); color: inherit; border-radius: 2px; }
+.diff-table .add mark { background: color-mix(in srgb, #2ea043 42%, transparent); color: inherit; border-radius: 2px; }
+.diff-table .empty { background: color-mix(in srgb, var(--line) 25%, transparent); }
+.diff-table tr.hunk td { background: color-mix(in srgb, var(--accent) 10%, transparent); color: var(--muted); font-family: var(--sans); font-size: 0.8rem; padding: 0.2rem 0.6rem; }
+.diff-table.is-split td.text + td.num { border-left: 1px solid var(--line); }
+@media (max-width: 700px) {
+  .compare-layout { display: none; }
+  .diff-table col.num { width: 2.4rem; }
+}
 .helpers-list { list-style: none; margin: 0 0 0.6rem; padding: 0; display: grid; gap: 0.5rem; }
 .helper { border: 1px solid var(--line); border-radius: 8px; padding: 0.5rem 0.7rem; }
 .helper p { margin: 0.15rem 0 0; overflow-wrap: anywhere; }

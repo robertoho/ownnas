@@ -63,6 +63,7 @@ apache-avro = { version = "0.22", default-features = false }
 djvu-rs = { version = "0.43", default-features = false, features = ["std"] }
 tiff = "0.11.3"
 sysinfo = "0.39.6"
+similar = { version = "2", features = ["inline"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
