@@ -439,6 +439,12 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/remotes/file", get(remote_file))
         .route("/api/remotes/access", post(remote_access))
         .route("/api/remotes/settings", post(remote_settings))
+        .route("/api/remotes/transfer", post(remote_transfer))
+        .route("/api/remotes/transfers", get(remote_transfers))
+        .route("/api/remotes/transfers/stop", post(remote_transfer_stop))
+        .route("/api/remotes/mkdir", post(remote_mkdir))
+        .route("/api/remotes/rename", post(remote_rename))
+        .route("/api/remotes/delete", post(remote_delete))
         .route("/api/cleanup/large", get(cleanup_large))
         .route("/api/cleanup/empty", get(cleanup_empty))
         .route("/api/cleanup/dates", get(cleanup_dates).post(cleanup_fix_dates))
@@ -5691,6 +5697,355 @@ async fn remote_settings(State(state): State<std::sync::Arc<AppState>>, headers:
     }
     tokio::task::spawn_blocking(|| crate::remotes::rclone().stop()).await.ok();
     Ok(Json(json!({ "ok": true })))
+}
+
+// ---- Copying and moving between remotes and the library, renaming, deleting ----
+
+/// Runs `work` with the running rclone, in a thread of its own (rclone is asked over blocking
+/// HTTP).
+async fn with_rclone<T: Send + 'static>(state: &AppState, work: impl FnOnce(crate::remotes::Endpoint) -> Result<T, ApiError> + Send + 'static) -> Result<T, ApiError> {
+    let settings = remote_settings_of(state);
+    tokio::task::spawn_blocking(move || {
+        let endpoint = crate::remotes::rclone().endpoint(&settings).map_err(|err| ApiError::new(StatusCode::BAD_GATEWAY, err))?;
+        work(endpoint)
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not ask rclone"))?
+}
+
+fn gateway(err: String) -> ApiError {
+    ApiError::new(StatusCode::BAD_GATEWAY, err)
+}
+
+fn join_path(folder: &str, name: &str) -> String {
+    if folder.is_empty() { name.to_string() } else { format!("{folder}/{name}") }
+}
+
+/// A place in a copy: a remote's path, or (`remote` empty) the library's.
+#[derive(Deserialize, Clone)]
+struct RemotePlace {
+    #[serde(default)]
+    remote: String,
+    #[serde(default)]
+    path: String,
+}
+
+impl RemotePlace {
+    fn label(&self) -> String {
+        if self.remote.is_empty() { self.path.clone() } else { format!("{}:{}", self.remote, self.path) }
+    }
+}
+
+#[derive(Deserialize)]
+struct RemoteTransferBody {
+    /// "copy" or "move".
+    mode: String,
+    items: Vec<RemotePlace>,
+    /// The folder they go into.
+    dest: RemotePlace,
+}
+
+struct PlannedCopy {
+    from: crate::remotes::Place,
+    to: crate::remotes::Place,
+    dir: bool,
+    name: String,
+    label: String,
+    /// The item in the library it comes from, or the new item in the library.
+    library_from: Option<String>,
+    library_to: Option<String>,
+}
+
+/// What each item becomes, checked before anything is copied: that it is there, that a folder
+/// is not pasted inside itself, and a name free in the folder it goes into ("photo (2).jpg").
+fn plan_transfer(root: &std::path::Path, endpoint: &crate::remotes::Endpoint, moving: bool, items: &[RemotePlace], dest: &RemotePlace) -> Result<Vec<PlannedCopy>, ApiError> {
+    use crate::remotes::Place;
+    let lower = |name: &str| name.to_lowercase();
+    let not_there = || ApiError::new(StatusCode::NOT_FOUND, "That folder is not on the remote");
+    let (dest_local, dest_path, mut taken) = if dest.remote.is_empty() {
+        let found = files::resolve(root, &dest.path)?;
+        if !found.full.is_dir() {
+            return Err(FileError::NotADirectory.into());
+        }
+        let taken: std::collections::HashSet<String> = std::fs::read_dir(&found.full).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the folder"))?.flatten().map(|item| lower(&item.file_name().to_string_lossy())).collect();
+        (Some(found), String::new(), taken)
+    } else {
+        let path = crate::remotes::clean_path(&dest.path).ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "That path leaves the remote"))?;
+        match crate::remotes::stat(endpoint, &dest.remote, &path).map_err(gateway)? {
+            Some(entry) if entry.dir => {}
+            _ => return Err(not_there()),
+        }
+        let taken = crate::remotes::list(endpoint, &dest.remote, &path).map_err(gateway)?.iter().map(|entry| lower(&entry.name)).collect();
+        (None, path, taken)
+    };
+    let mut plan = Vec::new();
+    for item in items {
+        let (from, dir, name, library_from, already_there, inside) = if item.remote.is_empty() {
+            let found = files::resolve(root, &item.path)?;
+            if found.rel.is_empty() {
+                return Err(FileError::Forbidden.into());
+            }
+            let name = found.rel.rsplit('/').next().unwrap_or_default().to_string();
+            let dir = found.full.is_dir();
+            let already_there = dest_local.as_ref().is_some_and(|dest| found.full.parent() == Some(dest.full.as_path()));
+            let inside = dest_local.as_ref().is_some_and(|dest| dest.full.starts_with(&found.full));
+            (Place::Local(found.full), dir, name, Some(found.rel), already_there, inside)
+        } else {
+            let path = crate::remotes::clean_path(&item.path).filter(|path| !path.is_empty()).ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Choose a file or folder"))?;
+            let name = path.rsplit('/').next().unwrap_or_default().to_string();
+            let entry = crate::remotes::stat(endpoint, &item.remote, &path)
+                .map_err(gateway)?
+                .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("“{name}” is no longer on {}", item.remote)))?;
+            let same_remote = dest_local.is_none() && dest.remote == item.remote;
+            let parent = path.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
+            let already_there = same_remote && parent == dest_path;
+            let inside = same_remote && entry.dir && (dest_path == path || dest_path.starts_with(&format!("{path}/")));
+            (Place::Remote { name: item.remote.clone(), path }, entry.dir, name, None, already_there, inside)
+        };
+        if inside {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, format!("“{name}” cannot be pasted inside itself")));
+        }
+        if moving && already_there {
+            continue;
+        }
+        let new_name = crate::remotes::free_name(&name, dir, &taken);
+        taken.insert(lower(&new_name));
+        let (to, library_to) = match &dest_local {
+            Some(found) => (Place::Local(found.full.join(&new_name)), Some(join_path(&found.rel, &new_name))),
+            None => (Place::Remote { name: dest.remote.clone(), path: join_path(&dest_path, &new_name) }, None),
+        };
+        let label = format!("{} → {}", item.label(), RemotePlace { remote: dest.remote.clone(), path: join_path(&dest.path, &new_name) }.label());
+        plan.push(PlannedCopy { from, to, dir, name, label, library_from, library_to });
+    }
+    Ok(plan)
+}
+
+/// Copies or moves files and folders between remotes, or between a remote and the library, in
+/// the background; the page follows it with `/api/remotes/transfers`.
+async fn remote_transfer(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, Json(body): Json<RemoteTransferBody>) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let moving = match body.mode.as_str() {
+        "copy" => false,
+        "move" => true,
+        _ => return Err(ApiError::new(StatusCode::BAD_REQUEST, "Copy or move?")),
+    };
+    if body.items.is_empty() || body.items.len() > 10_000 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose what to paste"));
+    }
+    let mut names: Vec<&str> = body.items.iter().map(|item| item.remote.as_str()).chain([body.dest.remote.as_str()]).filter(|name| !name.is_empty()).collect();
+    names.sort_unstable();
+    names.dedup();
+    if names.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Both are in the library"));
+    }
+    for name in names {
+        may_use_remote(&state, &user, name)?;
+    }
+    if moving {
+        for item in body.items.iter().filter(|item| item.remote.is_empty()) {
+            check_deletable(&state, &item.path)?;
+        }
+    }
+    let root = state.root.clone();
+    let (items, dest) = (body.items.clone(), body.dest.clone());
+    let plan = with_rclone(&state, move |endpoint| plan_transfer(&root, &endpoint, moving, &items, &dest)).await?;
+    if plan.is_empty() {
+        return Ok(Json(json!({ "id": null, "message": "Already in this folder" })));
+    }
+    let (id, stop) = crate::remotes::begin_transfer(user.id, &body.mode, &body.dest.remote, &body.dest.path, plan.len());
+    let settings = remote_settings_of(&state);
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let _busy = crate::remotes::rclone().hold();
+        for (index, step) in plan.iter().enumerate() {
+            crate::remotes::update_transfer(id, |transfer| {
+                transfer.current = step.name.clone();
+                transfer.bytes = 0;
+                transfer.total_bytes = 0;
+                transfer.speed = 0.0;
+                transfer.eta = None;
+            });
+            let result = crate::remotes::rclone().endpoint(&settings).and_then(|endpoint| {
+                endpoint.transfer(&step.from, &step.to, step.dir, moving, Some(&stop), |progress| {
+                    crate::remotes::update_transfer(id, |transfer| {
+                        transfer.bytes = progress.bytes;
+                        transfer.total_bytes = progress.total;
+                        transfer.speed = progress.speed;
+                        transfer.eta = progress.eta;
+                    })
+                })
+            });
+            // Also after a failure, something may have been copied or moved already.
+            if let Some(rel) = &step.library_to {
+                invalidate_sizes(&state, &parent_rel_path(rel));
+            }
+            if let (true, Some(rel)) = (moving, &step.library_from) {
+                invalidate_sizes(&state, &parent_rel_path(rel));
+            }
+            match result {
+                Ok(()) => {
+                    if let (true, Some(rel)) = (moving, &step.library_from) {
+                        delete_meta(&state, rel);
+                    }
+                    record(&state, &user, if moving { "move" } else { "copy" }, &step.label);
+                    crate::remotes::update_transfer(id, |transfer| transfer.done = index + 1);
+                }
+                Err(err) => {
+                    crate::remotes::update_transfer(id, |transfer| {
+                        transfer.state = if err == crate::remotes::STOPPED { "stopped".into() } else { "failed".into() };
+                        transfer.error = (err != crate::remotes::STOPPED).then_some(err);
+                    });
+                    return;
+                }
+            }
+        }
+        crate::remotes::update_transfer(id, |transfer| {
+            transfer.state = "done".into();
+            transfer.current.clear();
+        });
+    });
+    Ok(Json(json!({ "id": id })))
+}
+
+/// This user's copies and moves, running or lately finished.
+async fn remote_transfers(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    Ok(Json(json!({ "transfers": crate::remotes::transfers_of(user.id) })))
+}
+
+#[derive(Deserialize)]
+struct RemoteStopBody {
+    id: u64,
+}
+
+async fn remote_transfer_stop(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, Json(body): Json<RemoteStopBody>) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    if !crate::remotes::stop_transfer(user.id, body.id) {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "That copy is not running"));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct RemoteNameBody {
+    remote: String,
+    #[serde(default)]
+    path: String,
+    name: String,
+}
+
+fn remote_new_name(name: &str) -> Result<String, ApiError> {
+    let name = name.trim().to_string();
+    if files::valid_new_component(&name) {
+        Ok(name)
+    } else {
+        Err(FileError::InvalidName.into())
+    }
+}
+
+fn already_there() -> ApiError {
+    ApiError::new(StatusCode::CONFLICT, "Something with that name is already there")
+}
+
+/// A new folder in a remote's folder `path`.
+async fn remote_mkdir(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, Json(body): Json<RemoteNameBody>) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    may_use_remote(&state, &user, &body.remote)?;
+    let folder = crate::remotes::clean_path(&body.path).ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "That path leaves the remote"))?;
+    let name = remote_new_name(&body.name)?;
+    let remote = body.remote.clone();
+    let path = join_path(&folder, &name);
+    let made = path.clone();
+    with_rclone(&state, move |endpoint| {
+        if !crate::remotes::stat(&endpoint, &remote, &folder).map_err(gateway)?.is_some_and(|entry| entry.dir) {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "That folder is not on the remote"));
+        }
+        if crate::remotes::stat(&endpoint, &remote, &made).map_err(gateway)?.is_some() {
+            return Err(already_there());
+        }
+        endpoint.mkdir(&remote, &made).map_err(gateway)
+    })
+    .await?;
+    record(&state, &user, "create-folder", &format!("{}:{path}", body.remote));
+    Ok(Json(json!({ "path": path })))
+}
+
+/// Renames a remote's file or folder (`path`) to `name`, in the same folder.
+async fn remote_rename(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, Json(body): Json<RemoteNameBody>) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    may_use_remote(&state, &user, &body.remote)?;
+    let path = crate::remotes::clean_path(&body.path).filter(|path| !path.is_empty()).ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Choose a file or folder"))?;
+    let name = remote_new_name(&body.name)?;
+    let parent = path.rsplit_once('/').map(|(parent, _)| parent.to_string()).unwrap_or_default();
+    let renamed = join_path(&parent, &name);
+    if renamed == path {
+        return Ok(Json(json!({ "path": path })));
+    }
+    let remote = body.remote.clone();
+    let (from, to) = (path.clone(), renamed.clone());
+    with_rclone(&state, move |endpoint| {
+        let entry = crate::remotes::stat(&endpoint, &remote, &from).map_err(gateway)?.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That is no longer on the remote"))?;
+        // Only the case changing ("a.txt" to "A.txt") finds itself on remotes that ignore it.
+        if from.to_lowercase() != to.to_lowercase() && crate::remotes::stat(&endpoint, &remote, &to).map_err(gateway)?.is_some() {
+            return Err(already_there());
+        }
+        let place = |path: &str| crate::remotes::Place::Remote { name: remote.clone(), path: path.to_string() };
+        endpoint.transfer(&place(&from), &place(&to), entry.dir, true, None, |_| {}).map_err(gateway)
+    })
+    .await?;
+    record(&state, &user, "rename", &format!("{}:{path} → {name}", body.remote));
+    Ok(Json(json!({ "path": renamed })))
+}
+
+#[derive(Deserialize)]
+struct RemoteDeleteBody {
+    remote: String,
+    paths: Vec<String>,
+}
+
+/// Deletes files and folders (with everything in them) of a remote, for good unless the remote
+/// keeps a bin of its own.
+async fn remote_delete(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, Json(body): Json<RemoteDeleteBody>) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    may_use_remote(&state, &user, &body.remote)?;
+    let mut paths = Vec::new();
+    for path in &body.paths {
+        paths.push(crate::remotes::clean_path(path).filter(|path| !path.is_empty()).ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Choose a file or folder"))?);
+    }
+    let remote = body.remote.clone();
+    let deleted = with_rclone(&state, move |endpoint| {
+        let mut deleted = Vec::new();
+        for path in paths {
+            let outcome = match crate::remotes::stat(&endpoint, &remote, &path) {
+                Ok(Some(entry)) => endpoint.delete(&remote, &path, entry.dir),
+                Ok(None) => Ok(()),
+                Err(err) => Err(err),
+            };
+            if let Err(err) = outcome {
+                return Ok((deleted, Some(err)));
+            }
+            deleted.push(path);
+        }
+        Ok((deleted, None))
+    })
+    .await?;
+    let (deleted, failure) = deleted;
+    for path in &deleted {
+        record(&state, &user, "delete", &format!("{}:{path}", body.remote));
+    }
+    if let Some(err) = failure {
+        return Err(ApiError::new(StatusCode::BAD_GATEWAY, if deleted.is_empty() { err } else { format!("Deleted {} of {}: {err}", deleted.len(), body.paths.len()) }));
+    }
+    Ok(Json(json!({ "deleted": deleted.len() })))
 }
 
 // ---- Signing MCP clients in with OAuth (oauth.rs) ----

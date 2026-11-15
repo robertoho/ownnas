@@ -2,6 +2,10 @@
 // Nextcloud, S3 buckets…), browsed like folders. Files open in a preview or download, streamed
 // through the server's rclone. Administrators choose who else sees each remote, and where
 // rclone and its config file are. Loaded on demand by app.js, which calls show() and hide().
+//
+// Files and folders have the library's context menu and clipboard (app.js's): copied or cut
+// here, they paste into another remote's folder or the library's, and the library's paste here.
+// The server's rclone does the copying, followed in the jobs panel.
 
 const TEXT_EXTENSIONS = new Set(["txt", "md", "markdown", "log", "csv", "tsv", "json", "xml", "yml", "yaml", "toml", "ini", "conf", "cfg", "sh", "bash", "zsh", "py", "js", "mjs", "ts", "rs", "go", "java", "c", "h", "cpp", "hpp", "cs", "php", "rb", "pl", "sql", "html", "htm", "css", "env", "properties", "gitignore", "dockerfile", "service", "srt", "vtt"]);
 const IMAGE_EXTENSIONS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif", "ico"]);
@@ -32,6 +36,10 @@ function el(tag, attrs = {}, ...children) {
   }
   return node;
 }
+
+const esc = (text) => String(text).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || "");
 
 const extensionOf = (name) => (name.includes(".") ? name.split(".").pop().toLowerCase() : "");
 
@@ -80,6 +88,12 @@ export function mountRemotes(host, ctx) {
   let entries = [];
   let filter = "";
   let asked = 0;
+  /// The full paths chosen in the folder shown, and where a Shift+click range starts.
+  let selected = new Set();
+  let anchor = "";
+  /// The entries shown (the filter applied), in order.
+  let shown = [];
+  const coarse = window.matchMedia("(pointer: coarse)");
 
   // rclone gives each entry's path from the remote's top.
   const fullPath = (entry) => entry.path || (path ? `${path}/${entry.name}` : entry.name);
@@ -133,7 +147,7 @@ export function mountRemotes(host, ctx) {
     });
     const form = el("form", { method: "dialog" },
       el("h3", {}, `Who can use “${item.name}”`),
-      el("p", { class: "muted" }, "Administrators can use every remote. They see its files, and can open and download them."),
+      el("p", { class: "muted" }, "Administrators can use every remote. They see its files, open and download them, and can copy, move, rename and delete them (unless the server is read-only)."),
       users.length ? el("div", { class: "remotes-access-users" }, boxes) : el("p", { class: "muted" }, "There are no other accounts yet. Add them in Settings > Users."),
       el("div", { class: "dialog-actions" },
         el("span", { class: "spacer" }),
@@ -200,22 +214,29 @@ export function mountRemotes(host, ctx) {
     const search = el("input", { type: "search", class: "remotes-filter", placeholder: "Filter this folder", "aria-label": "Filter this folder", value: filter });
     const refresh = el("button", { type: "button", title: "Look again" }, "Refresh");
     refresh.addEventListener("click", () => openFolder(remote, path));
-    const list = el("div", { class: "remotes-list", role: "list" });
+    const list = el("div", { class: "remotes-list", role: "listbox", "aria-multiselectable": "true" });
     const paintList = () => {
-      const shown = entries.filter((entry) => !filter || entry.name.toLowerCase().includes(filter.toLowerCase()));
+      shown = entries.filter((entry) => !filter || entry.name.toLowerCase().includes(filter.toLowerCase()));
       list.replaceChildren(...shown.map((entry) => {
-        const row = el("div", { class: `remote-row${entry.dir ? " is-dir" : ""}`, role: "listitem", tabindex: "0" },
+        const row = el("div", { class: `remote-row${entry.dir ? " is-dir" : ""}`, role: "option", tabindex: "0", "data-path": fullPath(entry) },
           el("span", { class: "remote-row-icon", "aria-hidden": "true" }, entry.dir ? "📁" : iconFor(entry)),
           el("span", { class: "remote-row-name", title: entry.name }, entry.name),
           el("span", { class: "remote-row-size muted" }, entry.dir ? "" : formatSize(entry.size)),
           el("span", { class: "remote-row-date muted" }, formatDate(entry.modified)),
           entry.dir ? el("span", {}) : el("a", { class: "remote-row-download", href: fileUrl(entry, true), title: "Download", "aria-label": `Download ${entry.name}`, onclick: (event) => event.stopPropagation() }, "⬇"));
-        const open = () => (entry.dir ? (location.hash = hashFor(remote, fullPath(entry))) : preview(entry, shown.filter((other) => !other.dir)));
-        row.addEventListener("click", open);
-        row.addEventListener("keydown", (event) => { if (event.key === "Enter") open(); });
+        row.addEventListener("click", (event) => {
+          // On touch screens a tap opens, as before, unless items are being chosen.
+          if (coarse.matches && !selected.size && !event.metaKey && !event.ctrlKey && !event.shiftKey) {
+            openEntry(entry);
+            return;
+          }
+          choose(entry, event);
+        });
+        row.addEventListener("dblclick", () => openEntry(entry));
         return row;
       }));
       count.textContent = loading ? "" : `${shown.length === entries.length ? entries.length : `${shown.length} of ${entries.length}`} item${entries.length === 1 ? "" : "s"}`;
+      paintSelection();
     };
     const count = el("span", { class: "muted remotes-count" });
     search.addEventListener("input", () => { filter = search.value; paintList(); });
@@ -228,14 +249,243 @@ export function mountRemotes(host, ctx) {
     if (!loading && !error) paintList();
   }
 
+  function openEntry(entry) {
+    if (entry.dir) location.hash = hashFor(remote, fullPath(entry));
+    else preview(entry, shown.filter((other) => !other.dir));
+  }
+
+  // ---- Choosing items, as in the library ----
+
+  const selectedEntries = () => shown.filter((entry) => selected.has(fullPath(entry)));
+
+  function choose(entry, event) {
+    const key = fullPath(entry);
+    if (event.shiftKey && anchor) {
+      const keys = shown.map(fullPath);
+      const [from, to] = [keys.indexOf(anchor), keys.indexOf(key)].sort((a, b) => a - b);
+      if (from >= 0) {
+        selected = new Set(keys.slice(from, to + 1));
+        paintSelection();
+        return;
+      }
+    }
+    if (event.metaKey || event.ctrlKey) {
+      if (selected.has(key)) selected.delete(key);
+      else selected.add(key);
+    } else {
+      selected = new Set([key]);
+    }
+    anchor = key;
+    paintSelection();
+  }
+
+  /// Marks the chosen rows, and the ones cut to the clipboard.
+  function paintSelection() {
+    const clip = ctx.clipboard();
+    const cut = new Set(clip && clip.mode === "cut" ? clip.items.filter((item) => item.remote === remote).map((item) => item.path) : []);
+    host.querySelectorAll(".remote-row[data-path]").forEach((row) => {
+      const on = selected.has(row.dataset.path);
+      row.classList.toggle("selected", on);
+      row.setAttribute("aria-selected", on ? "true" : "false");
+      row.classList.toggle("cut", cut.has(row.dataset.path));
+    });
+  }
+
+  // ---- The context menu ----
+
+  const menuButton = (action, label, danger = false) => `<button type="button" data-menu="${action}"${danger ? ' class="danger"' : ""}>${esc(label)}</button>`;
+
+  /// The menu for the items chosen, or (none chosen) for the folder shown.
+  function openMenu(x, y) {
+    const write = ctx.canWrite();
+    const items = selectedEntries();
+    const clip = ctx.clipboard();
+    const pasting = write && clip && clip.items.length;
+    const one = items.length === 1 ? items[0] : null;
+    const buttons = [];
+    if (items.length) {
+      buttons.push(`<div class="menu-label">${esc(one ? one.name : `${items.length} items`)}</div>`);
+      if (one) buttons.push(menuButton("open", "Open"));
+      if (items.every((entry) => !entry.dir)) buttons.push(menuButton("download", "Download"));
+      buttons.push(menuButton("copy", "Copy"));
+      if (write) buttons.push(menuButton("cut", "Cut"));
+      if (pasting) buttons.push(menuButton("paste", one && one.dir ? "Paste into folder" : "Paste"));
+      if (write && one) buttons.push(menuButton("rename", "Rename"));
+      if (write) buttons.push(menuButton("delete", "Delete", true));
+    } else {
+      buttons.push(`<div class="menu-label">${esc(path ? path.split("/").pop() : `${remote}:`)}</div>`);
+      if (write) buttons.push(menuButton("mkdir", "New folder"));
+      if (pasting) buttons.push(menuButton("paste", "Paste"));
+      if (shown.length) buttons.push(menuButton("selectAll", "Select all"));
+      buttons.push(menuButton("refresh", "Refresh"));
+    }
+    const into = one && one.dir ? fullPath(one) : path;
+    ctx.openMenu(x, y, buttons.join(""), (action) => run(action, items, into));
+  }
+
+  function run(action, items, into) {
+    const fail = (err) => ctx.toast(err.message, true);
+    const one = items.length === 1 ? items[0] : null;
+    if (action === "open" && one) openEntry(one);
+    if (action === "download") download(items);
+    if (action === "copy" || action === "cut") toClipboard(action, items);
+    if (action === "paste") paste(into);
+    if (action === "rename" && one) rename(one).catch(fail);
+    if (action === "delete") remove(items).catch(fail);
+    if (action === "mkdir") makeFolder().catch(fail);
+    if (action === "selectAll") selectAll();
+    if (action === "refresh") openFolder(remote, path);
+  }
+
+  function selectAll() {
+    selected = new Set(shown.map(fullPath));
+    anchor = shown.length ? fullPath(shown[0]) : "";
+    paintSelection();
+  }
+
+  function toClipboard(mode, items) {
+    if (!items.length) return;
+    ctx.setClipboard(mode, items.map((entry) => ({ remote, path: fullPath(entry), name: entry.name, dir: entry.dir })));
+    paintSelection();
+  }
+
+  function paste(into) {
+    const clip = ctx.clipboard();
+    if (!clip || !clip.items.length || !ctx.canWrite()) return;
+    ctx.paste({ remote, path: into }).catch((err) => ctx.toast(err.message, true));
+  }
+
+  /// Files download one after another (a remote's folder cannot be zipped on the way).
+  function download(items) {
+    const files = items.filter((entry) => !entry.dir);
+    files.forEach((entry, index) => {
+      setTimeout(() => {
+        const link = el("a", { href: fileUrl(entry, true), download: entry.name, hidden: true });
+        document.body.append(link);
+        link.click();
+        link.remove();
+      }, index * 400);
+    });
+  }
+
+  async function rename(entry) {
+    const name = ((await ctx.askText("Rename", "New name", entry.name, "Rename", { watchExtensionFrom: entry.dir ? "" : entry.name })) || "").trim();
+    if (!name || name === entry.name) return;
+    const answer = await ctx.api("/api/remotes/rename", { method: "POST", json: { remote, path: fullPath(entry), name } });
+    ctx.toast("Renamed");
+    selected = new Set([answer.path]);
+    await openFolder(remote, path, true);
+  }
+
+  async function remove(items) {
+    if (!items.length) return;
+    const what = items.length === 1 ? `“${items[0].name}”` : `${items.length} items`;
+    const folders = items.some((entry) => entry.dir) ? " Folders go with everything in them." : "";
+    if (!await ctx.askConfirm(`Delete ${what} from ${remote}?${folders} This cannot be undone here.`, "Delete")) return;
+    try {
+      await ctx.api("/api/remotes/delete", { method: "POST", json: { remote, paths: items.map(fullPath) } });
+      ctx.toast(items.length === 1 ? "Deleted" : `Deleted ${items.length} items`);
+    } finally {
+      selected = new Set();
+      await openFolder(remote, path, true);
+    }
+  }
+
+  async function makeFolder() {
+    const name = ((await ctx.askText("New folder", "Folder name", "New folder", "Create")) || "").trim();
+    if (!name) return;
+    const answer = await ctx.api("/api/remotes/mkdir", { method: "POST", json: { remote, path, name } });
+    ctx.toast("Folder created");
+    selected = new Set([answer.path]);
+    await openFolder(remote, path, true);
+  }
+
+  host.addEventListener("contextmenu", (event) => {
+    if (!remote || host.hidden || event.target.closest("input, textarea, a.remote-row-download")) return;
+    const row = event.target.closest(".remote-row[data-path]");
+    event.preventDefault();
+    // Ctrl+click chooses more items (as in the library), it does not open the menu.
+    if (event.ctrlKey) {
+      if (!row) return;
+      if (selected.has(row.dataset.path)) selected.delete(row.dataset.path);
+      else selected.add(row.dataset.path);
+      paintSelection();
+      return;
+    }
+    if (row) {
+      if (!selected.has(row.dataset.path)) {
+        selected = new Set([row.dataset.path]);
+        anchor = row.dataset.path;
+      }
+    } else {
+      selected = new Set();
+    }
+    paintSelection();
+    openMenu(event.clientX, event.clientY);
+  });
+
+  // A click on empty space lets go of what was chosen.
+  host.addEventListener("click", (event) => {
+    if (!remote || event.target.closest(".remote-row, button, a, input")) return;
+    if (!selected.size) return;
+    selected = new Set();
+    paintSelection();
+  });
+
+  /// The keys of the library, for a remote's folder.
+  function keydown(event) {
+    if (!remote) return;
+    const key = event.key.toLowerCase();
+    const command = event.metaKey || event.ctrlKey;
+    const write = ctx.canWrite();
+    const items = selectedEntries();
+    if (command && key === "a") {
+      event.preventDefault();
+      selectAll();
+    } else if (command && (key === "c" || (key === "x" && write)) && items.length) {
+      event.preventDefault();
+      toClipboard(key === "c" ? "copy" : "cut", items);
+    } else if (write && items.length && (event.key === "Delete" || (IS_MAC && event.metaKey && event.key === "Backspace"))) {
+      event.preventDefault();
+      remove(items).catch((err) => ctx.toast(err.message, true));
+    } else if (write && items.length === 1 && event.key === "F2") {
+      event.preventDefault();
+      rename(items[0]).catch((err) => ctx.toast(err.message, true));
+    } else if (event.key === "Enter" && items.length === 1 && !event.target.closest("button, a, input")) {
+      event.preventDefault();
+      openEntry(items[0]);
+    } else if (event.key === "Escape" && selected.size) {
+      selected = new Set();
+      paintSelection();
+    } else if ((event.key === "ArrowDown" || event.key === "ArrowUp") && shown.length && !command) {
+      event.preventDefault();
+      const keys = shown.map(fullPath);
+      const at = keys.indexOf(anchor);
+      const next = Math.max(0, Math.min(keys.length - 1, at < 0 ? 0 : at + (event.key === "ArrowDown" ? 1 : -1)));
+      if (event.shiftKey && anchor) selected.add(keys[next]);
+      else selected = new Set([keys[next]]);
+      anchor = keys[next];
+      paintSelection();
+      host.querySelector(`.remote-row[data-path="${CSS.escape(keys[next])}"]`)?.scrollIntoView({ block: "nearest" });
+    } else if (event.key === "Backspace" && !command && path) {
+      event.preventDefault();
+      location.hash = hashFor(remote, path.split("/").slice(0, -1).join("/"));
+    }
+  }
+
   function iconFor(entry) {
     const kind = previewKind(entry);
     return { image: "🖼", video: "🎞", audio: "🎵", pdf: "📕", text: "📄" }[kind] || "📄";
   }
 
-  async function openFolder(name, folder) {
+  /// Shows a folder of a remote; `keep`: the same folder again, keeping what is chosen.
+  async function openFolder(name, folder, keep = false) {
     const ticket = ++asked;
     if (name !== remote) filter = "";
+    if (!keep && (name !== remote || folder !== path)) {
+      selected = new Set();
+      anchor = "";
+    }
     remote = name;
     path = folder;
     entries = [];
@@ -312,6 +562,9 @@ export function mountRemotes(host, ctx) {
       host.hidden = false;
       const { remote: name, path: folder } = parseHash(hash);
       if (!name) {
+        remote = "";
+        path = "";
+        selected = new Set();
         host.replaceChildren(el("p", { class: "remotes-empty" }, el("span", { class: "spinner", "aria-hidden": "true" }), " Asking rclone…"));
         try {
           await loadOverview(true);
@@ -326,6 +579,29 @@ export function mountRemotes(host, ctx) {
     hide() {
       host.hidden = true;
       asked += 1;
+    },
+    keydown,
+    /// Pastes the clipboard into the folder shown.
+    pasteHere() {
+      if (!remote) {
+        ctx.toast("Open a folder of a remote to paste into", true);
+        return;
+      }
+      paste(path);
+    },
+    /// The menu, from the touch screens' button; false on the list of remotes.
+    openMenuAt(x, y) {
+      if (!remote) return false;
+      openMenu(x, y);
+      return true;
+    },
+    /// The clipboard changed.
+    repaint() {
+      if (remote) paintSelection();
+    },
+    /// Something was copied or moved: shows the folder again.
+    refresh() {
+      if (remote && !host.hidden) openFolder(remote, path, true);
     },
   };
 }
