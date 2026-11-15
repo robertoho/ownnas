@@ -1774,6 +1774,12 @@ function setSettingsTab(tab) {
 let indexStatusTimer = 0;
 
 function describeIndexStatus(status) {
+  const text = describeIndexWork(status);
+  const working = status.scanning || status.analyzing || (status.thumbnailing && status.thumbsDone < status.thumbsTotal);
+  return status.pausedForBackup && working ? `${text} Waiting for the backup to finish.` : text;
+}
+
+function describeIndexWork(status) {
   const count = `${Number(status.total).toLocaleString()} photos and videos indexed`;
   if (status.scanning) return `Looking through the library… ${Number(status.seen).toLocaleString()} found so far.`;
   if (status.analyzing) {

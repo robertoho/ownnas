@@ -476,6 +476,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/nas-backup/run", post(run_nas_backup))
         .route("/api/nas-backup/verify", post(verify_nas_backup))
         .route("/api/nas-backup/stop", post(stop_nas_backup))
+        .route("/api/nas-backup/tidy", post(tidy_nas_backup))
         .route("/api/nas-backup/snapshots", get(nas_backup_snapshots))
         .route("/api/nas-backup/browse", get(browse_nas_backup))
         .route("/api/nas-backup/restore", post(restore_nas_backup))
@@ -8171,6 +8172,11 @@ async fn nas_backup_status(State(state): State<std::sync::Arc<AppState>>, header
         "passwordSet": !secrets.password.is_empty(),
         "s3SecretSet": !secrets.s3_secret.is_empty(),
         "state": backup,
+        // What is free where a drive backup goes.
+        "space": (config.destination.kind == "local" && !config.destination.path.is_empty())
+            .then(|| crate::nas_backup::free_space(std::path::Path::new(&config.destination.path)))
+            .flatten()
+            .map(|(total, available)| json!({ "total": total, "available": available })),
         "progress": state.nas_backup.progress(),
         "next": if config.enabled { crate::nas_backup::next_slot(&config, now) } else { None },
         "alert": crate::nas_backup::alert(&config, &backup, now),
@@ -8302,7 +8308,7 @@ async fn reveal_nas_backup_password(
 }
 
 /// Starts a backup (or a check of the backup) in the background.
-async fn start_nas_backup(state: std::sync::Arc<AppState>, headers: HeaderMap, verify: bool) -> Result<Json<serde_json::Value>, ApiError> {
+async fn start_nas_backup(state: std::sync::Arc<AppState>, headers: HeaderMap, what: &'static str) -> Result<Json<serde_json::Value>, ApiError> {
     check_csrf(&headers)?;
     let (user, _) = require_user(&state, &headers)?;
     require_admin(&user)?;
@@ -8314,7 +8320,11 @@ async fn start_nas_backup(state: std::sync::Arc<AppState>, headers: HeaderMap, v
     let db_path = state.db_path.clone();
     std::thread::spawn(move || {
         let Ok(conn) = db::open(&db_path) else { return };
-        let _ = if verify { worker.verify(&ctx, &conn, "5%") } else { worker.backup(&ctx, &conn).map(|_| ()) };
+        let _ = match what {
+            "verify" => worker.verify(&ctx, &conn, "5%"),
+            "tidy" => worker.tidy(&ctx, &conn),
+            _ => worker.backup(&ctx, &conn).map(|_| ()),
+        };
     });
     // Let the worker claim itself, so the page sees it running.
     for _ in 0..20 {
@@ -8323,16 +8333,21 @@ async fn start_nas_backup(state: std::sync::Arc<AppState>, headers: HeaderMap, v
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    record(&state, &user, if verify { "backup-verify" } else { "backup-run" }, "");
+    record(&state, &user, &format!("backup-{what}"), "");
     Ok(Json(json!({ "started": true, "progress": state.nas_backup.progress() })))
 }
 
 async fn run_nas_backup(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
-    start_nas_backup(state, headers, false).await
+    start_nas_backup(state, headers, "run").await
 }
 
 async fn verify_nas_backup(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
-    start_nas_backup(state, headers, true).await
+    start_nas_backup(state, headers, "verify").await
+}
+
+/// Frees room at a full destination (see `NasBackup::tidy`).
+async fn tidy_nas_backup(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    start_nas_backup(state, headers, "tidy").await
 }
 
 async fn stop_nas_backup(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {

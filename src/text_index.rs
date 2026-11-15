@@ -133,7 +133,7 @@ impl TextIndex {
                 if read.is_empty() {
                     return Ok(());
                 }
-                crate::db_watch::pause_point();
+                crate::db_watch::heavy_pause_point();
                 store(&conn, read)?;
                 let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());
                 status.done += read.len() as u64;

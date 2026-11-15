@@ -37,6 +37,14 @@ const VERIFY_EVERY: i64 = 30 * 86400;
 /// After a failed run, it is tried again this much later, a few times.
 const RETRY_AFTER: i64 = 3600;
 const RETRIES: u32 = 3;
+/// A backup does not start with less room than this at the destination (on a drive) or in
+/// OwnNAS's data folder (for the database copy and restic's cache).
+const MIN_FREE: u64 = 512 * 1024 * 1024;
+/// At a drive, a little room is enough to start a backup that adds little: restic writes 16 MB
+/// at a time.
+const MIN_FREE_DESTINATION: u64 = 64 * 1024 * 1024;
+/// How the errors about a full destination begin, so the state can tell them apart.
+const FULL: &str = "The backup destination is full";
 
 // restic's exit codes.
 const EXIT_PARTIAL: i32 = 3;
@@ -88,6 +96,9 @@ pub struct Config {
     pub skip_trash: bool,
     /// restic exclude patterns, such as `*.tmp` or a folder's full path.
     pub excludes: Vec<String>,
+    /// Go easy on this computer: restic at low priority, on half the processor's cores and
+    /// reading one file at a time, with the thumbnail, photo, and text indexers waiting.
+    pub gentle: bool,
     /// When the schedule was last saved: slots before it are not caught up on.
     pub saved_at: i64,
 }
@@ -105,6 +116,7 @@ impl Default for Config {
             keep_monthly: 12,
             skip_trash: true,
             excludes: Vec::new(),
+            gentle: true,
             saved_at: 0,
         }
     }
@@ -145,6 +157,11 @@ pub struct State {
     pub last_summary: Option<Summary>,
     pub last_success: i64,
     pub failures_in_row: u32,
+    /// The last run failed because there was no room left: trying again in an hour would not help.
+    pub full: bool,
+    /// The last "Free up space": when it ended, and why it failed.
+    pub last_tidied: i64,
+    pub tidy_error: Option<String>,
     pub last_verified: i64,
     pub verify_result: String,
     pub verify_error: Option<String>,
@@ -434,7 +451,7 @@ fn due_in<Tz: chrono::TimeZone>(config: &Config, state: &State, now: i64, tz: &T
     if !config.enabled {
         return false;
     }
-    if state.last_result == "failed" && state.failures_in_row > 0 && state.failures_in_row <= RETRIES && now - state.last_finished >= RETRY_AFTER {
+    if state.last_result == "failed" && !state.full && state.failures_in_row > 0 && state.failures_in_row <= RETRIES && now - state.last_finished >= RETRY_AFTER {
         return config.frequency != "manual";
     }
     match slots_in(config, now, tz).filter(|&slot| slot <= now).last() {
@@ -491,6 +508,12 @@ impl Context {
             .env_remove("RESTIC_PASSWORD_COMMAND")
             .env_remove("RESTIC_REPOSITORY_FILE")
             .stdin(Stdio::null());
+        // The commands that read or write the whole backup.
+        if self.config.gentle && matches!(args.first(), Some(&("backup" | "check" | "forget" | "prune" | "restore"))) {
+            let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+            cmd.env("GOMAXPROCS", (cores / 2).max(1).to_string());
+            lower_priority(&mut cmd);
+        }
         if d.kind == "s3" {
             cmd.env("AWS_ACCESS_KEY_ID", &d.access_key_id).env("AWS_SECRET_ACCESS_KEY", &self.secrets.s3_secret);
             if !d.region.is_empty() {
@@ -520,6 +543,142 @@ impl Context {
         out.extend(self.config.excludes.iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()));
         out
     }
+}
+
+/// How errors about OwnNAS's own data folder being full begin.
+const DATA_FULL: &str = "OwnNAS's data folder is almost full";
+
+/// The space on the disk that holds `path` (or would hold it, when it does not exist yet):
+/// its size and what is free.
+pub fn free_space(path: &Path) -> Option<(u64, u64)> {
+    let existing = path.ancestors().find(|a| a.exists())?;
+    let stats = fs4::statvfs(existing).ok()?;
+    Some((stats.total_space(), stats.available_space()))
+}
+
+fn size_text(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["bytes", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 { format!("{bytes} bytes") } else { format!("{value:.1} {}", UNITS[unit]) }
+}
+
+fn full_text(available: Option<u64>) -> String {
+    let left = available.map(|a| format!(" ({} left)", size_text(a))).unwrap_or_default();
+    format!(
+        "{FULL}{left}. Make room there, keep fewer snapshots (then choose Free up space), or leave large folders out of the backup, then back up again. \
+         Your earlier snapshots are unharmed."
+    )
+}
+
+/// Whether restic stopped because a disk or a quota was full.
+fn ran_out_of_space(finished: &Finished) -> bool {
+    let text = format!("{}\n{}", finished.stderr, finished.stdout).to_ascii_lowercase();
+    ["no space left on device", "disk quota exceeded", "not enough space on the disk", "insufficient storage", "quotaexceeded", "storage quota", "file too large"]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+impl Context {
+    /// The message for a restic command that ran out of room: at the destination, or in
+    /// OwnNAS's data folder (restic's cache is there).
+    fn full_error(&self, finished: &Finished) -> Option<String> {
+        if !ran_out_of_space(finished) {
+            return None;
+        }
+        let data = self.data.display().to_string();
+        let ours = finished.stderr.lines().any(|line| line.contains(&data) && line.to_ascii_lowercase().contains("space"));
+        if ours {
+            let left = free_space(&self.data).map(|(_, a)| format!(" ({} left)", size_text(a))).unwrap_or_default();
+            return Some(format!("{DATA_FULL}{left}: restic keeps its cache there ({}). Make room on that disk, then back up again.", self.data.join(CACHE_DIR).display()));
+        }
+        // Not what is left: once what this run copied is removed, that is more than now.
+        Some(full_text(None))
+    }
+}
+
+/// Holds OwnNAS's heavy indexers while a backup runs, until dropped.
+struct HoldIndexing(bool);
+
+impl HoldIndexing {
+    fn new(hold: bool) -> Self {
+        if hold {
+            crate::db_watch::hold_for_backup(true);
+        }
+        Self(hold)
+    }
+}
+
+impl Drop for HoldIndexing {
+    fn drop(&mut self) {
+        if self.0 {
+            crate::db_watch::hold_for_backup(false);
+        }
+    }
+}
+
+/// Runs restic below everything else: the processor and the disk go to people using OwnNAS
+/// first, and the backup gets what is left.
+#[cfg(unix)]
+fn lower_priority(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" {
+        fn setiopolicy_np(iotype: libc::c_int, scope: libc::c_int, policy: libc::c_int) -> libc::c_int;
+    }
+    // SAFETY: only system calls run between fork and exec, and their failures are ignored.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpriority(libc::PRIO_PROCESS, 0, 15);
+            // The idle class: the disk serves restic when nothing else is waiting.
+            #[cfg(target_os = "linux")]
+            libc::syscall(libc::SYS_ioprio_set, 1, 0, 3 << 13);
+            // IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, IOPOL_UTILITY; kept across exec.
+            #[cfg(target_os = "macos")]
+            setiopolicy_np(0, 0, 4);
+            Ok(())
+        });
+    }
+}
+
+#[cfg(windows)]
+fn lower_priority(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+    cmd.creation_flags(BELOW_NORMAL_PRIORITY_CLASS);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lower_priority(_: &mut Command) {}
+
+/// `restic forget` with the keep rules, and `--prune` last.
+fn keep_rules(c: &Config) -> Vec<String> {
+    [
+        "forget".to_string(), "--tag".into(), TAG.into(), "--host".into(), HOST.into(),
+        "--keep-last".into(), "1".into(),
+        "--keep-daily".into(), c.keep_daily.to_string(),
+        "--keep-weekly".into(), c.keep_weekly.to_string(),
+        "--keep-monthly".into(), c.keep_monthly.to_string(),
+        "--prune".into(),
+    ]
+    .into()
+}
+
+/// Interrupts restic as Ctrl+C would (killing it where that is not possible).
+fn interrupt(child: &Mutex<Child>) {
+    let mut child = child.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(unix)]
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: a signal to the child, which has not been waited for, so its id is still its own.
+        if unsafe { libc::kill(pid, libc::SIGINT) } == 0 {
+            return;
+        }
+    }
+    let _ = child.kill();
 }
 
 /// What a finished restic command printed, and how it ended.
@@ -559,6 +718,9 @@ fn error_text(finished: &Finished) -> String {
 /// Adds what to do about the errors people run into most.
 fn explain(line: &str) -> String {
     let lower = line.to_ascii_lowercase();
+    if lower.contains("no space left on device") || lower.contains("disk quota exceeded") {
+        return full_text(None);
+    }
     if lower.contains("permission denied (publickey") || lower.contains("host key verification failed") {
         return format!("The other machine did not accept this computer's SSH key. Add the key shown on this page to its ~/.ssh/authorized_keys. ({line})");
     }
@@ -678,6 +840,12 @@ impl NasBackup {
                         gave_up = true;
                         let _ = watched.lock().unwrap_or_else(|e| e.into_inner()).kill();
                     }
+                    // restic would retry writing to a full disk for many minutes: it is
+                    // interrupted at once instead (as with Ctrl+C, so it removes its lock).
+                    if !gave_up && line.to_ascii_lowercase().contains("no space left on device") {
+                        gave_up = true;
+                        interrupt(&watched);
+                    }
                     if text.len() < 1 << 20 {
                         text.push_str(&line);
                         text.push('\n');
@@ -739,6 +907,7 @@ impl NasBackup {
     /// check that the backup reads back.
     pub fn backup(&self, ctx: &Context, conn: &rusqlite::Connection) -> Result<Summary, String> {
         self.begin("backup", "Getting ready")?;
+        let _held = HoldIndexing::new(ctx.config.gentle);
         let mut state = load_state(conn);
         state.last_started = crate::db::now_secs();
         save_state(conn, &state);
@@ -752,6 +921,7 @@ impl NasBackup {
                 state.last_summary = Some(summary.clone());
                 state.last_success = state.last_finished;
                 state.failures_in_row = 0;
+                state.full = false;
             }
             Err(err) if self.stopped() || err == "Stopped" => {
                 state.last_result = "stopped".into();
@@ -761,9 +931,22 @@ impl NasBackup {
                 state.last_result = "failed".into();
                 state.last_error = Some(err.clone());
                 state.failures_in_row += 1;
+                state.full = err.starts_with(FULL) || err.starts_with(DATA_FULL);
             }
         }
         save_state(conn, &state);
+        // What the run copied before the destination filled up is of no use (restic had not
+        // written down what is in it yet): it goes, so the destination has its room back.
+        if matches!(&result, Err(err) if err.starts_with(FULL)) && !self.stopped() {
+            let tidied = self.tidy_steps(ctx, conn);
+            let mut state = load_state(conn);
+            state.last_tidied = crate::db::now_secs();
+            state.tidy_error = tidied.err();
+            if state.tidy_error.is_none() {
+                state.last_error = state.last_error.map(|e| format!("{e} What this run copied was removed again."));
+            }
+            save_state(conn, &state);
+        }
         if result.is_ok() && !self.stopped() && state.last_finished - state.last_verified > VERIFY_EVERY {
             let _ = self.verify_steps(ctx, conn, "2%");
         }
@@ -772,6 +955,25 @@ impl NasBackup {
     }
 
     fn backup_steps(&self, ctx: &Context, conn: &rusqlite::Connection) -> Result<Summary, String> {
+        let d = &ctx.config.destination;
+        if d.kind == "local" {
+            let folder = Path::new(&d.path);
+            // A drive that is not plugged in leaves an empty folder where it mounts, on the
+            // system's own disk: a new backup there would fill that disk.
+            if !folder.exists() && load_state(conn).last_success > 0 {
+                return Err(format!("The backup folder {} is not there. Is the backup drive connected?", folder.display()));
+            }
+            if let Some((_, available)) = free_space(folder) {
+                if available < MIN_FREE_DESTINATION {
+                    return Err(full_text(Some(available)));
+                }
+            }
+        }
+        if let Some((_, available)) = free_space(&ctx.data) {
+            if available < MIN_FREE {
+                return Err(format!("{DATA_FULL} ({} left): the backup needs room there for a copy of the database and its cache.", size_text(available)));
+            }
+        }
         // A consistent copy of the database, taken while OwnNAS keeps running.
         let staging = ctx.data.join(STAGING_DIR);
         std::fs::create_dir_all(&staging).map_err(|_| "Could not prepare the database copy".to_string())?;
@@ -789,6 +991,10 @@ impl NasBackup {
         let root = ctx.root.display().to_string();
         let data = ctx.data.display().to_string();
         let mut args: Vec<String> = ["backup", "--json", "--tag", TAG, "--host", HOST].iter().map(|s| s.to_string()).collect();
+        if ctx.config.gentle {
+            // One file at a time (restic reads two): a hard disk is not kept seeking between them.
+            args.extend(["--read-concurrency".into(), "1".into()]);
+        }
         for pattern in ctx.excludes() {
             args.push("--exclude".into());
             args.push(pattern);
@@ -805,7 +1011,7 @@ impl NasBackup {
             _ => {}
         })?;
         if finished.code != 0 && finished.code != EXIT_PARTIAL {
-            return Err(error_text(&finished));
+            return Err(ctx.full_error(&finished).unwrap_or_else(|| error_text(&finished)));
         }
         summary.unreadable = unreadable;
         let _ = std::fs::remove_file(&copy);
@@ -814,21 +1020,44 @@ impl NasBackup {
             p.phase = "Removing old snapshots".into();
             p.current = None;
         });
-        let c = &ctx.config;
-        let keep = [
-            "forget".to_string(), "--tag".into(), TAG.into(), "--host".into(), HOST.into(), "--prune".into(),
-            "--keep-last".into(), "1".into(),
-            "--keep-daily".into(), c.keep_daily.to_string(),
-            "--keep-weekly".into(), c.keep_weekly.to_string(),
-            "--keep-monthly".into(), c.keep_monthly.to_string(),
-        ];
+        let keep = keep_rules(&ctx.config);
         let refs: Vec<&str> = keep.iter().map(String::as_str).collect();
         let forgot = self.run(ctx.command(&refs), |_| {})?;
         if forgot.code != 0 {
             // The snapshot is safe; only the tidying failed.
-            return Err(format!("The backup worked, but removing old snapshots failed: {}", error_text(&forgot)));
+            return Err(format!("The backup worked, but removing old snapshots failed: {}", ctx.full_error(&forgot).unwrap_or_else(|| error_text(&forgot))));
         }
 
+        self.measure(ctx, conn)?;
+        *self.snapshots.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        Ok(summary)
+    }
+
+    fn tidy_steps(&self, ctx: &Context, conn: &rusqlite::Connection) -> Result<(), String> {
+        self.connect(ctx)?;
+        let _ = self.run(ctx.command(&["unlock"]), |_| {})?;
+        self.set_progress(|p| {
+            p.phase = "Removing snapshots past the keep rules".into();
+            p.current = None;
+        });
+        let keep = keep_rules(&ctx.config);
+        let refs: Vec<&str> = keep[..keep.len() - 1].iter().map(String::as_str).collect();
+        let forgot = self.run(ctx.command(&refs), |_| {})?;
+        if forgot.code != 0 {
+            return Err(ctx.full_error(&forgot).unwrap_or_else(|| error_text(&forgot)));
+        }
+        // Its own step, as `forget --prune` does not prune when no snapshot went. Only files
+        // nothing uses are deleted, none rewritten: that would need room the destination lacks.
+        self.set_progress(|p| p.phase = "Deleting what nothing uses".into());
+        let pruned = self.run(ctx.command(&["prune", "--max-unused", "unlimited"]), |_| {})?;
+        if pruned.code != 0 {
+            return Err(ctx.full_error(&pruned).unwrap_or_else(|| error_text(&pruned)));
+        }
+        self.measure(ctx, conn)
+    }
+
+    /// Writes down what the backup takes at the destination.
+    fn measure(&self, ctx: &Context, conn: &rusqlite::Connection) -> Result<(), String> {
         self.set_progress(|p| p.phase = "Measuring the backup".into());
         let mut stored = None;
         let stats = self.run(ctx.command(&["stats", "--json", "--mode", "raw-data", "--no-lock"]), |value| {
@@ -841,13 +1070,28 @@ impl NasBackup {
             state.stored_bytes = stored;
             save_state(conn, &state);
         }
+        Ok(())
+    }
+
+    /// Frees room at a full destination: snapshots past the keep rules go, and so does what
+    /// backups that did not finish copied. Nothing is rewritten, which would need room itself.
+    pub fn tidy(&self, ctx: &Context, conn: &rusqlite::Connection) -> Result<(), String> {
+        self.begin("tidy", "Freeing space")?;
+        let _held = HoldIndexing::new(ctx.config.gentle);
+        let result = self.tidy_steps(ctx, conn);
+        let mut state = load_state(conn);
+        state.last_tidied = crate::db::now_secs();
+        state.tidy_error = result.as_ref().err().cloned();
+        save_state(conn, &state);
         *self.snapshots.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        Ok(summary)
+        self.end();
+        result
     }
 
     /// Reads back a share of the backup (such as "5%") to check it is all there and intact.
     pub fn verify(&self, ctx: &Context, conn: &rusqlite::Connection, subset: &str) -> Result<(), String> {
         self.begin("verify", "Checking the backup")?;
+        let _held = HoldIndexing::new(ctx.config.gentle);
         let result = self.verify_steps(ctx, conn, subset);
         self.end();
         result
@@ -1164,6 +1408,10 @@ mod tests {
         assert!(due_in(&c, &s, now, &chrono::Utc));
         s.failures_in_row = RETRIES + 1;
         assert!(!due_in(&c, &s, now, &chrono::Utc));
+        // A full destination is not: it waits for the next slot.
+        s.failures_in_row = 1;
+        s.full = true;
+        assert!(!due_in(&c, &s, now, &chrono::Utc));
         c.enabled = false;
         assert!(!due_in(&c, &State::default(), now, &chrono::Utc));
     }
@@ -1179,6 +1427,29 @@ mod tests {
         assert_eq!(alert(&c, &late, now).unwrap()["problem"], "late");
         let failed = State { last_result: "failed".into(), last_error: Some("x".into()), ..State::default() };
         assert_eq!(alert(&c, &failed, now).unwrap()["problem"], "failed");
+    }
+
+    #[test]
+    fn running_out_of_space() {
+        let finished = |stderr: &str| Finished { code: 1, stdout: String::new(), stderr: stderr.into() };
+        let ctx = Context {
+            restic: "restic".into(),
+            root: "/library".into(),
+            data: "/var/ownnas".into(),
+            db_path: "/var/ownnas/ownnas.db".into(),
+            config: Config { destination: Destination { kind: "sftp".into(), ..Destination::default() }, ..Config::default() },
+            secrets: Secrets::default(),
+        };
+        let full = finished("Save(<data/1f2e>) returned error, retrying after 552ms: write /mnt/backup/data/1f/1f2e: no space left on device");
+        assert!(ctx.full_error(&full).unwrap().starts_with(FULL));
+        let cache = finished("Fatal: unable to save to cache: write /var/ownnas/backup-cache/abc/data/12: no space left on device");
+        assert!(ctx.full_error(&cache).unwrap().starts_with(DATA_FULL), "restic's cache is in OwnNAS's data folder");
+        assert!(ctx.full_error(&finished("Fatal: wrong password or no key found")).is_none());
+        assert!(explain("write /x: disk quota exceeded").starts_with(FULL));
+        assert!(Config::default().gentle, "backups go easy on the computer unless told otherwise");
+        let old: Config = serde_json::from_str(r#"{"enabled":true,"frequency":"daily"}"#).unwrap();
+        assert!(old.gentle, "settings saved before the option have it on");
+        assert_eq!(size_text(1_500_000_000), "1.5 GB");
     }
 
     #[test]

@@ -846,7 +846,7 @@ export function mountGallery(root, ctx) {
         } catch {}
       }, 2000);
     } else if (info.thumbnailing && info.thumbsDone < info.thumbsTotal) {
-      status.textContent = `${plural(info.total, "photo or video", "photos and videos")} · making thumbnails ${number(info.thumbsDone)} of ${number(info.thumbsTotal)}`;
+      status.textContent = `${plural(info.total, "photo or video", "photos and videos")} · making thumbnails ${number(info.thumbsDone)} of ${number(info.thumbsTotal)}${info.pausedForBackup ? " · waiting for the backup to finish" : ""}`;
       const mine = generation;
       statusTimer = setTimeout(async () => {
         try {

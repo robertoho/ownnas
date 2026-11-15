@@ -107,6 +107,8 @@ function poll() {
         } else if (before.action === "restore" && done.lastRestore) {
           if (done.lastRestore.error) ctx.toast(`The restore failed: ${done.lastRestore.error}`, true);
           else ctx.toast(`Restored to ${done.lastRestore.to}`);
+        } else if (before.action === "tidy") {
+          ctx.toast(done.tidyError ? `Could not free space: ${done.tidyError}` : "Space freed at the destination", Boolean(done.tidyError));
         } else if (before.action === "verify") {
           ctx.toast(done.verifyResult === "ok" ? "The backup checked out" : `The check found problems: ${done.verifyError}`, done.verifyResult !== "ok");
         }
@@ -133,12 +135,21 @@ function renderStatus() {
   card.append(line);
   if (result === "warning" && state.lastError) card.append(el("p", { class: "text-warning" }, state.lastError));
   if (result === "failed" && state.lastSuccess) card.append(el("p", { class: "muted" }, `The last one that worked was ${when(state.lastSuccess)}.`));
+  if (result === "failed" && state.full) {
+    card.append(el("p", { class: "muted" }, config.frequency === "manual"
+      ? "It is not tried again on its own: once there is room, choose Back up now."
+      : "It is not tried again in an hour, as other failures are: the next scheduled backup tries again, or choose Back up now once there is room."));
+  }
   const facts = [];
   facts.push(`To ${status.where}`);
   if (config.frequency === "manual") facts.push("only when you choose Back up now");
   else if (status.next) facts.push(`next ${when(status.next)}`);
   if (state.storedBytes) facts.push(`it takes ${size(state.storedBytes)} there`);
+  if (status.space) facts.push(`${size(status.space.available)} free of ${size(status.space.total)}`);
   card.append(el("p", { class: "muted" }, `${facts.join(" · ")}.`));
+  if (status.space && status.space.available < Math.max(status.space.total * 0.05, 2e9)) {
+    card.append(el("p", { class: "text-warning" }, `The backup drive is nearly full (${size(status.space.available)} left). Make room there, keep fewer snapshots, or leave large folders out before it runs out.`));
+  }
   if (state.lastVerified) {
     card.append(el("p", { class: state.verifyResult === "ok" ? "muted" : "text-warning" },
       state.verifyResult === "ok" ? `Last checked ${when(state.lastVerified)}: a sample read back correctly.` : `The check ${when(state.lastVerified)} found problems: ${state.verifyError}`));
@@ -148,13 +159,14 @@ function renderStatus() {
     card.append(el("p", { class: "muted" }, `Last restore ${when(state.lastRestore.finished)} went to `, open));
   }
   if (progress) {
-    const label = { backup: "Backing up", restore: "Restoring", verify: "Checking the backup", connect: "Connecting" }[progress.action] || progress.action;
+    const label = { backup: "Backing up", restore: "Restoring", verify: "Checking the backup", connect: "Connecting", tidy: "Freeing space" }[progress.action] || progress.action;
     const bar = el("span");
     bar.style.width = `${Math.round((progress.percent || 0) * 100)}%`;
     const bits = [];
     if (progress.totalFiles) bits.push(`${number(progress.filesDone)} of ${number(progress.totalFiles)} files`);
     if (progress.totalBytes) bits.push(`${size(progress.bytesDone)} of ${size(progress.totalBytes)}`);
     if (progress.secondsRemaining) bits.push(`about ${duration(progress.secondsRemaining)} left`);
+    if (config.gentle && progress.action !== "connect") bits.push("going easy on this computer");
     card.append(el("div", { class: "backup-progress" },
       el("p", {}, el("strong", {}, label), ` · ${progress.phase}`),
       el("div", { class: "backup-bar", role: "progressbar", "aria-valuemin": "0", "aria-valuemax": "100", "aria-valuenow": String(Math.round((progress.percent || 0) * 100)) }, bar),
@@ -169,6 +181,10 @@ function renderStatus() {
       el("button", { type: "button", class: "primary", onclick: () => start("run") }, "Back up now"),
       el("button", { type: "button", onclick: () => start("verify"), title: "Reads back 5% of the backup to check it is complete and intact" }, "Check the backup"),
     );
+    if (state.full) {
+      actions.append(el("button", { type: "button", onclick: () => start("tidy"),
+        title: "Removes the snapshots past the keep rules (after you lower them) and what unfinished backups left at the destination" }, "Free up space"));
+    }
   }
   card.append(actions);
   return card;
@@ -375,6 +391,13 @@ function renderForm() {
     el("label", { class: "check" }, skipTrash, " Leave out the Trash"),
     field("Also leave out", excludes, "One per line: a pattern such as *.iso, or a folder's full path."));
 
+  // How hard.
+  const gentle = el("input", { type: "checkbox" });
+  gentle.checked = config.gentle !== false;
+  form.append(el("h3", {}, "While it runs"),
+    el("label", { class: "check" }, gentle, " Go easy on this computer"),
+    el("p", { class: "muted" }, "restic runs at low priority, on half the processor and reading one file at a time, and OwnNAS's thumbnails and photo and text indexing wait until it ends. Backups take longer, and OwnNAS stays quick. Turn it off to back up as fast as possible."));
+
   const account = el("input", { type: "password", autocomplete: "current-password" });
   form.append(field("Your account password", account, "Needed when you change where backups go or their password."));
   const error = el("p", { class: "form-error", role: "alert" });
@@ -403,6 +426,7 @@ function renderForm() {
         keepMonthly: Number(keepMonthly.value) || 0,
         skipTrash: skipTrash.checked,
         excludes: excludes.value.split("\n"),
+        gentle: gentle.checked,
       },
     };
     if (repoPassword.value && !repoPassword.closest("label").hidden) body.password = repoPassword.value;

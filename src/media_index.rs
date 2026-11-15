@@ -101,6 +101,8 @@ pub struct Status {
     pub analyzing: Option<String>,
     pub analysis_done: u64,
     pub analysis_total: u64,
+    /// Waiting for a backup of the NAS to end before going on.
+    pub paused_for_backup: bool,
 }
 
 /// Runs scans in a background thread: at start, every half hour, and when asked to.
@@ -148,12 +150,13 @@ impl Indexer {
         if !rest.is_zero() {
             std::thread::sleep(rest);
         }
-        crate::db_watch::pause_point();
+        crate::db_watch::heavy_pause_point();
     }
 
     pub fn status(&self) -> Status {
         let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner()).clone();
         status.speed = Some(self.speed());
+        status.paused_for_backup = crate::db_watch::held_for_backup();
         // Asked for and about to begin: whoever asked should wait for it to end.
         status.scanning = status.scanning || *self.wake.lock().unwrap_or_else(|err| err.into_inner());
         status
@@ -486,7 +489,7 @@ fn note_moving(conn: &Connection, root: &Path, live: &[String], pace: &dyn Fn(st
             tx.execute("UPDATE media_index SET motion = 1 WHERE path = ?1 AND motion IS NOT 1", [path]).map_err(sql)?;
         }
         tx.commit().map_err(sql)?;
-        crate::db_watch::pause_point();
+        crate::db_watch::heavy_pause_point();
     }
     loop {
         let waiting: Vec<String> = {

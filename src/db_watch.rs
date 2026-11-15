@@ -44,6 +44,8 @@ static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
 static PAUSED: AtomicBool = AtomicBool::new(false);
 /// Set while a write-ahead log that cannot be emptied is filling the disk.
 static HELD_BACK: AtomicBool = AtomicBool::new(false);
+/// Set while a backup of the NAS runs gently: the heavy indexers wait for it to end.
+static BACKING_UP: AtomicBool = AtomicBool::new(false);
 
 /// The background indexers call this before each piece of database work: while the logs are
 /// being emptied, or indexing is held back, they wait here, with no read open.
@@ -51,6 +53,28 @@ pub fn pause_point() {
     while PAUSED.load(Ordering::Relaxed) || HELD_BACK.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+/// Where the heavy indexers (thumbnails, photo details and search, text from documents) wait:
+/// at `pause_point`, and also while a backup runs, so the backup and the people using OwnNAS
+/// have the disk and processor. The file index keeps going, so search finds new files.
+pub fn heavy_pause_point() {
+    loop {
+        pause_point();
+        if !BACKING_UP.load(Ordering::Relaxed) {
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Holds the heavy indexers at `heavy_pause_point` while a backup runs.
+pub fn hold_for_backup(hold: bool) {
+    BACKING_UP.store(hold, Ordering::Relaxed);
+}
+
+pub fn held_for_backup() -> bool {
+    BACKING_UP.load(Ordering::Relaxed)
 }
 
 /// Holds the indexers at their `pause_point` until called again with `false`. Returns whether
