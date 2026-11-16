@@ -6,6 +6,10 @@
 //!
 //! The administrator sees every remote and chooses who else may; the remotes' passwords and
 //! tokens stay in rclone's config file and never reach the browser.
+//!
+//! Files and folders are copied and moved by that rclone too (`operations/copyfile`,
+//! `sync/copy`…, run as rclone's background jobs so they can be followed and stopped), between
+//! remotes and between a remote and the library.
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -180,12 +184,23 @@ impl Drop for Daemon {
 pub struct Rclone {
     daemon: Mutex<Option<Daemon>>,
     watching: std::sync::atomic::AtomicBool,
+    /// Copies and moves under way: rclone is not stopped for being idle while there are any.
+    busy: std::sync::atomic::AtomicUsize,
+}
+
+/// Held while a copy runs, so rclone is not stopped as idle under it.
+pub struct Busy(&'static Rclone);
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// The one rclone of this OwnNAS.
 pub fn rclone() -> &'static Rclone {
     static ONE: OnceLock<Rclone> = OnceLock::new();
-    ONE.get_or_init(|| Rclone { daemon: Mutex::new(None), watching: std::sync::atomic::AtomicBool::new(false) })
+    ONE.get_or_init(|| Rclone { daemon: Mutex::new(None), watching: std::sync::atomic::AtomicBool::new(false), busy: std::sync::atomic::AtomicUsize::new(0) })
 }
 
 /// Where to reach the running rclone.
@@ -222,6 +237,11 @@ impl Rclone {
         drop(old);
     }
 
+    pub fn hold(&'static self) -> Busy {
+        self.busy.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Busy(self)
+    }
+
     fn watch_idle(&'static self) {
         if self.watching.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
@@ -229,7 +249,11 @@ impl Rclone {
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_secs(60));
             let mut daemon = self.daemon.lock().unwrap_or_else(|e| e.into_inner());
-            if daemon.as_ref().is_some_and(|running| running.last_used.elapsed() > IDLE) {
+            if self.busy.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                if let Some(running) = daemon.as_mut() {
+                    running.last_used = Instant::now();
+                }
+            } else if daemon.as_ref().is_some_and(|running| running.last_used.elapsed() > IDLE) {
                 let old = daemon.take();
                 drop(daemon);
                 drop(old);
@@ -341,7 +365,9 @@ impl Endpoint {
 /// rclone's error, in words someone can act on.
 fn friendly(error: &str) -> String {
     let lower = error.to_ascii_lowercase();
-    if lower.contains("didn't find section in config file") {
+    if lower.contains("context canceled") {
+        STOPPED.into()
+    } else if lower.contains("didn't find section in config file") {
         "There is no such remote in rclone's config".into()
     } else if lower.contains("directory not found") || lower.contains("object not found") || lower.contains("not found") && lower.contains("dir") {
         "That folder is not on the remote".into()
@@ -417,6 +443,253 @@ pub fn list(endpoint: &Endpoint, remote: &str, path: &str) -> Result<Vec<Entry>,
     Ok(out)
 }
 
+/// One file or folder of a remote, or `None` when there is nothing at that path.
+pub fn stat(endpoint: &Endpoint, remote: &str, path: &str) -> Result<Option<Entry>, String> {
+    if path.is_empty() {
+        return Ok(Some(Entry { name: String::new(), path: String::new(), dir: true, size: 0, modified: 0, mime: String::new() }));
+    }
+    let answer = endpoint.call("operations/stat", json!({ "fs": format!("{remote}:"), "remote": path }))?;
+    let item = match answer.get("item") {
+        Some(item) if item.is_object() => item,
+        _ => return Ok(None),
+    };
+    let text = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+    Ok(Some(Entry {
+        name: text("Name"),
+        path: text("Path"),
+        dir: item.get("IsDir").and_then(Value::as_bool).unwrap_or(false),
+        size: item.get("Size").and_then(Value::as_i64).unwrap_or(0).max(0) as u64,
+        modified: chrono::DateTime::parse_from_rfc3339(&text("ModTime")).map(|at| at.timestamp()).unwrap_or(0),
+        mime: text("MimeType"),
+    }))
+}
+
+// ---- Copying, moving, renaming, deleting ----
+
+/// One end of a copy: a path on a remote, or a file or folder on this computer (in the library).
+#[derive(Clone, Debug)]
+pub enum Place {
+    Remote { name: String, path: String },
+    Local(PathBuf),
+}
+
+impl Place {
+    /// rclone's `fs` for the folder holding it, and its `remote` inside that: how files are named.
+    fn split(&self) -> (String, String) {
+        match self {
+            Place::Remote { name, path } => (format!("{name}:"), path.clone()),
+            Place::Local(full) => (
+                full.parent().map(|parent| parent.display().to_string()).unwrap_or_default(),
+                full.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// rclone's `fs` for the item itself: how folders are named. A local path is absolute, so
+    /// rclone never takes a part of it for a remote's name.
+    fn whole(&self) -> String {
+        match self {
+            Place::Remote { name, path } => format!("{name}:{path}"),
+            Place::Local(full) => full.display().to_string(),
+        }
+    }
+}
+
+/// A name not among `taken` (lower-cased): "photo.jpg", then "photo (2).jpg"…, as the library does.
+pub fn free_name(name: &str, dir: bool, taken: &std::collections::HashSet<String>) -> String {
+    if !taken.contains(&name.to_lowercase()) {
+        return name.to_string();
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(at) if !dir && at > 0 => (&name[..at], &name[at..]),
+        _ => (name, ""),
+    };
+    (2..10_000).map(|index| format!("{stem} ({index}){ext}")).find(|candidate| !taken.contains(&candidate.to_lowercase())).unwrap_or_else(|| name.to_string())
+}
+
+/// How far a job of rclone has got.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Progress {
+    pub bytes: u64,
+    pub total: u64,
+    pub speed: f64,
+    pub eta: Option<f64>,
+}
+
+impl Endpoint {
+    /// Runs a job in the background of rclone and waits for it, telling how far it got, and
+    /// stopping it when `stop` turns true.
+    pub fn run_job(&self, method: &str, mut body: Value, stop: Option<&std::sync::atomic::AtomicBool>, mut progress: impl FnMut(Progress)) -> Result<(), String> {
+        body["_async"] = json!(true);
+        let jobid = self.call(method, body)?.get("jobid").and_then(Value::as_i64).ok_or("rclone did not start the job")?;
+        let group = format!("job/{jobid}");
+        let mut stopping = false;
+        let outcome = loop {
+            std::thread::sleep(Duration::from_millis(400));
+            if !stopping && stop.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+                stopping = true;
+                let _ = self.call("job/stop", json!({ "jobid": jobid }));
+            }
+            if let Ok(stats) = self.call("core/stats", json!({ "group": group })) {
+                progress(Progress {
+                    bytes: stats.get("bytes").and_then(Value::as_u64).unwrap_or(0),
+                    total: stats.get("totalBytes").and_then(Value::as_u64).unwrap_or(0),
+                    speed: stats.get("speed").and_then(Value::as_f64).unwrap_or(0.0),
+                    eta: stats.get("eta").and_then(Value::as_f64),
+                });
+            }
+            let status = match self.call("job/status", json!({ "jobid": jobid })) {
+                Ok(status) => status,
+                Err(err) => break Err(err),
+            };
+            if status.get("finished").and_then(Value::as_bool).unwrap_or(false) {
+                break if stopping {
+                    Err(STOPPED.to_string())
+                } else if status.get("success").and_then(Value::as_bool).unwrap_or(false) {
+                    Ok(())
+                } else {
+                    Err(friendly(status.get("error").and_then(Value::as_str).unwrap_or("rclone could not do that")))
+                };
+            }
+        };
+        let _ = self.call("core/stats-delete", json!({ "group": group }));
+        outcome
+    }
+
+    /// Copies or moves a file or a folder (with everything in it) from one place to another,
+    /// `to` being the new item itself (its folder must be there).
+    pub fn transfer(&self, from: &Place, to: &Place, dir: bool, moving: bool, stop: Option<&std::sync::atomic::AtomicBool>, progress: impl FnMut(Progress)) -> Result<(), String> {
+        if dir {
+            let method = if moving { "sync/move" } else { "sync/copy" };
+            self.run_job(method, json!({ "srcFs": from.whole(), "dstFs": to.whole(), "createEmptySrcDirs": true, "deleteEmptySrcDirs": moving }), stop, progress)?;
+            if moving {
+                // What is left of the folder moved is empty: take it away too.
+                match from {
+                    Place::Local(full) => {
+                        let _ = std::fs::remove_dir(full);
+                    }
+                    Place::Remote { name, path } => {
+                        let _ = self.call("operations/rmdir", json!({ "fs": format!("{name}:"), "remote": path }));
+                    }
+                }
+            }
+            Ok(())
+        } else {
+            let (src_fs, src_remote) = from.split();
+            let (dst_fs, dst_remote) = to.split();
+            let method = if moving { "operations/movefile" } else { "operations/copyfile" };
+            self.run_job(method, json!({ "srcFs": src_fs, "srcRemote": src_remote, "dstFs": dst_fs, "dstRemote": dst_remote }), stop, progress)
+        }
+    }
+
+    pub fn mkdir(&self, remote: &str, path: &str) -> Result<(), String> {
+        self.call("operations/mkdir", json!({ "fs": format!("{remote}:"), "remote": path })).map(|_| ())
+    }
+
+    /// Deletes a file, or a folder with everything in it.
+    pub fn delete(&self, remote: &str, path: &str, dir: bool) -> Result<(), String> {
+        let method = if dir { "operations/purge" } else { "operations/deletefile" };
+        self.run_job(method, json!({ "fs": format!("{remote}:"), "remote": path }), None, |_| {})
+    }
+}
+
+/// What a stopped job answers.
+pub const STOPPED: &str = "Stopped";
+
+// ---- Copies under way, for the page to follow ----
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Transfer {
+    pub id: u64,
+    /// "copy" or "move".
+    pub mode: String,
+    /// Where to: the remote ("" for the library) and its folder.
+    pub dest_remote: String,
+    pub dest_path: String,
+    pub items: usize,
+    pub done: usize,
+    /// The item being copied now.
+    pub current: String,
+    pub bytes: u64,
+    pub total_bytes: u64,
+    pub speed: f64,
+    pub eta: Option<f64>,
+    /// "running", "done", "failed" or "stopped".
+    pub state: String,
+    pub error: Option<String>,
+}
+
+struct Slot {
+    user: i64,
+    transfer: Transfer,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    finished: Option<Instant>,
+}
+
+/// Finished copies are kept this long for the page to tell how they went.
+const KEEP_FINISHED: Duration = Duration::from_secs(10 * 60);
+
+fn slots() -> &'static Mutex<Vec<Slot>> {
+    static SLOTS: OnceLock<Mutex<Vec<Slot>>> = OnceLock::new();
+    SLOTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// A new copy (running), and the flag that stops it.
+pub fn begin_transfer(user: i64, mode: &str, dest_remote: &str, dest_path: &str, items: usize) -> (u64, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let transfer = Transfer {
+        id,
+        mode: mode.to_string(),
+        dest_remote: dest_remote.to_string(),
+        dest_path: dest_path.to_string(),
+        items,
+        done: 0,
+        current: String::new(),
+        bytes: 0,
+        total_bytes: 0,
+        speed: 0.0,
+        eta: None,
+        state: "running".into(),
+        error: None,
+    };
+    let mut all = slots().lock().unwrap_or_else(|e| e.into_inner());
+    all.retain(|slot| slot.finished.is_none_or(|at| at.elapsed() < KEEP_FINISHED));
+    all.push(Slot { user, transfer, stop: stop.clone(), finished: None });
+    (id, stop)
+}
+
+pub fn update_transfer(id: u64, change: impl FnOnce(&mut Transfer)) {
+    let mut all = slots().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = all.iter_mut().find(|slot| slot.transfer.id == id) {
+        change(&mut slot.transfer);
+        if slot.transfer.state != "running" && slot.finished.is_none() {
+            slot.finished = Some(Instant::now());
+        }
+    }
+}
+
+/// This user's copies, running or lately finished.
+pub fn transfers_of(user: i64) -> Vec<Transfer> {
+    let mut all = slots().lock().unwrap_or_else(|e| e.into_inner());
+    all.retain(|slot| slot.finished.is_none_or(|at| at.elapsed() < KEEP_FINISHED));
+    all.iter().filter(|slot| slot.user == user).map(|slot| slot.transfer.clone()).collect()
+}
+
+/// Asks a copy of this user's to stop; false when there is no such copy running.
+pub fn stop_transfer(user: i64, id: u64) -> bool {
+    let all = slots().lock().unwrap_or_else(|e| e.into_inner());
+    match all.iter().find(|slot| slot.transfer.id == id && slot.user == user && slot.transfer.state == "running") {
+        Some(slot) => {
+            slot.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +707,15 @@ mod tests {
         assert_eq!(percent_encode("[odroid:]"), "%5Bodroid%3A%5D");
         assert_eq!(basic("x"), "Basic b3dubmFzOng=");
         assert_eq!(friendly("didn't find section in config file (\"x\")"), "There is no such remote in rclone's config");
+        assert_eq!(friendly("context canceled"), STOPPED);
+    }
+
+    #[test]
+    fn free_names() {
+        let taken: std::collections::HashSet<String> = ["photo.jpg", "photo (2).jpg", "docs.old"].iter().map(|name| name.to_string()).collect();
+        assert_eq!(free_name("new.txt", false, &taken), "new.txt");
+        assert_eq!(free_name("Photo.JPG", false, &taken), "Photo (3).JPG");
+        assert_eq!(free_name("docs.old", true, &taken), "docs.old (2)");
     }
 
     #[test]
@@ -451,6 +733,16 @@ mod tests {
         let answer = endpoint.call("operations/list", json!({ "fs": dir.display().to_string(), "remote": "" })).unwrap();
         let names: Vec<&str> = answer["list"].as_array().unwrap().iter().filter_map(|item| item["Name"].as_str()).collect();
         assert!(names.contains(&"hello.txt") && names.contains(&"inside"), "{names:?}");
+        // Copies a file and moves a folder, as pasting does.
+        std::fs::write(dir.join("inside/deep.txt"), "deep").unwrap();
+        std::fs::create_dir_all(dir.join("to")).unwrap();
+        let mut told = false;
+        endpoint.transfer(&Place::Local(dir.join("hello.txt")), &Place::Local(dir.join("to/hi.txt")), false, false, None, |_| told = true).unwrap();
+        endpoint.transfer(&Place::Local(dir.join("inside")), &Place::Local(dir.join("to/inside")), true, true, None, |_| {}).unwrap();
+        assert!(told);
+        assert_eq!(std::fs::read_to_string(dir.join("to/hi.txt")).unwrap(), "hello there");
+        assert_eq!(std::fs::read_to_string(dir.join("to/inside/deep.txt")).unwrap(), "deep");
+        assert!(dir.join("hello.txt").exists() && !dir.join("inside").exists());
         rclone().stop();
         std::fs::remove_dir_all(&dir).unwrap();
     }

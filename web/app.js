@@ -337,6 +337,7 @@ function showApp() {
   $("preview-move").hidden = !write;
   $("empty-trash-btn").hidden = true;
   $("remotes-btn").hidden = !state.me.remotes;
+  if (state.me.remotes) resumeRemoteTransfers();
   syncTerminalButton();
   refreshLibrary().catch((err) => toast(err.message, true));
 }
@@ -840,7 +841,7 @@ function renderFiles() {
         ? `<img alt="" loading="lazy" src="/api/raw?path=${encodeURIComponent(entry.path)}">`
         : `<span class="glyph kind-${esc(entry.kind)}" aria-hidden="true">${entryIcon(entry)}</span>`);
     const selected = state.selected.has(entry.path);
-    const cut = state.clipboard && state.clipboard.mode === "cut" && state.clipboard.items.some((item) => item.path === entry.path);
+    const cut = state.clipboard && state.clipboard.mode === "cut" && state.clipboard.items.some((item) => !item.remote && item.path === entry.path);
     const archiveFolder = entry.kind === "archive-folder";
     const trashFolder = entry.kind === "trash-folder";
     const mediaCard = ["image", "svg", "video", "model3d"].includes(entry.kind);
@@ -1152,6 +1153,7 @@ const ICON_LOCK = "M4.75 7V5.25a3.25 3.25 0 0 1 6.5 0V7 M3.5 7h9v7h-9z M8 9.75v1
 
 const MENU_ICONS = {
   open: ICON_OPEN,
+  refresh: "M13 8a5 5 0 1 1-1.46-3.54 M13 2.5v2.5h-2.5",
   popout: ICON_OPEN,
   download: "M8 2.5v8 M5 8l3 3 3-3 M2.5 12.5v1a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-1",
   downloadZip: "M4 2.5h5.5L13.5 6v7.5a1 1 0 0 1-1 1h-8.5a1 1 0 0 1-1-1v-10a1 1 0 0 1 1-1z M9.5 2.5V6H13.5 M7 4.5v1 M7 6.5v1 M7 8.5v1 M6 10.5h2v2H6z",
@@ -1363,7 +1365,7 @@ function paintSelection() {
     const selected = state.selected.has(card.dataset.path || card.dataset.columnEntry);
     card.classList.toggle("selected", selected);
     card.setAttribute("aria-selected", selected ? "true" : "false");
-    const cut = state.clipboard && state.clipboard.mode === "cut" && state.clipboard.items.some((item) => item.path === (card.dataset.path || card.dataset.columnEntry));
+    const cut = state.clipboard && state.clipboard.mode === "cut" && state.clipboard.items.some((item) => !item.remote && item.path === (card.dataset.path || card.dataset.columnEntry));
     card.classList.toggle("cut", !!cut);
   });
   updateSelectionSummary();
@@ -1464,7 +1466,8 @@ function renderClipboard() {
     return;
   }
   const verb = clip.mode === "cut" ? "Moving" : "Copying";
-  $("clipboard-title").textContent = clip.items.length === 1 ? `${verb} 1 item` : `${verb} ${clip.items.length} items`;
+  const from = clip.items[0].remote ? ` from ${clip.items[0].remote}` : "";
+  $("clipboard-title").textContent = clip.items.length === 1 ? `${verb} 1 item${from}` : `${verb} ${clip.items.length} items${from}`;
   $("clipboard-list").innerHTML = clip.items.map((item) => `<li>${esc(item.name)}</li>`).join("");
   $("clipboard-paste").hidden = !(state.me && !state.me.readonly);
   box.hidden = false;
@@ -1474,7 +1477,8 @@ function setClipboard(mode, entries) {
   if (!entries.length) return;
   state.clipboard = {
     mode,
-    items: entries.map((entry) => ({ path: entry.path, name: entry.name, dir: !!entry.dir })),
+    // `remote`: the rclone remote an item is on ("" in the library).
+    items: entries.map((entry) => ({ path: entry.path, name: entry.name, dir: !!entry.dir, remote: entry.remote || "" })),
   };
   renderClipboard();
   paintSelection();
@@ -1486,7 +1490,116 @@ function clearClipboard() {
   paintSelection();
 }
 
+/// Pastes the clipboard into a folder of a remote, or (`remote` "") of the library, when a remote
+/// is on either side: the server copies through rclone in the background, followed in the jobs
+/// panel, where it can be stopped.
+async function pasteToPlace(dest) {
+  const clip = state.clipboard;
+  if (!clip || !clip.items.length) return;
+  const answer = await api("/api/remotes/transfer", {
+    method: "POST",
+    json: { mode: clip.mode === "cut" ? "move" : "copy", items: clip.items.map((item) => ({ remote: item.remote || "", path: item.path })), dest },
+  });
+  if (!answer.id) {
+    toast(answer.message || "Already in this folder");
+    return;
+  }
+  // As in the library, a paste empties the clipboard.
+  state.clipboard = null;
+  renderClipboard();
+  paintSelection();
+  remotesApi?.repaint();
+  trackRemoteTransfer(answer.id);
+}
+
+const trackedTransfers = new Set();
+
+function transferPlace(remote, path) {
+  if (!remote) return `“${path ? path.split("/").pop() : (state.me?.rootName || "Library")}”`;
+  return `${remote}:${path ? `/${path}` : ""}`;
+}
+
+/// Shows a copy to or from a remote in the jobs panel until it finishes, then shows the folders
+/// again.
+function trackRemoteTransfer(id) {
+  if (trackedTransfers.has(id)) return;
+  trackedTransfers.add(id);
+  const jobId = `remote-${id}`;
+  const stop = () => {
+    api("/api/remotes/transfers/stop", { method: "POST", json: { id } }).catch((err) => toast(err.message, true));
+  };
+  const tick = async () => {
+    let transfer;
+    try {
+      transfer = (await api("/api/remotes/transfers")).transfers.find((item) => item.id === id);
+    } catch {
+      setTimeout(tick, 3000);
+      return;
+    }
+    if (!transfer) {
+      removeJob(jobId);
+      trackedTransfers.delete(id);
+      return;
+    }
+    const where = transferPlace(transfer.destRemote, transfer.destPath);
+    const count = transfer.items === 1 ? "1 item" : `${transfer.items} items`;
+    if (transfer.state === "running") {
+      const fraction = transfer.totalBytes ? Math.min(1, transfer.bytes / transfer.totalBytes) : 0;
+      const stats = [
+        transfer.totalBytes ? `${formatSize(transfer.bytes)} of ${formatSize(transfer.totalBytes)}` : "",
+        transfer.speed > 0 ? `${formatSize(Math.round(transfer.speed))}/s` : "",
+        transfer.items > 1 ? `item ${Math.min(transfer.done + 1, transfer.items)} of ${transfer.items}` : "",
+      ].filter(Boolean).join(" · ");
+      upsertJob(jobId, {
+        title: `${transfer.mode === "move" ? "Moving" : "Copying"} ${count} to ${where}`,
+        detail: transfer.current,
+        stats,
+        percent: ((transfer.done + fraction) / transfer.items) * 100,
+        cancelable: true,
+        onCancel: stop,
+      });
+      setTimeout(tick, 800);
+      return;
+    }
+    removeJob(jobId);
+    trackedTransfers.delete(id);
+    const verb = transfer.mode === "move" ? "Moved" : "Copied";
+    if (transfer.state === "done") toast(`${verb} ${count} to ${where}`);
+    else if (transfer.state === "stopped") toast(`Stopped: ${transfer.done} of ${transfer.items} ${transfer.mode === "move" ? "moved" : "copied"}`);
+    else toast(transfer.error || "The copy failed", true);
+    if (remotesOpen()) remotesApi?.refresh();
+    else if (state.me) {
+      invalidateFolderSizes();
+      load(state.path).catch((err) => toast(err.message, true));
+    }
+  };
+  tick();
+}
+
+/// Copies to or from remotes still running (after the page was loaded again, say).
+function resumeRemoteTransfers() {
+  api("/api/remotes/transfers")
+    .then((data) => data.transfers.filter((item) => item.state === "running").forEach((item) => trackRemoteTransfer(item.id)))
+    .catch(() => {});
+}
+
+/// The context menu with another view's own entries (Remotes'): `html` is its buttons, and
+/// `onAction(action, button)` runs the one chosen.
+function openCustomMenu(x, y, html, onAction) {
+  closeMenuSub();
+  state.menuHandler = onAction;
+  const menu = $("menu");
+  menu.innerHTML = html;
+  decorateMenu(menu);
+  menu.hidden = false;
+  menu.scrollTop = 0;
+  const rect = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - rect.width - 8))}px`;
+  menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - rect.height - 8))}px`;
+}
+
 function openSelectionMenu(x, y, pasteInto) {
+  state.menuHandler = null;
   const entries = selectedEntries();
   const write = state.me && !state.me.readonly;
   const clip = state.clipboard && state.clipboard.items.length;
@@ -2592,6 +2705,14 @@ async function remotes() {
       api,
       toast,
       isAdmin: () => !!(state.me && state.me.admin),
+      canWrite: () => !!(state.me && !state.me.readonly),
+      openMenu: openCustomMenu,
+      closeMenu,
+      clipboard: () => state.clipboard,
+      setClipboard,
+      paste: pasteToPlace,
+      askText,
+      askConfirm,
     });
   }
   return remotesApi;
@@ -5035,6 +5156,10 @@ async function createFolderWithSelection(entries) {
 async function pasteClipboard(dest) {
   const clip = state.clipboard;
   if (!clip || !clip.items.length) return;
+  if (clip.items.some((item) => item.remote)) {
+    await pasteToPlace({ remote: "", path: dest });
+    return;
+  }
   const remaining = [];
   let done = 0;
   let error = null;
@@ -6787,6 +6912,12 @@ $("menu").addEventListener("click", (event) => {
   event.preventDefault();
   event.stopPropagation();
   const action = button.getAttribute("data-menu");
+  if (state.menuHandler) {
+    const handler = state.menuHandler;
+    closeMenu();
+    handler(action, button);
+    return;
+  }
   if (action === "convertMenu") {
     openMenuSub("convert", button);
     return;
@@ -7868,6 +7999,11 @@ window.addEventListener("keydown", (event) => {
   if (typing) return;
   // The file list is hidden behind the Gallery: its keys (type to filter, Delete…) are off.
   if (galleryOpen()) return;
+  // Remotes has keys of its own (copy, cut, delete, rename…).
+  if (remotesOpen()) {
+    remotesApi?.keydown(event);
+    return;
+  }
   if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === "z" && !document.querySelector("dialog[open]")) {
     event.preventDefault(); undoFileOperation(); return;
   }
@@ -7953,6 +8089,16 @@ window.addEventListener("paste", (event) => {
 
   const data = event.clipboardData;
   if (!data) return;
+
+  // In Remotes, a paste goes into the remote's folder shown.
+  if (remotesOpen()) {
+    if (event.target.closest("input, textarea, select, [contenteditable]")) return;
+    if (state.clipboard && state.clipboard.items.length) {
+      event.preventDefault();
+      remotesApi?.pasteHere();
+    }
+    return;
+  }
 
   const editingSensitive = event.target.closest("#login-view, #password-dialog, #text-dialog, #create-file-dialog, #comment-input, #tag-input, #bulk-tag-input, #search, [data-editor-input], [data-csv-editor]");
   const hasFiles = clipboardHasFiles(data);
@@ -8192,10 +8338,14 @@ $("fab-menu").addEventListener("click", (event) => {
     closeMenu();
     return;
   }
-  const entries = selectedEntries();
-  let pasteInto = state.path;
-  if (entries.length === 1 && entries[0].dir) pasteInto = entries[0].path;
-  openSelectionMenu(8, 8, pasteInto);
+  if (remotesOpen()) {
+    if (!remotesApi?.openMenuAt(8, 8)) return;
+  } else {
+    const entries = selectedEntries();
+    let pasteInto = state.path;
+    if (entries.length === 1 && entries[0].dir) pasteInto = entries[0].path;
+    openSelectionMenu(8, 8, pasteInto);
+  }
   const fab = event.currentTarget.getBoundingClientRect();
   const rect = menu.getBoundingClientRect();
   menu.style.left = `${Math.max(8, Math.min(fab.right - rect.width, window.innerWidth - rect.width - 8))}px`;
@@ -9736,6 +9886,10 @@ $("preview-move").addEventListener("click", () => {
 
 $("clipboard-clear").addEventListener("click", clearClipboard);
 $("clipboard-paste").addEventListener("click", () => {
+  if (remotesOpen()) {
+    remotesApi?.pasteHere();
+    return;
+  }
   pasteClipboard(state.path).catch((err) => toast(err.message, true));
 });
 
