@@ -170,6 +170,7 @@ function tagColor(tag) {
 const $ = (id) => document.getElementById(id);
 let loadGen = 0;
 let loadingTimer = 0;
+let loadingToken = 0;
 let toastTimer = 0;
 let skipNextClick = false;
 let activeDownload = null;
@@ -224,6 +225,8 @@ async function renderColumns() {
   const path = state.path;
   const paths = [""];
   for (const part of path.split("/").filter(Boolean)) paths.push(paths.at(-1) ? `${paths.at(-1)}/${part}` : part);
+  // The folders above take a moment to list: "Loading…" meanwhile, as for any folder.
+  const loading = beginFilesLoading();
   try {
     const listings = await Promise.all(paths.map(p => p === path ? Promise.resolve({entries: state.entries}) : api(`/api/list?path=${encodeURIComponent(p)}${state.hidden ? "&hidden=1" : ""}`)));
     if (generation !== columnGeneration || state.view !== "columns" || state.path !== path) return;
@@ -237,6 +240,7 @@ async function renderColumns() {
     }).join('');
     $("files").lastElementChild?.scrollIntoView({block: "nearest", inline: "nearest"});
   } catch (err) { if (generation === columnGeneration) toast(err.message, true); }
+  finally { endFilesLoading(loading); }
 }
 async function api(url, options = {}) {
   const headers = new Headers(options.headers || {});
@@ -935,19 +939,17 @@ async function load(path, options = {}) {
     state.editor.dirty = false;
   }
   const gen = ++loadGen;
-  const hidden = state.hidden ? "&hidden=1" : "";
-  // Quick listings show no spinner, so it doesn't flicker on every click.
-  clearTimeout(loadingTimer);
-  loadingTimer = setTimeout(() => showFilesLoading(true), 150);
-  let data;
+  const loading = beginFilesLoading();
   try {
-    data = await api(`/api/list?path=${encodeURIComponent(path)}${hidden}`);
+    await showListing(path, options, gen);
   } finally {
-    if (gen === loadGen) {
-      clearTimeout(loadingTimer);
-      showFilesLoading(false);
-    }
+    endFilesLoading(loading);
   }
+}
+
+async function showListing(path, options, gen) {
+  const hidden = state.hidden ? "&hidden=1" : "";
+  const data = await api(`/api/list?path=${encodeURIComponent(path)}${hidden}`);
   if (gen !== loadGen) return;
   state.listed = true;
   const changedFolder = state.path !== (data.path || "");
@@ -988,9 +990,52 @@ async function load(path, options = {}) {
   }
 }
 
+/// How long a load runs before it shows "Loading…", so quick ones don't flash it.
+const LOADING_DELAY = 180;
+
+function loadingPill(label) {
+  const pill = document.createElement("span");
+  pill.className = "loading-pill";
+  const spinner = document.createElement("span");
+  spinner.className = "spinner";
+  spinner.setAttribute("aria-hidden", "true");
+  pill.append(spinner, label);
+  return pill;
+}
+
+/// A place for "Loading…", to put where content is on its way. It stays empty (and
+/// silent) for a moment; whatever replaces it once the content is in cancels it.
+function loadingStatus(label = "Loading…") {
+  const status = document.createElement("div");
+  status.className = "loading-status";
+  status.setAttribute("role", "status");
+  status.setAttribute("aria-live", "polite");
+  setTimeout(() => { if (status.isConnected) status.append(loadingPill(label)); }, LOADING_DELAY);
+  return status;
+}
+
+/// A load of the files starts: "Loading…" over them if it takes a moment. A newer load
+/// takes over the indicator (one already showing stays up, without a flicker).
+function beginFilesLoading() {
+  const token = ++loadingToken;
+  clearTimeout(loadingTimer);
+  if (!$("files-loading").firstChild) {
+    loadingTimer = setTimeout(() => { if (token === loadingToken) showFilesLoading(true); }, LOADING_DELAY);
+  }
+  return token;
+}
+
+/// The load is done (or failed): unless a newer one took over, the indicator goes.
+function endFilesLoading(token) {
+  if (token !== loadingToken) return;
+  clearTimeout(loadingTimer);
+  showFilesLoading(false);
+}
+
 /// While a folder loads: a spinner over the files, and the folder being left dimmed.
 function showFilesLoading(on) {
-  $("files-loading").hidden = !on;
+  const status = $("files-loading");
+  if (on !== !!status.firstChild) status.replaceChildren(...(on ? [loadingPill("Loading…")] : []));
   $("files").classList.toggle("is-loading", on);
   $("files").setAttribute("aria-busy", on ? "true" : "false");
   if (on) $("empty").hidden = true;
@@ -2630,6 +2675,7 @@ async function gallery() {
     galleryApi = galleryModule.mountGallery($("gallery"), {
       api,
       toast,
+      loadingStatus,
       workspacesChanged: (count) => { state.workspaceCount = count; },
       askText,
       askConfirm,
@@ -9593,7 +9639,7 @@ async function runDeepSearch() {
   const box = $("search-results");
   panel.hidden = false;
   syncSearchHint();
-  box.innerHTML = `<span class="search-message muted">Searching…</span>`;
+  box.replaceChildren(loadingStatus("Searching…"));
   try {
     const data = await api(
       `/api/search?path=${encodeURIComponent(state.path)}&q=${encodeURIComponent(q)}`,

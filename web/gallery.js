@@ -101,6 +101,8 @@ function thumbUrl(item) {
 }
 
 export function mountGallery(root, ctx) {
+  /// "Loading…" with a spinner where a view's content is on its way (after a moment).
+  const loading = (label) => ctx.loadingStatus(label);
   let route = { tab: "photos" };
   let items = []; // the album's or tag's photos (the timeline loads month by month)
   let byPath = new Map(); // path -> item, for every tile shown
@@ -614,7 +616,7 @@ export function mountGallery(root, ctx) {
     const mine = ++generation;
     months = [];
     actions.replaceChildren(...uploadButton(), el("button", { type: "button", onclick: rescan, title: "Look through the library again for new or changed photos" }, "Rescan"));
-    body.replaceChildren(el("p", { class: "muted gallery-message" }, "Loading photos…"));
+    body.replaceChildren(loading("Loading photos…"));
     let data;
     try {
       data = await api("/api/gallery/days");
@@ -744,7 +746,7 @@ export function mountGallery(root, ctx) {
   async function showHidden() {
     const mine = ++generation;
     actions.replaceChildren();
-    body.replaceChildren(el("p", { class: "muted gallery-message" }, "Loading…"));
+    body.replaceChildren(loading("Loading…"));
     try {
       const data = await api("/api/gallery/hidden");
       if (stale(mine)) return;
@@ -763,6 +765,7 @@ export function mountGallery(root, ctx) {
   async function loadMonth(month, mine) {
     if (!month || month.loaded || month.loading) return;
     month.loading = true;
+    for (const day of month.days) day.grid.classList.add("is-loading");
     try {
       const data = await api(`/api/gallery/timeline?from=${month.from}&to=${month.to}&limit=50000`);
       if (stale(mine)) return;
@@ -773,7 +776,7 @@ export function mountGallery(root, ctx) {
         byDay.get(day).push(item);
       }
       for (const day of month.days) {
-        day.grid.classList.remove("is-placeholder");
+        day.grid.classList.remove("is-placeholder", "is-loading");
         day.grid.style.height = "";
         day.grid.replaceChildren(...(byDay.get(day.day) || []).map(tile));
         byDay.delete(day.day);
@@ -787,6 +790,7 @@ export function mountGallery(root, ctx) {
       if (!stale(mine)) ctx.toast(err.message, true);
     } finally {
       month.loading = false;
+      for (const day of month.days) day.grid.classList.remove("is-loading");
     }
   }
 
@@ -992,7 +996,7 @@ export function mountGallery(root, ctx) {
 
   async function showAlbums(id) {
     const mine = ++generation;
-    body.replaceChildren(el("p", { class: "muted gallery-message" }, "Loading albums…"));
+    body.replaceChildren(loading("Loading albums…"));
     try {
       const data = await api(`/api/albums${id ? `?id=${id}` : ""}`);
       if (stale(mine)) return;
@@ -1480,7 +1484,7 @@ export function mountGallery(root, ctx) {
 
   async function showTags(tag) {
     const mine = ++generation;
-    body.replaceChildren(el("p", { class: "muted gallery-message" }, "Loading tags…"));
+    body.replaceChildren(loading("Loading tags…"));
     actions.replaceChildren();
     try {
       if (!tag) {
@@ -1564,7 +1568,7 @@ export function mountGallery(root, ctx) {
     const mine = ++generation;
     searchBox.value = query;
     actions.replaceChildren();
-    body.replaceChildren(el("p", { class: "muted gallery-message" }, "Searching…"));
+    body.replaceChildren(loading("Searching…"));
     try {
       const data = await api(`/api/gallery/search?q=${encodeURIComponent(query)}`);
       if (stale(mine)) return;
@@ -1582,7 +1586,7 @@ export function mountGallery(root, ctx) {
   async function showSimilar(path) {
     const mine = ++generation;
     actions.replaceChildren();
-    body.replaceChildren(el("p", { class: "muted gallery-message" }, "Looking for similar photos…"));
+    body.replaceChildren(loading("Looking for similar photos…"));
     try {
       let data;
       let preview;
@@ -1623,7 +1627,7 @@ export function mountGallery(root, ctx) {
   async function showPeople(hiddenOnes) {
     const mine = ++generation;
     actions.replaceChildren();
-    body.replaceChildren(el("p", { class: "muted gallery-message" }, "Loading people…"));
+    body.replaceChildren(loading("Loading people…"));
     try {
       const data = await api(`/api/people${hiddenOnes ? "?hidden=1" : ""}`);
       if (stale(mine)) return;
@@ -1651,7 +1655,7 @@ export function mountGallery(root, ctx) {
 
   async function showPerson(id) {
     const mine = ++generation;
-    body.replaceChildren(el("p", { class: "muted gallery-message" }, "Loading…"));
+    body.replaceChildren(loading("Loading…"));
     try {
       const data = await api(`/api/people/photos?id=${id}`);
       if (stale(mine)) return;
@@ -1793,7 +1797,7 @@ export function mountGallery(root, ctx) {
   async function showMemoryYear(year) {
     const mine = ++generation;
     actions.replaceChildren();
-    body.replaceChildren(el("p", { class: "muted gallery-message" }, "Loading…"));
+    body.replaceChildren(loading("Loading…"));
     try {
       const data = await memories();
       if (stale(mine)) return;
@@ -1816,7 +1820,7 @@ export function mountGallery(root, ctx) {
   async function showPlaces() {
     const mine = ++generation;
     actions.replaceChildren();
-    body.replaceChildren(el("p", { class: "muted gallery-message" }, "Loading the map…"));
+    body.replaceChildren(loading("Loading the map…"));
     let viewers;
     let data;
     try {

@@ -915,28 +915,46 @@ input, select, textarea {
 .files { padding: 1rem; min-height: min(60vh, 28rem); position: relative; transition: opacity 0.15s; }
 .files.is-loading { opacity: 0.5; pointer-events: none; }
 .files-loading { position: sticky; top: 0; z-index: 5; height: 0; display: flex; justify-content: center; overflow: visible; pointer-events: none; }
-.files-loading-pill {
-  margin-top: 5rem;
+.files-loading .loading-pill { margin-top: 5rem; }
+/* "Loading…" with a spinner, shown only once a load has taken a moment (loadingStatus in app.js). */
+.loading-status { display: flex; justify-content: center; padding: 2.5rem 1rem; }
+.loading-status:empty { padding: 0; }
+.search-results .loading-status { grid-column: 1 / -1; padding: 0.75rem 0.5rem; }
+.loading-pill {
   display: inline-flex;
   align-items: center;
   gap: 0.6rem;
-  padding: 0.55rem 1rem;
-  border: 1px solid var(--line);
+  padding: 0.55rem 1.05rem 0.55rem 0.8rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--line));
   border-radius: 999px;
-  background: var(--bg-2);
-  color: var(--muted);
+  background: var(--bg-3);
+  color: var(--text);
+  font-size: 0.92rem;
   box-shadow: var(--shadow);
+  animation: loading-in 0.2s ease-out both;
 }
+@keyframes loading-in { from { opacity: 0; transform: translateY(4px); } }
+/* A ring whose accent arc fades into its tail, over a faint track. */
 .spinner {
-  width: 1rem;
-  height: 1rem;
-  border: 2px solid var(--line);
-  border-top-color: var(--accent);
+  flex: none;
+  display: inline-block;
+  width: 1.15rem;
+  height: 1.15rem;
   border-radius: 50%;
-  animation: spinner-turn 0.8s linear infinite;
+  background: conic-gradient(from 0deg, transparent 15%, var(--accent)), var(--line);
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2.6px), #000 calc(100% - 2.2px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 2.6px), #000 calc(100% - 2.2px));
+  vertical-align: -0.2em;
+  animation: spinner-turn 0.85s linear infinite;
 }
 @keyframes spinner-turn { to { transform: rotate(360deg); } }
-@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } }
+@keyframes spinner-pulse { 50% { opacity: 0.35; } }
+/* No spinning for those who ask for less motion: the ring breathes instead. */
+@media (prefers-reduced-motion: reduce) {
+  .spinner { background: var(--accent); animation: spinner-pulse 1.8s ease-in-out infinite; }
+  .loading-pill { animation-name: loading-fade-in; }
+}
+@keyframes loading-fade-in { from { opacity: 0; } }
 .files:focus { outline: none; }
 .files:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .files.pointer-focused:focus-visible { outline: none; }
@@ -4119,6 +4137,11 @@ body.is-notes .app > .explorer-status-bar { display: none; }
 .gallery-month { margin: 1.4rem 0 0.2rem; font-size: 1.25rem; }
 .gallery-day h3 { margin: 0.9rem 0 0.45rem; color: var(--muted); font-size: 0.85rem; font-weight: 600; }
 .gallery-subhead { margin: 1.2rem 0 0.5rem; color: var(--muted); font-size: 0.85rem; }
+/* A month still on its way: its days show as soft blocks that breathe until the photos come. */
+.gallery-grid.is-placeholder { border-radius: 6px; background: var(--bg-2); }
+.gallery-grid.is-placeholder.is-loading { animation: placeholder-breathe 1.6s ease-in-out infinite; }
+@keyframes placeholder-breathe { 50% { opacity: 0.45; } }
+@media (prefers-reduced-motion: reduce) { .gallery-grid.is-placeholder.is-loading { animation-duration: 3.2s; } }
 .gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(var(--gallery-tile), 45vw), 1fr)); gap: 4px; }
 .gallery-tile {
   position: relative;
