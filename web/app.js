@@ -2055,7 +2055,10 @@ async function findSimilar(path) {
   }
   if (smart.search.enabled && smart.search.ready) {
     if (!$("preview").hidden && !closePreview()) return;
-    location.hash = `#gallery/similar/${encodeURIComponent(path)}`;
+    // From the Gallery, look in the workspace it shows (All, Not in any workspace, or one), even
+    // for a photo picked into it from elsewhere; from the files, the Gallery decides.
+    const scope = galleryOpen() ? (location.hash.match(/^#gallery\/(all|none|w\d+)(?=\/|$)/) || [])[1] : "";
+    location.hash = `#gallery/${scope ? `${scope}/` : ""}similar/${encodeURIComponent(path)}`;
     return;
   }
   if (smart.search.enabled) {

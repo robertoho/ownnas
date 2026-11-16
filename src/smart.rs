@@ -564,6 +564,80 @@ mod tests {
     }
 
     #[test]
+    fn searches_look_only_inside_the_workspace_shown() {
+        use crate::workspaces::{self, Members, UNSORTED};
+        let conn = conn();
+        // The same beach in two workspaces' folders, another picked into Work, one in none.
+        let beach = unit(&[1.0, 0.1, 0.0]);
+        for (path, vector) in [
+            ("Work/beach.jpg", beach.clone()),
+            ("Home/beach-copy.jpg", unit(&[0.98, 0.12, 0.01])),
+            ("Phone/beach-picked.jpg", unit(&[0.97, 0.1, 0.05])),
+            ("Loose/beach-loose.jpg", unit(&[0.99, 0.1, 0.02])),
+            ("Work/snow.jpg", unit(&[0.0, 0.2, 1.0])),
+        ] {
+            store_description(&conn, &index(&conn, path), &vector).unwrap();
+        }
+        let work = workspaces::create(&conn, "Work", &["Work".into()]).unwrap();
+        let home = workspaces::create(&conn, "Home", &["Home".into()]).unwrap();
+        workspaces::change_items(&conn, &[work], &["Phone/beach-picked.jpg".into()], true, "ana").unwrap();
+        let descriptions = DescriptionCache::default().get(&conn).unwrap();
+        let neutral = unit(&[0.5, 0.5, 0.5]);
+        let paths = |found: Vec<(String, f32)>| {
+            let mut paths: Vec<String> = found.into_iter().map(|(path, _)| path).collect();
+            paths.sort();
+            paths
+        };
+        let words = |members: &Members| paths(matching_text_where(&descriptions, &unit(&[1.0, 0.0, 0.0]), &neutral, 10, &|path| members.has(path)));
+        // "Find similar" to Work's beach, as the server asks: never the photo itself.
+        let similar = |members: &Members| {
+            paths(nearest_where(&descriptions, &beach, 10, &|path| path != "Work/beach.jpg" && members.has(path)).into_iter().filter(|(_, score)| *score >= 0.6).collect())
+        };
+
+        let in_work = workspaces::members(&conn, Some(work)).unwrap();
+        assert_eq!(words(&in_work), ["Phone/beach-picked.jpg", "Work/beach.jpg"], "its folders and what was picked into it");
+        assert_eq!(similar(&in_work), ["Phone/beach-picked.jpg"], "not the copy in Home");
+        let in_home = workspaces::members(&conn, Some(home)).unwrap();
+        assert_eq!(words(&in_home), ["Home/beach-copy.jpg"]);
+        assert_eq!(similar(&in_home), ["Home/beach-copy.jpg"], "a photo from elsewhere finds those in the workspace");
+        let unsorted = workspaces::members(&conn, Some(UNSORTED)).unwrap();
+        assert_eq!(words(&unsorted), ["Loose/beach-loose.jpg"], "Not in any workspace keeps its meaning");
+        let every = workspaces::members(&conn, None).unwrap();
+        assert_eq!(words(&every).len(), 4, "no workspace: the whole library");
+        assert_eq!(similar(&every), ["Home/beach-copy.jpg", "Loose/beach-loose.jpg", "Phone/beach-picked.jpg"]);
+
+        // The limit counts only the workspace's photos: the best one there is not crowded out.
+        assert_eq!(nearest_where(&descriptions, &beach, 1, &|path| in_home.has(path))[0].0, "Home/beach-copy.jpg");
+    }
+
+    #[test]
+    fn people_and_their_photos_are_counted_inside_the_workspace() {
+        let conn = conn();
+        let ana = unit(&[1.0, 0.05, 0.0, 0.0]);
+        let mut people_index = PeopleIndex::load(&conn).unwrap();
+        for path in ["Work/1.jpg", "Work/2.jpg", "Home/3.jpg", "Phone/4.jpg"] {
+            store_faces(&conn, &index(&conn, path), &[face(ana.clone())], &mut people_index).unwrap();
+        }
+        let work = crate::workspaces::create(&conn, "Work", &["Work".into()]).unwrap();
+        let home = crate::workspaces::create(&conn, "Home", &["Home".into()]).unwrap();
+        let empty = crate::workspaces::create(&conn, "Empty", &["Nothing".into()]).unwrap();
+        crate::workspaces::change_items(&conn, &[home], &["Phone/4.jpg".into()], true, "ana").unwrap();
+        let count = |workspace| people_in(&conn, false, workspace).unwrap().iter().map(|person| person.photos).collect::<Vec<_>>();
+        assert_eq!(count(None), [4]);
+        assert_eq!(count(Some(work)), [2]);
+        assert_eq!(count(Some(home)), [2], "in its folder, and picked into it");
+        assert!(count(Some(empty)).is_empty(), "nobody shows where they have no photos");
+        assert!(count(Some(crate::workspaces::UNSORTED)).is_empty());
+        let id = people(&conn, false).unwrap()[0].id;
+        let photos = |workspace| person_photos_in(&conn, id, workspace).unwrap().into_iter().map(|(item, _)| item.path).collect::<Vec<_>>();
+        assert_eq!(photos(Some(work)), ["Work/2.jpg", "Work/1.jpg"]);
+        let mut at_home = photos(Some(home));
+        at_home.sort();
+        assert_eq!(at_home, ["Home/3.jpg", "Phone/4.jpg"]);
+        assert_eq!(photos(None).len(), 4);
+    }
+
+    #[test]
     fn faces_group_into_people_and_corrections_stick() {
         let conn = conn();
         let ana = unit(&[1.0, 0.05, 0.0, 0.0]);

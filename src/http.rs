@@ -11152,4 +11152,69 @@ mod tests {
             RangeReq::Unsatisfiable
         ));
     }
+
+    /// The Gallery passes its workspace with each lookup, and the server answers from inside it.
+    #[tokio::test]
+    async fn gallery_lookups_answer_from_the_workspace_asked_for() {
+        let (root, data) = scratch();
+        let state = Arc::new(new_state(root, data, false, false, false, false, crate::update::UpdateConfig::default()).unwrap());
+        let (work, home) = {
+            let conn = state.db.lock().unwrap();
+            db::create_user(&conn, "ada", "longenough").unwrap();
+            let mut people = crate::smart::PeopleIndex::load(&conn).unwrap();
+            for path in ["Work/1.jpg", "Work/2.jpg", "Home/3.jpg", "Loose/4.jpg"] {
+                conn.execute(
+                    "INSERT INTO media_index(path, kind, size, mtime, taken_at, date_source, indexed_at) VALUES(?1, 'image', 10, 20, 30, 'exif', 1)",
+                    [path],
+                )
+                .unwrap();
+                let item = crate::smart::Pending { path: path.into(), kind: "image".into(), size: 10, mtime: 20 };
+                let face = crate::smart::FoundFace { x: 0.1, y: 0.1, w: 0.2, h: 0.2, score: 0.9, vector: vec![1.0, 0.0, 0.0, 0.0] };
+                crate::smart::store_faces(&conn, &item, &[face], &mut people).unwrap();
+            }
+            (crate::workspaces::create(&conn, "Work", &["Work".into()]).unwrap(), crate::workspaces::create(&conn, "Home", &["Home".into()]).unwrap())
+        };
+        let app = router(state);
+        let login = Request::builder()
+            .method("POST")
+            .uri("/api/login")
+            .header("content-type", "application/json")
+            .header("x-ownnas", "1")
+            .body(Body::from(r#"{"username":"ada","password":"longenough"}"#))
+            .unwrap();
+        let response = app.clone().oneshot(login).await.unwrap();
+        let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string();
+        let get = |uri: String| {
+            let app = app.clone();
+            let cookie = cookie.clone();
+            async move {
+                let response = app.oneshot(Request::builder().uri(uri).header("cookie", cookie).body(Body::empty()).unwrap()).await.unwrap();
+                let status = response.status();
+                (status, serde_json::from_slice::<serde_json::Value>(&body_bytes(response).await).unwrap_or_default())
+            }
+        };
+        let photos_of = |data: &serde_json::Value| -> Vec<String> {
+            let mut paths: Vec<String> = data["items"].as_array().unwrap().iter().map(|item| item["path"].as_str().unwrap().to_string()).collect();
+            paths.sort();
+            paths
+        };
+
+        let (_, every) = get("/api/people".into()).await;
+        assert_eq!(every["people"][0]["photos"], 4);
+        let person = every["people"][0]["id"].as_i64().unwrap();
+        let (_, in_work) = get(format!("/api/people?workspace={work}")).await;
+        assert_eq!(in_work["people"][0]["photos"], 2, "counted inside the workspace");
+        let (_, photos) = get(format!("/api/people/photos?id={person}&workspace={work}")).await;
+        assert_eq!(photos_of(&photos), ["Work/1.jpg", "Work/2.jpg"]);
+        let (_, photos) = get(format!("/api/people/photos?id={person}&workspace={home}")).await;
+        assert_eq!(photos_of(&photos), ["Home/3.jpg"]);
+        let (_, photos) = get(format!("/api/people/photos?id={person}&workspace={}", crate::workspaces::UNSORTED)).await;
+        assert_eq!(photos_of(&photos), ["Loose/4.jpg"], "Not in any workspace");
+        let (_, photos) = get(format!("/api/people/photos?id={person}")).await;
+        assert_eq!(photos_of(&photos).len(), 4, "no workspace: the whole library");
+        let (_, timeline) = get(format!("/api/gallery/timeline?workspace={home}")).await;
+        assert_eq!(photos_of(&timeline), ["Home/3.jpg"]);
+        let (status, _) = get("/api/people?workspace=999".into()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "a workspace that is gone is not every photo");
+    }
 }
