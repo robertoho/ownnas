@@ -632,7 +632,8 @@ impl Server {
     }
 
     /// Files and folders in `path` and below whose name, tags, or contents (text, PDFs, and
-    /// pictures read by OCR) match `words`. `tag:name` finds one tag exactly.
+    /// pictures read by OCR) match `words`. `tag:name` finds one tag exactly; `size:>100MB`,
+    /// `size:<2GB` or `size:10MB..1GB` keeps files of those sizes (no folders), the largest first.
     pub fn search(&self, path: String, words: String) -> Result<Vec<SearchHit>, ClientError> {
         #[derive(serde::Deserialize)]
         struct Hits {

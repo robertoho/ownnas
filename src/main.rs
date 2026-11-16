@@ -15,6 +15,7 @@ mod documents;
 mod ebook;
 mod file_index;
 mod files;
+mod search_terms;
 mod font_info;
 mod helper_tools;
 mod text_index;

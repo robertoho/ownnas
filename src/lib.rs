@@ -21,6 +21,7 @@ pub mod documents;
 pub mod ebook;
 pub mod file_index;
 pub mod files;
+pub mod search_terms;
 pub mod font_info;
 pub mod helper_tools;
 pub mod text_index;

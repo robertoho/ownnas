@@ -6,6 +6,7 @@
 
 use crate::agent_keys::{self, AgentKey, Allowed};
 use crate::http::AppState;
+use crate::search_terms::SizeRange;
 use crate::{db, documents, files, mcp_files, mcp_organise, mcp_photos, thumbs, versions};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -346,9 +347,11 @@ fn reading_tools() -> Vec<Value> {
         {
             "name": "search",
             "title": "Search files",
-            "description": "Finds files by name, by the words inside them, and by tag. Start the query with tag: to look only at tags.",
-            "inputSchema": { "type": "object", "required": ["query"], "properties": {
-                "query": { "type": "string", "description": "What to look for." },
+            "description": "Finds files by name, by the words inside them, and by tag. Start the query with tag: to look only at tags. To find files by size, give min_size and/or max_size, or put size:>100MB, size:<2GB or size:10MB..1GB in the query (1 KB = 1024 bytes): folders are then left out and the largest files come first. A size range alone, with no words, lists every file within it.",
+            "inputSchema": { "type": "object", "properties": {
+                "query": { "type": "string", "description": "What to look for. May hold size: terms." },
+                "min_size": { "type": ["integer", "string"], "description": "Only files at least this big: bytes, or a size such as \"500MB\"." },
+                "max_size": { "type": ["integer", "string"], "description": "Only files at most this big: bytes, or a size such as \"2GB\"." },
                 "path": path("Only search this folder. Leave out to search everything this key can use."),
                 "offset": { "type": "integer", "minimum": 0, "description": "How many results to skip." },
                 "limit": { "type": "integer", "minimum": 1, "maximum": SEARCH_MOST, "description": "How many results to return." },
@@ -490,7 +493,13 @@ async fn call_tool(state: &Arc<AppState>, key: &AgentKey, params: &Value) -> Res
     let query = args.text("query");
     let outcome = match name.as_str() {
         "list_folder" => list_folder(state, key, &path, number("offset").unwrap_or(0), number("limit").unwrap_or(LIST_DEFAULT)).await,
-        "search" => search(state, key, &path, &query, number("offset").unwrap_or(0), number("limit").unwrap_or(SEARCH_DEFAULT)).await,
+        "search" => match (size_arg(&args, "min_size"), size_arg(&args, "max_size")) {
+            (Ok(min), Ok(max)) => {
+                let size = SizeRange::new(min, max);
+                search(state, key, &path, &query, size, number("offset").unwrap_or(0), number("limit").unwrap_or(SEARCH_DEFAULT)).await
+            }
+            (Err(stop), _) | (_, Err(stop)) => Err(stop),
+        },
         "read_text" => read_text(state, key, &path, number("offset").unwrap_or(0), number("limit").unwrap_or(READ_DEFAULT)).await,
         "get_info" => get_info(state, key, &path).await,
         "get_thumbnail" => get_thumbnail(state, key, &path, args.text("size") == "large").await,
@@ -615,8 +624,24 @@ async fn list_folder(state: &Arc<AppState>, key: &AgentKey, path: &str, offset: 
     Ok(as_text(&json!({ "path": listed, "entries": shown, "more": more })))
 }
 
-async fn search(state: &Arc<AppState>, key: &AgentKey, path: &str, query: &str, offset: u64, limit: u64) -> Result<Vec<Value>, Stop> {
-    if query.trim().is_empty() {
+/// A size given as bytes, or written like "500MB".
+fn size_arg(args: &Args, name: &str) -> Result<Option<u64>, Stop> {
+    match args.raw().get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) if text.trim().is_empty() => Ok(None),
+        Some(Value::String(text)) => match crate::search_terms::parse_size(text) {
+            Some(bytes) => Ok(Some(bytes)),
+            None => failed(&format!("Could not read the size \"{text}\": give bytes, or a size such as 500MB or 2GB.")),
+        },
+        Some(value) => match value.as_u64() {
+            Some(bytes) => Ok(Some(bytes)),
+            None => failed(&format!("{name} must be a number of bytes, or a size such as 500MB.")),
+        },
+    }
+}
+
+async fn search(state: &Arc<AppState>, key: &AgentKey, path: &str, query: &str, size: SizeRange, offset: u64, limit: u64) -> Result<Vec<Value>, Stop> {
+    if query.trim().is_empty() && !size.is_set() {
         return failed("Give something to search for.");
     }
     let limit = limit.clamp(1, SEARCH_MOST) as usize;
@@ -625,9 +650,15 @@ async fn search(state: &Arc<AppState>, key: &AgentKey, path: &str, query: &str, 
     } else {
         vec![allowed(state, key, path).await?.rel]
     };
+    // A size: term that cannot be read is said once, not taken for a missing folder.
+    let sized = match crate::search_terms::parse(query) {
+        Ok(terms) if terms.size.and(size).is_empty() => return failed("No file can be that size: the smallest size is above the largest."),
+        Ok(terms) => terms.size.and(size).is_set(),
+        Err(err) => return failed(&err),
+    };
     let mut found = Vec::new();
     for place in places {
-        match crate::http::search_hits(state, place, query.to_string()).await {
+        match crate::http::search_hits(state, place, query.to_string(), size).await {
             Ok(hits) => found.extend(hits),
             // A folder of the key's that has gone missing should not spoil the others.
             Err(_) if path.is_empty() => continue,
@@ -646,6 +677,10 @@ async fn search(state: &Arc<AppState>, key: &AgentKey, path: &str, query: &str, 
             }
             hit.path = place.rel;
             hits.push(hit);
+        }
+        // Each folder's are the largest first: so are all of them together.
+        if sized {
+            hits.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
         }
         Ok(hits)
     })

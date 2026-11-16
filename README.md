@@ -5,7 +5,7 @@ OwnNAS is a small web server you compile yourself. It shares one folder and its 
 - **File browser:** upload, download, move, rename, a Trash, and earlier versions of saved files.
 - **Previews:** photos (RAW, HEIC, Live Photos), video, music, PDFs, Office documents, e-books, 3D models, maps, and more. Text and spreadsheets can be edited in place.
 - **Music player:** play a folder and its subfolders, or a playlist, in a bar that keeps playing while you browse, with a quick panel for the queue and the music played lately.
-- **Search:** file names and the words inside documents and pictures, plus tags and comments.
+- **Search:** file names and the words inside documents and pictures, plus tags and comments, and files by size.
 - **Photo gallery:** a timeline, nested albums that never move your files, places on a map, and workspaces (Family, Work, a customer…).
 - **Smart photos:** optional search by description, similar photos, and faces grouped into people, all on your own machine.
 - **Terminals in any folder:** open a shell in any folder of the NAS from a browser or phone, with status for coding agents like Claude Code.
@@ -54,7 +54,9 @@ On Windows PowerShell:
 
 Then open `http://127.0.0.1:8787`. From another device on the VPN, open `http://<this-computer-vpn-address>:8787`.
 
-The library page can bookmark folders, remember recently opened files, search by name and file contents (text, PDF text, and OCR’d images when `tesseract` is available), measure a folder, download the current folder as a zip, and show an activity log. A file preview can move, duplicate, hash, step through images, and attach shared tags and comments (keyed by path, with size/mtime fingerprints so OwnNAS can warn when a file changed without dropping the notes; metadata follows OwnNAS rename/move/trash/restore).
+The library page can bookmark folders, remember recently opened files, search by name and file contents (text, PDF text, and OCR’d images when `tesseract` is available) and by size, measure a folder, download the current folder as a zip, and show an activity log. A file preview can move, duplicate, hash, step through images, and attach shared tags and comments (keyed by path, with size/mtime fingerprints so OwnNAS can warn when a file changed without dropping the notes; metadata follows OwnNAS rename/move/trash/restore).
+
+**Find files by size.** The Size button next to Search sets a range (at least, at most, or both, in KB, MB or GB), or type it into Search: `size:>100MB`, `size:<2GB`, `size:>=1GB`, `size:<=500KB`, or a range with both ends included, `size:500MB..2GB` (`size:1GB..` and `size:..10MB` leave one end open). Sizes count in steps of 1024, as OwnNAS shows them. A size goes with the rest of the search (`holiday size:>1GB`) and, like any search, looks in the folder you are in and below. With a size, folders are left out, the largest files come first, and a size alone (no words) lists the files within it — the 100 largest — handy for clearing space. The results' Sort switches between best match, largest or smallest first, name, and newest. As you type, `size:` filters the folder you are in too. Search by size uses the file index, so a size with no words works once the library has been indexed. Agents get the same through the `search` tool (`min_size` and `max_size`, or `size:` in the query), and the `/api/search` endpoint takes `min_size` and `max_size` in bytes.
 
 The database and thumbnail cache default to `./ownnas-data/ownnas.db`. That folder must sit outside `--root`.
 
@@ -363,7 +365,7 @@ Right-click a folder, or the empty space inside one, and choose **Sort into fold
 
 AI agents such as Claude reach the library over MCP at `https://<server>/mcp` with an agent key. An administrator makes keys in **Settings → Agents**, choosing which folders each one can use and what it can do there:
 
-- **Read:** list folders and search them; read text, documents and PDFs (and the text read from photos); read spreadsheets and CSV files as cells; look at photos (large enough to read a photographed page); see a file's details and earlier versions; see what changed lately and what takes up space; and find photos by what they show, by similar look, by date, by album, or by the people in them.
+- **Read:** list folders and search them (by name, words inside, tag, or size); read text, documents and PDFs (and the text read from photos); read spreadsheets and CSV files as cells; look at photos (large enough to read a photographed page); see a file's details and earlier versions; see what changed lately and what takes up space; and find photos by what they show, by similar look, by date, by album, or by the people in them.
 - **Read and organise:** everything above, plus tagging, making folders, renaming, moving, moving to the Trash, and arranging albums. Nothing is ever deleted for good, protected files are left alone, and a key's own folders cannot be renamed, moved or put in the Trash.
 - **Read, organise and write:** everything above, plus making text files, changing a passage in one, adding rows to CSV and TSV files, and copying. Before a file changes, what it held is kept in its history.
 

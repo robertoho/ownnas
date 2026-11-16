@@ -886,6 +886,35 @@ input, select, textarea {
 .search-wrap #search-go {
   flex: 0 0 auto;
 }
+/* Find files by size: a range of sizes, set here or typed as size:>100MB (app.js sizeRange). */
+.search-wrap { position: relative; }
+.size-filter-btn { flex: 0 0 auto; height: 2.15rem; padding: 0 0.75rem; white-space: nowrap; font-size: 0.85rem; max-width: 11rem; overflow: hidden; text-overflow: ellipsis; }
+.size-filter-btn.active { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+.size-filter {
+  position: absolute;
+  top: calc(100% + 0.35rem);
+  right: 0;
+  z-index: 40;
+  width: min(20rem, calc(100vw - 2rem));
+  box-sizing: border-box;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--bg-2);
+  box-shadow: var(--shadow);
+  display: grid;
+  gap: 0.5rem;
+}
+.size-filter[hidden] { display: none; }
+.size-filter-row { display: grid; grid-template-columns: 4.5rem minmax(0, 1fr) auto; gap: 0.4rem; align-items: center; font-size: 0.88rem; }
+.size-filter-row input { min-width: 0; }
+.size-filter-note { margin: 0; font-size: 0.78rem; }
+.size-filter-note code { font-family: var(--mono); font-size: 0.95em; }
+.size-filter-actions { display: flex; justify-content: flex-end; gap: 0.4rem; }
+.search-panel-head { flex-wrap: wrap; }
+.search-panel-head > div:first-child { flex: 1 1 18rem; min-width: 0; }
+.search-panel-actions { margin-left: auto; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; justify-content: flex-end; }
+.search-hit-size { font-variant-numeric: tabular-nums; }
 .search-panel {
   margin: 0 1rem 0.35rem;
   padding: 0.75rem 0.9rem;

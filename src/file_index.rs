@@ -18,6 +18,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::files;
+use crate::search_terms::SizeRange;
 use crate::media_index::Speed;
 
 /// Set once a scan of the whole library has finished: until then, search walks the disk.
@@ -437,8 +438,6 @@ pub struct NameHit {
     pub dir: bool,
 }
 
-/// Files and folders under `rel` whose names have `query` in them (lower case), folders and the
-/// shallowest first.
 /// What `rel` and everything below it hold, from the index: bytes, files, and the photo-library
 /// packages inside it (indexed only by name: measure those on disk). `None` when `rel` is not
 /// in the index yet, or is inside a package itself.
@@ -487,18 +486,40 @@ pub fn folder_total(conn: &Connection, rel: &str) -> Result<Option<(u64, u64, Ve
     Ok(Some((bytes.max(0) as u64, files.max(0) as u64, packages)))
 }
 
-pub fn search_names(conn: &Connection, rel: &str, query: &str, limit: usize) -> Result<Vec<NameHit>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT path, dir FROM file_index
-             WHERE path != '' AND instr(name_lower, ?1) > 0
-               AND (?2 = '' OR (path >= ?2 || '/' AND path < ?2 || '0'))
-             ORDER BY dir DESC, length(path) - length(replace(path, '/', '')), path
-             LIMIT ?3",
-        )
-        .map_err(|err| err.to_string())?;
+/// Files and folders under `rel` whose names have `query` in them (lower case; an empty query
+/// takes every name), folders and the shallowest first. With a size range, only files of a size
+/// in it, the largest first.
+pub fn search_names(conn: &Connection, rel: &str, query: &str, size: SizeRange, limit: usize) -> Result<Vec<NameHit>, String> {
+    let mut sql = String::from("SELECT path, dir FROM file_index WHERE path != ''");
+    let mut args: Vec<rusqlite::types::Value> = Vec::new();
+    let mut arg = |value: rusqlite::types::Value| {
+        args.push(value);
+        format!("?{}", args.len())
+    };
+    if !query.is_empty() {
+        sql += &format!(" AND instr(name_lower, {}) > 0", arg(query.to_string().into()));
+    }
+    if !rel.is_empty() {
+        // Paths below `rel` sort between "rel/" and "rel0" ('0' follows '/').
+        sql += &format!(" AND path >= {} AND path < {}", arg(format!("{rel}/").into()), arg(format!("{rel}0").into()));
+    }
+    let bytes = |size: u64| rusqlite::types::Value::Integer(size.min(i64::MAX as u64) as i64);
+    if size.is_set() {
+        sql += " AND dir = 0";
+        if let Some(min) = size.min {
+            sql += &format!(" AND size >= {}", arg(bytes(min)));
+        }
+        if let Some(max) = size.max {
+            sql += &format!(" AND size <= {}", arg(bytes(max)));
+        }
+        sql += " ORDER BY size DESC, path";
+    } else {
+        sql += " ORDER BY dir DESC, length(path) - length(replace(path, '/', '')), path";
+    }
+    sql += &format!(" LIMIT {}", arg(rusqlite::types::Value::Integer(limit as i64)));
+    let mut stmt = conn.prepare(&sql).map_err(|err| err.to_string())?;
     let rows = stmt
-        .query_map(params![query, rel, limit as i64], |row| Ok(NameHit { path: row.get(0)?, dir: row.get(1)? }))
+        .query_map(rusqlite::params_from_iter(args.iter()), |row| Ok(NameHit { path: row.get(0)?, dir: row.get(1)? }))
         .map_err(|err| err.to_string())?;
     Ok(rows.filter_map(Result::ok).collect())
 }
@@ -533,7 +554,7 @@ mod tests {
     }
 
     fn names(library: &Library, query: &str, rel: &str) -> Vec<String> {
-        search_names(&library.conn, rel, query, 100).unwrap().into_iter().map(|hit| hit.path).collect()
+        search_names(&library.conn, rel, query, SizeRange::default(), 100).unwrap().into_iter().map(|hit| hit.path).collect()
     }
 
     /// Let the clock move on, so a change gives a folder a new time.
@@ -631,6 +652,33 @@ mod tests {
         assert_eq!(folder_total(&library.conn, "Fotos/2016").unwrap().map(|t| (t.0, t.1)), Some((3, 1)));
         assert_eq!(folder_total(&library.conn, "").unwrap().map(|t| (t.0, t.1)), Some((9, 3)));
         assert_eq!(folder_total(&library.conn, "Nope").unwrap(), None, "not indexed");
+    }
+
+    #[test]
+    fn finds_files_by_size() {
+        let library = library();
+        let lib = library.root.join("lib");
+        fs::create_dir_all(lib.join("Videos/big")).unwrap();
+        fs::create_dir_all(lib.join("Docs")).unwrap();
+        fs::write(lib.join("Videos/small clip.mp4"), vec![0u8; 100]).unwrap();
+        fs::write(lib.join("Videos/big/long clip.mp4"), vec![0u8; 5000]).unwrap();
+        fs::write(lib.join("Videos/big/trailer.mov"), vec![0u8; 2000]).unwrap();
+        fs::write(lib.join("Docs/clip notes.txt"), vec![0u8; 3000]).unwrap();
+        scan_all(&library, "", false);
+        let sized = |query: &str, rel: &str, min: Option<u64>, max: Option<u64>| -> Vec<String> {
+            search_names(&library.conn, rel, query, SizeRange::new(min, max), 100).unwrap().into_iter().map(|hit| hit.path).collect()
+        };
+        // Largest first, folders left out (their names match too).
+        assert_eq!(sized("", "", Some(1000), None), ["Videos/big/long clip.mp4", "Docs/clip notes.txt", "Videos/big/trailer.mov"]);
+        assert_eq!(sized("", "", None, Some(2000)), ["Videos/big/trailer.mov", "Videos/small clip.mp4"]);
+        assert_eq!(sized("", "", Some(2000), Some(3000)), ["Docs/clip notes.txt", "Videos/big/trailer.mov"], "both ends included");
+        // With the name and the folder searched.
+        assert_eq!(sized("clip", "", Some(1000), None), ["Videos/big/long clip.mp4", "Docs/clip notes.txt"]);
+        assert_eq!(sized("clip", "Videos", Some(1000), None), ["Videos/big/long clip.mp4"]);
+        assert_eq!(sized("big", "", Some(1), None), Vec::<String>::new(), "the folder named big is not a file");
+        assert_eq!(sized("", "Videos/big", None, Some(u64::MAX)), ["Videos/big/long clip.mp4", "Videos/big/trailer.mov"]);
+        // Without a size, folders still come first.
+        assert_eq!(names(&library, "big", ""), ["Videos/big"]);
     }
 
     #[test]

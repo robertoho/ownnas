@@ -36,6 +36,8 @@ const state = {
   direction: localStorage.getItem("ownnas-dir") || "asc",
   hidden: localStorage.getItem("ownnas-hidden") === "1",
   filter: "",
+  /// The size filter's range, in bytes (null: open); typed size: terms add to it.
+  sizeRange: { min: null, max: null },
   searchController: null,
   searchHits: [],
   current: null,
@@ -589,11 +591,82 @@ async function customizeFolders(entries) {
   toast('Folder appearance saved');
 }
 
+/// Sizes count in steps of 1024, as formatSize shows them (and as the server reads them).
+const SIZE_POWERS = { "": 0, b: 0, byte: 0, bytes: 0, k: 1, kb: 1, kib: 1, m: 2, mb: 2, mib: 2, g: 3, gb: 3, gib: 3, t: 4, tb: 4, tib: 4 };
+
+/// "500", "1.5GB", "100 mb" or "2g" in bytes; null when it cannot be read.
+function parseSize(text) {
+  const match = /^([\d.,]+)\s*([a-z]*)$/i.exec(String(text).trim());
+  if (!match) return null;
+  const number = Number(match[1].replace(",", "."));
+  const power = SIZE_POWERS[match[2].toLowerCase()];
+  if (!Number.isFinite(number) || number < 0 || power === undefined) return null;
+  return Math.round(number * 1024 ** power);
+}
+
+/// `>X`, `>=X`, `<X`, `<=X`, `X..Y`, `X..` or `..Y`, as a range; null when it cannot be read.
+function parseSizeRange(value) {
+  const read = (text) => (text === "" ? null : parseSize(text));
+  if (value.includes("..")) {
+    const [low, high] = value.split("..", 2);
+    const min = read(low), max = read(high);
+    if ((low !== "" && min === null) || (high !== "" && max === null) || (min === null && max === null)) return null;
+    return { min, max };
+  }
+  for (const [op, make] of [[">=", (n) => ({ min: n, max: null })], ["<=", (n) => ({ min: null, max: n })], [">", (n) => ({ min: n + 1, max: null })], ["<", (n) => (n > 0 ? { min: null, max: n - 1 } : { min: 1, max: 0 })]]) {
+    if (value.startsWith(op)) {
+      const n = parseSize(value.slice(op.length));
+      return n === null ? null : make(n);
+    }
+  }
+  return null;
+}
+
+/// The sizes in both ranges.
+function sizeRangeAnd(a, b) {
+  const pick = (x, y, f) => (x == null ? y : y == null ? x : f(x, y));
+  return { min: pick(a.min, b.min, Math.max), max: pick(a.max, b.max, Math.min) };
+}
+
+const sizeRangeSet = (range) => range.min != null || range.max != null;
+const inSizeRange = (size, range) => (range.min == null || size >= range.min) && (range.max == null || size <= range.max);
+const isSizeTerm = (token) => token.slice(0, 5).toLowerCase() === "size:";
+
+/// Takes the size: terms out of a search, as the server does (src/search_terms.rs): the words
+/// left and the range they set. One that cannot be read (yet: it may be half typed) sets nothing.
+function parseSearchTerms(raw) {
+  const tokens = raw.trim().split(/\s+/).filter(Boolean);
+  if (!tokens.some(isSizeTerm)) return { words: raw.trim(), size: { min: null, max: null } };
+  const words = [];
+  let size = { min: null, max: null };
+  for (let i = 0; i < tokens.length; i += 1) {
+    if (!isSizeTerm(tokens[i])) { words.push(tokens[i]); continue; }
+    let value = tokens[i].slice(5);
+    if (!value && i + 1 < tokens.length) value = tokens[++i];
+    const range = value ? parseSizeRange(value) : null;
+    if (range) size = sizeRangeAnd(size, range);
+  }
+  return { words: words.join(" "), size };
+}
+
+/// How the size filter's button shows a range: "≥ 500 MB", "≤ 2 GB" or "500 MB–2 GB".
+function sizeRangeLabel(range) {
+  if (range.min != null && range.max != null) return `${formatSize(range.min)}–${formatSize(range.max)}`;
+  if (range.min != null) return `≥ ${formatSize(range.min)}`;
+  if (range.max != null) return `≤ ${formatSize(range.max)}`;
+  return "Size";
+}
+
 function sortedEntries() {
-  const raw = state.filter.trim();
+  const terms = parseSearchTerms(state.filter);
+  const size = sizeRangeAnd(terms.size, state.sizeRange);
+  const sized = sizeRangeSet(size);
+  const raw = terms.words;
   const lower = raw.toLowerCase();
   const tagQuery = lower.startsWith("tag:") ? lower.slice(4).trim() : "";
   const items = state.entries.filter((entry) => {
+    // A size range leaves folders out, as a search by size does.
+    if (sized && (entry.dir || !inSizeRange(entry.size || 0, size))) return false;
     if (!raw) return true;
     if (tagQuery) {
       return (entry.tags || []).some((tag) => tag.toLowerCase() === tagQuery || tag.toLowerCase().includes(tagQuery));
@@ -9584,6 +9657,7 @@ function focusSearch() {
 function resetSearch() {
   state.filter = "";
   $("search").value = "";
+  setSizeRange({ min: null, max: null });
   clearDeepSearch();
 }
 
@@ -9604,8 +9678,8 @@ function syncSearchHint() {
   if (!hint) return;
   const ocr = !!(state.me && state.me.ocr);
   hint.innerHTML = ocr
-    ? `Searching this folder and below for partial file and folder names, tags, and text in documents (including PDFs and OCR’d images). Press Enter. Use <code>tag:family</code> for an exact tag.`
-    : `Searching this folder and below for partial file and folder names, tags, and text in documents (including PDFs). Install <code>tesseract</code> for image OCR (<button type="button" class="link-button" data-open-helpers>check what is installed</button>). Press Enter. Use <code>tag:family</code> for an exact tag.`;
+    ? `Searching this folder and below for partial file and folder names, tags, and text in documents (including PDFs and OCR’d images). Press Enter. Use <code>tag:family</code> for an exact tag, <code>size:&gt;100MB</code> or <code>size:10MB..1GB</code> for files by size.`
+    : `Searching this folder and below for partial file and folder names, tags, and text in documents (including PDFs). Install <code>tesseract</code> for image OCR (<button type="button" class="link-button" data-open-helpers>check what is installed</button>). Press Enter. Use <code>tag:family</code> for an exact tag, <code>size:&gt;100MB</code> or <code>size:10MB..1GB</code> for files by size.`;
 }
 
 $("search-hint").addEventListener("click", (event) => {
@@ -9627,7 +9701,8 @@ function openTagSearch(tag) {
 async function runDeepSearch() {
   const q = ($("search").value || "").trim();
   state.filter = q;
-  if (!q) {
+  const size = state.sizeRange;
+  if (!q && !sizeRangeSet(size)) {
     clearDeepSearch();
     toast("Type something to search", true);
     return;
@@ -9641,42 +9716,13 @@ async function runDeepSearch() {
   syncSearchHint();
   box.replaceChildren(loadingStatus("Searching…"));
   try {
-    const data = await api(
-      `/api/search?path=${encodeURIComponent(state.path)}&q=${encodeURIComponent(q)}`,
-      { signal: controller.signal },
-    );
+    let url = `/api/search?path=${encodeURIComponent(state.path)}&q=${encodeURIComponent(q)}`;
+    if (size.min != null) url += `&min_size=${size.min}`;
+    if (size.max != null) url += `&max_size=${size.max}`;
+    const data = await api(url, { signal: controller.signal });
     if (state.searchController !== controller) return;
-    const hits = data.hits || [];
-    state.searchHits = hits;
-    box.innerHTML = hits.length
-      ? hits.map((hit) => {
-        const kind = hit.dir ? "folder" : (hit.kind || "file");
-        const name = hit.name || hit.path.split("/").pop();
-        const folder = parentPath(hit.path);
-        const extras = [];
-        if (hit.matchedTag) extras.push(`<span class="tag-chip mini">#${esc(hit.matchedTag)}</span>`);
-        if (hit.matchedContent) extras.push(`<span class="search-hit-snippet" title="${esc(hit.matchedContent)}">${esc(hit.matchedContent)}</span>`);
-        const model = kind === "model3d" ? `<span class="model-thumbnail" data-model-path="${esc(hit.path)}" data-model-name="${esc(name)}" data-model-modified="${hit.modified || 0}" data-model-size="${hit.size || 0}"><span class="glyph kind-model3d" aria-hidden="true">${typeIcon("model3d")}</span></span>` : "";
-        const image = !hit.dir && (kind === "image" || kind === "video" || kind === "svg")
-          ? `<img alt="" loading="lazy" src="${kind === "svg" ? "/api/raw" : "/api/thumb"}?path=${encodeURIComponent(hit.path)}">`
-          : "";
-        const where = folder || (state.me && state.me.rootName) || "Library";
-        return `<div class="search-hit-card"><button class="search-hit" type="button" data-hit="${esc(hit.path)}" data-dir="${hit.dir ? "1" : "0"}" title="${esc(hit.path)}">
-          <span class="search-hit-thumb"><span class="glyph kind-${esc(kind)}" aria-hidden="true">${entryIcon({ ...hit, name, kind })}</span>${image}${model}</span>
-          <span class="search-hit-details">
-            <span class="search-hit-name">${esc(name)}</span>
-            <span class="search-hit-path">${esc(where)}</span>
-            ${extras.join("")}
-          </span>
-        </button><button class="search-hit-folder" type="button" data-hit-folder="${esc(hit.path)}" title="Open the containing folder (${esc(where)})" aria-label="Open the folder containing ${esc(name)}"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="${ICON_FOLDER}" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg></button></div>`;
-      }).join("")
-      : `<span class="search-message muted">No matches under this folder</span>`;
-    observeModelThumbnails(box);
-    box.querySelectorAll("img").forEach((img) => {
-      img.addEventListener("load", () => img.classList.add("loaded"));
-      img.addEventListener("error", () => img.remove());
-      if (img.complete && img.naturalWidth) img.classList.add("loaded");
-    });
+    state.searchHits = data.hits || [];
+    renderSearchHits();
   } catch (err) {
     if (state.searchController !== controller) return;
     if (isCancelError(err)) {
@@ -9689,6 +9735,139 @@ async function runDeepSearch() {
     if (state.searchController === controller) state.searchController = null;
   }
 }
+
+/// The search's hits in the order the results' Sort asks for ("Best match": as the server gave
+/// them, which for a search by size is the largest first).
+function sortedSearchHits() {
+  const hits = [...state.searchHits];
+  const order = $("search-sort").value;
+  const byName = (a, b) => (a.name || a.path).localeCompare(b.name || b.path, undefined, { numeric: true, sensitivity: "base" });
+  if (order === "size-desc") hits.sort((a, b) => (b.size || 0) - (a.size || 0) || byName(a, b));
+  else if (order === "size-asc") hits.sort((a, b) => (a.size || 0) - (b.size || 0) || byName(a, b));
+  else if (order === "name") hits.sort(byName);
+  else if (order === "modified") hits.sort((a, b) => (b.modified || 0) - (a.modified || 0) || byName(a, b));
+  return hits;
+}
+
+function renderSearchHits() {
+  const box = $("search-results");
+  const hits = sortedSearchHits();
+  box.innerHTML = hits.length
+    ? hits.map((hit) => {
+      const kind = hit.dir ? "folder" : (hit.kind || "file");
+      const name = hit.name || hit.path.split("/").pop();
+      const folder = parentPath(hit.path);
+      const extras = [];
+      if (hit.matchedTag) extras.push(`<span class="tag-chip mini">#${esc(hit.matchedTag)}</span>`);
+      if (hit.matchedContent) extras.push(`<span class="search-hit-snippet" title="${esc(hit.matchedContent)}">${esc(hit.matchedContent)}</span>`);
+      const model = kind === "model3d" ? `<span class="model-thumbnail" data-model-path="${esc(hit.path)}" data-model-name="${esc(name)}" data-model-modified="${hit.modified || 0}" data-model-size="${hit.size || 0}"><span class="glyph kind-model3d" aria-hidden="true">${typeIcon("model3d")}</span></span>` : "";
+      const image = !hit.dir && (kind === "image" || kind === "video" || kind === "svg")
+        ? `<img alt="" loading="lazy" src="${kind === "svg" ? "/api/raw" : "/api/thumb"}?path=${encodeURIComponent(hit.path)}">`
+        : "";
+      const where = folder || (state.me && state.me.rootName) || "Library";
+      const size = hit.dir ? "" : `<span class="search-hit-path search-hit-size">${esc(formatSize(hit.size || 0))}</span>`;
+      return `<div class="search-hit-card"><button class="search-hit" type="button" data-hit="${esc(hit.path)}" data-dir="${hit.dir ? "1" : "0"}" title="${esc(hit.path)}">
+        <span class="search-hit-thumb"><span class="glyph kind-${esc(kind)}" aria-hidden="true">${entryIcon({ ...hit, name, kind })}</span>${image}${model}</span>
+        <span class="search-hit-details">
+          <span class="search-hit-name">${esc(name)}</span>
+          <span class="search-hit-path">${esc(where)}</span>
+          ${size}
+          ${extras.join("")}
+        </span>
+      </button><button class="search-hit-folder" type="button" data-hit-folder="${esc(hit.path)}" title="Open the containing folder (${esc(where)})" aria-label="Open the folder containing ${esc(name)}"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="${ICON_FOLDER}" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg></button></div>`;
+    }).join("")
+    : `<span class="search-message muted">${sizeRangeSet(sizeRangeAnd(parseSearchTerms(state.filter).size, state.sizeRange)) ? "No files of that size" : "No matches"} under this folder</span>`;
+  observeModelThumbnails(box);
+  box.querySelectorAll("img").forEach((img) => {
+    img.addEventListener("load", () => img.classList.add("loaded"));
+    img.addEventListener("error", () => img.remove());
+    if (img.complete && img.naturalWidth) img.classList.add("loaded");
+  });
+}
+
+$("search-sort").addEventListener("change", () => renderSearchHits());
+
+/// Sets the size filter's range (bytes, null for an open end) and shows it on its button.
+function setSizeRange(range) {
+  state.sizeRange = { min: range.min ?? null, max: range.max ?? null };
+  const button = $("size-filter-btn");
+  const set = sizeRangeSet(state.sizeRange);
+  button.textContent = sizeRangeLabel(state.sizeRange);
+  button.classList.toggle("active", set);
+  button.title = set ? `Files of ${sizeRangeLabel(state.sizeRange)} (change or clear)` : "Find files by size";
+}
+
+/// Shows a size in the filter's box in the largest unit it is a whole (or tenth) of.
+function fillSizeField(input, unitSelect, bytes, fallbackUnit) {
+  if (bytes == null) {
+    input.value = "";
+    unitSelect.value = fallbackUnit;
+    return;
+  }
+  const units = [1073741824, 1048576, 1024];
+  const unit = units.find((u) => bytes >= u && Math.abs(bytes / u * 10 - Math.round(bytes / u * 10)) < 1e-6) || 1024;
+  unitSelect.value = String(unit);
+  input.value = String(Math.round(bytes / unit * 100) / 100);
+}
+
+function openSizeFilter(open) {
+  const panel = $("size-filter");
+  panel.hidden = !open;
+  $("size-filter-btn").setAttribute("aria-expanded", open ? "true" : "false");
+  if (!open) return;
+  fillSizeField($("size-min"), $("size-min-unit"), state.sizeRange.min, "1048576");
+  fillSizeField($("size-max"), $("size-max-unit"), state.sizeRange.max, "1073741824");
+  $("size-min").focus();
+}
+
+function applySizeFilter() {
+  const read = (input, unitSelect) => {
+    const text = input.value.trim();
+    if (!text) return null;
+    const value = Number(text);
+    if (!Number.isFinite(value) || value < 0) throw new Error("Enter a size of 0 or more");
+    return Math.round(value * Number(unitSelect.value));
+  };
+  let range;
+  try {
+    range = { min: read($("size-min"), $("size-min-unit")), max: read($("size-max"), $("size-max-unit")) };
+  } catch (err) {
+    toast(err.message, true);
+    return;
+  }
+  if (range.min != null && range.max != null && range.min > range.max) {
+    toast("The smallest size is above the largest", true);
+    return;
+  }
+  setSizeRange(range);
+  openSizeFilter(false);
+  renderFiles();
+  if (sizeRangeSet(state.sizeRange) || ($("search").value || "").trim()) runDeepSearch().catch((err) => toast(err.message, true));
+  else clearDeepSearch();
+}
+
+$("size-filter-btn").addEventListener("click", () => openSizeFilter($("size-filter").hidden));
+$("size-filter-apply").addEventListener("click", applySizeFilter);
+$("size-filter-clear").addEventListener("click", () => {
+  $("size-min").value = "";
+  $("size-max").value = "";
+  applySizeFilter();
+});
+$("size-filter").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    applySizeFilter();
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    openSizeFilter(false);
+    $("size-filter-btn").focus();
+  }
+});
+document.addEventListener("pointerdown", (event) => {
+  if ($("size-filter").hidden || event.target.closest("#size-filter, #size-filter-btn")) return;
+  openSizeFilter(false);
+});
 
 $("search-results").addEventListener("click", (event) => {
   // The folder a match is in, with the match selected there.

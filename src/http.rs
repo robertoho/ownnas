@@ -23,6 +23,7 @@ use crate::db::{self, User};
 use crate::files::{self, FileError};
 use crate::pdf_ops;
 use crate::preview;
+use crate::search_terms::SizeRange;
 use crate::thumbs;
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
@@ -9274,6 +9275,9 @@ fn copy_meta(state: &AppState, from: &str, to: &str) {
 struct SearchQuery {
     path: Option<String>,
     q: Option<String>,
+    /// Sizes in bytes a file must be within (both ends included): set, folders are left out.
+    min_size: Option<u64>,
+    max_size: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -9442,17 +9446,25 @@ async fn search(
     Query(query): Query<SearchQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
-    let hits = search_hits(&state, rel_of(&query.path), query.q.unwrap_or_default()).await?;
+    let size = SizeRange::new(query.min_size, query.max_size);
+    let hits = search_hits(&state, rel_of(&query.path), query.q.unwrap_or_default(), size).await?;
     let mut payload = json!({ "hits": hits });
     decorate_folder_appearance(&state, &mut payload["hits"])?;
     decorate_protection(&state, &mut payload["hits"])?;
     Ok(Json(payload))
 }
 
-/// What a search finds under the folder `rel`: names, words inside files, and tags.
-pub(crate) async fn search_hits(state: &std::sync::Arc<AppState>, rel: String, raw: String) -> Result<Vec<files::SearchHit>, ApiError> {
+/// What a search finds under the folder `rel`: names, words inside files, and tags. `size:`
+/// terms in `raw` (`size:>100MB`, `size:10MB..1GB`) narrow it to files within a size range, as
+/// does `size`; with a range, folders are left out and the largest files come first.
+pub(crate) async fn search_hits(state: &std::sync::Arc<AppState>, rel: String, raw: String, size: SizeRange) -> Result<Vec<files::SearchHit>, ApiError> {
     let root = state.root.clone();
-    let trimmed = raw.trim();
+    let terms = crate::search_terms::parse(&raw).map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    let size = terms.size.and(size);
+    if size.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "No file can be that size: the smallest size is above the largest."));
+    }
+    let trimmed = terms.words.as_str();
     let (tag_only, exact_tag, needle) = if let Some(rest) = trimmed
         .strip_prefix("tag:")
         .or_else(|| trimmed.strip_prefix("TAG:"))
@@ -9462,7 +9474,7 @@ pub(crate) async fn search_hits(state: &std::sync::Arc<AppState>, rel: String, r
     } else {
         (false, false, trimmed.to_string())
     };
-    if needle.is_empty() {
+    if needle.is_empty() && (tag_only || !size.is_set()) {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "Enter a search"));
     }
 
@@ -9480,7 +9492,12 @@ pub(crate) async fn search_hits(state: &std::sync::Arc<AppState>, rel: String, r
             let options = files::SearchOptions { ocr, cache_dir };
             if !indexed {
                 // Until the whole library is indexed (and inside photo-library packages), walk it.
-                return files::search(&root, &rel, &needle, &options);
+                if needle.is_empty() {
+                    return Err(FileError::Rejected("Searching by size alone needs the file index, which is not ready yet: add a name to look for, or try again once the library has been indexed"));
+                }
+                let mut hits = files::search(&root, &rel, &needle, &options)?;
+                hits.retain(|hit| !size.is_set() || (!hit.dir && size.contains(hit.size)));
+                return Ok(hits);
             }
             let start = files::resolve(&root, &rel)?;
             if !start.full.is_dir() {
@@ -9488,17 +9505,18 @@ pub(crate) async fn search_hits(state: &std::sync::Arc<AppState>, rel: String, r
             }
             let lower = needle.trim().to_lowercase();
             let listed = db::open(&db_path).map_err(|_| FileError::Rejected("Could not open the search index")).and_then(|conn| {
-                let names = crate::file_index::search_names(&conn, &start.rel, &lower, 100)
+                let names = crate::file_index::search_names(&conn, &start.rel, &lower, size, 100)
                     .map_err(|_| FileError::Rejected("Could not read the search index"))?;
                 // Only words read ahead of time: files the reader has not reached yet are not opened
                 // here, since reading them (OCR above all) would keep every search waiting.
-                let words = crate::text_index::search(&conn, &start.rel, &lower, 100).unwrap_or_default();
+                let words = if lower.is_empty() { Vec::new() } else { crate::text_index::search(&conn, &start.rel, &lower, 100).unwrap_or_default() };
                 Ok((names, words))
             });
             let (names, words) = listed?;
             files::search_listed(
                 &root,
                 &needle,
+                size,
                 names.into_iter().map(|hit| (hit.path, hit.dir)).collect(),
                 words.into_iter().map(|hit| (hit.path, hit.snippet)).collect(),
             )
@@ -9508,7 +9526,9 @@ pub(crate) async fn search_hits(state: &std::sync::Arc<AppState>, rel: String, r
             .map_err(ApiError::from)?
     };
 
-    let tag_matches = {
+    let tag_matches = if needle.is_empty() {
+        Vec::new()
+    } else {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
         db::search_tags(&conn, &needle, &rel, exact_tag)
             .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?
@@ -9534,6 +9554,9 @@ pub(crate) async fn search_hits(state: &std::sync::Arc<AppState>, rel: String, r
                     .unwrap_or_else(|| path.clone());
                 let dir = resolved.full.is_dir();
                 let Ok(meta) = resolved.full.metadata() else { continue };
+                if size.is_set() && (dir || !size.contains(meta.len())) {
+                    continue;
+                }
                 out.push(files::SearchHit {
                     kind: if dir {
                         "folder".to_string()
@@ -9580,6 +9603,9 @@ pub(crate) async fn search_hits(state: &std::sync::Arc<AppState>, rel: String, r
         hits.extend(extras);
     }
 
+    if size.is_set() {
+        hits.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+    }
     Ok(hits)
 }
 
@@ -11006,6 +11032,29 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let search: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
         assert_eq!(search["hits"][0]["folderAppearance"]["icon"], "work");
+
+        // By size: typed in the search, or set apart; folders (named "clip" too) are left out.
+        files::make_dir(&root, "Projects", "clip folder").unwrap();
+        std::fs::write(root.join("big clip.bin"), vec![0u8; 5000]).unwrap();
+        std::fs::write(root.join("Projects/small clip.bin"), vec![0u8; 100]).unwrap();
+        std::fs::write(root.join("Projects/mid clip.bin"), vec![0u8; 3000]).unwrap();
+        let search_for = |uri: &str| {
+            let app = app.clone();
+            let request = Request::builder().uri(uri).header("cookie", &cookie).body(Body::empty()).unwrap();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let body: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+                let paths: Vec<String> = body["hits"].as_array().map_or_else(Vec::new, |hits| hits.iter().map(|hit| hit["path"].as_str().unwrap().to_string()).collect());
+                (status, paths)
+            }
+        };
+        assert_eq!(search_for("/api/search?q=clip%20size:%3E1KB").await, (StatusCode::OK, vec!["big clip.bin".to_string(), "Projects/mid clip.bin".to_string()]));
+        assert_eq!(search_for("/api/search?q=clip&max_size=1024").await, (StatusCode::OK, vec!["Projects/small clip.bin".to_string()]));
+        assert_eq!(search_for("/api/search?path=Projects&q=clip&min_size=1000").await, (StatusCode::OK, vec!["Projects/mid clip.bin".to_string()]));
+        assert_eq!(search_for("/api/search?q=clip%20size:2KB..&max_size=4000").await, (StatusCode::OK, vec!["Projects/mid clip.bin".to_string()]), "both ranges count");
+        assert_eq!(search_for("/api/search?q=clip%20size:100MB").await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(search_for("/api/search?q=clip&min_size=10&max_size=5").await.0, StatusCode::BAD_REQUEST);
 
         let readonly_app = router(Arc::new(new_state(root.clone(), root.parent().unwrap().join("data"), true, false, false, false, crate::update::UpdateConfig::default()).unwrap()));
         let response = readonly_app.oneshot(Request::builder().method("POST")

@@ -9,6 +9,8 @@ use std::time::UNIX_EPOCH;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::search_terms::SizeRange;
+
 pub const MAX_LIST: usize = 5_000;
 const ARCHIVE_DIR: &str = ".ownnas-archive";
 const ARCHIVE_MARK: &str = ".ownnas-id";
@@ -1681,15 +1683,17 @@ pub fn search(
 /// A search using the name index: `names` are the files and folders whose names matched (as
 /// library paths, with whether each is a folder), `words` the files whose words (read ahead of
 /// time) matched. Files the reader has not reached yet are not opened: their words turn up once
-/// it has read them. What has gone since it was indexed is left out.
+/// it has read them. What has gone since it was indexed is left out, and with a size range set,
+/// folders and files whose size on disk is now outside it.
 pub fn search_listed(
     root: &Path,
     query: &str,
+    size: SizeRange,
     names: Vec<(String, bool)>,
     words: Vec<(String, Option<String>)>,
 ) -> Result<Vec<SearchHit>, FileError> {
     let query = query.trim().to_lowercase();
-    if query.is_empty() {
+    if query.is_empty() && !size.is_set() {
         return Err(FileError::Rejected("Enter a search"));
     }
     let root = root.canonicalize().map_err(map_io)?;
@@ -1699,6 +1703,9 @@ pub fn search_listed(
         let Ok(meta) = full.symlink_metadata() else { return };
         let name = rel.rsplit('/').next().unwrap_or(rel).to_string();
         let dir = meta.is_dir();
+        if size.is_set() && (dir || !size.contains(meta.len())) {
+            return;
+        }
         hits.push(SearchHit {
             kind: if !dir {
                 kind_of(&name).to_string()

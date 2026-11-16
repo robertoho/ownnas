@@ -114,6 +114,24 @@
     <div class="toolbar">
       <div class="search-wrap">
         <input id="search" type="search" placeholder="Search names, tags, or file contents…" aria-label="Search names, tags, or file contents" autocomplete="off">
+        <button id="size-filter-btn" class="size-filter-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="size-filter" title="Find files by size">Size</button>
+        <div id="size-filter" class="size-filter" role="group" aria-label="Find files by size" hidden>
+          <div class="size-filter-row">
+            <label for="size-min">At least</label>
+            <input id="size-min" type="number" min="0" step="any" inputmode="decimal" placeholder="Any">
+            <select id="size-min-unit" aria-label="Unit of the smallest size"><option value="1024">KB</option><option value="1048576" selected>MB</option><option value="1073741824">GB</option></select>
+          </div>
+          <div class="size-filter-row">
+            <label for="size-max">At most</label>
+            <input id="size-max" type="number" min="0" step="any" inputmode="decimal" placeholder="Any">
+            <select id="size-max-unit" aria-label="Unit of the largest size"><option value="1024">KB</option><option value="1048576">MB</option><option value="1073741824" selected>GB</option></select>
+          </div>
+          <p class="muted size-filter-note">Files only, the largest first. Can also be typed: <code>size:&gt;100MB</code>, <code>size:10MB..1GB</code>.</p>
+          <div class="size-filter-actions">
+            <button id="size-filter-clear" type="button">Clear</button>
+            <button id="size-filter-apply" class="primary" type="button">Search</button>
+          </div>
+        </div>
         <button id="search-go" class="icon-btn" type="button" title="Search this folder and below" aria-label="Search this folder and below">
           <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
             <circle cx="7" cy="7" r="4.25" fill="none" stroke="currentColor" stroke-width="1.5"/>
@@ -274,7 +292,18 @@
             <strong>Search results</strong>
             <p id="search-hint" class="muted search-hint"></p>
           </div>
-          <button id="search-panel-close" type="button">Clear</button>
+          <div class="search-panel-actions">
+            <label class="sort-label">Sort
+              <select id="search-sort" aria-label="Sort search results">
+                <option value="best">Best match</option>
+                <option value="size-desc">Largest first</option>
+                <option value="size-asc">Smallest first</option>
+                <option value="name">Name</option>
+                <option value="modified">Newest first</option>
+              </select>
+            </label>
+            <button id="search-panel-close" type="button">Clear</button>
+          </div>
         </div>
         <div id="search-results" class="search-results"></div>
       </section>
