@@ -3157,7 +3157,7 @@ dependencies = [
 
 [[package]]
 name = "ownnas"
-version = "0.9.8"
+version = "0.9.9"
 dependencies = [
  "apache-avro",
  "argon2",
@@ -3266,7 +3266,7 @@ dependencies = [
 
 [[package]]
 name = "ownnas-mount"
-version = "0.9.8"
+version = "0.9.9"
 dependencies = [
  "clap",
  "fuser",
