@@ -2259,8 +2259,26 @@ export function mountGallery(root, ctx) {
     let scope = route.scope;
     if (scope === undefined) {
       scope = storedWorkspace();
-      // "Find similar photos" from the files: look where the photo is.
-      if (route.tab === "similar" && route.path && scope !== null && !inWorkspace(scope, route.path)) scope = null;
+      // "Find similar photos" from the files: look in the workspace shown if the photo is in it
+      // (in its folders, picked into it, or in no workspace for Not in any workspace), else in
+      // every photo. Only the server knows the picked ones.
+      if (route.tab === "similar" && route.path && scope !== null && !inWorkspace(scope, route.path)) {
+        const mine = ++generation;
+        const stored = scope;
+        ctx.api("/api/workspaces/membership", { method: "POST", json: { paths: [route.path] } })
+          .then((standing) => {
+            const inside = standing.workspaces.filter((entry) => entry.inside > 0).map((entry) => entry.id);
+            return stored === UNSORTED ? !inside.length : inside.includes(stored);
+          })
+          .catch(() => false)
+          .then((keep) => {
+            if (stale(mine)) return;
+            const where = !keep ? "all" : stored === UNSORTED ? "none" : `w${stored}`;
+            history.replaceState(null, "", `#gallery/${where}/${hash.replace(/^#?gallery\/?/, "")}`);
+            show(location.hash);
+          });
+        return;
+      }
     }
     if (scope === UNSORTED ? !workspaces.length : scope !== null && !workspaces.some((entry) => entry.id === scope)) scope = null;
     setWorkspace(scope);
