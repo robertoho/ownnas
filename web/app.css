@@ -4408,6 +4408,16 @@ body.is-notes .app > .explorer-status-bar { display: none; }
 .version-info .muted { font-size: 0.85em; overflow-wrap: anywhere; }
 .version-actions { display: flex; gap: 0.35rem; flex-wrap: wrap; }
 .versions-note { font-size: 0.85em; }
+.two-factor-dialog { width: min(30rem, calc(100vw - 2rem)); }
+.two-factor-step { display: grid; gap: 0.6rem; margin: 0.6rem 0; }
+.two-factor-step label { display: grid; gap: 0.3rem; }
+.two-factor-step button { justify-self: start; }
+.two-factor-scan { display: flex; flex-wrap: wrap; gap: 0.9rem; align-items: center; margin: 0.4rem 0 0.8rem; }
+.two-factor-qr { width: 11rem; height: 11rem; border-radius: 8px; background: #fff; padding: 0.3rem; }
+.two-factor-secret { font-family: var(--mono); font-size: 0.85rem; overflow-wrap: anywhere; max-width: 14rem; user-select: all; }
+.two-factor-codes { columns: 2; font-family: var(--mono); padding-left: 1.6rem; margin: 0.5rem 0; }
+.two-factor-codes li { margin: 0.15rem 0; }
+.two-factor-choices { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.6rem 0; }
 .compare-dialog { width: min(72rem, calc(100vw - 2rem)); }
 .compare-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.9rem; }
 .compare-bar label { display: inline-flex; align-items: center; gap: 0.35rem; }

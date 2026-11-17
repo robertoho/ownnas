@@ -327,7 +327,27 @@ Point the task or service at the release binary with absolute paths. Prefer mach
 
 Thumbnails are small JPEGs (PNG for pictures with transparency) kept in the data folder; the Gallery makes them in the background after each scan, newest photos first, so scrolling does not wait. Video thumbnails use `ffmpeg` when it is on `PATH`. HEIC and AVIF photos (from iPhones, for example) get thumbnails through `sips` on macOS, or `heif-convert` or `ffmpeg` elsewhere. Content search OCR for images uses `tesseract` when it is on `PATH`. Pictures, SVG, PDF, audio, video playback, text, CSV, JSON, zip, and tar (including `.tar.gz`) preview without either.
 
-Put OwnNAS behind HTTPS and pass `--secure-cookie` if you terminate TLS with a reverse proxy. The login is the application boundary; the VPN is the network boundary.
+Put OwnNAS behind HTTPS, either its own (`--tls-cert`) or a reverse proxy's. The login is the application boundary; the VPN is the network boundary.
+
+## On the internet, behind a reverse proxy
+
+A VPN (Tailscale, WireGuard) is still the safest way in. To reach OwnNAS from the open internet, bind it to this machine and put a reverse proxy with HTTPS in front, such as Caddy, which gets certificates by itself:
+
+```bash
+ownnas serve --root /srv/media --addr 127.0.0.1:8787
+```
+
+```
+nas.example.com {
+    reverse_proxy 127.0.0.1:8787
+}
+```
+
+- **The proxy:** OwnNAS believes a proxy on the same machine about the client's address (`X-Forwarded-For`) and about HTTPS (`X-Forwarded-Proto`), and nobody else. A proxy on another machine or in a container network is added with `--trusted-proxy 172.17.0.0/16` (or `OWNNAS_TRUSTED_PROXY`, addresses or networks separated by commas). Over HTTPS the session cookie is `Secure` and browsers are told to keep using HTTPS (`Strict-Transport-Security`) by themselves; `--secure-cookie` makes the cookie `Secure` always. With nginx, set `client_max_body_size 0` for large uploads and pass `Upgrade` and `Connection` for terminals.
+- **Wrong passwords** slow down whoever sends them instead of locking anyone out: after five, the address waits a second, then twice as long after each one, up to a quarter of an hour; the account itself waits at most half a minute, so a stranger cannot keep its owner out. Sign-ins and failed ones are in the activity log with the address they came from. The same goes for passwords asked again inside OwnNAS.
+- **Two-factor sign-in** (the shield button at the top): signing in also asks for a 6-digit code from an authenticator app (Google or Microsoft Authenticator, 1Password, Aegis…). Turning it on shows a QR code, checks one code, signs the account's other devices out, and gives ten recovery codes, each good for one sign-in if the phone is lost. A code signs in once. Lost both? `ownnas user two-factor-off --username NAME` on the server turns it off. The phone, desktop, and command-line clients do not ask for codes yet, so they cannot sign in to an account with it on.
+- **Terminals** from outside the local network or VPN need HTTPS and an account with two-factor sign-in, besides the terminal password if one is set.
+- **Every account** can read and change the whole library (only Settings are kept to administrators), so give accounts only to people you trust with all of it.
 
 ## Earlier versions
 

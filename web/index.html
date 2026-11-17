@@ -37,6 +37,9 @@
       <label>Password
         <input id="login-pass" name="password" type="password" autocomplete="current-password" required>
       </label>
+      <label id="login-code-row" hidden>Code from your authenticator app
+        <input id="login-code" name="code" inputmode="numeric" autocomplete="one-time-code" placeholder="123456 or a recovery code" spellcheck="false">
+      </label>
       <p id="login-error" class="form-error" role="alert"></p>
       <button type="submit">Sign in</button>
     </form>
@@ -100,6 +103,12 @@
               <rect x="3" y="7" width="10" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/>
               <path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
               <circle cx="8" cy="10.5" r="1" fill="currentColor"/>
+            </svg>
+          </button>
+          <button id="two-factor-btn" class="icon-btn" type="button" title="Two-factor sign-in" aria-label="Two-factor sign-in">
+            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+              <path d="M8 1.5 13 3.5v4c0 3.2-2.1 5.6-5 7-2.9-1.4-5-3.8-5-7v-4L8 1.5z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+              <path d="m5.6 8 1.7 1.7L10.6 6.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
             </svg>
           </button>
           <button id="logout-btn" class="icon-btn" type="button" title="Sign out" aria-label="Sign out">
@@ -736,6 +745,15 @@
         <button value="cancel" type="submit" formnovalidate>Cancel</button>
         <button id="confirm-ok" value="ok" type="submit" class="danger">OK</button>
       </div>
+    </form>
+  </dialog>
+
+  <dialog id="two-factor-dialog" class="two-factor-dialog" aria-labelledby="two-factor-title">
+    <h3 id="two-factor-title">Two-factor sign-in</h3>
+    <div id="two-factor-body"></div>
+    <p id="two-factor-error" class="form-error" role="alert"></p>
+    <form method="dialog" class="dialog-actions" id="two-factor-actions">
+      <button value="cancel" type="submit">Close</button>
     </form>
   </dialog>
 

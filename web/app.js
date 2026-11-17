@@ -6619,18 +6619,159 @@ applyTheme(currentTheme());
 $("login-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   $("login-error").textContent = "";
+  const code = $("login-code-row").hidden ? undefined : $("login-code").value.trim();
   try {
     await api("/api/login", {
       method: "POST",
       allow401: true,
-      json: { username: $("login-user").value, password: $("login-pass").value },
+      json: { username: $("login-user").value, password: $("login-pass").value, code },
     });
     $("login-pass").value = "";
+    $("login-code").value = "";
+    $("login-code-row").hidden = true;
     await boot();
   } catch (err) {
+    // The password was right; this account also wants a code from its authenticator app.
+    if (err.data && err.data.twoFactor) {
+      $("login-code-row").hidden = false;
+      $("login-code").value = "";
+      $("login-code").focus();
+    }
     $("login-error").textContent = err.message;
   }
 });
+// Another name or password starts again without the code.
+for (const id of ["login-user", "login-pass"]) {
+  $(id).addEventListener("input", () => {
+    if (!$("login-code-row").hidden) $("login-code-row").hidden = true;
+  });
+}
+
+// ---- Two-factor sign-in: codes from an authenticator app, and recovery codes ----
+
+function twoFactorPart(tag, attrs = {}, ...children) {
+  const element = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (key === "class") element.className = value;
+    else if (key.startsWith("on")) element.addEventListener(key.slice(2), value);
+    else element.setAttribute(key, value);
+  }
+  element.append(...children.filter((child) => child !== null && child !== undefined));
+  return element;
+}
+
+async function openTwoFactor() {
+  $("two-factor-error").textContent = "";
+  $("two-factor-body").replaceChildren(twoFactorPart("p", { class: "muted" }, "Loading…"));
+  if (!$("two-factor-dialog").open) $("two-factor-dialog").showModal();
+  try {
+    const status = await api("/api/two-factor");
+    showTwoFactorStatus(status);
+  } catch (err) {
+    $("two-factor-error").textContent = err.message;
+  }
+}
+
+/// A password field and a button, for the steps that ask for the account password again.
+function passwordStep(label, buttonText, run) {
+  const password = twoFactorPart("input", { type: "password", autocomplete: "current-password", required: "" });
+  const button = twoFactorPart("button", { type: "submit", class: "primary" }, buttonText);
+  const form = twoFactorPart("form", { class: "two-factor-step" }, twoFactorPart("label", {}, label, password), button);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    $("two-factor-error").textContent = "";
+    button.disabled = true;
+    try {
+      await run(password.value);
+    } catch (err) {
+      $("two-factor-error").textContent = err.message;
+      button.disabled = false;
+    }
+  });
+  setTimeout(() => password.focus(), 0);
+  return form;
+}
+
+function showTwoFactorStatus(status) {
+  const body = $("two-factor-body");
+  if (!status.enabled) {
+    body.replaceChildren(
+      twoFactorPart("p", {}, "Off. Signing in needs only your password."),
+      twoFactorPart("p", { class: "muted" }, "With it on, signing in also asks for a 6-digit code from an authenticator app on your phone (Google Authenticator, Microsoft Authenticator, 1Password, Aegis…), so a stolen password is not enough. It is needed to use terminals from outside your network."),
+      passwordStep("Your account password", "Turn on…", async (password) => {
+        const setup = await api("/api/two-factor/setup", { method: "POST", json: { accountPassword: password } });
+        showTwoFactorScan(setup);
+      }),
+    );
+    return;
+  }
+  const left = status.recoveryLeft;
+  body.replaceChildren(
+    twoFactorPart("p", {}, "On. Signing in asks for a code from your authenticator app."),
+    twoFactorPart("p", { class: left <= 2 ? "text-warning" : "muted" }, `${left} recovery code${left === 1 ? "" : "s"} left.${left <= 2 ? " Make new ones before they run out." : ""}`),
+    twoFactorPart("div", { class: "two-factor-choices" },
+      twoFactorPart("button", { type: "button", onclick: () => body.replaceChildren(passwordStep("Your account password", "Make new recovery codes", async (password) => {
+        const made = await api("/api/two-factor/recovery", { method: "POST", json: { accountPassword: password } });
+        showRecoveryCodes(made.recoveryCodes, "New recovery codes. The old ones no longer work.");
+      })) }, "New recovery codes…"),
+      twoFactorPart("button", { type: "button", class: "danger", onclick: () => body.replaceChildren(passwordStep("Your account password", "Turn off", async (password) => {
+        await api("/api/two-factor/disable", { method: "POST", json: { accountPassword: password } });
+        toast("Two-factor sign-in is off");
+        showTwoFactorStatus({ enabled: false });
+      })) }, "Turn off…"),
+    ),
+  );
+}
+
+function showTwoFactorScan(setup) {
+  const body = $("two-factor-body");
+  const picture = twoFactorPart("img", { class: "two-factor-qr", alt: "QR code for your authenticator app" });
+  if (setup.qr) picture.src = URL.createObjectURL(new Blob([setup.qr], { type: "image/svg+xml" }));
+  const code = twoFactorPart("input", { inputmode: "numeric", autocomplete: "one-time-code", maxlength: "7", placeholder: "123456", required: "" });
+  const button = twoFactorPart("button", { type: "submit", class: "primary" }, "Turn on");
+  const form = twoFactorPart("form", { class: "two-factor-step" }, twoFactorPart("label", {}, "The 6-digit code the app shows", code), button);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    $("two-factor-error").textContent = "";
+    button.disabled = true;
+    try {
+      const done = await api("/api/two-factor/enable", { method: "POST", json: { code: code.value } });
+      state.me.twoFactor = true;
+      showRecoveryCodes(done.recoveryCodes, "Two-factor sign-in is on. Other devices signed in to this account were signed out.");
+    } catch (err) {
+      $("two-factor-error").textContent = err.message;
+      button.disabled = false;
+    }
+  });
+  body.replaceChildren(
+    twoFactorPart("p", {}, "1. Scan this with your authenticator app, or type the key into it."),
+    twoFactorPart("div", { class: "two-factor-scan" }, picture, twoFactorPart("code", { class: "two-factor-secret" }, setup.secret.replace(/(.{4})/g, "$1 ").trim())),
+    twoFactorPart("p", {}, "2. Enter the code it shows, to check it is set up right."),
+    form,
+  );
+  setTimeout(() => code.focus(), 0);
+}
+
+function showRecoveryCodes(codes, heading) {
+  const text = codes.join("\n");
+  const save = () => {
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(new Blob([`OwnNAS recovery codes for ${state.me?.username || ""} (${location.host})\nEach one signs in once, in place of a code from the app.\n\n${text}\n`], { type: "text/plain" }));
+    link.download = "ownnas-recovery-codes.txt";
+    link.click();
+  };
+  $("two-factor-body").replaceChildren(
+    twoFactorPart("p", {}, heading),
+    twoFactorPart("p", { class: "muted" }, "Keep these recovery codes somewhere safe, away from your phone. Each one signs you in once if you lose the phone. They are shown only now."),
+    twoFactorPart("ol", { class: "two-factor-codes" }, ...codes.map((code) => twoFactorPart("li", {}, twoFactorPart("code", {}, code)))),
+    twoFactorPart("div", { class: "two-factor-choices" },
+      twoFactorPart("button", { type: "button", onclick: () => navigator.clipboard?.writeText(text).then(() => toast("Recovery codes copied")) }, "Copy"),
+      twoFactorPart("button", { type: "button", onclick: save }, "Download"),
+    ),
+  );
+}
+
+$("two-factor-btn").addEventListener("click", () => openTwoFactor());
 
 $("logout-btn").addEventListener("click", async () => {
   await api("/api/logout", { method: "POST" });

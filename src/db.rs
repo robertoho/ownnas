@@ -926,6 +926,27 @@ fn ensure_admin_column(conn: &Connection) -> Result<(), String> {
         )
         .map_err(|_| "Could not add the admin column".to_string())?;
     }
+    // Two-factor sign-in: the authenticator secret (and one being set up), the last code's
+    // step (a code signs in once), and the one-time recovery codes, kept as hashes.
+    for (column, kind) in [("totp_secret", "TEXT"), ("totp_pending", "TEXT"), ("totp_used_step", "INTEGER NOT NULL DEFAULT 0")] {
+        let has: bool = conn
+            .prepare(&format!("SELECT 1 FROM pragma_table_info('users') WHERE name = '{column}'"))
+            .and_then(|mut stmt| stmt.exists([]))
+            .unwrap_or(false);
+        if !has {
+            conn.execute(&format!("ALTER TABLE users ADD COLUMN {column} {kind}"), [])
+                .map_err(|_| "Could not add two-factor sign-in to the accounts".to_string())?;
+        }
+    }
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS recovery_codes (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            code_hash TEXT NOT NULL,
+            PRIMARY KEY (user_id, code_hash)
+        )",
+        [],
+    )
+    .map_err(|_| "Could not add recovery codes".to_string())?;
     let admins: i64 = conn
         .query_row("SELECT COUNT(*) FROM users WHERE is_admin = 1", [], |row| row.get(0))
         .unwrap_or(0);
@@ -1078,6 +1099,7 @@ pub fn delete_user(conn: &Connection, username: &str) -> Result<(), String> {
     if user.is_admin && count_admins(conn)? <= 1 {
         return Err("Cannot remove the last administrator".into());
     }
+    let _ = conn.execute("DELETE FROM recovery_codes WHERE user_id = ?1", params![user.id]);
     let changed = conn
         .execute("DELETE FROM users WHERE username = ?1", params![username.trim()])
         .map_err(|_| "Could not delete the user".to_string())?;
@@ -1152,6 +1174,68 @@ pub fn delete_session(conn: &Connection, token: &str) -> Result<(), String> {
     )
     .map_err(|_| "Could not sign out".to_string())?;
     Ok(())
+}
+
+/// An account's two-factor sign-in: its secret (when on), one being set up, and the step of
+/// the last code used.
+pub struct TwoFactor {
+    pub secret: Option<String>,
+    pub pending: Option<String>,
+    pub used_step: i64,
+}
+
+pub fn two_factor(conn: &Connection, user_id: i64) -> TwoFactor {
+    conn.query_row("SELECT totp_secret, totp_pending, totp_used_step FROM users WHERE id = ?1", params![user_id], |row| {
+        Ok(TwoFactor { secret: row.get(0)?, pending: row.get(1)?, used_step: row.get(2)? })
+    })
+    .unwrap_or(TwoFactor { secret: None, pending: None, used_step: 0 })
+}
+
+pub fn set_two_factor_pending(conn: &Connection, user_id: i64, secret: Option<&str>) -> Result<(), String> {
+    conn.execute("UPDATE users SET totp_pending = ?2 WHERE id = ?1", params![user_id, secret])
+        .map(|_| ())
+        .map_err(|_| "Could not save two-factor sign-in".to_string())
+}
+
+/// Turns it on with the secret being set up, which a right code has just confirmed.
+pub fn enable_two_factor(conn: &Connection, user_id: i64, used_step: i64) -> Result<(), String> {
+    conn.execute(
+        "UPDATE users SET totp_secret = totp_pending, totp_pending = NULL, totp_used_step = ?2 WHERE id = ?1 AND totp_pending IS NOT NULL",
+        params![user_id, used_step],
+    )
+    .map_err(|_| "Could not turn on two-factor sign-in".to_string())
+    .and_then(|changed| if changed == 1 { Ok(()) } else { Err("Start setting up two-factor sign-in again".to_string()) })
+}
+
+pub fn disable_two_factor(conn: &Connection, user_id: i64) -> Result<(), String> {
+    conn.execute("UPDATE users SET totp_secret = NULL, totp_pending = NULL, totp_used_step = 0 WHERE id = ?1", params![user_id])
+        .and_then(|_| conn.execute("DELETE FROM recovery_codes WHERE user_id = ?1", params![user_id]))
+        .map(|_| ())
+        .map_err(|_| "Could not turn off two-factor sign-in".to_string())
+}
+
+pub fn set_two_factor_used(conn: &Connection, user_id: i64, step: i64) {
+    let _ = conn.execute("UPDATE users SET totp_used_step = ?2 WHERE id = ?1 AND totp_used_step < ?2", params![user_id, step]);
+}
+
+/// Replaces the account's recovery codes with these (given as hashes).
+pub fn set_recovery_codes(conn: &Connection, user_id: i64, hashes: &[String]) -> Result<(), String> {
+    let tx = conn.unchecked_transaction().map_err(|_| "Could not save the recovery codes".to_string())?;
+    tx.execute("DELETE FROM recovery_codes WHERE user_id = ?1", params![user_id]).map_err(|_| "Could not save the recovery codes".to_string())?;
+    for hash in hashes {
+        tx.execute("INSERT OR IGNORE INTO recovery_codes(user_id, code_hash) VALUES (?1, ?2)", params![user_id, hash])
+            .map_err(|_| "Could not save the recovery codes".to_string())?;
+    }
+    tx.commit().map_err(|_| "Could not save the recovery codes".to_string())
+}
+
+/// Uses up a recovery code: true when it was one of the account's.
+pub fn use_recovery_code(conn: &Connection, user_id: i64, hash: &str) -> bool {
+    conn.execute("DELETE FROM recovery_codes WHERE user_id = ?1 AND code_hash = ?2", params![user_id, hash]).is_ok_and(|n| n == 1)
+}
+
+pub fn recovery_codes_left(conn: &Connection, user_id: i64) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM recovery_codes WHERE user_id = ?1", params![user_id], |row| row.get(0)).unwrap_or(0)
 }
 
 pub fn delete_other_sessions(conn: &Connection, user_id: i64, keep_token: &str) -> Result<(), String> {

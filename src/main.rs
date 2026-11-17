@@ -19,7 +19,9 @@ mod search_terms;
 mod font_info;
 mod helper_tools;
 mod text_index;
+mod guard;
 mod text_diff;
+mod totp;
 mod versions;
 mod duplicates;
 mod video_meta;
@@ -192,6 +194,10 @@ struct ServeArgs {
     /// Mark the session cookie Secure. Turn this on behind HTTPS.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     secure_cookie: bool,
+    /// Reverse proxies to believe about the client's address and HTTPS (X-Forwarded-For and
+    /// X-Forwarded-Proto), besides this machine: addresses or networks, such as 172.17.0.0/16
+    #[arg(long, env = "OWNNAS_TRUSTED_PROXY", value_name = "ADDRESSES", value_delimiter = ',')]
+    trusted_proxy: Vec<String>,
     /// Open a browser window on this computer after the server starts
     #[arg(long, action = clap::ArgAction::SetTrue)]
     open: bool,
@@ -230,6 +236,8 @@ enum UserCommand {
     Password(UserPassArgs),
     /// Delete an account
     Remove(UserNameArgs),
+    /// Turn two-factor sign-in off for an account that lost its authenticator and recovery codes
+    TwoFactorOff(UserNameArgs),
     /// List accounts
     List(DataArgs),
 }
@@ -317,6 +325,14 @@ fn run(cli: Cli) -> Result<(), String> {
                 if left == 0 {
                     println!("No accounts remain. The next serve will ask you to create one.");
                 }
+                Ok(())
+            }
+            UserCommand::TwoFactorOff(args) => {
+                let conn = open_data(&args.data.data)?;
+                let user = db::find_user(&conn, &args.username)?.ok_or_else(|| "That user does not exist".to_string())?;
+                db::disable_two_factor(&conn, user.id)?;
+                let _ = db::log_event(&conn, Some(user.id), &user.username, "two-factor-off", "from the command line");
+                println!("Two-factor sign-in is off for {}. They can turn it on again after signing in.", user.username);
                 Ok(())
             }
             UserCommand::List(args) => {
@@ -450,6 +466,7 @@ fn serve(args: ServeArgs) -> Result<(), String> {
     )?;
     app_state.supervisor_restart = args.restart_by_supervisor;
     app_state.https = args.tls_cert.is_some();
+    app_state.trusted_proxies = guard::parse_trusted(&args.trusted_proxy)?;
     let state = Arc::new(app_state);
     state.start_media_index();
     state.nas_backup.start_scheduler(state.root.clone(), state.data_dir(), state.db_path.clone());

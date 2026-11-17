@@ -43,6 +43,10 @@ pub fn hash_password(password: &str) -> Result<String, String> {
         .map_err(|_| "Could not hash the password".to_string())
 }
 
+/// A hash of no one's password, checked when the account does not exist, so that a wrong
+/// name takes as long as a wrong password.
+pub static DUMMY_HASH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| hash_password("no such account").unwrap_or_default());
+
 pub fn verify_password(password: &str, encoded: &str) -> bool {
     let Ok(parsed) = PasswordHash::new(encoded) else {
         return false;

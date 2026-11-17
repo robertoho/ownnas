@@ -103,6 +103,10 @@ pub struct AppState {
     pub restart_requested: std::sync::atomic::AtomicBool,
     pub supervisor_restart: bool,
     pub attempts: Mutex<AttemptGate>,
+    /// Reverse proxies whose `X-Forwarded-For` and `X-Forwarded-Proto` count (`guard.rs`).
+    pub trusted_proxies: Vec<crate::guard::Net>,
+    /// Password checks running at once: each takes a moment of the processor and some memory.
+    pub verifying: tokio::sync::Semaphore,
     /// Signed-in sessions seen lately, by token hash, so most requests need not wait for the
     /// database to know who is asking. Emptied whenever sessions or accounts change.
     pub sessions: Mutex<std::collections::HashMap<String, (db::User, std::time::Instant)>>,
@@ -185,16 +189,24 @@ impl AppState {
     }
 }
 
+/// Wrong passwords: they slow down whoever sends them, more with each one, and never lock
+/// anyone out (`guard.rs`).
 pub struct AttemptGate {
-    users: std::collections::HashMap<String, (u32, Instant)>,
-    global: (u32, Instant),
+    /// By the client's address: a quarter of an hour at most between guesses.
+    clients: crate::guard::Throttle,
+    /// By account, from any address: half a minute at most, so a stranger cannot keep its
+    /// owner out for long, while guessing from many addresses stays slow.
+    accounts: crate::guard::Throttle,
+    /// A signed-in user's own password asked again, or the terminal password, by user.
+    scoped: crate::guard::Throttle,
 }
 
 impl AttemptGate {
     fn new() -> Self {
         Self {
-            users: std::collections::HashMap::new(),
-            global: (0, Instant::now()),
+            clients: crate::guard::Throttle::new(5, Duration::from_secs(15 * 60)),
+            accounts: crate::guard::Throttle::new(5, Duration::from_secs(30)),
+            scoped: crate::guard::Throttle::new(5, Duration::from_secs(15 * 60)),
         }
     }
 }
@@ -239,6 +251,8 @@ pub fn new_state(
         restart_requested: std::sync::atomic::AtomicBool::new(false),
         supervisor_restart: false,
         attempts: Mutex::new(AttemptGate::new()),
+        trusted_proxies: crate::guard::default_trusted(),
+        verifying: tokio::sync::Semaphore::new(4),
         sessions: Mutex::default(),
         https: false,
         terminals: crate::terminal::Terminals::default(),
@@ -335,6 +349,11 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/update/status", get(update_status))
         .route("/api/update/apply", post(update_apply))
         .route("/api/password", post(change_password))
+        .route("/api/two-factor", get(two_factor_status))
+        .route("/api/two-factor/setup", post(two_factor_setup))
+        .route("/api/two-factor/enable", post(two_factor_enable))
+        .route("/api/two-factor/disable", post(two_factor_disable))
+        .route("/api/two-factor/recovery", post(two_factor_recovery))
         .route("/api/users", get(list_users).post(create_managed_user))
         .route("/api/users/password", post(admin_set_password))
         .route("/api/users/admin", post(set_user_admin))
@@ -582,6 +601,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/sync/delete", post(sync_delete))
         .route("/api/sync/changes", get(sync_changes))
         .layer(axum::middleware::from_fn_with_state(state.clone(), note_changes))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), strict_transport))
         .with_state(state)
 }
 
@@ -833,6 +853,10 @@ struct LoginBody {
     /// `Authorization: Bearer <token>` instead of a cookie.
     #[serde(default)]
     token: bool,
+    /// The authenticator app's six digits, or a recovery code, for accounts with two-factor
+    /// sign-in. Without it such an account is told to send one (`"twoFactor": true`).
+    #[serde(default)]
+    code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1038,36 +1062,63 @@ fn require_admin(user: &User) -> Result<(), ApiError> {
     }
 }
 
-fn login_allowed(gate: &mut AttemptGate, username: &str) -> bool {
-    let now = Instant::now();
-    let window = Duration::from_secs(10 * 60);
-    if now.duration_since(gate.global.1) > window {
-        gate.global = (0, now);
-    }
-    if gate.global.0 >= 40 {
-        return false;
-    }
-    let key = username.trim().to_ascii_lowercase();
-    let entry = gate.users.entry(key).or_insert((0, now));
-    if now.duration_since(entry.1) > window {
-        *entry = (0, now);
-    }
-    entry.0 < 8
+/// For a password asked again of a signed-in user (`scope:username`).
+fn login_allowed(gate: &mut AttemptGate, key: &str) -> bool {
+    gate.scoped.wait(&key.trim().to_ascii_lowercase(), Instant::now()).is_none()
 }
 
-fn login_failed(gate: &mut AttemptGate, username: &str) {
-    let now = Instant::now();
-    gate.global.0 += 1;
-    if gate.global.1.elapsed() > Duration::from_secs(10 * 60) {
-        gate.global = (1, now);
-    }
-    let key = username.trim().to_ascii_lowercase();
-    let entry = gate.users.entry(key).or_insert((0, now));
-    entry.0 += 1;
+fn login_failed(gate: &mut AttemptGate, key: &str) {
+    gate.scoped.failed(&key.trim().to_ascii_lowercase(), Instant::now());
 }
 
-fn login_succeeded(gate: &mut AttemptGate, username: &str) {
-    gate.users.remove(&username.trim().to_ascii_lowercase());
+fn login_succeeded(gate: &mut AttemptGate, key: &str) {
+    gate.scoped.succeeded(&key.trim().to_ascii_lowercase());
+}
+
+/// The address of whoever is asking (through a trusted proxy, the client's).
+fn client_ip(state: &AppState, headers: &HeaderMap, peer: &Peer) -> Option<std::net::IpAddr> {
+    crate::guard::client_ip(peer.0, headers, &state.trusted_proxies)
+}
+
+/// Whether the request came over HTTPS: to OwnNAS itself, or to a trusted proxy.
+fn over_https(state: &AppState, headers: &HeaderMap, peer: &Peer) -> bool {
+    state.https || crate::guard::forwarded_https(peer.0, headers, &state.trusted_proxies)
+}
+
+/// The session cookie is `Secure` when asked to be, and whenever the request came over HTTPS.
+fn secure_cookie(state: &AppState, headers: &HeaderMap, peer: &Peer) -> bool {
+    state.secure_cookie || over_https(state, headers, peer)
+}
+
+/// A password checked off the async threads, a few at a time.
+async fn verify_password_slowly(state: &AppState, password: &str, hash: Option<&str>) -> bool {
+    let _permit = state.verifying.acquire().await;
+    let (password, hash) = (password.to_string(), hash.map(str::to_string));
+    tokio::task::spawn_blocking(move || match hash {
+        Some(hash) => auth::verify_password(&password, &hash),
+        // No such account: the same work, so how long it takes does not tell.
+        None => {
+            auth::verify_password(&password, &auth::DUMMY_HASH);
+            false
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// HTTPS is remembered for a year (`Strict-Transport-Security`) when the request came over it.
+async fn strict_transport(
+    State(state): State<std::sync::Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let peer = Peer(request.extensions().get::<axum::extract::ConnectInfo<SocketAddr>>().map(|info| info.0));
+    let https = over_https(&state, request.headers(), &peer);
+    let mut response = next.run(request).await;
+    if https {
+        response.headers_mut().insert(header::STRICT_TRANSPORT_SECURITY, header::HeaderValue::from_static("max-age=31536000"));
+    }
+    response
 }
 
 async fn index() -> impl IntoResponse {
@@ -1258,16 +1309,26 @@ async fn health() -> impl IntoResponse {
 async fn login(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
+    peer: Peer,
     Json(body): Json<LoginBody>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Response, ApiError> {
     check_csrf(&headers)?;
+    let client = client_ip(&state, &headers, &peer).map(|ip| ip.to_string()).unwrap_or_default();
+    let account = body.username.trim().to_ascii_lowercase();
     {
+        let now = Instant::now();
         let mut gate = state.attempts.lock().unwrap_or_else(|err| err.into_inner());
-        if !login_allowed(&mut gate, &body.username) {
-            return Err(ApiError::new(
+        let wait = [gate.clients.wait(&client, now), gate.accounts.wait(&account, now)].into_iter().flatten().max();
+        if let Some(wait) = wait {
+            let mut response = ApiError::new(
                 StatusCode::TOO_MANY_REQUESTS,
-                "Too many sign-in attempts. Wait a few minutes and try again.",
-            ));
+                format!("Too many wrong sign-ins. Try again in {}.", crate::guard::wait_text(wait)),
+            )
+            .into_response();
+            if let Ok(value) = header::HeaderValue::from_str(&wait.as_secs().max(1).to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+            return Ok(response);
         }
     }
     let user = {
@@ -1275,45 +1336,92 @@ async fn login(
         db::find_user(&conn, &body.username)
             .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?
     };
-    let valid = user
-        .as_ref()
-        .is_some_and(|user| auth::verify_password(&body.password, &user.password_hash));
-    if !valid {
+    let valid = verify_password_slowly(&state, &body.password, user.as_ref().map(|user| user.password_hash.as_str())).await;
+    let failed = |state: &AppState| {
+        let now = Instant::now();
         let mut gate = state.attempts.lock().unwrap_or_else(|err| err.into_inner());
-        login_failed(&mut gate, &body.username);
+        gate.clients.failed(&client, now);
+        gate.accounts.failed(&account, now);
+    };
+    if !valid {
+        failed(&state);
+        if let Some(user) = &user {
+            let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+            let _ = db::log_event(&conn, Some(user.id), &user.username, "sign-in-failed", &client);
+        }
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "Invalid username or password",
         ));
     }
     let user = user.unwrap();
+    // The password is right; an account with two-factor sign-in also needs a code.
+    let second = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        db::two_factor(&conn, user.id)
+    };
+    if let Some(secret) = &second.secret {
+        let code = body.code.as_deref().map(str::trim).unwrap_or_default();
+        if code.is_empty() {
+            return Err(ApiError {
+                status: StatusCode::UNAUTHORIZED,
+                body: json!({ "error": "Enter the 6-digit code from your authenticator app", "twoFactor": true }),
+            });
+        }
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        let accepted = match crate::totp::check(secret, code, db::now_secs(), second.used_step) {
+            Some(step) => {
+                db::set_two_factor_used(&conn, user.id, step);
+                true
+            }
+            None => crate::totp::normalize_recovery(code).is_some_and(|code| {
+                let used = db::use_recovery_code(&conn, user.id, &auth::token_hash(&code));
+                if used {
+                    let _ = db::log_event(&conn, Some(user.id), &user.username, "recovery-code-used", &client);
+                }
+                used
+            }),
+        };
+        if !accepted {
+            let _ = db::log_event(&conn, Some(user.id), &user.username, "sign-in-failed", &format!("{client} (wrong code)"));
+            drop(conn);
+            failed(&state);
+            return Err(ApiError {
+                status: StatusCode::UNAUTHORIZED,
+                body: json!({ "error": "That code is not right. Codes change every 30 seconds.", "twoFactor": true }),
+            });
+        }
+    }
     let token = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
         let token = db::create_session(&conn, user.id)
             .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
-        let _ = db::log_event(&conn, Some(user.id), &user.username, "sign-in", "");
+        let _ = db::log_event(&conn, Some(user.id), &user.username, "sign-in", &client);
         token
     };
     {
         let mut gate = state.attempts.lock().unwrap_or_else(|err| err.into_inner());
-        login_succeeded(&mut gate, &body.username);
+        gate.clients.succeeded(&client);
+        gate.accounts.succeeded(&account);
     }
     Ok((
         [(
             header::SET_COOKIE,
-            auth::session_cookie(&token, state.secure_cookie),
+            auth::session_cookie(&token, secure_cookie(&state, &headers, &peer)),
         )],
         Json(if body.token {
             json!({ "username": user.username, "token": token })
         } else {
             json!({ "username": user.username })
         }),
-    ))
+    )
+        .into_response())
 }
 
 async fn logout(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
+    peer: Peer,
 ) -> Result<impl IntoResponse, ApiError> {
     check_csrf(&headers)?;
     if let Some(token) = session_token(&headers) {
@@ -1328,10 +1436,115 @@ async fn logout(
     Ok((
         [(
             header::SET_COOKIE,
-            auth::clear_cookie(state.secure_cookie),
+            auth::clear_cookie(secure_cookie(&state, &headers, &peer)),
         )],
         Json(json!({ "ok": true })),
     ))
+}
+
+// ---- Two-factor sign-in (`totp.rs`) ----
+
+async fn two_factor_status(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    let (user, _) = require_user(&state, &headers)?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let second = db::two_factor(&conn, user.id);
+    Ok(Json(json!({ "enabled": second.secret.is_some(), "recoveryLeft": db::recovery_codes_left(&conn, user.id) })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TwoFactorBody {
+    #[serde(default)]
+    account_password: String,
+    #[serde(default)]
+    code: String,
+}
+
+/// Starts setting it up: a new secret, as text and as a QR code for the authenticator app.
+async fn two_factor_setup(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<TwoFactorBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    confirm_account_password(&state, &user, &body.account_password, "two-factor")?;
+    let secret = crate::totp::new_secret();
+    {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        db::set_two_factor_pending(&conn, user.id, Some(&secret)).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    }
+    let host = headers.get(header::HOST).and_then(|value| value.to_str().ok()).map(|host| host.split(':').next().unwrap_or(host).to_string()).unwrap_or_default();
+    let issuer = if host.is_empty() || host == "localhost" || host.parse::<std::net::IpAddr>().is_ok() { "OwnNAS".to_string() } else { format!("OwnNAS ({host})") };
+    let uri = crate::totp::uri(&issuer, &user.username, &secret);
+    Ok(Json(json!({ "secret": secret, "uri": uri, "qr": crate::totp::qr_svg(&uri) })))
+}
+
+fn new_recovery_codes(conn: &rusqlite::Connection, user_id: i64) -> Result<Vec<String>, ApiError> {
+    let codes = crate::totp::new_recovery_codes();
+    let hashes: Vec<String> = codes.iter().map(|code| auth::token_hash(code)).collect();
+    db::set_recovery_codes(conn, user_id, &hashes).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(codes)
+}
+
+/// Turns it on once a code from the app shows it was set up right; answers the recovery codes.
+async fn two_factor_enable(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<TwoFactorBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, token) = require_user(&state, &headers)?;
+    let gate_key = format!("two-factor-code:{}", user.username);
+    if !login_allowed(&mut state.attempts.lock().unwrap_or_else(|err| err.into_inner()), &gate_key) {
+        return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Too many attempts. Wait a few minutes and try again."));
+    }
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    let pending = db::two_factor(&conn, user.id).pending.ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "Start setting up two-factor sign-in again"))?;
+    let Some(step) = crate::totp::check(&pending, &body.code, db::now_secs(), 0) else {
+        login_failed(&mut state.attempts.lock().unwrap_or_else(|err| err.into_inner()), &gate_key);
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "That code is not right. Check the phone's clock, and type the code the app shows now."));
+    };
+    login_succeeded(&mut state.attempts.lock().unwrap_or_else(|err| err.into_inner()), &gate_key);
+    db::enable_two_factor(&conn, user.id, step).map_err(|err| ApiError::new(StatusCode::CONFLICT, err))?;
+    let codes = new_recovery_codes(&conn, user.id)?;
+    // Other places signed in to this account sign in again, now with a code.
+    let _ = db::delete_other_sessions(&conn, user.id, &token);
+    let _ = db::log_event(&conn, Some(user.id), &user.username, "two-factor-on", "");
+    drop(conn);
+    forget_sessions(&state);
+    Ok(Json(json!({ "enabled": true, "recoveryCodes": codes })))
+}
+
+async fn two_factor_disable(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<TwoFactorBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    confirm_account_password(&state, &user, &body.account_password, "two-factor")?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    db::disable_two_factor(&conn, user.id).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let _ = db::log_event(&conn, Some(user.id), &user.username, "two-factor-off", "");
+    Ok(Json(json!({ "enabled": false })))
+}
+
+/// New recovery codes in place of the old ones.
+async fn two_factor_recovery(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<TwoFactorBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    confirm_account_password(&state, &user, &body.account_password, "two-factor")?;
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    if db::two_factor(&conn, user.id).secret.is_none() {
+        return Err(ApiError::new(StatusCode::CONFLICT, "Two-factor sign-in is off"));
+    }
+    let codes = new_recovery_codes(&conn, user.id)?;
+    Ok(Json(json!({ "recoveryCodes": codes })))
 }
 
 async fn me(
@@ -1346,6 +1559,7 @@ async fn me(
         "username": user.username,
         "admin": user.is_admin,
         "readonly": state.readonly,
+        "twoFactor": db::two_factor(&state.db.lock().unwrap_or_else(|err| err.into_inner()), user.id).secret.is_some(),
         "version": env!("CARGO_PKG_VERSION"),
         "rootName": files::root_label(&state.root),
         "ffmpeg": state.ffmpeg,
@@ -1562,13 +1776,20 @@ async fn remove_managed_user(
 async fn change_password(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
+    peer: Peer,
     Json(body): Json<PasswordBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     check_csrf(&headers)?;
     let (user, token) = require_user(&state, &headers)?;
-    if !auth::verify_password(&body.current, &user.password_hash) {
+    let gate_key = format!("password:{}", user.username);
+    if !login_allowed(&mut state.attempts.lock().unwrap_or_else(|err| err.into_inner()), &gate_key) {
+        return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "Too many attempts. Wait a few minutes and try again."));
+    }
+    if !verify_password_slowly(&state, &body.current, Some(&user.password_hash)).await {
+        login_failed(&mut state.attempts.lock().unwrap_or_else(|err| err.into_inner()), &gate_key);
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "Current password is wrong"));
     }
+    login_succeeded(&mut state.attempts.lock().unwrap_or_else(|err| err.into_inner()), &gate_key);
     auth::validate_password(&body.new).map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     db::set_password(&conn, &user.username, &body.new)
@@ -1582,7 +1803,7 @@ async fn change_password(
     Ok((
         [(
             header::SET_COOKIE,
-            auth::session_cookie(&new_token, state.secure_cookie),
+            auth::session_cookie(&new_token, secure_cookie(&state, &headers, &peer)),
         )],
         Json(json!({ "ok": true })),
     ))
@@ -7147,28 +7368,10 @@ fn local_network(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// Terminals are refused over plain HTTP from the open internet. A reverse proxy on this
-/// machine is trusted to report the real client and scheme.
+/// Terminals are refused over plain HTTP from the open internet. A trusted reverse proxy
+/// (this machine, or `--trusted-proxy`) reports the real client and scheme.
 fn terminal_transport_ok(state: &AppState, headers: &HeaderMap, peer: &Peer) -> bool {
-    if state.https {
-        return true;
-    }
-    let Some(peer) = peer.0 else { return false };
-    if peer.ip().is_loopback() {
-        let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
-        if header("x-forwarded-proto").is_some_and(|proto| proto.eq_ignore_ascii_case("https")) {
-            return true;
-        }
-        if let Some(forwarded) = header("x-forwarded-for") {
-            return forwarded
-                .split(',')
-                .next()
-                .and_then(|ip| ip.trim().parse().ok())
-                .is_some_and(local_network);
-        }
-        return true;
-    }
-    local_network(peer.ip())
+    over_https(state, headers, peer) || client_ip(state, headers, peer).is_some_and(local_network)
 }
 
 fn terminal_locked_error() -> ApiError {
@@ -7196,6 +7399,14 @@ fn terminal_access(state: &AppState, headers: &HeaderMap, peer: &Peer) -> Result
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "Terminals need HTTPS when you connect from outside your network or VPN",
+        ));
+    }
+    // A terminal is this computer's shell: from the internet, a password alone is not enough.
+    let from_outside = !client_ip(state, headers, peer).is_some_and(local_network);
+    if from_outside && db::two_factor(&state.db.lock().unwrap_or_else(|err| err.into_inner()), user.id).secret.is_none() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Turn on two-factor sign-in (the shield button at the top) to use terminals from outside your network or VPN",
         ));
     }
     let token_hash = auth::token_hash(&token);
