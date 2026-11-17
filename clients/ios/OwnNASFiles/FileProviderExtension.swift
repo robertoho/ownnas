@@ -1,4 +1,5 @@
 import FileProvider
+import OSLog
 import UniformTypeIdentifiers
 
 /// The server in the Files app: one location per signed-in server (a file provider domain whose
@@ -430,8 +431,10 @@ final class FolderEnumerator: NSObject, NSFileProviderEnumerator {
     }
 }
 
-/// What the system watches for changes everywhere: everything it has seen, kept up to date from
-/// the server's change feed (the app tells the system when there is something new).
+/// What the system watches for changes everywhere: everything it has seen (what is in each
+/// folder it listed), kept up to date from the server's change feed (the app tells the system
+/// when there is something new). On the Mac this is the only place changes come from: the system
+/// does not ask a folder it already has what changed in it, not even when it is opened.
 final class WorkingSet: NSObject, NSFileProviderEnumerator {
     weak var provider: FileProviderExtension?
 
@@ -441,8 +444,21 @@ final class WorkingSet: NSObject, NSFileProviderEnumerator {
 
     func invalidate() {}
 
+    /// Everything in the folders the system has, listed again (the system asks when it starts
+    /// over, as after a change feed cursor expired).
     func enumerateItems(for observer: NSFileProviderEnumerationObserver, startingAt page: NSFileProviderPage) {
-        observer.finishEnumerating(upTo: nil)
+        Task.detached { [provider] in
+            guard let provider else {
+                observer.finishEnumeratingWithError(NSFileProviderError(.serverUnreachable))
+                return
+            }
+            do {
+                try ChangeFeed.relist(provider) { items, _ in observer.didEnumerate(items) }
+                observer.finishEnumerating(upTo: nil)
+            } catch {
+                observer.finishEnumeratingWithError(FileProviderExtension.fileError(error))
+            }
+        }
     }
 
     func enumerateChanges(for observer: NSFileProviderChangeObserver, from anchor: NSFileProviderSyncAnchor) {
@@ -486,26 +502,29 @@ enum ChangeFeed {
                 do {
                     feed = try provider.call { try provider.server().changes(cursor: cursor, waitSeconds: 0) }
                 } catch ClientError.NotFound {
-                    // A server from before the change feed: folders are listed again when opened.
+                    // A server from before the change feed: what the system has is listed again.
                     if folder != nil { observer.finishEnumeratingWithError(NSFileProviderError(.syncAnchorExpired)) }
-                    else { observer.finishEnumeratingChanges(upTo: anchor, moreComing: false) }
+                    else { try relistChanges(provider, to: observer, upTo: anchor) }
                     return
                 }
-                if !feed.watching {
-                    // The server cannot watch its folder: folders are listed again when opened.
+                if !feed.watching || feed.expired {
+                    // The feed cannot say what changed: the server restarted or missed changes
+                    // (the cursor expired), or it cannot watch its folder. A folder starts over;
+                    // everything the system has is listed again. (Only asking the system to start
+                    // over would not do on the Mac: it lists only the working set again, never
+                    // the folders it already has.)
                     if folder != nil { observer.finishEnumeratingWithError(NSFileProviderError(.syncAnchorExpired)) }
-                    else { observer.finishEnumeratingChanges(upTo: anchor, moreComing: false) }
-                    return
-                }
-                if feed.expired {
-                    observer.finishEnumeratingWithError(NSFileProviderError(.syncAnchorExpired))
+                    else { try relistChanges(provider, to: observer, upTo: NSFileProviderSyncAnchor(Data(feed.cursor.utf8))) }
                     return
                 }
                 let writable = provider.writable()
                 var updated: [NSFileProviderItem] = []
                 var deleted: [NSFileProviderItemIdentifier] = []
                 for change in feed.changes {
-                    if let folder, (change.path as NSString).deletingLastPathComponent != folder { continue }
+                    let parent = (change.path as NSString).deletingLastPathComponent
+                    if let folder, parent != folder { continue }
+                    // Only what is in a folder the system has: the rest it lists when opened.
+                    if folder == nil, !change.deleted, !provider.ids.visited(parent) { continue }
                     if change.deleted {
                         // Only items the system knows; what was inside a folder goes with it.
                         if let id = provider.ids.known(change.path) {
@@ -523,6 +542,42 @@ enum ChangeFeed {
                 observer.finishEnumeratingWithError(FileProviderExtension.fileError(error))
             }
         }
+    }
+
+    /// Tells the system what is in every folder it has, and what it has that is gone, then moves
+    /// it to `anchor` (taken before listing, so a change made meanwhile comes again next time).
+    private static func relistChanges(_ provider: FileProviderExtension, to observer: NSFileProviderChangeObserver, upTo anchor: NSFileProviderSyncAnchor) throws {
+        try relist(provider) { items, gone in
+            if !gone.isEmpty { observer.didDeleteItems(withIdentifiers: gone) }
+            if !items.isEmpty { observer.didUpdate(items) }
+        }
+        observer.finishEnumeratingChanges(upTo: anchor, moreComing: false)
+    }
+
+    /// Lists every folder the system has again, a folder at a time: what is in it now, and the
+    /// identifiers of what the system has that is no longer there (a folder gone takes what was
+    /// inside it along).
+    static func relist(_ provider: FileProviderExtension, report: ([NSFileProviderItem], [NSFileProviderItemIdentifier]) -> Void) throws {
+        let writable = provider.writable()
+        let started = Date()
+        var listed = 0
+        for folder in provider.ids.visitedFolders() {
+            // Inside a folder found gone a moment ago.
+            if !provider.ids.visited(folder) { continue }
+            let entries: [Entry]
+            do {
+                entries = try provider.call { try provider.server().list(path: folder) }.entries
+            } catch ClientError.NotFound where !folder.isEmpty {
+                let id = provider.ids.known(folder)
+                provider.ids.removed(folder)
+                report([], id.map { [$0] } ?? [])
+                continue
+            }
+            let gone = provider.ids.listed(folder, names: Set(entries.map(\.name)))
+            report(entries.map { FileItem($0, writable: writable, ids: provider.ids) }, gone)
+            listed += 1
+        }
+        Logger(subsystem: "app.ownnas.files", category: "changes").notice("Listed \(listed) folders again in \(Date().timeIntervalSince(started), format: .fixed(precision: 1)) s")
     }
 }
 

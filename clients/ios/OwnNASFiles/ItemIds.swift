@@ -12,18 +12,29 @@ final class ItemIds: @unchecked Sendable {
     /// What is inside a folder follows the folder, unless chosen otherwise.
     private let keepFile: URL
     private var keep: [String: Bool] = [:]
+    /// The folders whose contents the system has (it listed them): what is listed again when the
+    /// server's change feed cannot say what changed. "" is the top, always there.
+    private let foldersFile: URL
+    private var folders: Set<String> = [""]
 
     init(domain: String) {
         let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         file = folder.appendingPathComponent("ids-\(domain).plist")
         keepFile = folder.appendingPathComponent("keep-\(domain).plist")
+        foldersFile = folder.appendingPathComponent("folders-\(domain).plist")
         if let data = try? Data(contentsOf: keepFile), let saved = try? PropertyListDecoder().decode([String: Bool].self, from: data) {
             keep = saved
         }
         if let data = try? Data(contentsOf: file), let saved = try? PropertyListDecoder().decode([String: String].self, from: data) {
             byPath = saved
             for (path, id) in saved { byId[id] = path }
+        }
+        if let data = try? Data(contentsOf: foldersFile), let saved = try? PropertyListDecoder().decode(Set<String>.self, from: data) {
+            folders.formUnion(saved)
+        } else {
+            // From before folders were remembered: a folder with something known in it was listed.
+            for path in byPath.keys { folders.insert((path as NSString).deletingLastPathComponent) }
         }
     }
 
@@ -75,8 +86,13 @@ final class ItemIds: @unchecked Sendable {
             keep[path] = nil
             keep[new + path.dropFirst(old.count)] = choice
         }
+        for path in folders where path == old || path.hasPrefix(old + "/") {
+            folders.remove(path)
+            folders.insert(new + path.dropFirst(old.count))
+        }
         saveLocked()
         saveKeepLocked()
+        saveFoldersLocked()
     }
 
     /// Forgets a deleted item and what was inside it.
@@ -90,8 +106,12 @@ final class ItemIds: @unchecked Sendable {
         for path in keep.keys where path == old || path.hasPrefix(old + "/") {
             keep[path] = nil
         }
+        if !old.isEmpty {
+            folders = folders.filter { $0 != old && !$0.hasPrefix(old + "/") }
+        }
         saveLocked()
         saveKeepLocked()
+        saveFoldersLocked()
     }
 
     /// The choice made for exactly this path, if any.
@@ -134,17 +154,39 @@ final class ItemIds: @unchecked Sendable {
         if let data = try? PropertyListEncoder().encode(keep) { try? data.write(to: keepFile, options: .atomic) }
     }
 
-    /// After listing a folder: forgets what is no longer in it (changed outside Files).
-    func listed(_ folder: String, names: Set<String>) {
+    /// After listing a folder: remembers that the system has its contents, and forgets what is no
+    /// longer in it (changed outside Files). Returns the identifiers of what it forgot.
+    @discardableResult
+    func listed(_ folder: String, names: Set<String>) -> [NSFileProviderItemIdentifier] {
         let prefix = folder.isEmpty ? "" : folder + "/"
         lock.lock()
-        let gone = byPath.keys.filter { path in
+        let gone = byPath.filter { path, _ in
             guard path.hasPrefix(prefix) else { return false }
             let rest = path.dropFirst(prefix.count)
             return !rest.contains("/") && !names.contains(String(rest))
         }
+        if folders.insert(folder).inserted { saveFoldersLocked() }
         lock.unlock()
-        for path in gone { removed(path) }
+        for path in gone.keys { removed(path) }
+        return gone.values.map { NSFileProviderItemIdentifier($0) }
+    }
+
+    /// Whether the system has this folder's contents (it was listed).
+    func visited(_ folder: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return folders.contains(folder)
+    }
+
+    /// Every folder the system has the contents of, each above what is inside it.
+    func visitedFolders() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return folders.sorted()
+    }
+
+    private func saveFoldersLocked() {
+        if let data = try? PropertyListEncoder().encode(folders) { try? data.write(to: foldersFile, options: .atomic) }
     }
 
     private func saveLocked() {

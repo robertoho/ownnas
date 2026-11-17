@@ -22,6 +22,8 @@ struct Journal {
     next: u64,
     /// Changed paths with their sequence numbers, oldest first.
     events: VecDeque<(u64, String)>,
+    /// The newest sequence number a cursor was handed out for: a client may have read up to it.
+    handed: u64,
 }
 
 pub struct Changes {
@@ -52,7 +54,7 @@ impl Changes {
         // A new epoch on every start: cursors handed out before do not count.
         let epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(1);
         Arc::new(Self {
-            journal: Mutex::new(Journal { epoch, next: 1, events: VecDeque::new() }),
+            journal: Mutex::new(Journal { epoch, next: 1, events: VecDeque::new(), handed: 0 }),
             wake: tokio::sync::Notify::new(),
             watching: std::sync::atomic::AtomicBool::new(false),
             watcher: Mutex::new(None),
@@ -118,8 +120,10 @@ impl Changes {
     pub fn record(&self, rel: String) {
         {
             let mut journal = self.journal();
-            // The same path again right away (a write in several parts) is one change.
-            if journal.events.back().is_some_and(|(_, last)| *last == rel) {
+            // The same path again right away (a write in several parts) is one change, unless a
+            // client may have read the first already: then it must hear of this one too (a file
+            // made, then renamed or deleted, would otherwise stay with clients).
+            if journal.events.back().is_some_and(|(seq, last)| *last == rel && *seq > journal.handed) {
                 return;
             }
             let seq = journal.next;
@@ -146,7 +150,8 @@ impl Changes {
 
     /// What changed after `cursor` (none: start from now).
     pub fn since(&self, cursor: Option<&str>) -> Since {
-        let journal = self.journal();
+        let mut journal = self.journal();
+        journal.handed = journal.next - 1;
         let now = format!("{}-{}", journal.epoch, journal.next - 1);
         let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) else {
             return Since::Changed { cursor: now, paths: Vec::new() };
@@ -249,6 +254,27 @@ mod tests {
         assert!(matches!(feed.since(Some("nonsense")), Since::Expired { .. }));
         feed.expire();
         assert!(matches!(feed.since(Some(&cursor)), Since::Expired { .. }), "missed changes expire every cursor");
+    }
+
+    #[test]
+    fn a_path_changed_again_after_a_client_read_it_is_a_new_change() {
+        let feed = Changes::new();
+        let Since::Changed { cursor: start, .. } = feed.since(None) else { panic!() };
+        feed.record("note.txt".into());
+        // A client hears of the new file...
+        let Since::Changed { cursor, paths } = feed.since(Some(&start)) else { panic!() };
+        assert_eq!(paths, ["note.txt"]);
+        // ...which is then renamed (or deleted): the old name changes again.
+        feed.record("note.txt".into());
+        feed.record("renamed.txt".into());
+        let Since::Changed { paths, .. } = feed.since(Some(&cursor)) else { panic!() };
+        assert_eq!(paths, ["note.txt", "renamed.txt"]);
+        // Repeats nobody read in between are still one change.
+        let Since::Changed { cursor, .. } = feed.since(Some(&cursor)) else { panic!() };
+        feed.record("big.bin".into());
+        feed.record("big.bin".into());
+        feed.record("big.bin".into());
+        assert_eq!(feed.since(Some(&cursor)), Since::Changed { cursor: format!("{}-4", cursor.split_once('-').unwrap().0), paths: vec!["big.bin".into()] });
     }
 
     #[tokio::test]

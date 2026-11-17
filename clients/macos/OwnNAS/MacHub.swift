@@ -149,7 +149,9 @@ final class MacHub: ObservableObject {
     // MARK: Changes on the server
 
     /// Follows a server's change feed while the app runs: each change tells Finder to ask the
-    /// Finder extension what changed (it reads the feed itself, from where it got to).
+    /// Finder extension what changed (it reads the feed itself, from where it got to). A server
+    /// that cannot say what changed (it cannot watch its folder, or is from before the feed) has
+    /// Finder look every minute instead: the extension then lists the folders Finder has again.
     private func watch(_ saved: SavedServer) {
         watches[saved.id]?.cancel()
         let store = self.store
@@ -167,14 +169,23 @@ final class MacHub: ObservableObject {
                     let feed = try await Task.detached { try connection.changes(cursor: asked, waitSeconds: 25) }.value
                     if !asked.isEmpty && (feed.expired || !feed.changes.isEmpty) { self?.tellFinder(saved.id) }
                     cursor = feed.cursor
-                    self?.status[saved.id] = feed.watching ? "Up to date" : "Up to date (the server cannot watch its folder: folders refresh when opened)"
+                    if feed.watching {
+                        self?.status[saved.id] = "Up to date"
+                    } else {
+                        // The server waited for nothing: changes there are not told.
+                        self?.status[saved.id] = "Up to date (the server cannot watch its folder: Finder looks for changes every minute)"
+                        try await Task.sleep(for: .seconds(35))
+                        self?.tellFinder(saved.id)
+                    }
                 } catch ClientError.Unauthorized {
                     self?.status[saved.id] = "Signed out by the server: sign in again"
                     return
                 } catch ClientError.NotFound {
-                    // A server from before the change feed: Finder still works, and lists
-                    // folders again when they are opened.
-                    self?.status[saved.id] = "Connected. Update the server for its changes to show in Finder at once"
+                    // A server from before the change feed.
+                    self?.status[saved.id] = "Connected. Finder looks for changes every minute (update the server for them to show at once)"
+                    try? await Task.sleep(for: .seconds(60))
+                    self?.tellFinder(saved.id)
+                } catch is CancellationError {
                     return
                 } catch {
                     server = nil
