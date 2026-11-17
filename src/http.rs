@@ -357,6 +357,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/users", get(list_users).post(create_managed_user))
         .route("/api/users/password", post(admin_set_password))
         .route("/api/users/admin", post(set_user_admin))
+        .route("/api/users/read-only", post(set_user_read_only))
         .route("/api/users/remove", post(remove_managed_user))
         .route("/.well-known/oauth-protected-resource", get(oauth_resource_metadata).options(oauth_preflight))
         .route("/.well-known/oauth-protected-resource/mcp", get(oauth_resource_metadata).options(oauth_preflight))
@@ -601,6 +602,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/sync/delete", post(sync_delete))
         .route("/api/sync/changes", get(sync_changes))
         .layer(axum::middleware::from_fn_with_state(state.clone(), note_changes))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), read_only_accounts))
         .layer(axum::middleware::from_fn_with_state(state.clone(), strict_transport))
         .with_state(state)
 }
@@ -1558,7 +1560,9 @@ async fn me(
         "libraryId": library_id,
         "username": user.username,
         "admin": user.is_admin,
-        "readonly": state.readonly,
+        // The web app hides changes either way: the whole server, or this account, is read-only.
+        "readonly": state.readonly || user.read_only,
+        "accountReadOnly": user.read_only,
         "twoFactor": db::two_factor(&state.db.lock().unwrap_or_else(|err| err.into_inner()), user.id).secret.is_some(),
         "version": env!("CARGO_PKG_VERSION"),
         "rootName": files::root_label(&state.root),
@@ -1743,6 +1747,65 @@ async fn set_user_admin(
         body.username.trim(),
     );
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadOnlyBody {
+    username: String,
+    read_only: bool,
+}
+
+async fn set_user_read_only(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<ReadOnlyBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        db::set_user_read_only(&conn, &body.username, body.read_only).map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    }
+    forget_sessions(&state);
+    record(&state, &user, if body.read_only { "user-read-only" } else { "user-read-write" }, body.username.trim());
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Requests that look and change nothing, which a read-only account may also send as POST.
+const READ_ONLY_POSTS: [&str; 12] = [
+    "/api/login",
+    "/api/logout",
+    "/api/password",
+    "/api/two-factor/setup",
+    "/api/two-factor/enable",
+    "/api/two-factor/disable",
+    "/api/two-factor/recovery",
+    "/api/download",
+    "/api/gallery/similar",
+    "/api/recent",
+    "/api/photo/motion/known",
+    "/api/terminal/lock",
+];
+
+/// Read-only accounts change nothing: every request but a look (and the few above) is
+/// refused before it reaches its handler, so a request added later is covered too.
+async fn read_only_accounts(
+    State(state): State<std::sync::Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let method = request.method();
+    let looks = method == axum::http::Method::GET || method == axum::http::Method::HEAD || method == axum::http::Method::OPTIONS;
+    if !looks && !READ_ONLY_POSTS.contains(&request.uri().path()) {
+        if let Ok((user, _)) = require_user(&state, request.headers()) {
+            if user.read_only {
+                return ApiError::new(StatusCode::FORBIDDEN, "This account can look at files but not change them").into_response();
+            }
+        }
+    }
+    next.run(request).await
 }
 
 #[derive(Deserialize)]

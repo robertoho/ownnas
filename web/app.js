@@ -3124,11 +3124,12 @@ async function loadUsers() {
       ${users.map((user) => `
         <tr data-username="${esc(user.username)}">
           <td>${esc(user.username)}</td>
-          <td>${user.isAdmin ? `<span class="pill">Admin</span>` : `<span class="muted">Member</span>`}</td>
+          <td>${user.isAdmin ? `<span class="pill">Admin</span>` : user.readOnly ? `<span class="muted">Read-only</span>` : `<span class="muted">Member</span>`}${user.twoFactor ? ` <span class="muted" title="Signs in with a code from an authenticator app">· two-factor</span>` : ""}</td>
           <td>
             <div class="user-actions">
               <button type="button" data-user-password="${esc(user.username)}">Reset password</button>
               <button type="button" data-user-admin="${esc(user.username)}" data-admin="${user.isAdmin ? "0" : "1"}">${user.isAdmin ? "Revoke admin" : "Make admin"}</button>
+              ${user.isAdmin ? "" : `<button type="button" data-user-read-only="${esc(user.username)}" data-read-only="${user.readOnly ? "0" : "1"}" title="${user.readOnly ? "Let this account change files again" : "This account can look at everything and change nothing"}">${user.readOnly ? "Allow changes" : "Make read-only"}</button>`}
               <button type="button" class="danger" data-user-remove="${esc(user.username)}">Remove</button>
             </div>
           </td>
@@ -8660,7 +8661,16 @@ $("users-list").addEventListener("click", async (event) => {
   const passwordBtn = event.target.closest("[data-user-password]");
   const adminBtn = event.target.closest("[data-user-admin]");
   const removeBtn = event.target.closest("[data-user-remove]");
+  const readOnlyBtn = event.target.closest("[data-user-read-only]");
   try {
+    if (readOnlyBtn) {
+      const username = readOnlyBtn.dataset.userReadOnly;
+      const readOnly = readOnlyBtn.dataset.readOnly === "1";
+      await api("/api/users/read-only", { method: "POST", json: { username, readOnly } });
+      toast(readOnly ? `${username} can now only look` : `${username} can change files again`);
+      await loadUsers();
+      return;
+    }
     if (passwordBtn) {
       const username = passwordBtn.dataset.userPassword;
       const password = await askText(`Reset password for ${username}`, "New password", "", "Save");

@@ -8,6 +8,8 @@ pub struct User {
     pub username: String,
     pub password_hash: String,
     pub is_admin: bool,
+    /// Can look at everything and change nothing (never an administrator).
+    pub read_only: bool,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -17,6 +19,8 @@ pub struct UserInfo {
     pub username: String,
     pub is_admin: bool,
     pub created_at: i64,
+    pub read_only: bool,
+    pub two_factor: bool,
 }
 
 pub fn open(path: &std::path::Path) -> Result<Connection, String> {
@@ -928,14 +932,14 @@ fn ensure_admin_column(conn: &Connection) -> Result<(), String> {
     }
     // Two-factor sign-in: the authenticator secret (and one being set up), the last code's
     // step (a code signs in once), and the one-time recovery codes, kept as hashes.
-    for (column, kind) in [("totp_secret", "TEXT"), ("totp_pending", "TEXT"), ("totp_used_step", "INTEGER NOT NULL DEFAULT 0")] {
+    for (column, kind) in [("totp_secret", "TEXT"), ("totp_pending", "TEXT"), ("totp_used_step", "INTEGER NOT NULL DEFAULT 0"), ("read_only", "INTEGER NOT NULL DEFAULT 0")] {
         let has: bool = conn
             .prepare(&format!("SELECT 1 FROM pragma_table_info('users') WHERE name = '{column}'"))
             .and_then(|mut stmt| stmt.exists([]))
             .unwrap_or(false);
         if !has {
             conn.execute(&format!("ALTER TABLE users ADD COLUMN {column} {kind}"), [])
-                .map_err(|_| "Could not add two-factor sign-in to the accounts".to_string())?;
+                .map_err(|_| "Could not update the accounts table".to_string())?;
         }
     }
     conn.execute(
@@ -1005,7 +1009,7 @@ pub fn list_users(conn: &Connection) -> Result<Vec<String>, String> {
 pub fn list_user_infos(conn: &Connection) -> Result<Vec<UserInfo>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, username, is_admin, created_at
+            "SELECT id, username, is_admin, created_at, read_only, totp_secret IS NOT NULL
              FROM users
              ORDER BY username COLLATE NOCASE",
         )
@@ -1017,6 +1021,8 @@ pub fn list_user_infos(conn: &Connection) -> Result<Vec<UserInfo>, String> {
                 username: row.get(1)?,
                 is_admin: row.get::<_, i64>(2)? != 0,
                 created_at: row.get(3)?,
+                read_only: row.get::<_, i64>(4)? != 0,
+                two_factor: row.get(5)?,
             })
         })
         .map_err(|_| "Could not read users".to_string())?;
@@ -1062,7 +1068,7 @@ pub fn create_user_with_admin(
 pub fn find_user(conn: &Connection, username: &str) -> Result<Option<User>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, username, password_hash, is_admin FROM users WHERE username = ?1",
+            "SELECT id, username, password_hash, is_admin, read_only FROM users WHERE username = ?1",
         )
         .map_err(|_| "Could not read users".to_string())?;
     let mut rows = stmt
@@ -1074,6 +1080,7 @@ pub fn find_user(conn: &Connection, username: &str) -> Result<Option<User>, Stri
             username: row.get(1).map_err(|_| "Could not read users".to_string())?,
             password_hash: row.get(2).map_err(|_| "Could not read users".to_string())?,
             is_admin: row.get::<_, i64>(3).map_err(|_| "Could not read users".to_string())? != 0,
+            read_only: row.get::<_, i64>(4).map_err(|_| "Could not read users".to_string())? != 0,
         }))
     } else {
         Ok(None)
@@ -1114,11 +1121,23 @@ pub fn set_user_admin(conn: &Connection, username: &str, is_admin: bool) -> Resu
     if user.is_admin && !is_admin && count_admins(conn)? <= 1 {
         return Err("Cannot remove the last administrator".into());
     }
+    // An administrator changes settings, so is never read-only.
     conn.execute(
-        "UPDATE users SET is_admin = ?1 WHERE id = ?2",
+        "UPDATE users SET is_admin = ?1, read_only = CASE WHEN ?1 = 1 THEN 0 ELSE read_only END WHERE id = ?2",
         params![if is_admin { 1 } else { 0 }, user.id],
     )
     .map_err(|_| "Could not update the administrator flag".to_string())?;
+    Ok(())
+}
+
+/// A read-only account looks at everything and changes nothing. Administrators cannot be.
+pub fn set_user_read_only(conn: &Connection, username: &str, read_only: bool) -> Result<(), String> {
+    let user = find_user(conn, username)?.ok_or_else(|| "That user does not exist".to_string())?;
+    if read_only && user.is_admin {
+        return Err("An administrator cannot be read-only. Take away administrator access first.".into());
+    }
+    conn.execute("UPDATE users SET read_only = ?1 WHERE id = ?2", params![read_only, user.id])
+        .map_err(|_| "Could not update the account".to_string())?;
     Ok(())
 }
 
@@ -1138,7 +1157,7 @@ pub fn user_for_token(conn: &Connection, token: &str) -> Result<Option<User>, St
     let now = now_secs();
     let mut stmt = conn
         .prepare(
-            "SELECT u.id, u.username, u.password_hash, u.is_admin
+            "SELECT u.id, u.username, u.password_hash, u.is_admin, u.read_only
              FROM sessions s
              JOIN users u ON u.id = s.user_id
              WHERE s.token_hash = ?1 AND s.expires_at > ?2",
@@ -1161,6 +1180,7 @@ pub fn user_for_token(conn: &Connection, token: &str) -> Result<Option<User>, St
             username: row.get(1).map_err(|_| "Could not read the session".to_string())?,
             password_hash: row.get(2).map_err(|_| "Could not read the session".to_string())?,
             is_admin: row.get::<_, i64>(3).map_err(|_| "Could not read the session".to_string())? != 0,
+            read_only: row.get::<_, i64>(4).map_err(|_| "Could not read the session".to_string())? != 0,
         }))
     } else {
         Ok(None)

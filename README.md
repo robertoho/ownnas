@@ -347,7 +347,7 @@ nas.example.com {
 - **Wrong passwords** slow down whoever sends them instead of locking anyone out: after five, the address waits a second, then twice as long after each one, up to a quarter of an hour; the account itself waits at most half a minute, so a stranger cannot keep its owner out. Sign-ins and failed ones are in the activity log with the address they came from. The same goes for passwords asked again inside OwnNAS.
 - **Two-factor sign-in** (the shield button at the top): signing in also asks for a 6-digit code from an authenticator app (Google or Microsoft Authenticator, 1Password, Aegis…). Turning it on shows a QR code, checks one code, signs the account's other devices out, and gives ten recovery codes, each good for one sign-in if the phone is lost. A code signs in once. Lost both? `ownnas user two-factor-off --username NAME` on the server turns it off. The phone, desktop, and command-line clients do not ask for codes yet, so they cannot sign in to an account with it on.
 - **Terminals** from outside the local network or VPN need HTTPS and an account with two-factor sign-in, besides the terminal password if one is set.
-- **Every account** can read and change the whole library (only Settings are kept to administrators), so give accounts only to people you trust with all of it.
+- **Accounts** see the whole library; only Settings are kept to administrators. **Make read-only** (Settings → Users) lets an account look at, search, play, and download everything and change nothing: anything else it asks is refused before it is even handled, sync and the apps included. Administrators cannot be read-only. Accounts limited to some folders are not there yet, so give accounts only to people who may see all of it.
 
 ## Earlier versions
 
