@@ -20,6 +20,10 @@ restarted or missed changes) the extension lists every folder Finder has shown a
 what is new and removing what is gone. A server that cannot watch its folder, or is from before
 the change feed, is looked at that way every minute.
 
+**About OwnNAS** in the menu shows the app's version and build, and the address and version of
+each server it is signed in to (asked for each time the window opens). **Copy Details** puts it
+all on the clipboard, for a bug report.
+
 ## Building
 
 Needs Xcode, XcodeGen (`brew install xcodegen`) and Rust (rustup).
@@ -41,7 +45,13 @@ with the team ID, so no provisioning profile is needed. To build under another t
 
 `./release.sh` builds `build/dist/OwnNAS-<version>-mac.dmg`, a disk image for the releases page.
 It holds the app for Apple silicon and Intel, notarized and stapled, so it opens on any Mac
-without warnings. The version comes from `MARKETING_VERSION` in `project.yml`.
+without warnings.
+
+The version is not set in `project.yml`: after each build, `../apple-version.sh` writes the
+release version from `[workspace.package]` in the top `Cargo.toml` into the app's and the
+extension's Info.plist, with the number of commits as the build and the commit itself
+(`OwnNASCommit`, ending in `+` when there were changes not committed). So bumping the release
+version there is all a release needs; the disk image is named after it too.
 
 Notarizing needs the team's Apple credentials in this Mac's keychain. Store them once:
 
@@ -66,6 +76,8 @@ lines, for the 16 and 32 pixel sizes. To change the icon, render the PNGs in
 
 ## Notes
 
+- Debug builds open About at launch when `OWNNAS_TEST_ABOUT` is set, and log what it shows
+  (`log show --predicate 'subsystem == "app.ownnas.mac" AND category == "about"'`).
 - The sign-in token stays in your login Keychain. The extension gets it from the app with the
   place in Finder, because Developer ID apps cannot share Keychain items without a provisioning
   profile.

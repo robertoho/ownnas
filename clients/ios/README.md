@@ -126,6 +126,9 @@ Choose your team under Signing & Capabilities, then press Run.
 - **Where Xcode finds cargo:** it starts scripts with a bare PATH, so the script looks for
   cargo in Homebrew's rustup, `/usr/local/opt/rustup`, and `~/.cargo/bin`.
 - **Simulators:** only Apple silicon simulators are built.
+- **Version:** not set in `project.yml`. After each build, `../apple-version.sh` writes the
+  release version from `[workspace.package]` in the top `Cargo.toml` into the app's and the
+  extension's Info.plist, with the number of commits as the build.
 - **Editing the project:** change `project.yml`, not the `.xcodeproj`, and run `xcodegen`
   again.
 

@@ -112,6 +112,10 @@ home folder (and in the file manager's sidebar) whose files download when opened
 "Always keep on this computer" and "Free up space" are in the menus of Dolphin, GNOME Files
 and Nemo. See [clients/linux/README.md](clients/linux/README.md).
 
+`ownnas-cloud` (in `clients/windows`) does the same in Windows Explorer: each server is a place
+in the navigation pane with online-only files. `ownnas-cloud status` lists the servers with
+the version each one runs, below the version of `ownnas-cloud` itself (also `--version`).
+
 ## Sync a folder with your computer
 
 `ownnas-sync` is a separate command-line client (in `clients/desktop`) that keeps a local
@@ -442,6 +446,8 @@ It lands in `/tmp/restore` under the path it had, ending in `backup-staging/ownn
 ## Updates
 
 New installations check the signed GitHub release feed once per day. When there is a new version, administrators see a small note in the status bar. Choosing it opens **Settings → Updates**, where they choose when to install it. The ✕ hides the note for a week, or until an even newer version comes out. `--update-url` and `--update-pubkey` still override the default feed for custom installations. Service-managed installs should pass `--restart-by-supervisor` so the service manager starts the replaced binary after a clean shutdown. Existing installations must first install a release that includes the updater. The release workflow requires the `OWNNAS_UPDATE_PRIVATE_KEY` Actions secret; its matching public key is embedded in the application.
+
+A release sets its version in one place: `version` under `[workspace.package]` in the top `Cargo.toml`. The server, `ownnascli`, `ownnas-sync`, `ownnas-mount` and `ownnas-cloud` take it from there (`version.workspace = true`), the Mac and iPhone apps' builds write it into their Info.plist (`clients/apple-version.sh`), and the release workflow checks that the tag matches it. The Android app's version is still set in its own Gradle file.
 
 OwnNAS also includes embedded ODT and XLSX editors. Open an `.odt` or `.xlsx` file, or create one from **New file**. The ODT editor edits the page directly, with formatting, headings and lists; the spreadsheet editor shows number formats, colours and merged cells, and recalculates common formulas as you type. The ODT module can be reused in other projects; see [web/odt-editor.md](web/odt-editor.md).
 

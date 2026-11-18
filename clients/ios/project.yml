@@ -12,8 +12,8 @@ settings:
     # Shared by the app and its Files extension (the server list). Change it together with the
     # bundle identifiers if you build under your own.
     OWNNAS_APP_GROUP: group.app.ownnas.ios
-    MARKETING_VERSION: "0.9.6"
-    CURRENT_PROJECT_VERSION: "1"
+    # The version and build are not set here: ../apple-version.sh writes them into each built
+    # Info.plist from the workspace Cargo.toml (the release version) and git (the build).
 targets:
   OwnNAS:
     type: application
@@ -27,6 +27,13 @@ targets:
       - framework: Generated/OwnNASCore.xcframework
         embed: false
       - target: OwnNASFiles
+    postBuildScripts:
+      - name: Stamp the release version
+        script: 'bash "$SRCROOT/../apple-version.sh" --stamp'
+        basedOnDependencyAnalysis: false
+        # So it runs after Xcode writes the Info.plist, not before.
+        inputFiles:
+          - $(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)
     entitlements:
       path: OwnNAS/OwnNAS.entitlements
       properties: &shared-entitlements
@@ -78,6 +85,13 @@ targets:
     dependencies:
       - framework: Generated/OwnNASCore.xcframework
         embed: false
+    postBuildScripts:
+      - name: Stamp the release version
+        script: 'bash "$SRCROOT/../apple-version.sh" --stamp'
+        basedOnDependencyAnalysis: false
+        # So it runs after Xcode writes the Info.plist, not before.
+        inputFiles:
+          - $(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)
     entitlements:
       path: OwnNASFiles/OwnNASFiles.entitlements
       properties: *shared-entitlements

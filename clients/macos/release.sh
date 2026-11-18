@@ -9,7 +9,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 profile=${PROFILE:-ownnas-notary}
-version=$(sed -n 's/^    MARKETING_VERSION: "\(.*\)"$/\1/p' project.yml)
+version=$(bash ../apple-version.sh)
 app=build/release/Build/Products/Release/OwnNAS.app
 dist=build/dist
 dmg=$dist/OwnNAS-$version-mac.dmg
