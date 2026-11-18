@@ -127,12 +127,21 @@ fn run(command: Command) -> Result<(), String> {
         }
         Command::Status => {
             let settings = load_settings();
+            println!("ownnas-cloud {}", env!("CARGO_PKG_VERSION"));
             if settings.accounts.is_empty() {
                 println!("No servers yet: run `ownnas-cloud setup --server … --username …`.");
             }
             for account in &settings.accounts {
                 let registered = sync::root_id(account).ok().and_then(|id| id.is_registered().ok()).unwrap_or(false);
                 println!("{} ({} as {}) at {}{}", account.name, account.server, account.username, account.folder.display(), if registered { "" } else { " — not in Explorer: run setup again" });
+                // The server's version, asked for now (`/api/me`).
+                let me = secret::unprotect(&account.token)
+                    .and_then(|token| api_for(&account.server, Some(token), account.ca_pem.as_deref(), &account.pinned))
+                    .and_then(|api| api.account().map_err(|err| err.to_string()));
+                match me {
+                    Ok(me) => println!("  server version {}", me.version),
+                    Err(err) => println!("  server version not known: {err}"),
+                }
             }
             println!("Log: {}", ownnas_cloud::data_dir().join("cloud.log").display());
             Ok(())

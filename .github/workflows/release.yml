@@ -77,7 +77,7 @@ jobs:
           import tomllib
           from pathlib import Path
 
-          cargo_version = tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"]
+          cargo_version = tomllib.loads(Path("Cargo.toml").read_text())["workspace"]["package"]["version"]
           expected_tag = f"v{cargo_version}"
           if os.environ["RELEASE_TAG"] != expected_tag:
               raise SystemExit(f"tag {os.environ['RELEASE_TAG']} does not match Cargo.toml ({expected_tag})")

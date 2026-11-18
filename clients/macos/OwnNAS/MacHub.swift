@@ -23,6 +23,10 @@ final class MacHub: ObservableObject {
     init() {
         servers = store.load()
         Task {
+            #if DEBUG
+            // Tests open About at launch with OWNNAS_TEST_ABOUT set (it logs what it shows).
+            if ProcessInfo.processInfo.environment["OWNNAS_TEST_ABOUT"] != nil { AboutWindow.show(self) }
+            #endif
             await syncDomains()
             await checkAllowed()
             for server in servers where store.token(server.id) != nil { watch(server) }

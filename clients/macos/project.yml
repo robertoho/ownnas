@@ -13,8 +13,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.9.6"
-    CURRENT_PROJECT_VERSION: "1"
+    # The version and build are not set here: ../apple-version.sh writes them into each built
+    # Info.plist from the workspace Cargo.toml (the release version) and git (the build).
     # Signed with a Developer ID, to give out outside the App Store (notarized for release).
     # The App Group starts with the team ID, which needs no provisioning profile on the Mac.
     DEVELOPMENT_TEAM: K27HXR2Q62
@@ -43,6 +43,13 @@ targets:
       - framework: Generated/OwnNASCore.xcframework
         embed: false
       - target: OwnNASFiles
+    postBuildScripts:
+      - name: Stamp the release version
+        script: 'bash "$SRCROOT/../apple-version.sh" --stamp'
+        basedOnDependencyAnalysis: false
+        # So it runs after Xcode writes the Info.plist, not before.
+        inputFiles:
+          - $(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)
     entitlements:
       path: OwnNAS/OwnNAS.entitlements
       properties:
@@ -55,8 +62,9 @@ targets:
       path: OwnNAS/Info.plist
       properties:
         CFBundleDisplayName: OwnNAS
-        CFBundleShortVersionString: $(MARKETING_VERSION)
-        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        # Placeholders: apple-version.sh writes the real ones after the build.
+        CFBundleShortVersionString: "0"
+        CFBundleVersion: "0"
         # A menu bar app: no Dock icon.
         LSUIElement: true
         LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
@@ -87,6 +95,13 @@ targets:
         com.apple.security.app-sandbox: true
         com.apple.security.network.client: true
         com.apple.security.application-groups: [$(OWNNAS_APP_GROUP)]
+    postBuildScripts:
+      - name: Stamp the release version
+        script: 'bash "$SRCROOT/../apple-version.sh" --stamp'
+        basedOnDependencyAnalysis: false
+        # So it runs after Xcode writes the Info.plist, not before.
+        inputFiles:
+          - $(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)
     # Built before the app, so it makes the Rust library and its bindings.
     preBuildScripts:
       - name: Build the Rust client library
@@ -98,8 +113,9 @@ targets:
       path: OwnNASFiles/Info.plist
       properties:
         CFBundleDisplayName: OwnNAS
-        CFBundleShortVersionString: $(MARKETING_VERSION)
-        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        # Placeholders: apple-version.sh writes the real ones after the build.
+        CFBundleShortVersionString: "0"
+        CFBundleVersion: "0"
         LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
         OwnNASAppGroup: $(OWNNAS_APP_GROUP)
         NSExtension:

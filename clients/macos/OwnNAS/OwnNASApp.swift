@@ -39,6 +39,7 @@ struct MenuContent: View {
         Button("Add a server…") { hub.showSignIn() }
         Toggle("Open at login", isOn: Binding(get: { hub.opensAtLogin }, set: { hub.setOpensAtLogin($0) }))
         Divider()
+        Button("About OwnNAS") { AboutWindow.show(hub) }
         Button("Quit OwnNAS") { NSApp.terminate(nil) }.keyboardShortcut("q")
     }
 }
