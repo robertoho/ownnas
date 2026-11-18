@@ -63,10 +63,11 @@ class Servers(private val context: Context, val store: ServerStore) {
     /** Who is signed in, and whether the server takes changes. Fetched once per app run. */
     fun account(id: String): Account = accounts[id] ?: blocking(id) { it.account() }.also { accounts[id] = it }
 
-    fun signIn(address: String, username: String, password: String, trust: Trust): SavedServer {
+    /** `code` is the two-factor code, once the server asked for one ([ClientException.TwoFactor]). */
+    fun signIn(address: String, username: String, password: String, trust: Trust, code: String? = null): SavedServer {
         val normalized = normalizeAddress(address)
         val ca = trust.caPem?.toByteArray()
-        val token = signIn(normalized, username.trim(), password, ca, trust.pinned)
+        val token = signIn(normalized, username.trim(), password, ca, trust.pinned, code?.trim()?.ifEmpty { null })
         val server = Server(normalized, token, ca, trust.pinned)
         val account = server.account()
         val saved = store.save(normalized, account.username, account.rootName, token, trust)

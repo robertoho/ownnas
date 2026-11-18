@@ -44,6 +44,9 @@ enum Command {
         /// PEM certificate of a private CA to trust (e.g. the `ca.pem` from `ownnas tls`).
         #[arg(long)]
         ca_cert: Option<PathBuf>,
+        /// The two-factor code, for an account with two-factor sign-in (asked for if omitted).
+        #[arg(long)]
+        code: Option<String>,
     },
     /// Link one more server folder to a local folder of its own, with the sign-in of a folder
     /// already set up (no password needed).
@@ -119,6 +122,7 @@ fn setup(
     password: Option<String>,
     remote: String,
     ca_cert: Option<PathBuf>,
+    code: Option<String>,
 ) -> Result<(), String> {
     let dir = local_dir(dir)?;
     let ca_cert = match ca_cert {
@@ -133,7 +137,7 @@ fn setup(
         None => rpassword::prompt_password(format!("Password for {}: ", config.username)).map_err(|err| err.to_string())?,
     };
     let api = api_for(&config, None)?;
-    config.token = api.login(&config.username, &password).map_err(|err| format!("Sign-in failed: {err}"))?;
+    config.token = api.login_on_terminal(&config.username, &password, code.as_deref()).map_err(|err| format!("Sign-in failed: {err}"))?;
     // Make sure the remote folder exists before the first sync.
     let api = api_for(&config, Some(config.token.clone()))?;
     if !config.remote.is_empty() {
@@ -355,8 +359,8 @@ fn logout(dir: &Path) -> Result<(), String> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Setup { dir, server, username, password, remote, ca_cert } => {
-            setup(&dir, server, username, password, remote, ca_cert)
+        Command::Setup { dir, server, username, password, remote, ca_cert, code } => {
+            setup(&dir, server, username, password, remote, ca_cert, code)
         }
         Command::Add { dir, remote, server, create } => add(&dir, &remote, server.as_deref(), create),
         Command::Folders { path, server } => list_server_folders(&path, server.as_deref()),

@@ -30,6 +30,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -37,6 +38,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
@@ -59,9 +62,13 @@ fun SignInScreen(vm: AppViewModel, existing: SavedServer?) {
     var showPassword by rememberSaveable { mutableStateOf(false) }
     var busy by rememberSaveable { mutableStateOf(false) }
     var error by rememberSaveable { mutableStateOf<String?>(null) }
+    // Shown once the server asks for a two-factor code (the account has two-factor sign-in on).
+    var askCode by rememberSaveable { mutableStateOf(false) }
+    var code by rememberSaveable { mutableStateOf("") }
+    val codeFocus = remember { FocusRequester() }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
-    val ready = address.isNotBlank() && username.isNotBlank() && password.isNotEmpty() && !busy
+    val ready = address.isNotBlank() && username.isNotBlank() && password.isNotEmpty() && (!askCode || code.isNotBlank()) && !busy
     var trust by remember { mutableStateOf(existing?.trust ?: Trust()) }
     // The fingerprint of a certificate this phone does not trust yet, while asking about it.
     var untrusted by remember { mutableStateOf<String?>(null) }
@@ -72,11 +79,16 @@ fun SignInScreen(vm: AppViewModel, existing: SavedServer?) {
         error = null
         scope.launch {
             try {
-                val server = vm.signIn(address, username, password, trust)
+                val server = vm.signIn(address, username, password, trust, code.takeIf { askCode })
                 vm.pop()
                 if (existing == null) vm.push(Screen.Browse(server.id, ""))
             } catch (err: ClientException.Unauthorized) {
                 error = "Wrong username or password"
+            } catch (err: ClientException.TwoFactor) {
+                // The first time, the field appearing says enough; after that, the code was wrong.
+                error = if (askCode) err.reason else null
+                askCode = true
+                code = ""
             } catch (err: ClientException.Untrusted) {
                 untrusted = runCatching { vm.fingerprint(address) }.getOrElse { "" }
             } catch (err: Exception) {
@@ -173,10 +185,25 @@ fun SignInScreen(vm: AppViewModel, existing: SavedServer?) {
                         )
                     }
                 },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Done),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = if (askCode) ImeAction.Next else ImeAction.Done),
                 keyboardActions = KeyboardActions(onDone = { submit() }),
                 modifier = Modifier.fillMaxWidth(),
             )
+            if (askCode) {
+                OutlinedTextField(
+                    value = code,
+                    onValueChange = { code = it.take(32) },
+                    label = { Text("Two-factor code") },
+                    supportingText = { Text("The 6 digits from your authenticator app, or a recovery code.") },
+                    singleLine = true,
+                    enabled = !busy,
+                    // Plain text: recovery codes have letters, and the keyboard offers SMS-style codes.
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done, autoCorrectEnabled = false),
+                    keyboardActions = KeyboardActions(onDone = { submit() }),
+                    modifier = Modifier.fillMaxWidth().focusRequester(codeFocus),
+                )
+                LaunchedEffect(Unit) { codeFocus.requestFocus() }
+            }
             error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium) }
             Button(onClick = ::submit, enabled = ready, modifier = Modifier.fillMaxWidth()) {
                 if (busy) CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp) else Text("Sign in")

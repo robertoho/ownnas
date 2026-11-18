@@ -28,6 +28,8 @@ target/release/ownnas-mount setup --server https://nas.example:8787 --username a
 - `--folder`: mount somewhere else.
 - `--cache-gb`: change the cache size limit.
 - `--ca-cert` / `--pin`: trust a server with its own certificate, as with `ownnas-sync`.
+- `--code`: the code for an account with two-factor sign-in (six digits from the
+  authenticator app, or a recovery code). Without it, `setup` asks for one on the terminal.
 - `--no-service`: run `ownnas-mount run` yourself instead of installing the service.
 
 Other commands:

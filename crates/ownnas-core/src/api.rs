@@ -54,6 +54,9 @@ pub enum ApiError {
     Locked,
     /// The caller stopped the transfer.
     Cancelled,
+    /// Sign-in needs a two-factor code (an authenticator code or a recovery code), or the one
+    /// sent was wrong. Holds the server's message; ask for a code and call [`Api::login`] again.
+    TwoFactor(String),
     Other(String),
 }
 
@@ -66,6 +69,7 @@ impl std::fmt::Display for ApiError {
             ApiError::Locked => write!(f, "enter the terminal password"),
             ApiError::Untrusted => write!(f, "the server's certificate is not trusted"),
             ApiError::Cancelled => write!(f, "cancelled"),
+            ApiError::TwoFactor(message) => write!(f, "{message}"),
             ApiError::Other(message) => write!(f, "{message}"),
         }
     }
@@ -143,11 +147,16 @@ impl Api {
     /// dead (phones and NATs drop idle ones), but not POST, so this does it here: the request
     /// never reached the server in that case, so sending it again is safe.
     pub(crate) fn post_json(&self, path: &str, body: serde_json::Value) -> Result<ureq::Response, ApiError> {
-        match self.request("POST", path).send_json(&body) {
+        self.post_json_raw(path, &body).map_err(map_err)
+    }
+
+    /// [`Api::post_json`] without turning the error into an [`ApiError`].
+    fn post_json_raw(&self, path: &str, body: &serde_json::Value) -> Result<ureq::Response, ureq::Error> {
+        match self.request("POST", path).send_json(body) {
             Err(ureq::Error::Transport(transport)) if transport.kind() == ureq::ErrorKind::Io => {
-                self.request("POST", path).send_json(&body).map_err(map_err)
+                self.request("POST", path).send_json(body)
             }
-            other => other.map_err(map_err),
+            other => other,
         }
     }
 
@@ -159,13 +168,57 @@ impl Api {
         }
     }
 
-    pub fn login(&self, username: &str, password: &str) -> Result<String, ApiError> {
-        let response = self.post_json("/api/login", json!({ "username": username, "password": password, "token": true }))?;
+    /// Signs in and returns a session token. `code` is the two-factor code (6 digits from an
+    /// authenticator app, or a recovery code like `k7dm-29xq`) for an account that has it on;
+    /// without one, such an account answers [`ApiError::TwoFactor`]. A wrong password or code
+    /// comes back with the server's own message.
+    pub fn login(&self, username: &str, password: &str, code: Option<&str>) -> Result<String, ApiError> {
+        let mut body = json!({ "username": username, "password": password, "token": true });
+        if let Some(code) = code.map(str::trim).filter(|code| !code.is_empty()) {
+            body["code"] = json!(code);
+        }
+        let response = match self.post_json_raw("/api/login", &body) {
+            Ok(response) => response,
+            Err(ureq::Error::Status(code @ (401 | 429), response)) => {
+                let body = response.into_json::<serde_json::Value>().unwrap_or_default();
+                let message = body["error"].as_str().map(str::to_string).unwrap_or_else(|| format!("HTTP {code}"));
+                return Err(if body["twoFactor"] == true { ApiError::TwoFactor(message) } else { ApiError::Other(message) });
+            }
+            Err(err) => return Err(map_err(err)),
+        };
         let body: serde_json::Value = response.into_json().map_err(|err| ApiError::Other(err.to_string()))?;
         body["token"]
             .as_str()
             .map(str::to_string)
             .ok_or_else(|| ApiError::Other("This OwnNAS server is too old for sync; update it first".into()))
+    }
+
+    /// [`Api::login`] for command-line tools. When the account wants a two-factor code and
+    /// `code` (their `--code`) was not given, asks for one on the terminal, up to three times;
+    /// without a terminal it says to pass `--code`.
+    pub fn login_on_terminal(&self, username: &str, password: &str, code: Option<&str>) -> Result<String, ApiError> {
+        use std::io::{BufRead, IsTerminal, Write};
+        let mut message = match self.login(username, password, code) {
+            Err(ApiError::TwoFactor(message)) if code.is_none() => message,
+            other => return other,
+        };
+        if !std::io::stdin().is_terminal() {
+            return Err(ApiError::TwoFactor(format!("{message}. Pass it with --code.")));
+        }
+        for _ in 0..3 {
+            eprint!("{message}\nTwo-factor code (or a recovery code): ");
+            let _ = std::io::stderr().flush();
+            let mut line = String::new();
+            std::io::stdin().lock().read_line(&mut line).map_err(|err| ApiError::Other(err.to_string()))?;
+            if line.trim().is_empty() {
+                break;
+            }
+            match self.login(username, password, Some(line.trim())) {
+                Err(ApiError::TwoFactor(again)) => message = again,
+                other => return other,
+            }
+        }
+        Err(ApiError::TwoFactor(message))
     }
 
     pub fn logout(&self) -> Result<(), ApiError> {

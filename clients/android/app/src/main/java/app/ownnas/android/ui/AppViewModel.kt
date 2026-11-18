@@ -190,8 +190,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }.getOrNull()
     }
 
-    suspend fun signIn(address: String, username: String, password: String, trust: Trust): SavedServer =
-        withContext(Dispatchers.IO) { hub.signIn(address, username, password, trust) }
+    suspend fun signIn(address: String, username: String, password: String, trust: Trust, code: String? = null): SavedServer =
+        withContext(Dispatchers.IO) { hub.signIn(address, username, password, trust, code) }
 
     /** The certificate fingerprint an `https://` server presents, before trusting it. */
     suspend fun fingerprint(address: String): String =
@@ -597,6 +597,7 @@ fun Throwable.userMessage(): String = when (this) {
     is ClientException.Cancelled -> "Cancelled"
     is ClientException.Locked -> "Enter the terminal password"
     is ClientException.Untrusted -> "The server's certificate changed or is not trusted. Sign in again to check it."
+    is ClientException.TwoFactor -> reason
     is ClientException.Failed -> reason
     else -> message ?: "Something went wrong"
 }

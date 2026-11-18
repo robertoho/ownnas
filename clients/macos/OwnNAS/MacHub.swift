@@ -27,7 +27,8 @@ final class MacHub: ObservableObject {
             await checkAllowed()
             for server in servers where store.token(server.id) != nil { watch(server) }
             #if DEBUG
-            // Tests sign in without the window: OWNNAS_TEST_ADDRESS, _USER and _PASSWORD.
+            // Tests sign in without the window: OWNNAS_TEST_ADDRESS, _USER and _PASSWORD (and
+            // _CODE for an account with two-factor sign-in).
             let env = ProcessInfo.processInfo.environment
             // And sign out of a test server again: OWNNAS_TEST_SIGN_OUT is its address.
             if let address = env["OWNNAS_TEST_SIGN_OUT"] {
@@ -35,7 +36,7 @@ final class MacHub: ObservableObject {
                 return
             }
             if let address = env["OWNNAS_TEST_ADDRESS"], let user = env["OWNNAS_TEST_USER"], let password = env["OWNNAS_TEST_PASSWORD"] {
-                do { try await signIn(address: address, username: user, password: password, caPem: nil, pinned: []) }
+                do { try await signIn(address: address, username: user, password: password, caPem: nil, pinned: [], code: env["OWNNAS_TEST_CODE"]) }
                 catch { NSLog("OwnNAS test sign-in failed: %@", userMessage(error)) }
                 return
             }
@@ -46,12 +47,14 @@ final class MacHub: ObservableObject {
 
     // MARK: Servers
 
-    /// Signs in and remembers the server (or signs it in again), and puts it in Finder.
-    func signIn(address: String, username: String, password: String, caPem: String?, pinned: [String]) async throws {
+    /// Signs in and remembers the server (or signs it in again), and puts it in Finder. `code` is
+    /// the two-factor code, once the server asked for one (`ClientError.TwoFactor`).
+    func signIn(address: String, username: String, password: String, caPem: String?, pinned: [String], code: String? = nil) async throws {
         let (normalized, token, account) = try await Task.detached(priority: .userInitiated) { () throws -> (String, String, Account) in
             let normalized = try normalizeAddress(input: address)
             let ca = caPem.map { Data($0.utf8) }
-            let token = try OwnNAS.signIn(address: normalized, username: username.trimmingCharacters(in: .whitespaces), password: password, caPem: ca, pinned: pinned)
+            let code = code?.trimmingCharacters(in: .whitespaces)
+            let token = try OwnNAS.signIn(address: normalized, username: username.trimmingCharacters(in: .whitespaces), password: password, caPem: ca, pinned: pinned, code: code?.isEmpty == false ? code : nil)
             let account = try Server(address: normalized, token: token, caPem: ca, pinned: pinned).account()
             return (normalized, token, account)
         }.value
@@ -232,6 +235,7 @@ func userMessage(_ error: Error) -> String {
     case ClientError.Unauthorized: return "Wrong username or password"
     case ClientError.NotFound: return "Not found on the server"
     case ClientError.Untrusted: return "The server's certificate is not trusted"
+    case ClientError.TwoFactor(let reason): return reason
     case ClientError.Failed(let reason): return reason
     default: return error.localizedDescription
     }

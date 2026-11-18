@@ -38,6 +38,9 @@ enum Command {
         /// A server certificate fingerprint to trust (as `ownnas serve` prints it).
         #[arg(long)]
         pin: Vec<String>,
+        /// The two-factor code, for an account with two-factor sign-in (asked for if left out).
+        #[arg(long)]
+        code: Option<String>,
         /// How much space opened files may take on this computer, in GB (default 10).
         #[arg(long)]
         cache_gb: Option<u64>,
@@ -91,7 +94,7 @@ fn run(command: Command) -> Result<(), String> {
     use ownnas_mount::{load_settings, save_settings, Account};
 
     match command {
-        Command::Setup { server, username, password, folder, ca_cert, pin, cache_gb, no_service } => {
+        Command::Setup { server, username, password, folder, ca_cert, pin, code, cache_gb, no_service } => {
             let server = server.trim_end_matches('/').to_string();
             let ca_pem = match ca_cert {
                 Some(path) => Some(std::fs::read_to_string(&path).map_err(|err| format!("Could not read {}: {err}", path.display()))?),
@@ -102,7 +105,7 @@ fn run(command: Command) -> Result<(), String> {
                 None => rpassword::prompt_password(format!("Password for {username}: ")).map_err(|err| err.to_string())?,
             };
             let api = api_for(&server, None, ca_pem.as_deref(), &pin)?;
-            let token = match api.login(&username, &password) {
+            let token = match api.login_on_terminal(&username, &password, code.as_deref()) {
                 Ok(token) => token,
                 Err(ApiError::Untrusted) => {
                     let fingerprint = ownnas_core::trust::server_fingerprint(&server).unwrap_or_default();

@@ -25,6 +25,10 @@ pub enum ClientError {
     Locked,
     /// The server's HTTPS certificate is not trusted: offer [`server_fingerprint`] to pin, or a CA file.
     Untrusted,
+    /// The account has two-factor sign-in: ask for a code (an authenticator app's six digits,
+    /// or a recovery code) and call [`sign_in`] again with it. Also when the code was wrong;
+    /// `reason` is the server's message, to show.
+    TwoFactor { reason: String },
     Failed { reason: String },
 }
 
@@ -37,6 +41,7 @@ impl std::fmt::Display for ClientError {
             ClientError::Cancelled => write!(f, "Cancelled"),
             ClientError::Locked => write!(f, "Enter the terminal password"),
             ClientError::Untrusted => write!(f, "The server's certificate is not trusted"),
+            ClientError::TwoFactor { reason } => write!(f, "{reason}"),
             ClientError::Failed { reason } => write!(f, "{reason}"),
         }
     }
@@ -51,6 +56,7 @@ impl From<ApiError> for ClientError {
             ApiError::Cancelled => ClientError::Cancelled,
             ApiError::Locked => ClientError::Locked,
             ApiError::Untrusted => ClientError::Untrusted,
+            ApiError::TwoFactor(reason) => ClientError::TwoFactor { reason },
             ApiError::Other(reason) => ClientError::Failed { reason },
         }
     }
@@ -320,17 +326,19 @@ fn trust(ca_pem: Option<Vec<u8>>, pinned: Vec<String>) -> Trust {
 
 /// Signs in with a password and returns a token for [`Server::new`]. `ca_pem` is a private
 /// CA to trust (the `ca.crt` from `ownnas tls generate`); `pinned` are certificate
-/// fingerprints the user accepted.
-#[uniffi::export]
+/// fingerprints the user accepted. `code` is the two-factor code, for an account that has
+/// it on: without one (or with a wrong one) this fails with [`ClientError::TwoFactor`].
+#[uniffi::export(default(code = None))]
 pub fn sign_in(
     address: String,
     username: String,
     password: String,
     ca_pem: Option<Vec<u8>>,
     pinned: Vec<String>,
+    code: Option<String>,
 ) -> Result<String, ClientError> {
     let api = Api::with_trust(&address, None, &trust(ca_pem, pinned)).map_err(failed)?;
-    Ok(api.login(&username, &password)?)
+    Ok(api.login(&username, &password, code.as_deref())?)
 }
 
 /// The SHA-256 fingerprint (`AB:CD:…`) of the certificate an `https://` server presents, to
