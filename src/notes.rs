@@ -342,13 +342,17 @@ pub fn relink(text: &str, old: &str, new: &str) -> Option<String> {
 /// After a note was renamed from `old` to `new` (file names without `.md`): points the links in
 /// the notes of `folder` (on disk `full`) to the new name. `keep` is called with each note's
 /// place and library path before it is changed (to keep a version). The notes changed.
-pub fn relink_folder(full: &Path, folder: &str, old: &str, new: &str, keep: &dyn Fn(&Path, &str)) -> Vec<String> {
+/// Of the notes `may_change` accepts (by library path).
+pub fn relink_folder(full: &Path, folder: &str, old: &str, new: &str, keep: &dyn Fn(&Path, &str), may_change: &dyn Fn(&str) -> bool) -> Vec<String> {
     if old.eq_ignore_ascii_case(new) {
         return Vec::new();
     }
     let mut changed = Vec::new();
     for note in list(full, folder) {
         let Some(inside) = note.path.strip_prefix(folder).map(|rest| rest.trim_start_matches('/')) else { continue };
+        if !may_change(&note.path) {
+            continue;
+        }
         let place = full.join(inside);
         let Ok(text) = std::fs::read_to_string(&place) else { continue };
         if let Some(relinked) = relink(&text, old, new) {

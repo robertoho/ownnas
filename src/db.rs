@@ -10,6 +10,18 @@ pub struct User {
     pub is_admin: bool,
     /// Can look at everything and change nothing (never an administrator).
     pub read_only: bool,
+    /// Kept to `folders` (never an administrator); with none of them left, it sees nothing.
+    pub limited: bool,
+    /// The library folders it may use, each read-write or read-only (`limited` accounts only).
+    pub folders: Vec<UserFolder>,
+}
+
+/// A library folder an account is limited to.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserFolder {
+    pub path: String,
+    pub read_only: bool,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -21,6 +33,8 @@ pub struct UserInfo {
     pub created_at: i64,
     pub read_only: bool,
     pub two_factor: bool,
+    pub limited: bool,
+    pub folders: Vec<UserFolder>,
 }
 
 pub fn open(path: &std::path::Path) -> Result<Connection, String> {
@@ -932,7 +946,7 @@ fn ensure_admin_column(conn: &Connection) -> Result<(), String> {
     }
     // Two-factor sign-in: the authenticator secret (and one being set up), the last code's
     // step (a code signs in once), and the one-time recovery codes, kept as hashes.
-    for (column, kind) in [("totp_secret", "TEXT"), ("totp_pending", "TEXT"), ("totp_used_step", "INTEGER NOT NULL DEFAULT 0"), ("read_only", "INTEGER NOT NULL DEFAULT 0")] {
+    for (column, kind) in [("totp_secret", "TEXT"), ("totp_pending", "TEXT"), ("totp_used_step", "INTEGER NOT NULL DEFAULT 0"), ("read_only", "INTEGER NOT NULL DEFAULT 0"), ("folder_limited", "INTEGER NOT NULL DEFAULT 0")] {
         let has: bool = conn
             .prepare(&format!("SELECT 1 FROM pragma_table_info('users') WHERE name = '{column}'"))
             .and_then(|mut stmt| stmt.exists([]))
@@ -942,6 +956,18 @@ fn ensure_admin_column(conn: &Connection) -> Result<(), String> {
                 .map_err(|_| "Could not update the accounts table".to_string())?;
         }
     }
+    // The folders a limited account may use (`users.folder_limited`), as library paths that
+    // follow moves and renames like other path metadata.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS user_folders (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            path TEXT NOT NULL,
+            read_only INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, path)
+        )",
+        [],
+    )
+    .map_err(|_| "Could not add folder limits to the accounts".to_string())?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS recovery_codes (
             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1009,7 +1035,7 @@ pub fn list_users(conn: &Connection) -> Result<Vec<String>, String> {
 pub fn list_user_infos(conn: &Connection) -> Result<Vec<UserInfo>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, username, is_admin, created_at, read_only, totp_secret IS NOT NULL
+            "SELECT id, username, is_admin, created_at, read_only, totp_secret IS NOT NULL, folder_limited
              FROM users
              ORDER BY username COLLATE NOCASE",
         )
@@ -1023,11 +1049,52 @@ pub fn list_user_infos(conn: &Connection) -> Result<Vec<UserInfo>, String> {
                 created_at: row.get(3)?,
                 read_only: row.get::<_, i64>(4)? != 0,
                 two_factor: row.get(5)?,
+                limited: row.get::<_, i64>(6)? != 0,
+                folders: Vec::new(),
             })
         })
         .map_err(|_| "Could not read users".to_string())?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|_| "Could not read users".to_string())
+    let mut infos = rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "Could not read users".to_string())?;
+    for info in &mut infos {
+        if info.limited {
+            info.folders = user_folders(conn, info.id)?;
+        }
+    }
+    Ok(infos)
+}
+
+/// The folders an account is limited to (whether it is limited is `User::limited`).
+pub fn user_folders(conn: &Connection, user_id: i64) -> Result<Vec<UserFolder>, String> {
+    let fail = |_| "Could not read the account's folders".to_string();
+    let mut stmt = conn
+        .prepare("SELECT path, read_only FROM user_folders WHERE user_id = ?1 ORDER BY path")
+        .map_err(fail)?;
+    let rows = stmt
+        .query_map([user_id], |row| Ok(UserFolder { path: row.get(0)?, read_only: row.get::<_, i64>(1)? != 0 }))
+        .map_err(fail)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(fail)
+}
+
+/// Limits an account to `folders` (library paths, already checked), or with `None` gives it the
+/// whole library again. Administrators cannot be limited.
+pub fn set_user_folders(conn: &mut Connection, username: &str, folders: Option<&[UserFolder]>) -> Result<(), String> {
+    let user = find_user(conn, username)?.ok_or_else(|| "That user does not exist".to_string())?;
+    if folders.is_some() && user.is_admin {
+        return Err("An administrator cannot be limited to some folders. Take away administrator access first.".into());
+    }
+    let fail = |_| "Could not update the account".to_string();
+    let tx = conn.transaction().map_err(fail)?;
+    tx.execute("DELETE FROM user_folders WHERE user_id = ?1", [user.id]).map_err(fail)?;
+    for folder in folders.unwrap_or_default() {
+        tx.execute(
+            "INSERT OR REPLACE INTO user_folders(user_id, path, read_only) VALUES (?1, ?2, ?3)",
+            params![user.id, folder.path, folder.read_only],
+        )
+        .map_err(fail)?;
+    }
+    tx.execute("UPDATE users SET folder_limited = ?1 WHERE id = ?2", params![folders.is_some(), user.id]).map_err(fail)?;
+    tx.commit().map_err(fail)
 }
 
 pub fn count_admins(conn: &Connection) -> Result<i64, String> {
@@ -1068,20 +1135,22 @@ pub fn create_user_with_admin(
 pub fn find_user(conn: &Connection, username: &str) -> Result<Option<User>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, username, password_hash, is_admin, read_only FROM users WHERE username = ?1",
+            "SELECT id, username, password_hash, is_admin, read_only, folder_limited FROM users WHERE username = ?1",
         )
         .map_err(|_| "Could not read users".to_string())?;
     let mut rows = stmt
         .query(params![username.trim()])
         .map_err(|_| "Could not read users".to_string())?;
     if let Some(row) = rows.next().map_err(|_| "Could not read users".to_string())? {
-        Ok(Some(User {
+        Ok(Some(with_folders(conn, User {
             id: row.get(0).map_err(|_| "Could not read users".to_string())?,
             username: row.get(1).map_err(|_| "Could not read users".to_string())?,
             password_hash: row.get(2).map_err(|_| "Could not read users".to_string())?,
             is_admin: row.get::<_, i64>(3).map_err(|_| "Could not read users".to_string())? != 0,
             read_only: row.get::<_, i64>(4).map_err(|_| "Could not read users".to_string())? != 0,
-        }))
+            limited: row.get::<_, i64>(5).map_err(|_| "Could not read users".to_string())? != 0,
+            folders: Vec::new(),
+        })?))
     } else {
         Ok(None)
     }
@@ -1107,6 +1176,7 @@ pub fn delete_user(conn: &Connection, username: &str) -> Result<(), String> {
         return Err("Cannot remove the last administrator".into());
     }
     let _ = conn.execute("DELETE FROM recovery_codes WHERE user_id = ?1", params![user.id]);
+    let _ = conn.execute("DELETE FROM user_folders WHERE user_id = ?1", params![user.id]);
     let changed = conn
         .execute("DELETE FROM users WHERE username = ?1", params![username.trim()])
         .map_err(|_| "Could not delete the user".to_string())?;
@@ -1123,7 +1193,8 @@ pub fn set_user_admin(conn: &Connection, username: &str, is_admin: bool) -> Resu
     }
     // An administrator changes settings, so is never read-only.
     conn.execute(
-        "UPDATE users SET is_admin = ?1, read_only = CASE WHEN ?1 = 1 THEN 0 ELSE read_only END WHERE id = ?2",
+        "UPDATE users SET is_admin = ?1, read_only = CASE WHEN ?1 = 1 THEN 0 ELSE read_only END,
+             folder_limited = CASE WHEN ?1 = 1 THEN 0 ELSE folder_limited END WHERE id = ?2",
         params![if is_admin { 1 } else { 0 }, user.id],
     )
     .map_err(|_| "Could not update the administrator flag".to_string())?;
@@ -1153,11 +1224,19 @@ pub fn create_session(conn: &Connection, user_id: i64) -> Result<String, String>
     Ok(token)
 }
 
+/// A limited account with its folders read in.
+fn with_folders(conn: &Connection, mut user: User) -> Result<User, String> {
+    if user.limited {
+        user.folders = user_folders(conn, user.id)?;
+    }
+    Ok(user)
+}
+
 pub fn user_for_token(conn: &Connection, token: &str) -> Result<Option<User>, String> {
     let now = now_secs();
     let mut stmt = conn
         .prepare(
-            "SELECT u.id, u.username, u.password_hash, u.is_admin, u.read_only
+            "SELECT u.id, u.username, u.password_hash, u.is_admin, u.read_only, u.folder_limited
              FROM sessions s
              JOIN users u ON u.id = s.user_id
              WHERE s.token_hash = ?1 AND s.expires_at > ?2",
@@ -1175,13 +1254,15 @@ pub fn user_for_token(conn: &Connection, token: &str) -> Result<Option<User>, St
             "UPDATE sessions SET expires_at = ?1 WHERE token_hash = ?2 AND expires_at < ?3",
             params![now + SESSION_SECS, auth::token_hash(token), now + SESSION_SECS / 2],
         );
-        Ok(Some(User {
+        Ok(Some(with_folders(conn, User {
             id: row.get(0).map_err(|_| "Could not read the session".to_string())?,
             username: row.get(1).map_err(|_| "Could not read the session".to_string())?,
             password_hash: row.get(2).map_err(|_| "Could not read the session".to_string())?,
             is_admin: row.get::<_, i64>(3).map_err(|_| "Could not read the session".to_string())? != 0,
             read_only: row.get::<_, i64>(4).map_err(|_| "Could not read the session".to_string())? != 0,
-        }))
+            limited: row.get::<_, i64>(5).map_err(|_| "Could not read the session".to_string())? != 0,
+            folders: Vec::new(),
+        })?))
     } else {
         Ok(None)
     }
@@ -1692,6 +1773,11 @@ pub fn add_comment(
     })
 }
 
+/// The file a comment is on.
+pub fn comment_path(conn: &Connection, id: i64) -> Option<String> {
+    conn.query_row("SELECT path FROM file_comments WHERE id = ?1", [id], |row| row.get(0)).ok()
+}
+
 pub fn remove_comment(conn: &Connection, id: i64) -> Result<(), String> {
     let changed = conn
         .execute("DELETE FROM file_comments WHERE id = ?1", params![id])
@@ -1718,6 +1804,11 @@ pub fn rewrite_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), 
          WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
         params![from, to],
     ).map_err(|_| "Could not move an agent key's folder".to_string())?;
+    conn.execute(
+        "UPDATE OR REPLACE user_folders SET path = CASE WHEN path = ?1 THEN ?2 ELSE ?2 || substr(path, length(?1) + 1) END
+         WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![from, to],
+    ).map_err(|_| "Could not move an account's folder".to_string())?;
     conn.execute(
         "UPDATE agent_key_excludes SET path = CASE WHEN path = ?1 THEN ?2 ELSE ?2 || substr(path, length(?1) + 1) END
          WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
@@ -2066,6 +2157,11 @@ pub fn delete_path_meta(conn: &Connection, path: &str) -> Result<(), String> {
         "DELETE FROM agent_key_folders WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
         params![path],
     ).map_err(|_| "Could not remove an agent key's folder".to_string())?;
+    // The account stays limited (`users.folder_limited`), to what is left.
+    conn.execute(
+        "DELETE FROM user_folders WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![path],
+    ).map_err(|_| "Could not remove an account's folder".to_string())?;
     conn.execute(
         "DELETE FROM agent_key_excludes WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
         params![path],

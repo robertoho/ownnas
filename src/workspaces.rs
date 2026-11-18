@@ -49,11 +49,56 @@ fn picked_sql(column: &str, workspace: Option<i64>) -> String {
     format!("EXISTS(SELECT 1 FROM workspace_items wi WHERE {which}wi.path = {column})")
 }
 
-/// SQL that is true when `column` (a library path) is in the workspace: in one of its folders
-/// (or one of them), or picked into it. Always true for `None` (every photo); for `UNSORTED`,
-/// true when it is in no workspace at all. The id is a number, so it is safe to write into the
-/// query.
-pub fn filter(workspace: Option<i64>, column: &str) -> String {
+/// What a Gallery request may show: a workspace (`None` for every photo, or `UNSORTED`), and,
+/// for an account limited to some folders (`access.rs`), only what is inside them. Every
+/// Gallery query takes one, so none can leave the account's folders out.
+#[derive(Clone, Debug, Default)]
+pub struct View {
+    pub workspace: Option<i64>,
+    /// The account's folders; `None` for the whole library.
+    pub folders: Option<Vec<String>>,
+}
+
+impl View {
+    /// Every photo, for an account that may see them all.
+    pub fn every() -> Self {
+        View::default()
+    }
+
+    /// A workspace, with no folder limit.
+    #[cfg(test)]
+    pub fn only(workspace: Option<i64>) -> Self {
+        View { workspace, folders: None }
+    }
+
+    pub fn of(workspace: Option<i64>, access: &crate::access::Access) -> Self {
+        View { workspace, folders: access.folder_paths() }
+    }
+
+    /// Every photo of the whole library, with no workspace and no folder limit.
+    pub fn is_everything(&self) -> bool {
+        self.workspace.is_none() && self.folders.is_none()
+    }
+
+    /// Whether the account's folders hold `path` (always without a limit).
+    pub fn allows(&self, path: &str) -> bool {
+        self.folders.as_ref().is_none_or(|folders| contains(folders, path) || folders.iter().any(String::is_empty))
+    }
+}
+
+/// SQL that is true when `column` (a library path) is in the view: in the workspace (in one of
+/// its folders, or one of them, or picked into it; always for `None`, every photo; for
+/// `UNSORTED`, when it is in no workspace at all), and inside the account's folders. The id is
+/// a number, so it is safe to write into the query; folders are quoted.
+pub fn filter(view: &View, column: &str) -> String {
+    let workspace = workspace_filter(view.workspace, column);
+    match &view.folders {
+        None => workspace,
+        Some(folders) => format!("({workspace} AND {})", crate::access::folders_sql(folders, column)),
+    }
+}
+
+fn workspace_filter(workspace: Option<i64>, column: &str) -> String {
     match workspace {
         None => "1".to_string(),
         Some(UNSORTED) => format!("(NOT {} AND NOT {})", in_folders_sql(column, None), picked_sql(column, None)),
@@ -63,24 +108,37 @@ pub fn filter(workspace: Option<i64>, column: &str) -> String {
 
 /// Who is in a workspace, for filtering in memory (smart search goes through every photo's
 /// description rather than the database).
-pub enum Members {
+pub enum Which {
     Every,
     Inside { folders: Vec<String>, picked: HashSet<String> },
     /// The photos in no workspace (`UNSORTED`): outside all of these.
     Outside { folders: Vec<String>, picked: HashSet<String> },
 }
 
+/// Who is in a view: its workspace's members, inside the account's folders.
+pub struct Members {
+    pub which: Which,
+    pub view: View,
+}
+
 impl Members {
+    /// Everyone, for an account that may see every photo.
+    pub fn every() -> Self {
+        Members { which: Which::Every, view: View::every() }
+    }
+
     pub fn has(&self, path: &str) -> bool {
-        match self {
-            Members::Every => true,
-            Members::Inside { folders, picked } => contains(folders, path) || picked.contains(path),
-            Members::Outside { folders, picked } => !contains(folders, path) && !picked.contains(path),
-        }
+        self.view.allows(path)
+            && match &self.which {
+                Which::Every => true,
+                Which::Inside { folders, picked } => contains(folders, path) || picked.contains(path),
+                Which::Outside { folders, picked } => !contains(folders, path) && !picked.contains(path),
+            }
     }
 }
 
-pub fn members(conn: &Connection, workspace: Option<i64>) -> Result<Members> {
+pub fn members(conn: &Connection, view: &View) -> Result<Members> {
+    let workspace = view.workspace;
     let strings = |sql: &str, id: Option<i64>| -> Result<Vec<String>> {
         let mut stmt = conn.prepare(sql)?;
         let rows = match id {
@@ -89,17 +147,18 @@ pub fn members(conn: &Connection, workspace: Option<i64>) -> Result<Members> {
         };
         Ok(rows)
     };
-    Ok(match workspace {
-        None => Members::Every,
-        Some(UNSORTED) => Members::Outside {
+    let which = match workspace {
+        None => Which::Every,
+        Some(UNSORTED) => Which::Outside {
             folders: strings("SELECT DISTINCT folder FROM workspace_folders", None)?,
             picked: strings("SELECT DISTINCT path FROM workspace_items", None)?.into_iter().collect(),
         },
-        Some(id) => Members::Inside {
+        Some(id) => Which::Inside {
             folders: folders(conn, id)?,
             picked: strings("SELECT path FROM workspace_items WHERE workspace_id = ?1", Some(id))?.into_iter().collect(),
         },
-    })
+    };
+    Ok(Members { which, view: view.clone() })
 }
 
 /// Whether `path` is in one of `folders` (or is one of them).
@@ -133,6 +192,12 @@ pub fn folders(conn: &Connection, id: i64) -> Result<Vec<String>> {
 }
 
 pub fn list(conn: &Connection) -> Result<Vec<Workspace>> {
+    list_seen(conn, None)
+}
+
+/// The workspaces as an account limited to `limit` (its folders; none for the whole library)
+/// sees them: those with some of its folders or photos, with only those counted and shown.
+pub fn list_seen(conn: &Connection, limit: Option<&[String]>) -> Result<Vec<Workspace>> {
     let found: Vec<(i64, String)> = {
         let mut stmt = conn.prepare("SELECT id, name FROM workspaces ORDER BY name COLLATE NOCASE, id")?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
@@ -145,22 +210,46 @@ pub fn list(conn: &Connection) -> Result<Vec<Workspace>> {
                 "SELECT count(*), coalesce(sum(NOT {}), 0) FROM media_index m
                  WHERE substr(m.path, 1, 14) <> '.ownnas-trash/' AND substr(m.path, 1, 6) <> 'Trash/' AND {}",
                 in_folders_sql("m.path", Some(id)),
-                filter(Some(id), "m.path")
+                filter(&View { workspace: Some(id), folders: limit.map(<[String]>::to_vec) }, "m.path")
             ),
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        out.push(Workspace { id, name, folders: folders(conn, id)?, photos, picked });
+        let mut shown = folders(conn, id)?;
+        if let Some(limit) = limit {
+            // Where its folders and the account's meet: the deeper of each pair.
+            let mut met: Vec<String> = Vec::new();
+            for folder in &shown {
+                for own in limit {
+                    let deeper = if contains(std::slice::from_ref(folder), own) || folder.is_empty() {
+                        own
+                    } else if contains(std::slice::from_ref(own), folder) || own.is_empty() {
+                        folder
+                    } else {
+                        continue;
+                    };
+                    if !met.contains(deeper) {
+                        met.push(deeper.clone());
+                    }
+                }
+            }
+            if met.is_empty() && photos == 0 {
+                continue;
+            }
+            shown = met;
+        }
+        out.push(Workspace { id, name, folders: shown, photos, picked });
     }
     Ok(out)
 }
 
-/// The photos and videos in no workspace yet (outside the Trash).
-pub fn unsorted_count(conn: &Connection) -> Result<i64> {
+/// The photos and videos in no workspace yet (outside the Trash), inside an account's folders
+/// (`limit`; none for the whole library).
+pub fn unsorted_seen(conn: &Connection, limit: Option<&[String]>) -> Result<i64> {
     Ok(conn.query_row(
         &format!(
             "SELECT count(*) FROM media_index m WHERE substr(m.path, 1, 14) <> '.ownnas-trash/' AND substr(m.path, 1, 6) <> 'Trash/' AND {}",
-            filter(Some(UNSORTED), "m.path")
+            filter(&View { workspace: Some(UNSORTED), folders: limit.map(<[String]>::to_vec) }, "m.path")
         ),
         [],
         |row| row.get(0),
@@ -446,7 +535,7 @@ mod tests {
         assert!(matches!(create(&conn, " work ", &[]), Err(AlbumError::Conflict(_))));
         let found = list(&conn).unwrap();
         assert_eq!((found[0].name.as_str(), found[0].photos), ("Work", 2));
-        let count = |ws| -> i64 { conn.query_row(&format!("SELECT count(*) FROM media_index m WHERE {}", filter(ws, "m.path")), [], |row| row.get(0)).unwrap() };
+        let count = |ws| -> i64 { conn.query_row(&format!("SELECT count(*) FROM media_index m WHERE {}", filter(&View::only(ws), "m.path")), [], |row| row.get(0)).unwrap() };
         assert_eq!(count(Some(work)), 2);
         assert_eq!(count(None), 5);
 
@@ -482,7 +571,7 @@ mod tests {
         assert_eq!(folders(&conn, work).unwrap(), ["Phone"], "the sub-folder is taken in by it");
         assert_eq!(folders(&conn, home).unwrap(), ["Phone"]);
         assert_eq!(change_folders(&conn, &[work], &["Phone".into()], true).unwrap(), 0, "already there");
-        let photos = |ws| -> i64 { conn.query_row(&format!("SELECT count(*) FROM media_index m WHERE {}", filter(Some(ws), "m.path")), [], |row| row.get(0)).unwrap() };
+        let photos = |ws| -> i64 { conn.query_row(&format!("SELECT count(*) FROM media_index m WHERE {}", filter(&View::only(Some(ws)), "m.path")), [], |row| row.get(0)).unwrap() };
         assert_eq!((photos(work), photos(home)), (2, 2));
         assert_eq!(standing("Phone/2024")[0], FolderStanding { id: work, direct: 0, through: 1, via: Some("Phone".into()), inner: 0 });
 
@@ -502,7 +591,7 @@ mod tests {
         let work = create(&conn, "Work", &["Work".into()]).unwrap();
         let private = create(&conn, "Private", &[]).unwrap();
         let count = |ws| -> i64 {
-            conn.query_row(&format!("SELECT count(*) FROM media_index m WHERE substr(m.path, 1, 14) <> '.ownnas-trash/' AND {}", filter(ws, "m.path")), [], |row| row.get(0)).unwrap()
+            conn.query_row(&format!("SELECT count(*) FROM media_index m WHERE substr(m.path, 1, 14) <> '.ownnas-trash/' AND {}", filter(&View::only(ws), "m.path")), [], |row| row.get(0)).unwrap()
         };
         assert_eq!((count(Some(work)), count(Some(private)), count(Some(UNSORTED))), (1, 0, 3));
 
@@ -516,25 +605,25 @@ mod tests {
         let found = list(&conn).unwrap();
         let private_row = found.iter().find(|space| space.id == private).unwrap();
         assert_eq!((private_row.photos, private_row.picked), (2, 2));
-        assert_eq!(unsorted_count(&conn).unwrap(), 1);
+        assert_eq!(unsorted_seen(&conn, None).unwrap(), 1);
 
-        let members = members(&conn, Some(work)).unwrap();
+        let members = members(&conn, &View::only(Some(work))).unwrap();
         assert!(members.has("Phone/1.jpg") && members.has("Work/a.jpg") && !members.has("Phone/2.jpg"));
-        assert!(super::members(&conn, Some(UNSORTED)).unwrap().has("Phone/3.jpg"));
-        assert!(!super::members(&conn, Some(UNSORTED)).unwrap().has("Phone/1.jpg"));
+        assert!(super::members(&conn, &View::only(Some(UNSORTED))).unwrap().has("Phone/3.jpg"));
+        assert!(!super::members(&conn, &View::only(Some(UNSORTED))).unwrap().has("Phone/1.jpg"));
 
         let seen = membership(&conn, &[both.clone(), "Work/a.jpg".into()]).unwrap();
         assert_eq!(seen, [Membership { id: work, inside: 2, picked: 1 }, Membership { id: private, inside: 1, picked: 1 }]);
 
         // A picked photo follows its file when it moves, and goes when it is deleted.
         db::rewrite_path_meta(&conn, "Phone", "Camera").unwrap();
-        assert!(super::members(&conn, Some(private)).unwrap().has("Camera/2.jpg"));
+        assert!(super::members(&conn, &View::only(Some(private))).unwrap().has("Camera/2.jpg"));
         db::delete_path_meta(&conn, "Camera/2.jpg").unwrap();
-        assert!(!super::members(&conn, Some(private)).unwrap().has("Camera/2.jpg"));
+        assert!(!super::members(&conn, &View::only(Some(private))).unwrap().has("Camera/2.jpg"));
 
         // Taking one out of a workspace leaves it in the other.
         assert_eq!(change_items(&conn, &[work], &["Camera/1.jpg".into()], false, "ana").unwrap(), 1);
-        assert!(super::members(&conn, Some(private)).unwrap().has("Camera/1.jpg"));
+        assert!(super::members(&conn, &View::only(Some(private))).unwrap().has("Camera/1.jpg"));
         assert!(change_items(&conn, &[UNSORTED], &["Camera/1.jpg".into()], true, "ana").is_err(), "not a workspace");
 
         // Deleting a workspace forgets what was picked into it.

@@ -670,9 +670,13 @@ fn tree_bytes(path: &Path) -> u64 {
     fs::read_dir(path).map_or(0, |items| items.flatten().map(|item| tree_bytes(&item.path())).sum())
 }
 
-pub fn trash_summary(root: &Path, before: i64) -> Result<TrashSummary, FileError> {
+/// The Trash as someone sees it who sees the items `seen` accepts (by where each was).
+pub fn trash_summary(root: &Path, before: i64, seen: &dyn Fn(&str) -> bool) -> Result<TrashSummary, FileError> {
     let mut summary = TrashSummary::default();
-    for (path, _, deleted_at) in trash_items(root)? {
+    for (path, name, deleted_at) in trash_items(root)? {
+        if !seen(&trash_original(root, &name).unwrap_or_default()) {
+            continue;
+        }
         summary.items += 1;
         summary.oldest = Some(summary.oldest.map_or(deleted_at, |oldest| oldest.min(deleted_at)));
         if deleted_at < before {
@@ -686,9 +690,14 @@ pub fn trash_summary(root: &Path, before: i64) -> Result<TrashSummary, FileError
 /// Permanently deletes what was moved to the Trash before `before` (seconds since 1970).
 /// Returns the paths deleted.
 pub fn empty_trash_before(root: &Path, before: i64) -> Result<Vec<String>, FileError> {
+    empty_trash_matching(root, before, &|_| true)
+}
+
+/// Like `empty_trash_before`, of the items `chosen` accepts (by the Trash path of each).
+pub fn empty_trash_matching(root: &Path, before: i64, chosen: &dyn Fn(&str) -> bool) -> Result<Vec<String>, FileError> {
     let mut removed = Vec::new();
     for (path, name, deleted_at) in trash_items(root)? {
-        if deleted_at >= before {
+        if deleted_at >= before || !chosen(&format!("{TRASH_DIR}/{name}")) {
             continue;
         }
         if path.is_dir() {
@@ -1153,7 +1162,7 @@ fn remove_trash_meta(root: &Path, rel: &str) -> Result<(), FileError> {
     Ok(())
 }
 
-fn trash_original(root: &Path, saved_as: &str) -> Option<String> {
+pub(crate) fn trash_original(root: &Path, saved_as: &str) -> Option<String> {
     read_trash_meta(root, saved_as)
         .ok()
         .flatten()
@@ -1457,7 +1466,7 @@ fn parent_rel(rel: &str) -> Option<String> {
     }
 }
 
-fn clean_parts(rel: &str) -> Result<Vec<String>, FileError> {
+pub(crate) fn clean_parts(rel: &str) -> Result<Vec<String>, FileError> {
     let rel = rel.trim().replace('\\', "/");
     if rel.contains('\0') || rel.contains(':') || rel.starts_with('/') {
         return Err(FileError::Forbidden);
@@ -3672,7 +3681,7 @@ mod tests {
             fs::write(&path, serde_json::to_vec(&meta).unwrap()).unwrap();
         }
         let month_ago = now_unix() - 30 * 86400;
-        let summary = trash_summary(&root, month_ago).unwrap();
+        let summary = trash_summary(&root, month_ago, &|_| true).unwrap();
         assert_eq!((summary.items, summary.old_items, summary.old_bytes, summary.oldest), (3, 2, 112, Some(long_ago)));
 
         let mut removed = empty_trash_before(&root, month_ago).unwrap();
@@ -3680,7 +3689,7 @@ mod tests {
         assert_eq!(removed, [".ownnas-trash/old folder", ".ownnas-trash/old.txt"]);
         let left = list_dir(&root, ".ownnas-trash", true, false).unwrap();
         assert_eq!(left.entries.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(), ["new.txt"]);
-        assert_eq!(trash_summary(&root, month_ago).unwrap().old_items, 0);
+        assert_eq!(trash_summary(&root, month_ago, &|_| true).unwrap().old_items, 0);
         let _ = fs::remove_dir_all(&root);
     }
 

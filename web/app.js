@@ -344,6 +344,12 @@ function showApp() {
   $("empty-trash-btn").hidden = true;
   $("remotes-btn").hidden = !state.me.remotes;
   if (state.me.remotes) resumeRemoteTransfers();
+  // Kept to some folders: nothing about the disk or the server (and nothing left from an
+  // earlier sign-in on this page).
+  if (state.me.folders) {
+    $("storage-meter").hidden = true;
+    $("health-alert").hidden = true;
+  }
   syncTerminalButton();
   refreshLibrary().catch((err) => toast(err.message, true));
 }
@@ -2421,7 +2427,8 @@ let storageTimer = 0;
 /// Asks the server about the disk (cheap: the folders are measured in the background). At most
 /// every 30 seconds unless `force`; again in a moment while a measurement is under way.
 async function refreshStorage(force = false) {
-  if (!state.me || (!force && Date.now() - storageFetched < 30000)) return;
+  // The disk is not shown to an account limited to some folders.
+  if (!state.me || state.me.folders || (!force && Date.now() - storageFetched < 30000)) return;
   storageFetched = Date.now();
   paintStorage(await api("/api/storage"));
 }
@@ -2994,7 +3001,12 @@ function openSettings(tab) {
   $("settings-tab-gallery").hidden = !admin;
   $("settings-tab-backup").hidden = !admin;
   $("settings-tab-agents").hidden = !admin;
+  // Kept to some folders: the disk and the server's health are not its business.
+  const limited = !!(state.me && state.me.folders);
+  $("settings-tab-storage").hidden = limited;
+  $("settings-tab-health").hidden = limited;
   if (!admin && (tab === "users" || tab === "terminal" || tab === "gallery" || tab === "agents" || tab === "backup")) tab = "theme";
+  if (limited && (tab === "storage" || tab === "health")) tab = "theme";
   if (!tab) tab = "theme";
   setSettingsTab(tab);
   renderThemeGrid();
@@ -3110,9 +3122,13 @@ async function applyUpdate() {
   }
 }
 
+/// The accounts as last listed in Settings → Users, by username.
+let knownUsers = new Map();
+
 async function loadUsers() {
   const data = await api("/api/users");
   const users = data.users || [];
+  knownUsers = new Map(users.map((user) => [user.username, user]));
   const host = $("users-list");
   if (!users.length) {
     host.innerHTML = `<p class="muted">No accounts yet.</p>`;
@@ -3124,11 +3140,12 @@ async function loadUsers() {
       ${users.map((user) => `
         <tr data-username="${esc(user.username)}">
           <td>${esc(user.username)}</td>
-          <td>${user.isAdmin ? `<span class="pill">Admin</span>` : user.readOnly ? `<span class="muted">Read-only</span>` : `<span class="muted">Member</span>`}${user.twoFactor ? ` <span class="muted" title="Signs in with a code from an authenticator app">· two-factor</span>` : ""}</td>
+          <td>${user.isAdmin ? `<span class="pill">Admin</span>` : user.readOnly ? `<span class="muted">Read-only</span>` : `<span class="muted">Member</span>`}${user.limited ? ` <span class="muted" title="${esc(userFoldersTitle(user))}">· ${user.folders.length === 1 ? "1 folder" : `${user.folders.length} folders`}</span>` : ""}${user.twoFactor ? ` <span class="muted" title="Signs in with a code from an authenticator app">· two-factor</span>` : ""}</td>
           <td>
             <div class="user-actions">
               <button type="button" data-user-password="${esc(user.username)}">Reset password</button>
               <button type="button" data-user-admin="${esc(user.username)}" data-admin="${user.isAdmin ? "0" : "1"}">${user.isAdmin ? "Revoke admin" : "Make admin"}</button>
+              ${user.isAdmin ? "" : `<button type="button" data-user-folders="${esc(user.username)}" title="Which library folders this account may see">Folders…</button>`}
               ${user.isAdmin ? "" : `<button type="button" data-user-read-only="${esc(user.username)}" data-read-only="${user.readOnly ? "0" : "1"}" title="${user.readOnly ? "Let this account change files again" : "This account can look at everything and change nothing"}">${user.readOnly ? "Allow changes" : "Make read-only"}</button>`}
               <button type="button" class="danger" data-user-remove="${esc(user.username)}">Remove</button>
             </div>
@@ -3137,6 +3154,95 @@ async function loadUsers() {
       `).join("")}
     </tbody>
   </table>`;
+}
+
+/// The folders an account is limited to, one per line, for a tooltip.
+function userFoldersTitle(user) {
+  if (!user.folders.length) return "No folders: this account sees nothing";
+  return user.folders.map((folder) => `${folder.path || "The whole library"}${folder.readOnly ? " (look only)" : ""}`).join("\n");
+}
+
+/// Settings → Users → Folders…: the whole library, or only some folders, each one where the
+/// account may change things or only look. Resolves with true when saved.
+function editUserFolders(user) {
+  return new Promise((resolve) => {
+    const dialog = document.createElement("dialog");
+    dialog.className = "user-folders";
+    dialog.innerHTML = `
+      <h3></h3>
+      <label class="user-folders-choice"><input type="radio" name="user-folders-scope" value="all"> The whole library</label>
+      <label class="user-folders-choice"><input type="radio" name="user-folders-scope" value="some"> Only these folders, and nothing else</label>
+      <div class="user-folders-list"></div>
+      <p class="muted user-folders-note">It sees the folders above these only as the way to them. Folders inside a chosen one follow its choice unless chosen too.</p>
+      <div class="dialog-actions">
+        <button type="button" data-folders="add">Add a folder…</button>
+        <span class="spacer"></span>
+        <button type="button" data-folders="cancel">Cancel</button>
+        <button type="button" data-folders="save" class="primary">Save</button>
+      </div>`;
+    dialog.querySelector("h3").textContent = `Folders for ${user.username}`;
+    document.body.append(dialog);
+    const folders = (user.folders || []).map((folder) => ({ path: folder.path, readOnly: !!folder.readOnly }));
+    let limited = !!user.limited;
+    let saved = false;
+    const list = dialog.querySelector(".user-folders-list");
+    const render = () => {
+      dialog.querySelector(`input[value="${limited ? "some" : "all"}"]`).checked = true;
+      dialog.querySelector('[data-folders="add"]').disabled = !limited;
+      list.hidden = !limited;
+      dialog.querySelector(".user-folders-note").hidden = !limited;
+      list.innerHTML = folders.length
+        ? folders.map((folder, index) => `<div class="user-folders-row">
+            <span class="user-folders-path" title="${esc(folder.path || "The whole library")}">${esc(folder.path || state.me.rootName || "Library")}</span>
+            <select data-folder-mode="${index}" aria-label="What ${esc(user.username)} may do in ${esc(folder.path || "the library")}">
+              <option value="write"${folder.readOnly ? "" : " selected"}>Look and change</option>
+              <option value="read"${folder.readOnly ? " selected" : ""}>Only look</option>
+            </select>
+            <button type="button" class="icon-btn" data-folder-remove="${index}" title="Take this folder away" aria-label="Take ${esc(folder.path || "the library")} away">✕</button>
+          </div>`).join("")
+        : `<p class="muted">No folders yet: until one is added, this account sees nothing.</p>`;
+    };
+    render();
+    dialog.addEventListener("change", (event) => {
+      if (event.target.name === "user-folders-scope") {
+        limited = event.target.value === "some";
+        render();
+      }
+      const mode = event.target.closest("[data-folder-mode]");
+      if (mode) folders[Number(mode.dataset.folderMode)].readOnly = mode.value === "read";
+    });
+    dialog.addEventListener("click", async (event) => {
+      const remove = event.target.closest("[data-folder-remove]");
+      if (remove) {
+        folders.splice(Number(remove.dataset.folderRemove), 1);
+        render();
+        return;
+      }
+      const action = event.target.closest("[data-folders]")?.dataset.folders;
+      if (action === "cancel") dialog.close();
+      if (action === "add") {
+        const path = await pickFolder({ title: `A folder for ${user.username}`, ok: "Add" });
+        if (path === null) return;
+        if (!folders.some((folder) => folder.path === path)) folders.push({ path, readOnly: false });
+        folders.sort((a, b) => a.path.localeCompare(b.path));
+        render();
+      }
+      if (action === "save") {
+        try {
+          await api("/api/users/folders", { method: "POST", json: { username: user.username, folders: limited ? folders : null } });
+          saved = true;
+          dialog.close();
+        } catch (err) {
+          toast(err.message, true);
+        }
+      }
+    });
+    dialog.addEventListener("close", () => {
+      dialog.remove();
+      resolve(saved);
+    });
+    dialog.showModal();
+  });
 }
 
 function setLibraryTab(tab) {
@@ -6433,8 +6539,12 @@ let healthTimer = 0;
 /// Shows a warning over the files when a disk OwnNAS uses is nearly full or a drive reports
 /// trouble. Dismissed, it stays away until something changes (or the next visit).
 async function pollHealthAlerts() {
-  const { alerts } = await api("/api/system/alerts");
   const box = $("health-alert");
+  if (state.me && state.me.folders) {
+    box.hidden = true;
+    return;
+  }
+  const { alerts } = await api("/api/system/alerts");
   if (!alerts.length) {
     box.hidden = true;
     return;
@@ -8662,7 +8772,16 @@ $("users-list").addEventListener("click", async (event) => {
   const adminBtn = event.target.closest("[data-user-admin]");
   const removeBtn = event.target.closest("[data-user-remove]");
   const readOnlyBtn = event.target.closest("[data-user-read-only]");
+  const foldersBtn = event.target.closest("[data-user-folders]");
   try {
+    if (foldersBtn) {
+      const user = knownUsers.get(foldersBtn.dataset.userFolders);
+      if (user && await editUserFolders(user)) {
+        toast(`${user.username}'s folders saved`);
+        await loadUsers();
+      }
+      return;
+    }
     if (readOnlyBtn) {
       const username = readOnlyBtn.dataset.userReadOnly;
       const readOnly = readOnlyBtn.dataset.readOnly === "1";

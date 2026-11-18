@@ -259,7 +259,7 @@ async fn photos_taken(state: &Arc<AppState>, key: &AgentKey, from: &str, to: &st
     blocking(move || {
         let items = {
             let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
-            crate::albums::taken_between(&conn, start, end + 86_399, TAKEN_SCAN, None).map_err(|_| Stop::Failed("Could not list the photos.".to_string()))?
+            crate::albums::taken_between(&conn, start, end + 86_399, TAKEN_SCAN, &crate::workspaces::View::every()).map_err(|_| Stop::Failed("Could not list the photos.".to_string()))?
         };
         let items: Vec<MediaItem> = items.into_iter().filter(|item| under(&folders, &item.path)).collect();
         // Checking every photo is slow for a large range: only the ones on this page.
@@ -279,8 +279,8 @@ fn albums_seen(state: &AppState, folders: &agent_keys::Scope) -> Result<Vec<(cra
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     let fail = |_| Stop::Failed("Could not list the albums.".to_string());
     let mut seen = Vec::new();
-    for album in crate::albums::all(&conn, None).map_err(fail)? {
-        let items: Vec<MediaItem> = crate::albums::items(&conn, album.id).map_err(fail)?.into_iter().filter(|item| under(folders, &item.path)).collect();
+    for album in crate::albums::all(&conn, &crate::workspaces::View::every()).map_err(fail)? {
+        let items: Vec<MediaItem> = crate::albums::items(&conn, album.id, &crate::workspaces::View::every()).map_err(fail)?.into_iter().filter(|item| under(folders, &item.path)).collect();
         if !items.is_empty() {
             seen.push((album, items));
         }
@@ -313,7 +313,7 @@ pub(crate) fn album_seen(state: &AppState, folders: &agent_keys::Scope, id: i64)
     if crate::albums::get(&conn, id).is_err() {
         return Ok(None);
     }
-    let items: Vec<MediaItem> = crate::albums::items(&conn, id).map_err(|_| Stop::Failed("Could not read the album.".to_string()))?.into_iter().filter(|item| under(folders, &item.path)).collect();
+    let items: Vec<MediaItem> = crate::albums::items(&conn, id, &crate::workspaces::View::every()).map_err(|_| Stop::Failed("Could not read the album.".to_string()))?.into_iter().filter(|item| under(folders, &item.path)).collect();
     Ok((!items.is_empty()).then_some(items))
 }
 

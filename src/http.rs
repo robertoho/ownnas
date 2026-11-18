@@ -18,6 +18,7 @@ use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, ReadBuf};
 use tokio_util::io::ReaderStream;
 
+use crate::access::{Access, Need};
 use crate::auth::{self, COOKIE_NAME};
 use crate::db::{self, User};
 use crate::files::{self, FileError};
@@ -358,6 +359,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/users/password", post(admin_set_password))
         .route("/api/users/admin", post(set_user_admin))
         .route("/api/users/read-only", post(set_user_read_only))
+        .route("/api/users/folders", post(set_user_folders))
         .route("/api/users/remove", post(remove_managed_user))
         .route("/.well-known/oauth-protected-resource", get(oauth_resource_metadata).options(oauth_preflight))
         .route("/.well-known/oauth-protected-resource/mcp", get(oauth_resource_metadata).options(oauth_preflight))
@@ -603,6 +605,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/sync/changes", get(sync_changes))
         .layer(axum::middleware::from_fn_with_state(state.clone(), note_changes))
         .layer(axum::middleware::from_fn_with_state(state.clone(), read_only_accounts))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), folder_limits))
         .layer(axum::middleware::from_fn_with_state(state.clone(), strict_transport))
         .with_state(state)
 }
@@ -1563,6 +1566,8 @@ async fn me(
         // The web app hides changes either way: the whole server, or this account, is read-only.
         "readonly": state.readonly || user.read_only,
         "accountReadOnly": user.read_only,
+        // Kept to some folders: the web app hides what such an account cannot use.
+        "folders": Access::of(&user).limited().then(|| user.folders.clone()),
         "twoFactor": db::two_factor(&state.db.lock().unwrap_or_else(|err| err.into_inner()), user.id).secret.is_some(),
         "version": env!("CARGO_PKG_VERSION"),
         "rootName": files::root_label(&state.root),
@@ -1572,10 +1577,11 @@ async fn me(
         "updatesSigned": state.update.pubkey.is_some(),
         "updateTarget": crate::update::current_target(),
         "terminal": user.is_admin && terminal_enabled(&state),
-        "remotes": user.is_admin || {
+        // Remotes are outside the library, so an account limited to some folders has none.
+        "remotes": user.is_admin || (!Access::of(&user).limited() && {
             let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
             crate::remotes::shared_with_any(&conn, user.id)
-        },
+        }),
     })))
 }
 
@@ -1809,6 +1815,168 @@ async fn read_only_accounts(
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UserFoldersBody {
+    username: String,
+    /// The folders to limit the account to; `null` for the whole library again.
+    folders: Option<Vec<UserFolderBody>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UserFolderBody {
+    path: String,
+    #[serde(default)]
+    read_only: bool,
+}
+
+/// Limits an account to some library folders, each read-write or read-only (`access.rs`), or
+/// gives it the whole library again.
+async fn set_user_folders(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<UserFoldersBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let folders = match &body.folders {
+        None => None,
+        Some(chosen) => {
+            if chosen.len() > 200 {
+                return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose up to 200 folders"));
+            }
+            let mut folders: Vec<db::UserFolder> = Vec::new();
+            for folder in chosen {
+                let not_folder = || ApiError::new(StatusCode::BAD_REQUEST, format!("“{}” is not a folder in the library", folder.path.trim()));
+                // Kept as where it really is, as the checks compare (links followed).
+                let found = files::resolve(&state.root, folder.path.trim()).map_err(|_| not_folder())?;
+                if !found.full.is_dir() {
+                    return Err(not_folder());
+                }
+                let rel = found.full.strip_prefix(state.root.canonicalize().unwrap_or_else(|_| state.root.clone())).map_err(|_| not_folder())?
+                    .components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/");
+                if files::is_under_trash(&rel) {
+                    return Err(ApiError::new(StatusCode::BAD_REQUEST, "A folder in the Trash cannot be given to an account"));
+                }
+                folders.retain(|known| known.path != rel);
+                folders.push(db::UserFolder { path: rel, read_only: folder.read_only });
+            }
+            folders.sort_by(|a, b| a.path.cmp(&b.path));
+            Some(folders)
+        }
+    };
+    {
+        let mut conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        db::set_user_folders(&mut conn, &body.username, folders.as_deref()).map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    }
+    forget_sessions(&state);
+    let detail = match &folders {
+        None => format!("{}: the whole library", body.username.trim()),
+        Some(folders) => format!(
+            "{}: {}",
+            body.username.trim(),
+            folders.iter().map(|folder| if folder.read_only { format!("{} (read-only)", folder.path) } else { folder.path.clone() }).collect::<Vec<_>>().join(", ")
+        ),
+    };
+    record(&state, &user, "user-folders", &detail);
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Accounts limited to some folders (`access.rs`): a request not in `access::ROUTES` is refused,
+/// and every library path one carries is checked before the handler runs, so a handler cannot
+/// forget to. Lists are kept to the account's folders by the handlers that return them.
+async fn folder_limits(
+    State(state): State<std::sync::Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path().to_string();
+    if !path.starts_with("/api/") {
+        return next.run(request).await;
+    }
+    // Not signed in: the handler says so.
+    let Ok((user, _)) = require_user(&state, request.headers()) else { return next.run(request).await };
+    let access = Access::of(&user);
+    if !access.limited() {
+        return next.run(request).await;
+    }
+    let Some(fields) = crate::access::route(request.method(), &path) else {
+        return ApiError::new(StatusCode::FORBIDDEN, "This account is limited to some folders and cannot use this").into_response();
+    };
+    let unreadable = || ApiError::new(StatusCode::BAD_REQUEST, "Could not read the request").into_response();
+    let mut wanted: Vec<(String, Need)> = Vec::new();
+    if let Some(rest) = path.strip_prefix("/api/book/").filter(|_| path != "/api/book/info") {
+        let Some(book) = rest.split('/').next().and_then(crate::access::decode_segment) else { return unreadable() };
+        wanted.push((book, Need::Read));
+    }
+    let query: Vec<(String, String)> = if fields.iter().any(|(field, _)| field.starts_with("q:")) {
+        match axum::extract::Query::<Vec<(String, String)>>::try_from_uri(request.uri()) {
+            Ok(axum::extract::Query(pairs)) => pairs,
+            Err(_) => return unreadable(),
+        }
+    } else {
+        Vec::new()
+    };
+    for (field, need) in fields.iter().filter_map(|(field, need)| field.strip_prefix("q:").map(|name| (name, *need))) {
+        let mut values: Vec<String> = query.iter().filter(|(name, _)| name == field).map(|(_, value)| value.clone()).collect();
+        if values.is_empty() {
+            // Left out, it is the top of the library to the handler.
+            values.push(String::new());
+        }
+        wanted.extend(values.into_iter().map(|value| (value, need)));
+    }
+    let request = if fields.iter().any(|(field, _)| field.starts_with("b:")) {
+        let (parts, body) = request.into_parts();
+        let Ok(bytes) = axum::body::to_bytes(body, LIMITED_BODY_MOST).await else {
+            return ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "That request is too large").into_response();
+        };
+        let value: serde_json::Value = if bytes.is_empty() {
+            json!({})
+        } else {
+            match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                Err(_) => return unreadable(),
+            }
+        };
+        for (field, need) in fields.iter().filter_map(|(field, need)| field.strip_prefix("b:").map(|name| (name, *need))) {
+            let Ok(values) = crate::access::body_values(&value, field) else { return unreadable() };
+            wanted.extend(values.into_iter().map(|value| (value, need)));
+        }
+        axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes))
+    } else {
+        request
+    };
+    if !wanted.is_empty() {
+        let root = state.root.clone();
+        let refused = tokio::task::spawn_blocking(move || wanted.iter().find_map(|(rel, need)| access.check(&root, rel, *need).err())).await;
+        match refused {
+            Ok(None) => {}
+            Ok(Some(refusal)) => return ApiError::new(refusal.status(), refusal.message()).into_response(),
+            Err(_) => return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not check the request").into_response(),
+        }
+    }
+    next.run(request).await
+}
+
+/// The largest request body read to check a limited account's paths (saving a spreadsheet is
+/// the largest).
+const LIMITED_BODY_MOST: usize = files::XLSX_MAX_BYTES + 16 * 1024 * 1024;
+
+/// The account asking, and where it may go.
+fn require_access(state: &AppState, headers: &HeaderMap) -> Result<(User, Access), ApiError> {
+    let (user, _) = require_user(state, headers)?;
+    let access = Access::of(&user);
+    Ok((user, access))
+}
+
+/// Refuses what the account may not do with a path, for handlers that find the path themselves
+/// (a version, a face, a comment by its id; the notes folder).
+fn check_access(state: &AppState, access: &Access, rel: &str, need: Need) -> Result<(), ApiError> {
+    access.check(&state.root, rel, need).map_err(|refusal| ApiError::new(refusal.status(), refusal.message()))
+}
+
+#[derive(Deserialize)]
 struct RemoveUserBody {
     username: String,
 }
@@ -1877,7 +2045,7 @@ async fn list(
     headers: HeaderMap,
     Query(query): Query<PathQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     let root = state.root.clone();
     let migrations = tokio::task::spawn_blocking({
         let root = root.clone();
@@ -1896,6 +2064,10 @@ async fn list(
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not list the folder"))?
         .map_err(ApiError::from)?;
+    if access.limited() {
+        // Above its folders, and in the Trash, only what leads to them or came from them.
+        listing.entries.retain(|entry| access.sees(&state.root, &entry.path));
+    }
     let paths: Vec<String> = listing.entries.iter().map(|entry| entry.path.clone()).collect();
     // With the index ready, folder sizes come from it afterwards (/api/usage, which the page asks
     // for each folder in the background): adding up big subtrees here would hold the listing,
@@ -2193,15 +2365,16 @@ struct WorkspaceQuery {
 }
 
 impl WorkspaceQuery {
-    /// The workspace, checked to exist (or `UNSORTED`, the photos in no workspace).
-    fn check(&self, conn: &rusqlite::Connection) -> Result<Option<i64>, ApiError> {
-        Ok(crate::workspaces::check_view(conn, self.workspace)?)
+    /// The workspace, checked to exist (or `UNSORTED`, the photos in no workspace), within the
+    /// account's folders.
+    fn check(&self, conn: &rusqlite::Connection, access: &Access) -> Result<crate::workspaces::View, ApiError> {
+        Ok(crate::workspaces::View::of(crate::workspaces::check_view(conn, self.workspace)?, access))
     }
 
-    /// Who is in the workspace, for filtering in memory.
-    fn members(&self, conn: &rusqlite::Connection) -> Result<crate::workspaces::Members, ApiError> {
-        let workspace = self.check(conn)?;
-        Ok(crate::workspaces::members(conn, workspace)?)
+    /// Who is in the workspace (within the account's folders), for filtering in memory.
+    fn members(&self, conn: &rusqlite::Connection, access: &Access) -> Result<crate::workspaces::Members, ApiError> {
+        let view = self.check(conn, access)?;
+        Ok(crate::workspaces::members(conn, &view)?)
     }
 }
 
@@ -2229,11 +2402,11 @@ async fn gallery_days(
     headers: HeaderMap,
     Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     let (days, hidden) = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-        let workspace = scope.check(&conn)?;
-        (crate::albums::days(&conn, workspace)?, crate::albums::hidden_count(&conn, workspace)?)
+        let workspace = scope.check(&conn, &access)?;
+        (crate::albums::days(&conn, &workspace)?, crate::albums::hidden_count(&conn, &workspace)?)
     };
     Ok(Json(json!({
         "days": days.into_iter().map(|(day, count)| json!({ "day": day, "count": count })).collect::<Vec<_>>(),
@@ -2266,13 +2439,13 @@ async fn gallery_places(
     Query(query): Query<PlacesQuery>,
     Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     let conn = own_connection(&state)?;
-    let workspace = scope.check(&conn)?;
+    let workspace = scope.check(&conn, &access)?;
     let zoom = query.zoom.unwrap_or(2);
     let bounds = query.bounds();
     let (places, extent) = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
-        Ok((crate::albums::places(&conn, zoom, bounds, 72.0, workspace)?, crate::albums::place_extent(&conn, workspace)?))
+        Ok((crate::albums::places(&conn, zoom, bounds, 72.0, &workspace)?, crate::albums::place_extent(&conn, &workspace)?))
     })
     .await
     .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the places"))??;
@@ -2289,12 +2462,12 @@ async fn gallery_place_items(
     Query(query): Query<PlacesQuery>,
     Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     let bounds = query.bounds().ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Say which part of the map"))?;
     let limit = query.limit.unwrap_or(500).min(5000);
     let conn = own_connection(&state)?;
-    let workspace = scope.check(&conn)?;
-    let (items, total) = crate::albums::placed_items(&conn, bounds, limit, workspace)?;
+    let workspace = scope.check(&conn, &access)?;
+    let (items, total) = crate::albums::placed_items(&conn, bounds, limit, &workspace)?;
     Ok(Json(json!({ "items": items, "total": total })))
 }
 
@@ -2312,13 +2485,13 @@ async fn gallery_memories(
     Query(query): Query<MemoriesQuery>,
     Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     if !(1..=12).contains(&query.month) || !(1..=31).contains(&query.day) {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "That is not a day"));
     }
     let conn = own_connection(&state)?;
-    let workspace = scope.check(&conn)?;
-    let years = crate::albums::on_this_day(&conn, query.month, query.day, query.year, 60, workspace)?;
+    let workspace = scope.check(&conn, &access)?;
+    let years = crate::albums::on_this_day(&conn, query.month, query.day, query.year, 60, &workspace)?;
     Ok(Json(json!({
         "years": years.into_iter().map(|(year, count, items)| json!({ "year": year, "count": count, "items": items })).collect::<Vec<_>>(),
     })))
@@ -2502,7 +2675,7 @@ async fn gallery_search(
     Query(query): Query<SmartSearchQuery>,
     Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     #[cfg(not(ownnas_ml))]
     {
         let _ = (query, scope);
@@ -2515,7 +2688,7 @@ async fn gallery_search(
         if text.is_empty() {
             return Ok(Json(json!({ "items": [] })));
         }
-        let members = scope.members(&state.db.lock().unwrap_or_else(|err| err.into_inner()))?;
+        let members = scope.members(&state.db.lock().unwrap_or_else(|err| err.into_inner()), &access)?;
         let worker = state.clone();
         let found = tokio::task::spawn_blocking(move || -> Result<Vec<(String, f32)>, String> {
             let vector = worker.models.describe_text(&text)?;
@@ -2547,7 +2720,7 @@ async fn gallery_similar(
     Query(scope): Query<WorkspaceQuery>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     #[cfg(not(ownnas_ml))]
     {
         let _ = (query, scope, body);
@@ -2561,7 +2734,7 @@ async fn gallery_similar(
             None if body.is_empty() => return Err(ApiError::new(StatusCode::BAD_REQUEST, "Choose a photo, or drop one in")),
             None => None,
         };
-        let members = scope.members(&state.db.lock().unwrap_or_else(|err| err.into_inner()))?;
+        let members = scope.members(&state.db.lock().unwrap_or_else(|err| err.into_inner()), &access)?;
         let worker = state.clone();
         let skip = sample.as_ref().map(|target| target.rel.clone());
         let found = tokio::task::spawn_blocking(move || -> Result<Vec<(String, f32)>, String> {
@@ -2617,12 +2790,12 @@ async fn list_people(
     Query(query): Query<PeopleQuery>,
     Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-    let workspace = scope.check(&conn)?;
+    let workspace = scope.check(&conn, &access)?;
     let hidden = query.hidden.as_deref() == Some("1");
-    let people = crate::smart::people_in(&conn, hidden, workspace).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
-    let hidden_count = if hidden { 0 } else { crate::smart::people_in(&conn, true, workspace).map(|list| list.len()).unwrap_or(0) };
+    let people = crate::smart::people_in(&conn, hidden, &workspace).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let hidden_count = if hidden { 0 } else { crate::smart::people_in(&conn, true, &workspace).map(|list| list.len()).unwrap_or(0) };
     Ok(Json(json!({ "people": people, "hiddenCount": hidden_count })))
 }
 
@@ -2637,14 +2810,14 @@ async fn person_photos(
     Query(query): Query<PersonQuery>,
     Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     let (person, photos) = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-        let workspace = scope.check(&conn)?;
+        let workspace = scope.check(&conn, &access)?;
         let person = crate::smart::person(&conn, query.id)
             .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?
             .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That person is no longer there"))?;
-        (person, crate::smart::person_photos_in(&conn, query.id, workspace).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?)
+        (person, crate::smart::person_photos_in(&conn, query.id, &workspace).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?)
     };
     let face_ids: Vec<i64> = photos.iter().map(|(_, face)| *face).collect();
     let items = gallery_items(&state, photos.into_iter().map(|(item, _)| item).collect(), true)
@@ -2733,12 +2906,13 @@ async fn face_crop(
     headers: HeaderMap,
     Query(query): Query<FaceQuery>,
 ) -> Result<Response, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     let found = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
         crate::smart::face_box(&conn, query.id).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?
     };
     let (path, x, y, w, h) = found.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "No such face"))?;
+    check_access(&state, &access, &path, Need::Read)?;
     let target = files::resolve(&state.root, &path)?;
     let cache = state.thumbs.join("faces");
     let id = query.id;
@@ -3274,11 +3448,11 @@ async fn gallery_hidden(
     headers: HeaderMap,
     Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     let items = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-        let workspace = scope.check(&conn)?;
-        crate::albums::hidden(&conn, workspace)?
+        let workspace = scope.check(&conn, &access)?;
+        crate::albums::hidden(&conn, &workspace)?
     };
     Ok(Json(json!({ "items": gallery_items(&state, items, true) })))
 }
@@ -3348,16 +3522,16 @@ async fn gallery_timeline(
     Query(query): Query<TimelineQuery>,
     Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     let ranged = query.from.zip(query.to);
     let limit = query.limit.unwrap_or(200).clamp(1, if ranged.is_some() { 50_000 } else { 1000 });
     let before = query.before.map(|at| (at, query.before_path.unwrap_or_default()));
     let items = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-        let workspace = scope.check(&conn)?;
+        let workspace = scope.check(&conn, &access)?;
         match ranged {
-            Some((from, to)) => crate::albums::taken_between(&conn, from, to, limit, workspace)?,
-            None => crate::albums::timeline(&conn, before, limit, workspace)?,
+            Some((from, to)) => crate::albums::taken_between(&conn, from, to, limit, &workspace)?,
+            None => crate::albums::timeline(&conn, before, limit, &workspace)?,
         }
     };
     let more = items.len() == limit;
@@ -3375,18 +3549,18 @@ async fn get_album(
     Query(query): Query<AlbumQuery>,
     Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     let (album, breadcrumb, children, items) = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-        let workspace = scope.check(&conn)?;
+        let workspace = scope.check(&conn, &access)?;
         match query.id {
             Some(id) => (
-                Some(crate::albums::get(&conn, id)?),
+                Some(crate::albums::get_in(&conn, id, &workspace)?),
                 crate::albums::breadcrumb(&conn, id)?,
-                crate::albums::children(&conn, Some(id), workspace)?,
-                crate::albums::items(&conn, id)?,
+                crate::albums::children(&conn, Some(id), &workspace)?,
+                crate::albums::items(&conn, id, &workspace)?,
             ),
-            None => (None, Vec::new(), crate::albums::children(&conn, None, workspace)?, Vec::new()),
+            None => (None, Vec::new(), crate::albums::children(&conn, None, &workspace)?, Vec::new()),
         }
     };
     Ok(Json(json!({
@@ -3402,10 +3576,11 @@ async fn album_tree(
     headers: HeaderMap,
     Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-    let workspace = scope.check(&conn)?;
-    Ok(Json(json!({ "albums": crate::albums::all(&conn, workspace)?, "workspaces": crate::workspaces::list(&conn)? })))
+    let workspace = scope.check(&conn, &access)?;
+    let workspaces = crate::workspaces::list_seen(&conn, workspace.folders.as_deref())?;
+    Ok(Json(json!({ "albums": crate::albums::all(&conn, &workspace)?, "workspaces": workspaces })))
 }
 
 #[derive(Deserialize)]
@@ -3422,12 +3597,12 @@ async fn create_album(
     Json(body): Json<CreateAlbumBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     check_csrf(&headers)?;
-    let (user, _) = require_user(&state, &headers)?;
+    let (user, access) = require_access(&state, &headers)?;
     require_write(&state)?;
     let album = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-        let workspace = scope.check(&conn)?;
-        let id = crate::albums::create(&conn, body.parent_id, &body.name, workspace)?;
+        let workspace = scope.check(&conn, &access)?;
+        let id = crate::albums::create(&conn, body.parent_id, &body.name, workspace.workspace)?;
         crate::albums::get(&conn, id)?
     };
     record(&state, &user, "album-create", &album.name);
@@ -3555,11 +3730,12 @@ async fn album_items(
 }
 
 async fn list_workspaces(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
+    let limit = access.folder_paths();
     let conn = own_connection(&state)?;
-    let workspaces = crate::workspaces::list(&conn)?;
+    let workspaces = crate::workspaces::list_seen(&conn, limit.as_deref())?;
     // Worth counting only once there are workspaces to sort photos into.
-    let unsorted = if workspaces.is_empty() { 0 } else { crate::workspaces::unsorted_count(&conn)? };
+    let unsorted = if workspaces.is_empty() { 0 } else { crate::workspaces::unsorted_seen(&conn, limit.as_deref())? };
     Ok(Json(json!({ "workspaces": workspaces, "unsorted": unsorted })))
 }
 
@@ -3763,7 +3939,7 @@ async fn rename_many(
         for item in outcome["made"].as_array().into_iter().flatten() {
             if let (Some(from), Some(to)) = (item["from"].as_str(), item["to"].as_str()) {
                 rewrite_meta(&state, from, to);
-                relink_notes(&state, &user.username, from, to).await;
+                relink_notes(&state, &Access::of(&user), &user.username, from, to).await;
             }
         }
         let count = outcome["made"].as_array().map_or(0, Vec::len);
@@ -3813,7 +3989,8 @@ pub(crate) fn notes_folder(state: &AppState) -> String {
 
 /// After a note was renamed, the [[links]] to it in the other notes follow (each changed note
 /// keeps its earlier version).
-pub(crate) async fn relink_notes(state: &AppState, by: &str, from: &str, to: &str) {
+/// Only notes `access` may change are changed (an account limited to some folders).
+pub(crate) async fn relink_notes(state: &AppState, access: &Access, by: &str, from: &str, to: &str) {
     let stem = |path: &str| -> Option<String> {
         let name = path.rsplit('/').next()?;
         let (stem, extension) = name.rsplit_once('.')?;
@@ -3826,13 +4003,15 @@ pub(crate) async fn relink_notes(state: &AppState, by: &str, from: &str, to: &st
     }
     let Ok(found) = files::resolve(&state.root, &folder) else { return };
     let (db_path, store, by) = (state.db_path.clone(), state.versions.clone(), by.to_string());
+    let (root, access) = (state.root.clone(), access.clone());
     let _ = tokio::task::spawn_blocking(move || {
         let keep = |full: &std::path::Path, rel: &str| {
             if let Ok(conn) = db::connect(&db_path) {
                 crate::versions::keep(&conn, &store, full, rel, &by, "edit");
             }
         };
-        crate::notes::relink_folder(&found.full, &found.rel, &old, &new, &keep)
+        let may_change = |rel: &str| access.check(&root, rel, Need::Write).is_ok();
+        crate::notes::relink_folder(&found.full, &found.rel, &old, &new, &keep, &may_change)
     })
     .await;
 }
@@ -3884,7 +4063,7 @@ async fn save_note(state: &AppState, user: &User, rel: String, text: String) -> 
 }
 
 async fn list_notes(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     let folder = notes_folder(&state);
     let found = files::resolve(&state.root, &folder).ok().filter(|found| found.full.is_dir());
     let Some(found) = found else {
@@ -3894,6 +4073,8 @@ async fn list_notes(State(state): State<std::sync::Arc<AppState>>, headers: Head
     let notes = tokio::task::spawn_blocking(move || crate::notes::list(&full, &rel))
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the notes"))?;
+    let mut notes = notes;
+    notes.retain(|note| access.holds(&note.path));
     let paths: Vec<String> = notes.iter().map(|note| note.path.clone()).collect();
     let tags = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
@@ -3925,8 +4106,11 @@ async fn create_note(
     Json(body): Json<NewNoteBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     check_csrf(&headers)?;
-    let (user, _) = require_user(&state, &headers)?;
+    let (user, access) = require_access(&state, &headers)?;
     require_write(&state)?;
+    // Before the notes folder (or the notebook) is made.
+    let notebook = body.notebook.as_deref().map(str::trim).filter(|notebook| !notebook.is_empty()).unwrap_or_default();
+    check_access(&state, &access, &format!("{}/{notebook}", notes_folder(&state)), Need::Write)?;
     if body.text.trim().is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "Write something first"));
     }
@@ -4078,8 +4262,9 @@ async fn archive_note(
 /// one ({{date}} becomes the day).
 async fn daily_note(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
     check_csrf(&headers)?;
-    let (user, _) = require_user(&state, &headers)?;
+    let (user, access) = require_access(&state, &headers)?;
     require_write(&state)?;
+    check_access(&state, &access, &format!("{}/{}", notes_folder(&state), crate::notes::DAILY), Need::Write)?;
     let (folder, full) = notes_dir(&state, true)?;
     match files::make_dir(&state.root, &folder, crate::notes::DAILY) {
         Ok(()) | Err(files::FileError::AlreadyExists) => {}
@@ -4270,10 +4455,10 @@ async fn all_tags(
     headers: HeaderMap,
     Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-    let workspace = scope.check(&conn)?;
-    let tags = crate::albums::tags(&conn, workspace)?;
+    let workspace = scope.check(&conn, &access)?;
+    let tags = crate::albums::tags(&conn, &workspace)?;
     Ok(Json(json!({ "tags": tags.into_iter().map(|(tag, count)| json!({ "tag": tag, "count": count })).collect::<Vec<_>>() })))
 }
 
@@ -4288,11 +4473,11 @@ async fn gallery_tag(
     Query(query): Query<GalleryTagQuery>,
     Query(scope): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     let items = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-        let workspace = scope.check(&conn)?;
-        crate::albums::tagged(&conn, query.tag.trim(), workspace)?
+        let workspace = scope.check(&conn, &access)?;
+        crate::albums::tagged(&conn, query.tag.trim(), &workspace)?
     };
     let items: Vec<_> = gallery_items(&state, items, true)
         .into_iter()
@@ -5194,7 +5379,7 @@ async fn gallery_upload_check(
     Json(body): Json<UploadCheckBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     check_csrf(&headers)?;
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     if body.sha256.len() != 64 || !body.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "That is not a SHA-256"));
     }
@@ -5205,7 +5390,7 @@ async fn gallery_upload_check(
         let members = {
             let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
             let workspace = body.workspace.filter(|id| *id != crate::workspaces::UNSORTED);
-            crate::workspaces::members(&conn, workspace).unwrap_or(crate::workspaces::Members::Every)
+            crate::workspaces::members(&conn, &crate::workspaces::View::of(workspace, &access)).unwrap_or_else(|_| crate::workspaces::Members::every())
         };
         let mut copies: Vec<String> = Vec::new();
         if let Some(folder) = body.folder.as_deref().map(|folder| folder.trim_matches('/')).filter(|folder| !folder.is_empty()) {
@@ -5213,7 +5398,7 @@ async fn gallery_upload_check(
             copies.extend(find_backup_copy(&state, &target, Some(body.size), Some(&sha256)));
         }
         for path in library_copies(&state, body.size, &sha256) {
-            if !copies.contains(&path) {
+            if !copies.contains(&path) && access.holds(&path) {
                 copies.push(path);
             }
         }
@@ -5221,7 +5406,7 @@ async fn gallery_upload_check(
         let inside = copies.iter().find(|path| members.has(path)).cloned();
         let in_workspace = inside.is_some();
         let copy = inside.or_else(|| copies.first().cloned());
-        let resized = if copy.is_none() { find_resized_copy(&state, &sha256) } else { None };
+        let resized = if copy.is_none() { find_resized_copy(&state, &sha256).filter(|path| access.holds(path)) } else { None };
         json!({
             "copy": copy,
             "inWorkspace": in_workspace,
@@ -5247,7 +5432,7 @@ async fn upload_same_size(
     Json(body): Json<SizesBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     check_csrf(&headers)?;
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     if body.sizes.len() > files::MAX_LIST {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "Too many files at once"));
     }
@@ -5255,7 +5440,7 @@ async fn upload_same_size(
     let mut found: Vec<u64> = body
         .sizes
         .into_iter()
-        .filter(|size| *size > 0 && db::paths_of_size(&conn, *size).iter().any(|path| !files::is_under_trash(path)))
+        .filter(|size| *size > 0 && db::paths_of_size(&conn, *size).iter().any(|path| !files::is_under_trash(path) && access.holds(path)))
         .collect();
     found.sort_unstable();
     found.dedup();
@@ -5280,7 +5465,7 @@ async fn upload_duplicates(
     Json(body): Json<DuplicatesBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     check_csrf(&headers)?;
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     if body.files.len() > files::MAX_LIST {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "Too many files at once"));
     }
@@ -5288,7 +5473,7 @@ async fn upload_duplicates(
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "That is not a SHA-256"));
     }
     let copies = tokio::task::spawn_blocking(move || {
-        body.files.iter().map(|file| library_copies(&state, file.size, &file.sha256.to_ascii_lowercase()).into_iter().next()).collect::<Vec<_>>()
+        body.files.iter().map(|file| library_copies(&state, file.size, &file.sha256.to_ascii_lowercase()).into_iter().find(|path| access.holds(path))).collect::<Vec<_>>()
     })
     .await
     .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not check the files"))?;
@@ -6752,7 +6937,7 @@ async fn rename(
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not rename the item"))?
         .map_err(ApiError::from)?;
     rewrite_meta(&state, &from, &to);
-    relink_notes(&state, &user.username, &from, &to).await;
+    relink_notes(&state, &Access::of(&user), &user.username, &from, &to).await;
     record(&state, &user, "rename", &label);
     Ok(Json(json!({ "ok": true, "path": to })))
 }
@@ -6822,8 +7007,25 @@ async fn empty_trash(
     Query(query): Query<TrashQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     check_csrf(&headers)?;
-    let (user, _) = require_user(&state, &headers)?;
+    let (user, access) = require_access(&state, &headers)?;
     require_write(&state)?;
+    if access.limited() {
+        // Only what was deleted from its read-write folders, so read-only ones are left.
+        let root = state.root.clone();
+        let before = query.older_than_days.map_or(i64::MAX, days_ago);
+        let check = access.clone();
+        let paths = tokio::task::spawn_blocking(move || {
+            files::empty_trash_matching(&root, before, &|original| check.check(&root, original, Need::Remove).is_ok())
+        })
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not empty the Trash"))?
+        .map_err(ApiError::from)?;
+        for path in &paths {
+            delete_meta(&state, path);
+        }
+        record(&state, &user, "empty-trash", &format!("{} item(s)", paths.len()));
+        return Ok(Json(json!({ "removed": paths.len() as u32 })));
+    }
     let root = state.root.clone();
     let failed = |_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not empty the Trash");
     let removed = match query.older_than_days {
@@ -6859,10 +7061,10 @@ async fn trash_summary(
     headers: HeaderMap,
     Query(query): Query<TrashQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     let root = state.root.clone();
     let before = days_ago(query.days.unwrap_or(30));
-    let summary = tokio::task::spawn_blocking(move || files::trash_summary(&root, before))
+    let summary = tokio::task::spawn_blocking(move || files::trash_summary(&root, before, &|original| access.holds(original)))
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not look in the Trash"))?
         .map_err(ApiError::from)?;
@@ -6932,8 +7134,13 @@ async fn upload_directories(
     Json(body): Json<UploadDirectoriesBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     check_csrf(&headers)?;
-    let (user, _) = require_user(&state, &headers)?;
+    let (user, access) = require_access(&state, &headers)?;
     require_write(&state)?;
+    if access.limited() {
+        for name in &body.names {
+            check_access(&state, &access, &format!("{}/{name}", rel_of(&body.path)), Need::Write)?;
+        }
+    }
     if body.names.len() > files::MAX_LIST {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "That folder contains too many directories"));
     }
@@ -6960,7 +7167,7 @@ async fn upload(
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, ApiError> {
     check_csrf(&headers)?;
-    let (user, _) = require_user(&state, &headers)?;
+    let (user, access) = require_access(&state, &headers)?;
     require_write(&state)?;
     let choice = upload_choice(&query)?;
     let dir_rel = rel_of(&query.path);
@@ -6980,6 +7187,10 @@ async fn upload(
             .map(|name| name.to_string())
             .filter(|name| !name.is_empty())
             .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "The upload is missing a file name"))?;
+        if access.limited() {
+            // A name may go into folders ("Trip/IMG_1.jpg"), through a link or a read-only one.
+            check_access(&state, &access, &format!("{dir_rel}/{filename}"), Need::Write)?;
+        }
         let root = state.root.clone();
         let dir = dir_rel.clone();
         let prepared = tokio::task::spawn_blocking(move || files::prepare_upload(&root, &dir, &filename, choice))
@@ -7123,10 +7334,15 @@ async fn sync_tree(
     headers: HeaderMap,
     Query(query): Query<SyncQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     let root = state.root.clone();
     let rel = rel_of(&query.path);
-    let entries = tokio::task::spawn_blocking(move || files::sync_tree(&root, &rel))
+    let entries = tokio::task::spawn_blocking(move || {
+        files::sync_tree(&root, &rel).map(|mut entries| {
+            entries.retain(|entry| access.sees(&root, &entry.path));
+            entries
+        })
+    })
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not list the folder"))?
         .map_err(ApiError::from)?;
@@ -7154,7 +7370,7 @@ async fn sync_changes(
     headers: HeaderMap,
     Query(query): Query<ChangesQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     let cursor = (!query.cursor.is_empty()).then_some(query.cursor.as_str());
     let since = state.changes.wait(cursor, Duration::from_secs(query.wait.min(55))).await;
     let watching = state.changes.watching();
@@ -7170,6 +7386,7 @@ async fn sync_changes(
         paths
             .into_iter()
             .filter(|path| folder.is_empty() || *path == folder || path.starts_with(&format!("{folder}/")))
+            .filter(|path| access.sees(&root, path))
             .filter_map(|path| {
                 files::sync_change(&root, &path).map(|now| match now {
                     Some(entry) => json!({ "path": entry.path, "dir": entry.dir, "size": entry.size, "mtime": entry.mtime }),
@@ -9291,8 +9508,9 @@ async fn version_file(
     headers: HeaderMap,
     Query(query): Query<VersionQuery>,
 ) -> Result<Response, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     let version = crate::versions::get(&own_connection(&state)?, query.id).ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That version is gone"))?;
+    check_access(&state, &access, &version.path, Need::Read)?;
     let name = version.path.rsplit('/').next().unwrap_or("file").to_string();
     let download = flag(&query.download);
     let name = if download {
@@ -9322,10 +9540,11 @@ async fn compare_versions(
     headers: HeaderMap,
     Query(query): Query<VersionCompareQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     let conn = own_connection(&state)?;
     let gone = || ApiError::new(StatusCode::NOT_FOUND, "That version is gone");
     let older = crate::versions::get(&conn, query.id).ok_or_else(gone)?;
+    check_access(&state, &access, &older.path, Need::Read)?;
     let name = older.path.rsplit('/').next().unwrap_or("file").to_string();
     let newer = if query.with == "current" {
         let found = files::resolve(&state.root, &older.path).map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "The file is not there any more"))?;
@@ -9336,6 +9555,7 @@ async fn compare_versions(
     } else {
         let id: i64 = query.with.parse().map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Choose what to compare with"))?;
         let version = crate::versions::get(&conn, id).ok_or_else(gone)?;
+        check_access(&state, &access, &version.path, Need::Read)?;
         crate::versions::file(&state.versions, version.id)
     };
     let old_path = crate::versions::file(&state.versions, older.id);
@@ -9380,9 +9600,11 @@ async fn restore_version(
     Json(body): Json<VersionBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     check_csrf(&headers)?;
-    let (user, _) = require_user(&state, &headers)?;
+    let (user, access) = require_access(&state, &headers)?;
     require_write(&state)?;
     let conn = own_connection(&state)?;
+    let version = crate::versions::get(&conn, body.id).ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That version is gone"))?;
+    check_access(&state, &access, &version.path, Need::Write)?;
     let (store, root, by) = (state.versions.clone(), state.root.clone(), user.username.clone());
     let version = tokio::task::spawn_blocking(move || crate::versions::restore(&conn, &store, &root, body.id, &by))
         .await
@@ -9400,10 +9622,11 @@ async fn delete_version(
     Json(body): Json<VersionBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     check_csrf(&headers)?;
-    let (user, _) = require_user(&state, &headers)?;
+    let (user, access) = require_access(&state, &headers)?;
     require_write(&state)?;
     let conn = own_connection(&state)?;
     let version = crate::versions::get(&conn, body.id).ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That version is gone"))?;
+    check_access(&state, &access, &version.path, Need::Write)?;
     crate::versions::delete(&conn, &state.versions, body.id).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     record(&state, &user, "delete-version", &version.path);
     Ok(Json(json!({ "ok": true })))
@@ -9496,7 +9719,10 @@ fn record(state: &AppState, user: &User, action: &str, detail: &str) {
 pub(crate) fn rewrite_meta(state: &AppState, from: &str, to: &str) {
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     let _ = db::rewrite_path_meta(&conn, from, to);
+    drop(conn);
     state.media.descriptions.invalidate();
+    // An account's folders may have moved with it.
+    forget_sessions(state);
 }
 
 /// Refuses deleting `rel` (or moving it to the Trash) while it, something in it, or the folder
@@ -9525,7 +9751,10 @@ fn name_in(rel: &str) -> &str {
 fn delete_meta(state: &AppState, path: &str) {
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     let _ = db::delete_path_meta(&conn, path);
+    drop(conn);
     state.media.descriptions.invalidate();
+    // An account's folders may be gone with it.
+    forget_sessions(state);
 }
 
 pub(crate) fn invalidate_sizes(state: &AppState, path: &str) {
@@ -9624,10 +9853,11 @@ async fn list_bookmarks(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (user, _) = require_user(&state, &headers)?;
+    let (user, access) = require_access(&state, &headers)?;
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-    let paths = db::list_bookmarks(&conn, user.id)
+    let mut paths = db::list_bookmarks(&conn, user.id)
         .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    paths.retain(|path| access.holds(path));
     Ok(Json(json!({ "paths": paths })))
 }
 
@@ -9677,10 +9907,11 @@ async fn list_recent(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (user, _) = require_user(&state, &headers)?;
+    let (user, access) = require_access(&state, &headers)?;
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-    let items = db::list_recent(&conn, user.id)
+    let mut items = db::list_recent(&conn, user.id)
         .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    items.retain(|item| access.holds(&item.path));
     Ok(Json(json!({ "items": items })))
 }
 
@@ -9719,9 +9950,20 @@ async fn search(
     headers: HeaderMap,
     Query(query): Query<SearchQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (_, access) = require_access(&state, &headers)?;
     let size = SizeRange::new(query.min_size, query.max_size);
-    let hits = search_hits(&state, rel_of(&query.path), query.q.unwrap_or_default(), size).await?;
+    let mut hits = search_hits(&state, rel_of(&query.path), query.q.unwrap_or_default(), size).await?;
+    if access.limited() {
+        // The file index and the words in files cover the whole library, and a search that
+        // walks the folders follows links.
+        let root = state.root.clone();
+        hits = tokio::task::spawn_blocking(move || {
+            hits.retain(|hit| access.holds(&hit.path) && access.check(&root, &hit.path, Need::Read).is_ok());
+            hits
+        })
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not search"))?;
+    }
     let mut payload = json!({ "hits": hits });
     decorate_folder_appearance(&state, &mut payload["hits"])?;
     decorate_protection(&state, &mut payload["hits"])?;
@@ -9988,10 +10230,18 @@ async fn activity(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers)?;
+    let (user, access) = require_access(&state, &headers)?;
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-    let events = db::list_events(&conn)
+    let mut events = db::list_events(&conn)
         .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    if access.limited() {
+        // Its own, and others' about one thing in its folders: a move or rename names a second
+        // place, which may be outside them.
+        events.retain(|event| {
+            let path = event.detail.split(" #").next().unwrap_or_default();
+            event.username == user.username || (!path.is_empty() && !path.contains(" → ") && !path.contains(" as ") && access.holds(path))
+        });
+    }
     Ok(Json(json!({ "events": events })))
 }
 
@@ -10382,9 +10632,14 @@ async fn remove_comment(
     Query(query): Query<CommentQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     check_csrf(&headers)?;
-    let (user, _) = require_user(&state, &headers)?;
+    let (user, access) = require_access(&state, &headers)?;
     require_write(&state)?;
     let id = query.id.ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Choose a comment"))?;
+    if access.limited() {
+        let path = db::comment_path(&state.db.lock().unwrap_or_else(|err| err.into_inner()), id)
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Comment not found"))?;
+        check_access(&state, &access, &path, Need::Write)?;
+    }
     {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
         db::remove_comment(&conn, id)
@@ -11179,6 +11434,285 @@ mod tests {
         answer(app.clone().oneshot(send("DELETE", "/api/entry?path=Trips%2FIMG_1.jpg", Body::empty(), false)).await.unwrap()).await;
         let has = answer(app.clone().oneshot(send("GET", &format!("/api/backup/has?{}", query("IMG_1.jpg", true)), Body::empty(), false)).await.unwrap()).await;
         assert_eq!(has["path"], serde_json::Value::Null);
+    }
+
+    /// An account limited to some folders (`access.rs`) gets 404 for everything outside them,
+    /// 403 for changes in its read-only ones, and lists of only what is inside them, area by area.
+    #[tokio::test]
+    async fn an_account_limited_to_folders_reaches_nothing_else() {
+        let (root, data) = scratch();
+        let state = Arc::new(new_state(root.clone(), data, false, false, false, false, crate::update::UpdateConfig::default()).unwrap());
+        {
+            let conn = state.db.lock().unwrap();
+            db::create_user(&conn, "ada", "longenough").unwrap();
+            db::create_user(&conn, "bo", "longenough2").unwrap();
+        }
+        let app = router(state.clone());
+        for dir in ["Family/Photos/2024", "Family/Private", "Work", "Other", "Notes"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for (path, text) in [
+            ("Family/Photos/a.jpg", "photo a"),
+            ("Family/Photos/b.jpg", "photo b"),
+            ("Family/Private/diary.txt", "private"),
+            ("Work/plan.txt", "plan"),
+            ("Other/secret.txt", "secret"),
+            ("Other/secret.jpg", "photo a"),
+            ("Notes/Shopping.md", "# Shopping\n"),
+        ] {
+            std::fs::write(root.join(path), text).unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("Other"), root.join("Family/Photos/other")).unwrap();
+        let sign_in = |username: &'static str, password: &'static str| {
+            let app = app.clone();
+            async move {
+                let login = Request::builder().method("POST").uri("/api/login").header("content-type", "application/json").header("x-ownnas", "1")
+                    .body(Body::from(json!({ "username": username, "password": password }).to_string())).unwrap();
+                let response = app.oneshot(login).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{username} signs in");
+                response.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string()
+            }
+        };
+        let ada = sign_in("ada", "longenough").await;
+        let bo = sign_in("bo", "longenough2").await;
+        let send = |cookie: &str, method: &str, uri: &str, body: Option<serde_json::Value>| {
+            let mut request = Request::builder().method(method).uri(uri).header("cookie", cookie).header("x-ownnas", "1");
+            if body.is_some() {
+                request = request.header("content-type", "application/json");
+            }
+            app.clone().oneshot(request.body(body.map_or_else(Body::empty, |body| Body::from(body.to_string()))).unwrap())
+        };
+        let json_of = |response: Response| async move {
+            let status = response.status();
+            let bytes = body_bytes(response).await;
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let q = |path: &str| path.replace('/', "%2F").replace(' ', "%20");
+
+        // Only an administrator gives folders, and not to an administrator.
+        let limit = json!({ "username": "bo", "folders": [{ "path": "Family/Photos" }, { "path": "Work", "readOnly": true }] });
+        assert_eq!(send(&bo, "POST", "/api/users/folders", Some(limit.clone())).await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(send(&ada, "POST", "/api/users/folders", Some(json!({ "username": "ada", "folders": [] }))).await.unwrap().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(send(&ada, "POST", "/api/users/folders", Some(json!({ "username": "bo", "folders": [{ "path": "Nowhere" }] }))).await.unwrap().status(), StatusCode::BAD_REQUEST);
+        json_of(send(&ada, "POST", "/api/users/folders", Some(limit)).await.unwrap()).await;
+        let me = json_of(send(&bo, "GET", "/api/me", None).await.unwrap()).await;
+        assert_eq!(me["folders"], json!([{ "path": "Family/Photos", "readOnly": false }, { "path": "Work", "readOnly": true }]));
+        let users = json_of(send(&ada, "GET", "/api/users", None).await.unwrap()).await;
+        assert_eq!(users["users"][1]["limited"], true);
+
+        let status = |response: Response| response.status();
+        let names = |listing: &serde_json::Value| listing["entries"].as_array().unwrap().iter().map(|entry| entry["path"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+
+        // The file browser: the folders above its own lead to them and show nothing else.
+        let top = json_of(send(&bo, "GET", "/api/list?path=", None).await.unwrap()).await;
+        assert_eq!(names(&top), ["Family", "Work"]);
+        let family = json_of(send(&bo, "GET", "/api/list?path=Family", None).await.unwrap()).await;
+        assert_eq!(names(&family), ["Family/Photos"]);
+        for path in ["Other", "Family/Private", "Family/Photos/other", "Notes"] {
+            assert_eq!(status(send(&bo, "GET", &format!("/api/list?path={}", q(path)), None).await.unwrap()), StatusCode::NOT_FOUND, "{path}");
+        }
+        for uri in ["/api/raw?path=Other%2Fsecret.txt", "/api/raw?path=Family%2FPrivate%2Fdiary.txt", "/api/meta?path=Other%2Fsecret.txt", "/api/raw?path=Family%2FPhotos%2F..%2FPrivate%2Fdiary.txt", "/api/thumb?path=Other%2Fsecret.jpg", "/api/hash?path=Other%2Fsecret.txt", "/api/usage?path=Other", "/api/usage?path=Family"] {
+            assert_eq!(status(send(&bo, "GET", uri, None).await.unwrap()), StatusCode::NOT_FOUND, "{uri}");
+        }
+        #[cfg(unix)]
+        assert_eq!(status(send(&bo, "GET", "/api/raw?path=Family%2FPhotos%2Fother%2Fsecret.txt", None).await.unwrap()), StatusCode::NOT_FOUND, "a link out of its folder");
+        assert_eq!(status(send(&bo, "GET", "/api/raw?path=Family%2FPhotos%2Fa.jpg", None).await.unwrap()), StatusCode::OK);
+        assert_eq!(status(send(&bo, "GET", "/api/raw?path=Work%2Fplan.txt", None).await.unwrap()), StatusCode::OK);
+        // The archive viewer and books, downloads and ZIPs.
+        for uri in ["/api/archive/list?path=Other%2Fsecret.zip", "/api/archive/entry?path=Other%2Fsecret.zip&entry=a", "/api/book/Other%2Fbook.epub/OEBPS/a.xhtml", "/api/zip?path=Other", "/api/zip?path=Family", "/api/versions?path=Other%2Fsecret.txt", "/api/duplicates?path=Other", "/api/duplicates?path=", "/api/cleanup/large?path=", "/api/sync/file?path=Other%2Fsecret.txt"] {
+            assert_eq!(status(send(&bo, "GET", uri, None).await.unwrap()), StatusCode::NOT_FOUND, "{uri}");
+        }
+        assert_eq!(status(send(&bo, "GET", "/api/zip?path=Family%2FPhotos", None).await.unwrap()), StatusCode::OK);
+        assert_eq!(status(send(&bo, "POST", "/api/download", Some(json!({ "paths": ["Family/Photos/a.jpg", "Other/secret.txt"] }))).await.unwrap()), StatusCode::NOT_FOUND, "one path outside is enough");
+        assert_eq!(status(send(&bo, "POST", "/api/download", Some(json!({ "paths": ["Family/Photos/a.jpg"] }))).await.unwrap()), StatusCode::OK);
+        // What is not for limited accounts at all.
+        for (method, uri) in [("GET", "/api/storage"), ("GET", "/api/drives"), ("GET", "/api/remotes"), ("GET", "/api/terminals"), ("GET", "/api/system"), ("GET", "/api/agent-keys"), ("GET", "/api/backup"), ("GET", "/api/users"), ("POST", "/api/notes/folder"), ("POST", "/api/albums/items")] {
+            assert_eq!(status(send(&bo, method, uri, None).await.unwrap()), StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+
+        // Changes: in its read-write folder only, and never its folders themselves.
+        assert_eq!(status(send(&bo, "POST", "/api/mkdir", Some(json!({ "path": "Family/Photos", "name": "Trip" }))).await.unwrap()), StatusCode::OK);
+        assert_eq!(status(send(&bo, "POST", "/api/mkdir", Some(json!({ "path": "Work", "name": "Mine" }))).await.unwrap()), StatusCode::FORBIDDEN);
+        assert_eq!(status(send(&bo, "POST", "/api/mkdir", Some(json!({ "path": "Other", "name": "Mine" }))).await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(send(&bo, "POST", "/api/mkdir", Some(json!({ "name": "Mine" }))).await.unwrap()), StatusCode::NOT_FOUND, "a path left out is the top");
+        assert_eq!(status(send(&bo, "POST", "/api/write", Some(json!({ "path": "Work/plan.txt", "content": "mine" }))).await.unwrap()), StatusCode::FORBIDDEN);
+        assert_eq!(status(send(&bo, "POST", "/api/rename", Some(json!({ "path": "Family/Photos", "name": "Pics" }))).await.unwrap()), StatusCode::FORBIDDEN);
+        assert_eq!(status(send(&bo, "DELETE", "/api/entry?path=Family%2FPhotos", None).await.unwrap()), StatusCode::FORBIDDEN);
+        assert_eq!(status(send(&bo, "POST", "/api/move", Some(json!({ "path": "Family/Photos/b.jpg", "dest": "Other" }))).await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(send(&bo, "POST", "/api/move", Some(json!({ "path": "Work/plan.txt", "dest": "Family/Photos" }))).await.unwrap()), StatusCode::FORBIDDEN);
+        assert_eq!(status(send(&bo, "POST", "/api/copy", Some(json!({ "path": "Other/secret.txt", "dest": "Family/Photos" }))).await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(send(&bo, "POST", "/api/copy", Some(json!({ "path": "Work/plan.txt", "dest": "Family/Photos/Trip" }))).await.unwrap()), StatusCode::OK);
+        assert_eq!(status(send(&bo, "POST", "/api/sort-folder/undo", Some(json!({ "moves": [{ "from": "Other/secret.txt", "to": "Family/Photos" }] }))).await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(send(&bo, "POST", "/api/duplicates/trash", Some(json!({ "groups": [{ "sha256": "x", "keep": ["Family/Photos/a.jpg"], "remove": ["Other/secret.jpg"] }] }))).await.unwrap()), StatusCode::NOT_FOUND);
+        assert!(root.join("Other/secret.jpg").exists() && root.join("Work/plan.txt").exists());
+
+        // Uploads, from the web app and from sync clients.
+        let upload = |cookie: &str, path: &str, filename: &str| {
+            let body = format!("--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\nnew\r\n--B--\r\n");
+            app.clone().oneshot(Request::builder().method("POST").uri(format!("/api/upload?path={}", q(path))).header("cookie", cookie).header("x-ownnas", "1")
+                .header("content-type", "multipart/form-data; boundary=B").body(Body::from(body)).unwrap())
+        };
+        assert_eq!(status(upload(&bo, "Other", "x.jpg").await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(upload(&bo, "Work", "x.jpg").await.unwrap()), StatusCode::FORBIDDEN);
+        #[cfg(unix)]
+        assert_eq!(status(upload(&bo, "Family/Photos", "other/x.jpg").await.unwrap()), StatusCode::NOT_FOUND, "a name through a link out");
+        assert_eq!(status(upload(&bo, "Family/Photos", "Trip/x.jpg").await.unwrap()), StatusCode::OK);
+        assert!(!root.join("Other/x.jpg").exists() && root.join("Family/Photos/Trip/x.jpg").exists());
+        let put = |cookie: &str, path: &str| app.clone().oneshot(Request::builder().method("PUT").uri(format!("/api/sync/file?path={}", q(path))).header("cookie", cookie).header("x-ownnas", "1").body(Body::from("synced")).unwrap());
+        assert_eq!(status(put(&bo, "Other/new.txt").await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(put(&bo, "Work/new.txt").await.unwrap()), StatusCode::FORBIDDEN);
+        assert_eq!(status(put(&bo, "Family/Photos/new.txt").await.unwrap()), StatusCode::OK);
+        assert_eq!(status(send(&bo, "POST", "/api/sync/delete", Some(json!({ "path": "Other/secret.txt" }))).await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(send(&bo, "POST", "/api/sync/mkdir", Some(json!({ "path": "Family/Private/x" }))).await.unwrap()), StatusCode::NOT_FOUND);
+        let duplicates = json_of(send(&bo, "POST", "/api/upload/duplicates", Some(json!({ "files": [{ "size": 7, "sha256": hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"photo a")) }] }))).await.unwrap()).await;
+        assert!(duplicates["copies"][0].is_null() || duplicates["copies"][0] == "Family/Photos/a.jpg", "never the copy in Other: {duplicates}");
+
+        // The sync tree and its change feed.
+        let tree = json_of(send(&bo, "GET", "/api/sync/tree?path=", None).await.unwrap()).await;
+        let synced: Vec<&str> = tree["entries"].as_array().unwrap().iter().map(|entry| entry["path"].as_str().unwrap()).collect();
+        assert!(synced.contains(&"Family") && synced.contains(&"Family/Photos/a.jpg") && synced.contains(&"Work/plan.txt"), "{synced:?}");
+        assert!(synced.iter().all(|path| *path == "Family" || path.starts_with("Family/Photos") || path.starts_with("Work")), "{synced:?}");
+        let start = json_of(send(&bo, "GET", "/api/sync/changes?cursor=&wait=0&path=", None).await.unwrap()).await;
+        for path in ["Other/secret.txt", "Family/Private/diary.txt", "Family/Photos/a.jpg"] {
+            state.changes.record(path.to_string());
+        }
+        let feed = json_of(send(&bo, "GET", &format!("/api/sync/changes?cursor={}&wait=0&path=", start["cursor"].as_str().unwrap()), None).await.unwrap()).await;
+        assert_eq!(feed["changes"].as_array().unwrap().iter().map(|change| change["path"].as_str().unwrap()).collect::<Vec<_>>(), ["Family/Photos/a.jpg"]);
+
+        // Search, by name and with only its hits.
+        let hits = json_of(send(&bo, "GET", "/api/search?path=&q=secret", None).await.unwrap()).await;
+        assert_eq!(hits["hits"], json!([]));
+        let hits = json_of(send(&bo, "GET", "/api/search?path=&q=jpg", None).await.unwrap()).await;
+        let found: Vec<&str> = hits["hits"].as_array().unwrap().iter().map(|hit| hit["path"].as_str().unwrap()).collect();
+        assert!(found.contains(&"Family/Photos/a.jpg") && found.iter().all(|path| path.starts_with("Family/Photos/")), "{found:?}");
+        assert_eq!(status(send(&bo, "GET", "/api/search?path=Other&q=secret", None).await.unwrap()), StatusCode::NOT_FOUND);
+
+        // The Gallery: the timeline, days, tags, albums and workspaces show only its photos.
+        {
+            let conn = state.db.lock().unwrap();
+            for (index, path) in ["Family/Photos/a.jpg", "Family/Photos/b.jpg", "Other/secret.jpg", "Family/Private/me.jpg"].iter().enumerate() {
+                conn.execute("INSERT OR REPLACE INTO media_index(path, kind, size, mtime, taken_at, date_source, indexed_at) VALUES(?1, 'image', 10, 20, ?2, 'exif', 1)", rusqlite::params![path, 1_000 + index as i64]).unwrap();
+                db::add_tag(&conn, path, "Beach").unwrap();
+            }
+            let mixed = crate::albums::create(&conn, None, "Mixed", None).unwrap();
+            crate::albums::change_items(&conn, mixed, &["Family/Photos/a.jpg".into(), "Other/secret.jpg".into()], true, "ada").unwrap();
+            crate::albums::set_cover(&conn, mixed, Some("Other/secret.jpg")).unwrap();
+            let hidden = crate::albums::create(&conn, None, "Elsewhere", None).unwrap();
+            crate::albums::change_items(&conn, hidden, &["Other/secret.jpg".into()], true, "ada").unwrap();
+            crate::workspaces::create(&conn, "Everything", &["Family".into(), "Other".into()]).unwrap();
+            crate::workspaces::create(&conn, "Others", &["Other".into()]).unwrap();
+        }
+        let paths_of = |items: &serde_json::Value| items.as_array().unwrap().iter().map(|item| item["path"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        let timeline = json_of(send(&bo, "GET", "/api/gallery/timeline", None).await.unwrap()).await;
+        assert_eq!(paths_of(&timeline["items"]), ["Family/Photos/b.jpg", "Family/Photos/a.jpg"]);
+        let all = json_of(send(&ada, "GET", "/api/gallery/timeline", None).await.unwrap()).await;
+        assert_eq!(all["items"].as_array().unwrap().len(), 4, "the administrator sees every photo");
+        let days = json_of(send(&bo, "GET", "/api/gallery/days", None).await.unwrap()).await;
+        assert_eq!(days["days"][0]["count"], 2);
+        let tags = json_of(send(&bo, "GET", "/api/tags/all", None).await.unwrap()).await;
+        assert_eq!(tags["tags"], json!([{ "tag": "Beach", "count": 2 }]));
+        let tagged = json_of(send(&bo, "GET", "/api/gallery/tag?tag=Beach", None).await.unwrap()).await;
+        assert_eq!(paths_of(&tagged["items"]).len(), 2);
+        let albums = json_of(send(&bo, "GET", "/api/albums", None).await.unwrap()).await;
+        assert_eq!(albums["albums"].as_array().unwrap().len(), 1, "an album of only others' photos is not there: {albums}");
+        assert_eq!((albums["albums"][0]["name"].as_str(), albums["albums"][0]["count"].as_i64()), (Some("Mixed"), Some(1)));
+        assert_eq!(albums["albums"][0]["cover"], "Family/Photos/a.jpg", "a cover outside is not shown");
+        let mixed = albums["albums"][0]["id"].as_i64().unwrap();
+        let album = json_of(send(&bo, "GET", &format!("/api/albums?id={mixed}"), None).await.unwrap()).await;
+        assert_eq!(paths_of(&album["items"]), ["Family/Photos/a.jpg"]);
+        assert_eq!(status(send(&bo, "GET", &format!("/api/albums?id={}", mixed + 1), None).await.unwrap()), StatusCode::NOT_FOUND);
+        let tree = json_of(send(&bo, "GET", "/api/albums/tree", None).await.unwrap()).await;
+        assert_eq!(tree["albums"].as_array().unwrap().len(), 1);
+        let workspaces = json_of(send(&bo, "GET", "/api/workspaces", None).await.unwrap()).await;
+        assert_eq!(workspaces["workspaces"].as_array().unwrap().len(), 1, "{workspaces}");
+        assert_eq!((workspaces["workspaces"][0]["folders"].clone(), workspaces["workspaces"][0]["photos"].as_i64()), (json!(["Family/Photos"]), Some(2)));
+        let everything = workspaces["workspaces"][0]["id"].as_i64().unwrap();
+        let inside = json_of(send(&bo, "GET", &format!("/api/gallery/timeline?workspace={everything}"), None).await.unwrap()).await;
+        assert_eq!(paths_of(&inside["items"]).len(), 2, "a workspace shows only its photos inside the folders");
+        assert_eq!(status(send(&bo, "GET", "/api/gallery/details?path=Other%2Fsecret.jpg", None).await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(send(&bo, "GET", "/api/gallery/similar?path=Other%2Fsecret.jpg", None).await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(send(&bo, "POST", "/api/gallery/hidden", Some(json!({ "paths": ["Other/secret.jpg"], "hidden": true }))).await.unwrap()), StatusCode::NOT_FOUND);
+
+        // Versions, by path and by id.
+        json_of(send(&ada, "POST", "/api/write", Some(json!({ "path": "Other/secret.txt", "content": "secret 2" }))).await.unwrap()).await;
+        let versions = json_of(send(&ada, "GET", "/api/versions?path=Other%2Fsecret.txt", None).await.unwrap()).await;
+        let id = versions["versions"][0]["id"].as_i64().expect("a version was kept");
+        assert_eq!(status(send(&bo, "GET", &format!("/api/versions/file?id={id}"), None).await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(send(&bo, "GET", &format!("/api/versions/compare?id={id}&with=current"), None).await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(send(&bo, "POST", "/api/versions/restore", Some(json!({ "id": id }))).await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(send(&bo, "POST", "/api/versions/delete", Some(json!({ "id": id }))).await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(send(&ada, "GET", &format!("/api/versions/file?id={id}"), None).await.unwrap()), StatusCode::OK);
+
+        // Notes: the notes folder is outside its folders.
+        let notes = json_of(send(&bo, "GET", "/api/notes", None).await.unwrap()).await;
+        assert_eq!(notes["notes"], json!([]));
+        assert_eq!(status(send(&bo, "POST", "/api/notes", Some(json!({ "text": "hello" }))).await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(send(&bo, "POST", "/api/notes/daily", None).await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(send(&bo, "POST", "/api/notes/tick", Some(json!({ "path": "Notes/Shopping.md", "line": 1, "text": "x", "done": true }))).await.unwrap()), StatusCode::NOT_FOUND);
+        let notes = json_of(send(&ada, "GET", "/api/notes", None).await.unwrap()).await;
+        assert_eq!(notes["notes"].as_array().unwrap().len(), 1);
+
+        // Bookmarks and recent files.
+        assert_eq!(status(send(&bo, "POST", "/api/bookmarks", Some(json!({ "path": "Other" }))).await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(send(&bo, "POST", "/api/recent", Some(json!({ "path": "Other/secret.txt" }))).await.unwrap()), StatusCode::NOT_FOUND);
+
+        // The Trash: an item is where it was deleted from.
+        json_of(send(&ada, "DELETE", "/api/entry?path=Other%2Fsecret.txt", None).await.unwrap()).await;
+        json_of(send(&ada, "DELETE", "/api/entry?path=Family%2FPhotos%2Fb.jpg", None).await.unwrap()).await;
+        let trash = json_of(send(&bo, "GET", &format!("/api/list?path={}", files::TRASH_DIR), None).await.unwrap()).await;
+        let in_trash = names(&trash);
+        assert_eq!(in_trash.len(), 1, "{in_trash:?}");
+        assert_eq!(status(send(&bo, "GET", &format!("/api/raw?path={}", q(&in_trash[0])), None).await.unwrap()), StatusCode::OK);
+        let everyone = names(&json_of(send(&ada, "GET", &format!("/api/list?path={}", files::TRASH_DIR), None).await.unwrap()).await);
+        let theirs = everyone.iter().find(|path| **path != in_trash[0]).unwrap().clone();
+        assert_eq!(status(send(&bo, "GET", &format!("/api/raw?path={}", q(&theirs)), None).await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(send(&bo, "POST", "/api/restore", Some(json!({ "path": theirs }))).await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(json_of(send(&bo, "GET", "/api/trash/summary", None).await.unwrap()).await["items"], 1);
+        assert_eq!(json_of(send(&bo, "POST", "/api/trash/empty", None).await.unwrap()).await["removed"], 1);
+        assert_eq!(names(&json_of(send(&ada, "GET", &format!("/api/list?path={}", files::TRASH_DIR), None).await.unwrap()).await), [theirs], "the other item stays");
+
+        // The activity log: its own, and nothing about elsewhere.
+        let events = json_of(send(&bo, "GET", "/api/activity", None).await.unwrap()).await;
+        let details: Vec<String> = events["events"].as_array().unwrap().iter().map(|event| event["detail"].as_str().unwrap().to_string()).collect();
+        assert!(!details.is_empty() && details.iter().all(|detail| !detail.contains("Other") && !detail.contains("Private")), "{details:?}");
+
+        // Its folders follow a rename, and with them all gone it sees nothing at all.
+        json_of(send(&ada, "POST", "/api/rename", Some(json!({ "path": "Work", "name": "Jobs" }))).await.unwrap()).await;
+        assert_eq!(status(send(&bo, "GET", "/api/raw?path=Jobs%2Fplan.txt", None).await.unwrap()), StatusCode::OK);
+        assert_eq!(status(send(&bo, "POST", "/api/write", Some(json!({ "path": "Jobs/plan.txt", "content": "mine" }))).await.unwrap()), StatusCode::FORBIDDEN, "still read-only");
+        for path in ["Jobs", "Family"] {
+            json_of(send(&ada, "DELETE", &format!("/api/entry?path={path}"), None).await.unwrap()).await;
+        }
+        json_of(send(&ada, "POST", "/api/trash/empty", None).await.unwrap()).await;
+        assert_eq!(json_of(send(&bo, "GET", "/api/me", None).await.unwrap()).await["folders"], json!([]));
+        assert_eq!(status(send(&bo, "GET", "/api/list?path=", None).await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(send(&bo, "GET", "/api/raw?path=Other%2Fsecret.jpg", None).await.unwrap()), StatusCode::NOT_FOUND);
+        // The whole library again.
+        json_of(send(&ada, "POST", "/api/users/folders", Some(json!({ "username": "bo", "folders": null }))).await.unwrap()).await;
+        assert_eq!(status(send(&bo, "GET", "/api/raw?path=Other%2Fsecret.jpg", None).await.unwrap()), StatusCode::OK);
+    }
+
+    /// Every request listed for limited accounts (`access::ROUTES`) is one the server answers,
+    /// so a typo there cannot leave an area unreachable, or stand for one that is not checked.
+    #[tokio::test]
+    async fn every_route_for_limited_accounts_exists() {
+        let (app, _) = app().await;
+        let login = Request::builder().method("POST").uri("/api/login").header("content-type", "application/json").header("x-ownnas", "1")
+            .body(Body::from(r#"{"username":"ada","password":"longenough"}"#)).unwrap();
+        let response = app.clone().oneshot(login).await.unwrap();
+        let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string();
+        for (method, path, _) in crate::access::ROUTES {
+            if path.ends_with('*') || ["/api/login", "/api/logout"].contains(path) {
+                continue;
+            }
+            let request = Request::builder().method(*method).uri(*path).header("cookie", &cookie).header("x-ownnas", "1").body(Body::empty()).unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let body = body_bytes(response).await;
+            assert!(status != StatusCode::METHOD_NOT_ALLOWED && !(status == StatusCode::NOT_FOUND && body.is_empty()), "{method} {path}: {status}");
+        }
     }
 
     #[tokio::test]

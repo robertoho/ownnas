@@ -288,12 +288,12 @@ pub struct Person {
 
 /// The people worth showing: named, or seen at least twice. Hidden ones only when asked.
 pub fn people(conn: &Connection, hidden: bool) -> Result<Vec<Person>, String> {
-    people_in(conn, hidden, None)
+    people_in(conn, hidden, &crate::workspaces::View::every())
 }
 
 /// The people worth showing who are in a workspace's photos, with their photos there.
-pub fn people_in(conn: &Connection, hidden: bool, workspace: Option<i64>) -> Result<Vec<Person>, String> {
-    let in_workspace = crate::workspaces::filter(workspace, "f.path");
+pub fn people_in(conn: &Connection, hidden: bool, view: &crate::workspaces::View) -> Result<Vec<Person>, String> {
+    let in_workspace = crate::workspaces::filter(view, "f.path");
     let mut stmt = sql(conn.prepare(&format!(
         "SELECT * FROM (SELECT p.id, p.name, p.faces,
             (SELECT count(DISTINCT path) FROM faces f WHERE f.person_id = p.id AND {NOT_IN_TRASH} AND {in_workspace}) AS photos,
@@ -304,7 +304,7 @@ pub fn people_in(conn: &Connection, hidden: bool, workspace: Option<i64>) -> Res
          ORDER BY p.name IS NULL, p.faces DESC, p.id)
          WHERE photos > 0 OR ?3"
     )))?;
-    let rows = sql(stmt.query_map(params![hidden as i64, MIN_FACES, workspace.is_none()], |row| {
+    let rows = sql(stmt.query_map(params![hidden as i64, MIN_FACES, view.is_everything()], |row| {
         Ok(Person { id: row.get(0)?, name: row.get(1)?, faces: row.get(2)?, photos: row.get(3)?, hidden: row.get::<_, i64>(4)? != 0, cover_face: row.get(5)? })
     }))?;
     sql(rows.collect())
@@ -326,11 +326,11 @@ pub fn person(conn: &Connection, id: i64) -> Result<Option<Person>, String> {
 
 /// The photos a person is in, newest first, with the face that is them in each.
 pub fn person_photos(conn: &Connection, id: i64) -> Result<Vec<(crate::albums::MediaItem, i64)>, String> {
-    person_photos_in(conn, id, None)
+    person_photos_in(conn, id, &crate::workspaces::View::every())
 }
 
 /// The photos a person is in within a workspace.
-pub fn person_photos_in(conn: &Connection, id: i64, workspace: Option<i64>) -> Result<Vec<(crate::albums::MediaItem, i64)>, String> {
+pub fn person_photos_in(conn: &Connection, id: i64, view: &crate::workspaces::View) -> Result<Vec<(crate::albums::MediaItem, i64)>, String> {
     let mut stmt = sql(conn.prepare(&format!(
         "SELECT f.path, m.kind, m.taken_at, m.date_source, m.width, m.height, m.size,
                 EXISTS(SELECT 1 FROM timeline_hidden h WHERE h.path = f.path), min(f.id)
@@ -338,7 +338,7 @@ pub fn person_photos_in(conn: &Connection, id: i64, workspace: Option<i64>) -> R
          WHERE f.person_id = ?1 AND {} AND {}
          GROUP BY f.path ORDER BY m.taken_at DESC, f.path DESC",
         NOT_IN_TRASH.replace("path", "f.path"),
-        crate::workspaces::filter(workspace, "f.path")
+        crate::workspaces::filter(view, "f.path")
     )))?;
     let rows = sql(stmt.query_map([id], |row| {
         Ok((
@@ -594,15 +594,15 @@ mod tests {
             paths(nearest_where(&descriptions, &beach, 10, &|path| path != "Work/beach.jpg" && members.has(path)).into_iter().filter(|(_, score)| *score >= 0.6).collect())
         };
 
-        let in_work = workspaces::members(&conn, Some(work)).unwrap();
+        let in_work = workspaces::members(&conn, &workspaces::View::only(Some(work))).unwrap();
         assert_eq!(words(&in_work), ["Phone/beach-picked.jpg", "Work/beach.jpg"], "its folders and what was picked into it");
         assert_eq!(similar(&in_work), ["Phone/beach-picked.jpg"], "not the copy in Home");
-        let in_home = workspaces::members(&conn, Some(home)).unwrap();
+        let in_home = workspaces::members(&conn, &workspaces::View::only(Some(home))).unwrap();
         assert_eq!(words(&in_home), ["Home/beach-copy.jpg"]);
         assert_eq!(similar(&in_home), ["Home/beach-copy.jpg"], "a photo from elsewhere finds those in the workspace");
-        let unsorted = workspaces::members(&conn, Some(UNSORTED)).unwrap();
+        let unsorted = workspaces::members(&conn, &workspaces::View::only(Some(UNSORTED))).unwrap();
         assert_eq!(words(&unsorted), ["Loose/beach-loose.jpg"], "Not in any workspace keeps its meaning");
-        let every = workspaces::members(&conn, None).unwrap();
+        let every = workspaces::members(&conn, &workspaces::View::only(None)).unwrap();
         assert_eq!(words(&every).len(), 4, "no workspace: the whole library");
         assert_eq!(similar(&every), ["Home/beach-copy.jpg", "Loose/beach-loose.jpg", "Phone/beach-picked.jpg"]);
 
@@ -622,19 +622,25 @@ mod tests {
         let home = crate::workspaces::create(&conn, "Home", &["Home".into()]).unwrap();
         let empty = crate::workspaces::create(&conn, "Empty", &["Nothing".into()]).unwrap();
         crate::workspaces::change_items(&conn, &[home], &["Phone/4.jpg".into()], true, "ana").unwrap();
-        let count = |workspace| people_in(&conn, false, workspace).unwrap().iter().map(|person| person.photos).collect::<Vec<_>>();
+        let count = |workspace| people_in(&conn, false, &crate::workspaces::View::only(workspace)).unwrap().iter().map(|person| person.photos).collect::<Vec<_>>();
         assert_eq!(count(None), [4]);
         assert_eq!(count(Some(work)), [2]);
         assert_eq!(count(Some(home)), [2], "in its folder, and picked into it");
         assert!(count(Some(empty)).is_empty(), "nobody shows where they have no photos");
         assert!(count(Some(crate::workspaces::UNSORTED)).is_empty());
         let id = people(&conn, false).unwrap()[0].id;
-        let photos = |workspace| person_photos_in(&conn, id, workspace).unwrap().into_iter().map(|(item, _)| item.path).collect::<Vec<_>>();
+        let photos = |workspace| person_photos_in(&conn, id, &crate::workspaces::View::only(workspace)).unwrap().into_iter().map(|(item, _)| item.path).collect::<Vec<_>>();
         assert_eq!(photos(Some(work)), ["Work/2.jpg", "Work/1.jpg"]);
         let mut at_home = photos(Some(home));
         at_home.sort();
         assert_eq!(at_home, ["Home/3.jpg", "Phone/4.jpg"]);
         assert_eq!(photos(None).len(), 4);
+        // An account limited to some folders sees people only in its photos there.
+        let limited = |folders: &[&str]| crate::workspaces::View { workspace: None, folders: Some(folders.iter().map(|f| f.to_string()).collect()) };
+        let counted = |view| people_in(&conn, false, &view).unwrap().iter().map(|person| person.photos).collect::<Vec<_>>();
+        assert_eq!(counted(limited(&["Work"])), [2]);
+        assert!(counted(limited(&["Nothing"])).is_empty(), "nobody, where it has no photos");
+        assert_eq!(person_photos_in(&conn, id, &limited(&["Home", "Phone"])).unwrap().len(), 2);
     }
 
     #[test]

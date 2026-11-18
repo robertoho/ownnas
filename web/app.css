@@ -3039,6 +3039,15 @@ dialog { color: var(--text); }
   padding: 0.25rem 0.55rem;
   font-size: 0.78rem;
 }
+.user-folders { width: min(560px, calc(100vw - 2rem)); display: grid; gap: 0.6rem; }
+.user-folders:not([open]) { display: none; }
+.user-folders h3 { margin: 0; }
+.user-folders-choice { display: flex; align-items: center; gap: 0.45rem; }
+.user-folders-list[hidden] { display: none; }
+.user-folders-list { display: grid; gap: 0.35rem; max-height: 50vh; overflow: auto; padding: 0.2rem 0 0.2rem 1.6rem; }
+.user-folders-row { display: flex; align-items: center; gap: 0.45rem; min-width: 0; }
+.user-folders-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.user-folders-note { margin: 0; font-size: 0.8rem; }
 .user-form {
   display: grid;
   gap: 0.55rem;

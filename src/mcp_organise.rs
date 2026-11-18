@@ -432,7 +432,7 @@ pub(crate) async fn undo(state: &Arc<AppState>, id: i64, by_user: &str) -> Resul
             let (back_from, back_to) = (to.clone(), from.clone());
             tokio::task::spawn_blocking(move || files::move_exact(&root, &back_from, &back_to)).await.map_err(|_| "Could not undo it".to_string())?.map_err(message)?;
             crate::http::rewrite_meta(state, &to, &from);
-            crate::http::relink_notes(state, by_user, &to, &from).await;
+            crate::http::relink_notes(state, &crate::access::Access::whole(), by_user, &to, &from).await;
             crate::http::invalidate_sizes(state, &from);
             crate::http::invalidate_sizes(state, &to);
         }
@@ -626,7 +626,7 @@ async fn rename(state: &Arc<AppState>, key: &AgentKey, path: &str, name: &str) -
     let (root, from, to_name) = (state.root.clone(), found.rel.clone(), name.trim().to_string());
     let to = blocking(move || files::rename_entry(&root, &from, &to_name).map_err(file_error)).await?;
     crate::http::rewrite_meta(state, &found.rel, &to);
-    crate::http::relink_notes(state, &by(key), &found.rel, &to).await;
+    crate::http::relink_notes(state, &crate::access::Access::whole(), &by(key), &found.rel, &to).await;
     log(state, key, "rename", &format!("{} → {to}", found.rel));
     done(json!({ "path": to }), json!({ "kind": "moved", "from": found.rel, "to": to }))
 }
@@ -740,7 +740,7 @@ async fn rename_many(state: &Arc<AppState>, key: &AgentKey, args: &Args<'_>) -> 
     let (made, failed_renames) = blocking(move || Ok(crate::rename_many::apply(&root, &plan))).await?;
     for item in &made {
         crate::http::rewrite_meta(state, &item.from, &item.to);
-        crate::http::relink_notes(state, &by(key), &item.from, &item.to).await;
+        crate::http::relink_notes(state, &crate::access::Access::whole(), &by(key), &item.from, &item.to).await;
     }
     log(state, key, "rename-many", &format!("{} file(s)", made.len()));
     let failed_list: Vec<Value> = failed_renames.iter().map(|(path, why)| json!({ "path": path, "why": why })).collect();
@@ -792,7 +792,7 @@ async fn album_items(state: &Arc<AppState>, key: &AgentKey, args: &Args<'_>, add
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     let who = by(key);
     // Only what really changes is undone later.
-    let before: std::collections::HashSet<String> = crate::albums::items(&conn, id).map(|items| items.into_iter().map(|item| item.path).collect()).unwrap_or_default();
+    let before: std::collections::HashSet<String> = crate::albums::items(&conn, id, &crate::workspaces::View::every()).map(|items| items.into_iter().map(|item| item.path).collect()).unwrap_or_default();
     let really: Vec<&String> = paths.iter().filter(|path| before.contains(*path) != add).collect();
     let undo = json!({ "kind": "album_items", "id": id, "add": add, "paths": really });
     let changed = crate::albums::change_items(&conn, id, &paths, add, &who).map_err(|err| Stop::Failed(err.to_string()))?;
