@@ -18,6 +18,10 @@ struct SignInView: View {
     @State private var problem: String?
     @State private var fingerprint: String?
     @State private var choosingCA = false
+    /// Shown once the server asks for a two-factor code (the account has two-factor sign-in on).
+    @State private var askCode = false
+    @State private var code = ""
+    @FocusState private var codeFocused: Bool
 
     var body: some View {
         Form {
@@ -31,13 +35,24 @@ struct SignInView: View {
             } footer: {
                 Text("Use https:// when the server is outside your home network or VPN.")
             }
+            if askCode {
+                Section {
+                    TextField("Two-factor code", text: $code)
+                        .textContentType(.oneTimeCode).textInputAutocapitalization(.never).autocorrectionDisabled()
+                        .focused($codeFocused)
+                        .onSubmit(signIn)
+                } footer: {
+                    Text("The 6 digits from your authenticator app, or a recovery code.")
+                }
+            }
+            // Above the keyboard, next to the fields it is about.
+            if let problem {
+                Section { Text(problem).foregroundStyle(.red) }
+            }
             Section {
                 Button(caPem == nil ? "Trust a private certificate authority…" : "Certificate authority chosen ✓") { choosingCA = true }
             } footer: {
                 Text("For servers using the certificate from “ownnas tls generate”: choose its ca.crt.")
-            }
-            if let problem {
-                Section { Text(problem).foregroundStyle(.red) }
             }
         }
         .navigationTitle(existing == nil ? "Add server" : "Sign in")
@@ -46,7 +61,7 @@ struct SignInView: View {
             ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
             ToolbarItem(placement: .confirmationAction) {
                 if working { ProgressView() } else {
-                    Button("Sign in", action: signIn).disabled(address.isEmpty || username.isEmpty || password.isEmpty)
+                    Button("Sign in", action: signIn).disabled(address.isEmpty || username.isEmpty || password.isEmpty || (askCode && code.trimmingCharacters(in: .whitespaces).isEmpty))
                 }
             }
         }
@@ -87,7 +102,7 @@ struct SignInView: View {
         Task {
             defer { working = false }
             do {
-                let saved = try await hub.signIn(address: address, username: username, password: password, caPem: caPem, pinned: pinned)
+                let saved = try await hub.signIn(address: address, username: username, password: password, caPem: caPem, pinned: pinned, code: askCode ? code : nil)
                 dismiss()
                 hub.path = [.browse(server: saved.id, path: "")]
             } catch ClientError.Untrusted {
@@ -99,6 +114,12 @@ struct SignInView: View {
                 }
             } catch ClientError.Unauthorized {
                 problem = "Wrong username or password"
+            } catch let ClientError.TwoFactor(reason) {
+                // The first time, the field appearing says enough; after that, the code was wrong.
+                if askCode { problem = reason }
+                askCode = true
+                code = ""
+                codeFocused = true
             } catch {
                 problem = userMessage(error)
             }

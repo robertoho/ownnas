@@ -6,6 +6,10 @@ them. In Finder's menu, **Keep Downloaded** downloads a file or folder and keeps
 coming, and **Keep Online Only** frees the space and stops that. What you add, change, rename or
 delete there goes back to the server (deleting moves to the server's Trash).
 
+For an account with two-factor sign-in, a code field appears after the password (the
+authenticator app's six digits, or a recovery code). The app keeps the session token, so the
+code is not asked for again until it expires or you sign out.
+
 The Finder part is a File Provider extension, the same code as the iPhone app's Files location
 (`../ios/OwnNASFiles`). Changes made on the server, whether through OwnNAS or on its disk
 directly, reach Finder within seconds: the app follows the server's change feed
@@ -66,4 +70,5 @@ lines, for the 16 and 32 pixel sizes. To change the icon, render the PNGs in
   place in Finder, because Developer ID apps cannot share Keychain items without a provisioning
   profile.
 - Debug builds can sign in without the window, for tests: launch with `OWNNAS_TEST_ADDRESS`,
-  `OWNNAS_TEST_USER` and `OWNNAS_TEST_PASSWORD` set (`open --env …`).
+  `OWNNAS_TEST_USER` and `OWNNAS_TEST_PASSWORD` set (`open --env …`), and `OWNNAS_TEST_CODE`
+  for an account with two-factor sign-in.

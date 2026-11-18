@@ -18,6 +18,14 @@ struct SignInView: View {
     @State private var working = false
     @State private var problem: String?
     @State private var fingerprint: String?
+    /// Shown once the server asks for a two-factor code (the account has two-factor sign-in on).
+    @State private var askCode = false
+    @State private var code = ""
+    @FocusState private var codeFocused: Bool
+
+    private var ready: Bool {
+        !working && !address.isEmpty && !username.isEmpty && !password.isEmpty && (!askCode || !code.trimmingCharacters(in: .whitespaces).isEmpty)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -30,6 +38,12 @@ struct SignInView: View {
                 TextField("Username", text: $username).textContentType(.username)
                 SecureField("Password", text: $password).textContentType(.password)
                     .onSubmit(signIn)
+                if askCode {
+                    TextField("Two-factor code", text: $code, prompt: Text("123456 or a recovery code"))
+                        .textContentType(.oneTimeCode)
+                        .focused($codeFocused)
+                        .onSubmit(signIn)
+                }
                 LabeledContent("Certificate") {
                     Button(caPem == nil ? "Trust a private certificate authority…" : "Certificate authority chosen ✓", action: chooseCA)
                 }
@@ -43,7 +57,7 @@ struct SignInView: View {
                 if working { ProgressView().controlSize(.small) }
                 Button("Sign in", action: signIn)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(working || address.isEmpty || username.isEmpty || password.isEmpty)
+                    .disabled(!ready)
             }
         }
         .padding(20)
@@ -81,14 +95,20 @@ struct SignInView: View {
     }
 
     private func signIn() {
-        guard !working, !address.isEmpty, !username.isEmpty, !password.isEmpty else { return }
+        guard ready else { return }
         working = true
         problem = nil
         Task {
             defer { working = false }
             do {
-                try await hub.signIn(address: address, username: username, password: password, caPem: caPem, pinned: pinned)
+                try await hub.signIn(address: address, username: username, password: password, caPem: caPem, pinned: pinned, code: askCode ? code : nil)
                 close()
+            } catch let ClientError.TwoFactor(reason) {
+                // The first time, the field appearing says enough; after that, the code was wrong.
+                problem = askCode ? reason : "Enter the 6-digit code from your authenticator app, or a recovery code."
+                askCode = true
+                code = ""
+                codeFocused = true
             } catch ClientError.Untrusted {
                 let typed = address
                 do {

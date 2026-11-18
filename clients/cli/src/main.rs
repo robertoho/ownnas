@@ -44,7 +44,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Sign in to a server. The password is asked for, or read from OWNNAS_PASSWORD.
+    /// Sign in to a server. The password is asked for, or read from OWNNAS_PASSWORD. An account
+    /// with two-factor sign-in is also asked for a code, unless --code gives it.
     Login {
         /// Server address, for example https://nas.example:8787
         server: String,
@@ -56,6 +57,9 @@ enum Command {
         /// A server certificate fingerprint to trust (as `ownnas serve` prints it).
         #[arg(long)]
         fingerprint: Option<String>,
+        /// The two-factor code: six digits from the authenticator app, or a recovery code.
+        #[arg(long)]
+        code: Option<String>,
     },
     /// Sign out on the server and forget the sign-in here.
     Logout,
@@ -509,7 +513,7 @@ fn copy(source: &str, destination: &str, delete: bool, after: After, flags: &Fla
     }
 }
 
-fn login(server: String, username: Option<String>, ca_cert: Option<PathBuf>, fingerprint: Option<String>) -> Result<(), String> {
+fn login(server: String, username: Option<String>, ca_cert: Option<PathBuf>, fingerprint: Option<String>, code: Option<String>) -> Result<(), String> {
     let server = normalize_address(&server)?;
     let username = match username {
         Some(name) => name,
@@ -530,7 +534,7 @@ fn login(server: String, username: Option<String>, ca_cert: Option<PathBuf>, fin
     };
     let pinned: Vec<String> = fingerprint.into_iter().collect();
     let api = api_for(&server, None, ca_cert.as_deref(), &pinned)?;
-    let token = match api.login(&username, &password) {
+    let token = match api.login_on_terminal(&username, &password, code.as_deref()) {
         Ok(token) => token,
         Err(ApiError::Untrusted) => {
             let seen = server_fingerprint(&server).unwrap_or_else(|_| "unknown".into());
@@ -628,7 +632,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     progress::init(cli.quiet);
     let result = match cli.command {
-        Command::Login { server, username, ca_cert, fingerprint } => login(server, username, ca_cert, fingerprint),
+        Command::Login { server, username, ca_cert, fingerprint, code } => login(server, username, ca_cert, fingerprint, code),
         Command::Logout => logout(),
         Command::Status => status(),
         Command::Ls { path } => list(&path),

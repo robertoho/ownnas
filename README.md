@@ -145,7 +145,8 @@ makes a server folder that doesn't exist yet. With more than one server, pick it
 (`%APPDATA%\OwnNAS` on Windows).
 
 `setup` signs in once and stores a token in `~/OwnNAS/.ownnas-sync/config.json`; the
-password is not saved. Pass `--ca-cert ca.crt` when the server uses a certificate from
+password is not saved. An account with two-factor sign-in is asked for its code (or pass
+`--code 123456`; a recovery code works too). Pass `--ca-cert ca.crt` when the server uses a certificate from
 `ownnas tls generate`. `run` syncs once; `--watch` syncs again every 30 seconds
 (`--interval`), and `--dry-run` only lists what would change.
 
@@ -158,7 +159,9 @@ password is not saved. Pass `--ca-cert ca.crt` when the server uses a certificat
 
 The client uses the `/api/sync/*` endpoints, which native apps can use as well.
 Authenticate with `POST /api/login` and `{"token": true}`, then send
-`Authorization: Bearer <token>`. Tokens stay valid while in use.
+`Authorization: Bearer <token>`. Tokens stay valid while in use. An account with two-factor sign-in
+answers 401 with `"twoFactor": true` (and a message in `"error"`) until the body also has
+`"code"`: the authenticator app's six digits, or a recovery code.
 
 `GET /api/sync/changes?cursor=…&wait=25` is the change feed clients follow instead of listing
 everything again: the paths that changed since the cursor (each with what is there now, or
@@ -346,7 +349,7 @@ nas.example.com {
 
 - **The proxy:** OwnNAS believes a proxy on the same machine about the client's address (`X-Forwarded-For`) and about HTTPS (`X-Forwarded-Proto`), and nobody else. A proxy on another machine or in a container network is added with `--trusted-proxy 172.17.0.0/16` (or `OWNNAS_TRUSTED_PROXY`, addresses or networks separated by commas). Over HTTPS the session cookie is `Secure` and browsers are told to keep using HTTPS (`Strict-Transport-Security`) by themselves; `--secure-cookie` makes the cookie `Secure` always. With nginx, set `client_max_body_size 0` for large uploads and pass `Upgrade` and `Connection` for terminals.
 - **Wrong passwords** slow down whoever sends them instead of locking anyone out: after five, the address waits a second, then twice as long after each one, up to a quarter of an hour; the account itself waits at most half a minute, so a stranger cannot keep its owner out. Sign-ins and failed ones are in the activity log with the address they came from. The same goes for passwords asked again inside OwnNAS.
-- **Two-factor sign-in** (the shield button at the top): signing in also asks for a 6-digit code from an authenticator app (Google or Microsoft Authenticator, 1Password, Aegis…). Turning it on shows a QR code, checks one code, signs the account's other devices out, and gives ten recovery codes, each good for one sign-in if the phone is lost. A code signs in once. Lost both? `ownnas user two-factor-off --username NAME` on the server turns it off. The phone, desktop, and command-line clients do not ask for codes yet, so they cannot sign in to an account with it on.
+- **Two-factor sign-in** (the shield button at the top): signing in also asks for a 6-digit code from an authenticator app (Google or Microsoft Authenticator, 1Password, Aegis…). Turning it on shows a QR code, checks one code, signs the account's other devices out, and gives ten recovery codes, each good for one sign-in if the phone is lost. A code signs in once. Lost both? `ownnas user two-factor-off --username NAME` on the server turns it off. The phone and Mac apps show a code field when the server asks for one; `ownnascli login`, `ownnas-sync setup`, `ownnas-mount setup`, and `ownnas-cloud setup` ask for the code on the terminal, or take it with `--code`. Clients that keep a session token don't ask again until it expires or is signed out.
 - **Terminals** from outside the local network or VPN need HTTPS and an account with two-factor sign-in, besides the terminal password if one is set.
 - **Accounts** see the whole library unless they are limited; only Settings are kept to administrators. **Make read-only** (Settings → Users) lets an account look at, search, play, and download everything and change nothing: anything else it asks is refused before it is even handled, sync and the apps included. Administrators cannot be read-only.
 - **Folders…** (Settings → Users) limits an account to some library folders, each where it may look and change, or only look. It then sees nothing else: the folders above its own show only the way to them, and everything else answers "not found", as if it were not there. That covers the file browser, search (names and the words in files), the Gallery (timeline, places, memories, smart search, people, tags, albums and workspaces show only its photos), duplicates and tidying up, versions, the Trash (an item counts as where it was deleted from, and emptying the Trash empties only its own items), the activity log (its own actions, and others' on single items in its folders), notes, downloads and ZIPs, uploads, and the sync apps (the folder tree and the change feed). Paths are checked after following links, so a link inside one of its folders does not lead out. It cannot rename, move or delete a folder it was given, and a read-only folder inside a read-write one stays read-only. Settings, terminals, remotes, drives, disk and health, backups, agent keys, and changes to what every account shares (people, albums, workspaces, the notes folder) are not open to it. Its folders follow renames and moves; if they are all deleted, it sees nothing rather than everything. Administrators cannot be limited, and making a limited account an administrator gives it the whole library again.

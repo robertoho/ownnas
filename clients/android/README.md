@@ -7,7 +7,10 @@ and, later, sync run in Rust: `crates/ownnas-core` is the client library shared 
 
 What works now:
 
-- Several servers, each signed in with a token encrypted by an Android Keystore key.
+- Several servers, each signed in with a token encrypted by an Android Keystore key. For an
+  account with two-factor sign-in, a code field appears after the password (the authenticator
+  app's six digits, or a recovery code); the token keeps the phone signed in, so the code is not
+  asked for again until it expires.
 - Folders with thumbnails and pull to refresh, shown as the web app's layouts (the view button
   in the top bar): List, Icons (square tiles, small to large), Masonry (photos keep their shape),
   and Columns (the folders above as columns beside this one), which needs a wide window: the

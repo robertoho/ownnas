@@ -9,7 +9,9 @@ What works now:
 - **Servers:** several servers, each signed in with a token kept in the Keychain (this device
   only). HTTPS with a private certificate works too. The app shows the certificate's SHA-256
   fingerprint to compare with the one `ownnas serve` prints, or takes the `ca.crt` from
-  `ownnas tls generate`.
+  `ownnas tls generate`. For an account with two-factor sign-in, a code field appears after the
+  password (the authenticator app's six digits, or a recovery code); the token then keeps the
+  phone signed in, so the code is not asked for again until it expires.
 - **Folders:**
   - Folders with thumbnails, pull to refresh, and badges on folders with open terminals.
   - Layouts, as in the web app (the view button in the toolbar): List, Icons (square tiles, small
