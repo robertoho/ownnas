@@ -164,7 +164,8 @@ Authenticate with `POST /api/login` and `{"token": true}`, then send
 everything again: the paths that changed since the cursor (each with what is there now, or
 `"deleted": true`) and the cursor to ask from next, waiting up to `wait` seconds for a change.
 Ask without a cursor to start from now. `"expired": true` means list everything again (the
-server restarted, or changes were missed). A watcher on the shared folder feeds it, so changes
+server restarted, or changes were missed). A path changed again after a client may have read its
+last change is told again, so a file made and then renamed or deleted is never left behind. A watcher on the shared folder feeds it, so changes
 made on the server's disk directly show up too; `"watching": false` means it could not be
 started (on Linux, raise `fs.inotify.max_user_watches` for very large folders).
 

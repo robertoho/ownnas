@@ -9,7 +9,12 @@ delete there goes back to the server (deleting moves to the server's Trash).
 The Finder part is a File Provider extension, the same code as the iPhone app's Files location
 (`../ios/OwnNASFiles`). Changes made on the server, whether through OwnNAS or on its disk
 directly, reach Finder within seconds: the app follows the server's change feed
-(`/api/sync/changes`) and tells Finder, and the extension reads what changed.
+(`/api/sync/changes`) and tells Finder, and the extension reads what changed. This needs the
+app running (**Open at login**). Finder does not look for changes in a folder it has already
+shown, not even when you open it again, so when the feed cannot say what changed (the server
+restarted or missed changes) the extension lists every folder Finder has shown again, adding
+what is new and removing what is gone. A server that cannot watch its folder, or is from before
+the change feed, is looked at that way every minute.
 
 ## Building
 
