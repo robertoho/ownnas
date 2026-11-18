@@ -19,7 +19,23 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # No release with a crate that has a known vulnerability (RustSec advisory database).
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Audit Cargo.lock
+        run: cargo audit
+
   prepare:
+    needs: audit
     runs-on: ubuntu-24.04
     steps:
       - name: Create draft release if needed

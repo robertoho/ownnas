@@ -28,7 +28,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 mime_guess = "2"
 rand = "0.8"
 rpassword = "7"
-rusqlite = { version = "0.40", default-features = false, features = ["bundled", "limits", "trace"] }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled", "limits", "trace"] }
 self-replace = "1"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
@@ -40,13 +40,13 @@ xz2 = "0.1"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tower = { version = "0.5", features = ["util"] }
-zip = "2"
-lopdf = "0.34"
+zip = "9"
+lopdf = "0.42"
 jxl-oxide = { version = "0.12", default-features = false, features = ["image"] }
 lofty = "0.25"
 roxmltree = "0.21"
 cfb = "0.15"
-calamine = { version = "0.36", default-features = false }
+calamine = { version = "0.38", default-features = false }
 sevenz-rust2 = { version = "0.24", default-features = false, features = ["bzip2", "ppmd"] }
 unrar = "0.5"
 bzip2 = "0.5"

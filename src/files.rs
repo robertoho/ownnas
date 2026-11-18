@@ -3824,7 +3824,7 @@ fn validate_xlsx_package(bytes: &[u8]) -> Result<(), FileError> {
         let part = archive.by_index(index).map_err(|_| FileError::Rejected("Invalid spreadsheet part"))?;
         total = total.saturating_add(part.size());
         if total > 100 * 1024 * 1024 { return Err(FileError::Rejected("Spreadsheet expands beyond 100 MB")); }
-        let name = part.name();
+        let name = part.name().map_err(|_| FileError::Rejected("Invalid spreadsheet part"))?;
         if name.starts_with("_xmlsignatures/") {
             return Err(FileError::Rejected("Digitally signed spreadsheets cannot be edited"));
         }
@@ -3882,7 +3882,7 @@ pub fn write_odt_bytes(root: &Path, rel: &str, bytes: &[u8], expected_hash: &str
         .map_err(|_| FileError::Rejected("Invalid ODT package"))?;
     if archive.len() > 4096 { return Err(FileError::Rejected("Too many document parts")); }
     let first = archive.by_index(0).map_err(|_| FileError::Rejected("Invalid ODT package"))?;
-    if first.name() != "mimetype" || first.compression() != zip::CompressionMethod::Stored {
+    if !first.name().is_ok_and(|name| name == "mimetype") || first.compression() != zip::CompressionMethod::Stored {
         return Err(FileError::Rejected("ODT mimetype entry must be first and uncompressed"));
     }
     drop(first);
@@ -3902,7 +3902,7 @@ pub fn write_odt_bytes(root: &Path, rel: &str, bytes: &[u8], expected_hash: &str
         let mut part = archive.by_index(i).map_err(|_| FileError::Rejected("Invalid document part"))?;
         total = total.saturating_add(part.size());
         if total > 100 * 1024 * 1024 { return Err(FileError::Rejected("Document expands beyond 100 MB")); }
-        if part.name() == "mimetype" {
+        if part.name().is_ok_and(|name| name == "mimetype") {
             let mut value = String::new();
             part.read_to_string(&mut value).map_err(|_| FileError::Rejected("Invalid ODT mimetype"))?;
             if value != "application/vnd.oasis.opendocument.text" { return Err(FileError::Rejected("Invalid ODT mimetype")); }
@@ -3919,7 +3919,11 @@ pub fn write_odt_bytes(root: &Path, rel: &str, bytes: &[u8], expected_hash: &str
             return Err(FileError::Rejected("Invalid ODT content document"));
         }
     }
-    if archive.file_names().any(|name| name.to_ascii_lowercase().starts_with("meta-inf/") && name.to_ascii_lowercase().contains("signatures")) {
+    // A part whose name cannot be read could be a signature: refused too.
+    if archive.file_names().any(|name| name.map_or(true, |name| {
+        let name = name.to_ascii_lowercase();
+        name.starts_with("meta-inf/") && name.contains("signatures")
+    })) {
         return Err(FileError::Rejected("Digitally signed documents cannot be edited"));
     }
     let old = fs::read(&target.full).map_err(map_io)?;
@@ -4014,7 +4018,7 @@ mod document_package_tests {
         let original = fs::read(root.join(&rel)).unwrap();
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&original)).unwrap();
         let first = archive.by_index(0).unwrap();
-        assert_eq!(first.name(), "mimetype");
+        assert_eq!(first.name().unwrap(), "mimetype");
         assert_eq!(first.compression(), zip::CompressionMethod::Stored);
         drop(first);
         let hash = hex::encode(Sha256::digest(&original));

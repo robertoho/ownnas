@@ -400,14 +400,14 @@ fn merge_documents(documents: Vec<Document>) -> Result<Document, FileError> {
     let mut pages_object: Option<(ObjectId, Object)> = None;
 
     for (object_id, object) in documents_objects {
-        match object.type_name().unwrap_or("") {
-            "Catalog" => {
+        match object.type_name().unwrap_or(b"") {
+            b"Catalog" => {
                 catalog_object = Some((
                     catalog_object.map(|(id, _)| id).unwrap_or(object_id),
                     object,
                 ));
             }
-            "Pages" => {
+            b"Pages" => {
                 if let Ok(dictionary) = object.as_dict() {
                     let mut dictionary = dictionary.clone();
                     if let Some((_, ref existing)) = pages_object {
@@ -421,7 +421,7 @@ fn merge_documents(documents: Vec<Document>) -> Result<Document, FileError> {
                     ));
                 }
             }
-            "Page" | "Outlines" | "Outline" => {}
+            b"Page" | b"Outlines" | b"Outline" => {}
             _ => {
                 document.objects.insert(object_id, object);
             }

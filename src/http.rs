@@ -106,6 +106,8 @@ pub struct AppState {
     pub attempts: Mutex<AttemptGate>,
     /// Reverse proxies whose `X-Forwarded-For` and `X-Forwarded-Proto` count (`guard.rs`).
     pub trusted_proxies: Vec<crate::guard::Net>,
+    /// Whose accounts must use two-factor sign-in from outside the local network (`TwoFactorRule`).
+    pub two_factor_rule: std::sync::atomic::AtomicU8,
     /// Password checks running at once: each takes a moment of the processor and some memory.
     pub verifying: tokio::sync::Semaphore,
     /// Signed-in sessions seen lately, by token hash, so most requests need not wait for the
@@ -237,6 +239,7 @@ pub fn new_state(
     let db_path = data_dir.join("ownnas.db");
     crate::db_watch::log_to(&data_dir);
     let conn = db::open(&db_path)?;
+    let two_factor_rule = TwoFactorRule::saved(&conn) as u8;
     // Before anything else reads it: a log left large by an earlier run is emptied and cut back.
     if let Some(before) = db::checkpoint(&db_path).filter(|&before| before > 256 * 1024 * 1024) {
         crate::db_watch::log(&format!("emptied a {} MB write-ahead log", before / (1024 * 1024)));
@@ -266,6 +269,7 @@ pub fn new_state(
         supervisor_restart: false,
         attempts: Mutex::new(AttemptGate::new()),
         trusted_proxies: crate::guard::default_trusted(),
+        two_factor_rule: std::sync::atomic::AtomicU8::new(two_factor_rule),
         verifying: tokio::sync::Semaphore::new(4),
         sessions: Mutex::default(),
         https: false,
@@ -373,6 +377,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/users/admin", post(set_user_admin))
         .route("/api/users/read-only", post(set_user_read_only))
         .route("/api/users/folders", post(set_user_folders))
+        .route("/api/users/two-factor-rule", post(set_two_factor_rule))
         .route("/api/users/remove", post(remove_managed_user))
         .route("/.well-known/oauth-protected-resource", get(oauth_resource_metadata).options(oauth_preflight))
         .route("/.well-known/oauth-protected-resource/mcp", get(oauth_resource_metadata).options(oauth_preflight))
@@ -618,6 +623,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/sync/changes", get(sync_changes))
         .layer(axum::middleware::from_fn_with_state(state.clone(), note_changes))
         .layer(axum::middleware::from_fn_with_state(state.clone(), read_only_accounts))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), two_factor_outside))
         .layer(axum::middleware::from_fn_with_state(state.clone(), folder_limits))
         .layer(axum::middleware::from_fn_with_state(state.clone(), strict_transport))
         .with_state(state)
@@ -1373,6 +1379,13 @@ async fn login(
         ));
     }
     let user = user.unwrap();
+    // An account that must use two-factor sign-in but has not turned it on can sign in only from
+    // the local network or VPN, where it can turn it on: from outside, the password is not enough.
+    if must_turn_on_two_factor(&state, &user) && !client_ip(&state, &headers, &peer).is_some_and(local_network) {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        let _ = db::log_event(&conn, Some(user.id), &user.username, "sign-in-refused", &format!("{client} (needs two-factor sign-in)"));
+        return Err(ApiError::new(StatusCode::FORBIDDEN, TWO_FACTOR_NEEDED));
+    }
     // The password is right; an account with two-factor sign-in also needs a code.
     let second = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
@@ -1542,9 +1555,15 @@ async fn two_factor_disable(
     check_csrf(&headers)?;
     let (user, _) = require_user(&state, &headers)?;
     confirm_account_password(&state, &user, &body.account_password, "two-factor")?;
+    if TwoFactorRule::now(&state).covers(&user) {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "This account must use two-factor sign-in: an administrator chose so under Users"));
+    }
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     db::disable_two_factor(&conn, user.id).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     let _ = db::log_event(&conn, Some(user.id), &user.username, "two-factor-off", "");
+    drop(conn);
+    // Sessions remembered as using it are looked up again.
+    forget_sessions(&state);
     Ok(Json(json!({ "enabled": false })))
 }
 
@@ -1582,6 +1601,8 @@ async fn me(
         // Kept to some folders: the web app hides what such an account cannot use.
         "folders": Access::of(&user).limited().then(|| user.folders.clone()),
         "twoFactor": db::two_factor(&state.db.lock().unwrap_or_else(|err| err.into_inner()), user.id).secret.is_some(),
+        // This account must use two-factor sign-in (from outside the local network).
+        "twoFactorRequired": TwoFactorRule::now(&state).covers(&user),
         "version": env!("CARGO_PKG_VERSION"),
         "rootName": files::root_label(&state.root),
         "ffmpeg": state.ffmpeg,
@@ -1685,7 +1706,114 @@ async fn list_users(
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     let users = db::list_user_infos(&conn)
         .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
-    Ok(Json(json!({ "users": users })))
+    Ok(Json(json!({ "users": users, "twoFactorRule": TwoFactorRule::now(&state).name() })))
+}
+
+/// Whose accounts must use two-factor sign-in. It counts from outside the local network (and
+/// VPN): there a password alone does not sign in, and a session made inside does not work. From
+/// inside, such an account can still sign in, to turn two-factor sign-in on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum TwoFactorRule {
+    Nobody = 0,
+    Admins = 1,
+    Everyone = 2,
+}
+
+const TWO_FACTOR_NEEDED: &str = "This account must use two-factor sign-in, which is not on yet. Sign in from your local network or VPN and turn it on (the shield button), then you can sign in from anywhere.";
+
+impl TwoFactorRule {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "nobody" => Some(Self::Nobody),
+            "admins" => Some(Self::Admins),
+            "everyone" => Some(Self::Everyone),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Nobody => "nobody",
+            Self::Admins => "admins",
+            Self::Everyone => "everyone",
+        }
+    }
+
+    fn saved(conn: &rusqlite::Connection) -> Self {
+        db::get_setting(conn, db::SETTING_TWO_FACTOR_RULE).ok().flatten().and_then(|name| Self::parse(&name)).unwrap_or(Self::Nobody)
+    }
+
+    fn now(state: &AppState) -> Self {
+        match state.two_factor_rule.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => Self::Admins,
+            2 => Self::Everyone,
+            _ => Self::Nobody,
+        }
+    }
+
+    fn covers(self, user: &User) -> bool {
+        match self {
+            Self::Nobody => false,
+            Self::Admins => user.is_admin,
+            Self::Everyone => true,
+        }
+    }
+}
+
+/// The account must use two-factor sign-in and has not turned it on.
+fn must_turn_on_two_factor(state: &AppState, user: &User) -> bool {
+    !user.two_factor && TwoFactorRule::now(state).covers(user)
+}
+
+/// From outside the local network, a session of an account that must use two-factor sign-in but
+/// has not turned it on (made inside, before the rule, or before turning it off) does nothing but
+/// turn it on. AI agents' keys (bearer tokens) are not sessions: they have their own rules.
+async fn two_factor_outside(
+    State(state): State<std::sync::Arc<AppState>>,
+    peer: Peer,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    const ALLOWED: [&str; 5] = ["/api/me", "/api/logout", "/api/two-factor", "/api/two-factor/setup", "/api/two-factor/enable"];
+    if TwoFactorRule::now(&state) != TwoFactorRule::Nobody
+        && bearer_token(request.headers()).is_none()
+        && !ALLOWED.contains(&request.uri().path())
+        && !client_ip(&state, request.headers(), &peer).is_some_and(local_network)
+    {
+        if let Ok((user, _)) = require_user(&state, request.headers()) {
+            if must_turn_on_two_factor(&state, &user) {
+                return ApiError::new(StatusCode::FORBIDDEN, TWO_FACTOR_NEEDED).into_response();
+            }
+        }
+    }
+    next.run(request).await
+}
+
+#[derive(Deserialize)]
+struct TwoFactorRuleBody {
+    rule: String,
+}
+
+/// Sets whose accounts must use two-factor sign-in. Only an administrator who uses it can.
+async fn set_two_factor_rule(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<TwoFactorRuleBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let rule = TwoFactorRule::parse(&body.rule).ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Choose nobody, admins, or everyone"))?;
+    if rule != TwoFactorRule::Nobody && !user.two_factor {
+        return Err(ApiError::new(StatusCode::CONFLICT, "Turn on two-factor sign-in for your own account first (the shield button)"));
+    }
+    let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+    db::set_setting(&conn, db::SETTING_TWO_FACTOR_RULE, (rule != TwoFactorRule::Nobody).then_some(rule.name()))
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    state.two_factor_rule.store(rule as u8, std::sync::atomic::Ordering::Relaxed);
+    let _ = db::log_event(&conn, Some(user.id), &user.username, "two-factor-rule", rule.name());
+    Ok(Json(json!({ "twoFactorRule": rule.name() })))
 }
 
 #[derive(Deserialize)]
@@ -11339,6 +11467,77 @@ mod tests {
             .await
             .unwrap()
             .to_vec()
+    }
+
+    #[tokio::test]
+    async fn two_factor_can_be_required_from_outside() {
+        let (root, data) = scratch();
+        let state = Arc::new(new_state(root, data, false, false, false, false, crate::update::UpdateConfig::default()).unwrap());
+        {
+            let conn = state.db.lock().unwrap();
+            db::create_user(&conn, "ada", "longenough").unwrap();
+            db::create_user_with_admin(&conn, "carl", "longenough", true).unwrap();
+            db::create_user(&conn, "bo", "longenough").unwrap();
+        }
+        let app = router(state.clone());
+        let call = |method: &str, path: &str, body: Option<serde_json::Value>, cookie: &str, from: &str| {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("x-ownnas", "1")
+                .extension(axum::extract::ConnectInfo::<SocketAddr>(format!("{from}:40000").parse().unwrap()));
+            if !cookie.is_empty() {
+                request = request.header("cookie", cookie);
+            }
+            app.clone().oneshot(request.body(Body::from(body.map(|b| b.to_string()).unwrap_or_default())).unwrap())
+        };
+        let (lan, outside) = ("192.168.1.5", "203.0.113.5");
+        let login = |user: &'static str, from: &'static str| {
+            let call = &call;
+            async move {
+                let response = call("POST", "/api/login", Some(json!({ "username": user, "password": "longenough" })), "", from).await.unwrap();
+                let status = response.status();
+                let cookie = response.headers().get(header::SET_COOKIE).map(|c| c.to_str().unwrap().split(';').next().unwrap().to_string()).unwrap_or_default();
+                (status, cookie)
+            }
+        };
+        let (_, ada) = login("ada", lan).await;
+        let rule = |cookie: &str, rule: &str| call("POST", "/api/users/two-factor-rule", Some(json!({ "rule": rule })), cookie, lan);
+        assert_eq!(rule(&ada, "admins").await.unwrap().status(), StatusCode::CONFLICT, "not while the admin asking does not use it");
+        {
+            let conn = state.db.lock().unwrap();
+            let id = db::find_user(&conn, "ada").unwrap().unwrap().id;
+            db::set_two_factor_pending(&conn, id, Some(&crate::totp::new_secret())).unwrap();
+            db::enable_two_factor(&conn, id, 0).unwrap();
+        }
+        forget_sessions(&state);
+        assert_eq!(rule(&ada, "admins").await.unwrap().status(), StatusCode::OK);
+
+        // An administrator without it: not from outside, but from inside (to turn it on).
+        assert_eq!(login("carl", outside).await.0, StatusCode::FORBIDDEN);
+        let (status, carl) = login("carl", lan).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(call("GET", "/api/list?path=", None, &carl, lan).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(call("GET", "/api/list?path=", None, &carl, outside).await.unwrap().status(), StatusCode::FORBIDDEN, "a session made inside does not work outside");
+        let me = call("GET", "/api/me", None, &carl, outside).await.unwrap();
+        assert_eq!(me.status(), StatusCode::OK, "but it can see why, and turn it on");
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body_bytes(me).await).unwrap()["twoFactorRequired"], true);
+        assert_eq!(call("POST", "/api/two-factor/setup", Some(json!({ "accountPassword": "longenough" })), &carl, outside).await.unwrap().status(), StatusCode::OK);
+
+        // Members are not covered by "admins"; they are by "everyone".
+        assert_eq!(login("bo", outside).await.0, StatusCode::OK);
+        assert_eq!(rule(&ada, "everyone").await.unwrap().status(), StatusCode::OK);
+        assert_eq!(login("bo", outside).await.0, StatusCode::FORBIDDEN);
+        // An account that uses it is asked for its code as before, and cannot turn it off.
+        assert_eq!(login("ada", outside).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(call("POST", "/api/two-factor/disable", Some(json!({ "accountPassword": "longenough" })), &ada, lan).await.unwrap().status(), StatusCode::FORBIDDEN);
+        // Only administrators set the rule, and the setting outlives a restart.
+        let (_, bo) = login("bo", lan).await;
+        assert_eq!(rule(&bo, "nobody").await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(TwoFactorRule::saved(&state.db.lock().unwrap()), TwoFactorRule::Everyone);
+        assert_eq!(rule(&ada, "nobody").await.unwrap().status(), StatusCode::OK);
+        assert_eq!(login("carl", outside).await.0, StatusCode::OK);
     }
 
     #[tokio::test]

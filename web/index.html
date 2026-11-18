@@ -519,6 +519,16 @@
     </section>
     <section id="settings-users" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-users" hidden>
       <p class="muted">Administrators can add accounts, reset passwords, and grant admin access.</p>
+      <div class="two-factor-rule">
+        <label>Two-factor sign-in required for
+          <select id="two-factor-rule">
+            <option value="nobody">Nobody</option>
+            <option value="admins">Administrators</option>
+            <option value="everyone">Everyone</option>
+          </select>
+        </label>
+        <p class="muted">From outside your local network or VPN, those accounts need a code from their authenticator app. One that has not turned two-factor sign-in on can sign in only from inside, to turn it on. Your own account must use it before you can require it.</p>
+      </div>
       <div id="users-list"></div>
       <form id="user-create-form" class="user-form">
         <strong>Add user</strong>

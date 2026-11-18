@@ -14,7 +14,13 @@ pub struct User {
     pub limited: bool,
     /// The library folders it may use, each read-write or read-only (`limited` accounts only).
     pub folders: Vec<UserFolder>,
+    /// Signs in with a code from an authenticator app too.
+    pub two_factor: bool,
 }
+
+/// The setting saying whose accounts must use two-factor sign-in from outside the local network:
+/// "admins" or "everyone" (none: nobody's).
+pub const SETTING_TWO_FACTOR_RULE: &str = "two_factor_required";
 
 /// A library folder an account is limited to.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -42,9 +48,9 @@ pub fn open(path: &std::path::Path) -> Result<Connection, String> {
         std::fs::create_dir_all(parent)
             .map_err(|_| format!("Could not create {}", parent.display()))?;
     }
-    let conn = open_file(path)
+    let mut conn = open_file(path)
         .map_err(|_| format!("Could not open the database at {}", path.display()))?;
-    crate::db_watch::watch(&conn);
+    crate::db_watch::watch(&mut conn);
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|_| "Could not configure SQLite".to_string())?;
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -107,8 +113,8 @@ fn tune(conn: &Connection) -> rusqlite::Result<()> {
 /// A further connection to the database (already made by `open`), for background work and
 /// anything slow that should not hold up the shared one.
 pub fn connect(path: &std::path::Path) -> rusqlite::Result<Connection> {
-    let conn = open_file(path)?;
-    crate::db_watch::watch(&conn);
+    let mut conn = open_file(path)?;
+    crate::db_watch::watch(&mut conn);
     conn.busy_timeout(std::time::Duration::from_secs(10))?;
     attach_index(&conn, &index_path(path).to_string_lossy())?;
     tune(&conn)?;
@@ -189,8 +195,8 @@ static COPIED_BEFORE: std::sync::LazyLock<std::sync::Mutex<std::collections::Has
 /// each time would only stall every write. `insist` waits anyway.
 fn checkpoint_waiting(path: &std::path::Path, wait: u64, insist: bool) -> Option<u64> {
     let [_, (_, wal), _, (_, index_wal)] = file_sizes(path);
-    let conn = open_file(path).ok()?;
-    crate::db_watch::watch(&conn);
+    let mut conn = open_file(path).ok()?;
+    crate::db_watch::watch(&mut conn);
     attach_index(&conn, &index_path(path).to_string_lossy()).ok()?;
     let mut emptied = true;
     for (schema, size) in [("main", wal), ("idx", index_wal)] {
@@ -1135,7 +1141,7 @@ pub fn create_user_with_admin(
 pub fn find_user(conn: &Connection, username: &str) -> Result<Option<User>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, username, password_hash, is_admin, read_only, folder_limited FROM users WHERE username = ?1",
+            "SELECT id, username, password_hash, is_admin, read_only, folder_limited, totp_secret IS NOT NULL FROM users WHERE username = ?1",
         )
         .map_err(|_| "Could not read users".to_string())?;
     let mut rows = stmt
@@ -1150,6 +1156,7 @@ pub fn find_user(conn: &Connection, username: &str) -> Result<Option<User>, Stri
             read_only: row.get::<_, i64>(4).map_err(|_| "Could not read users".to_string())? != 0,
             limited: row.get::<_, i64>(5).map_err(|_| "Could not read users".to_string())? != 0,
             folders: Vec::new(),
+            two_factor: row.get::<_, i64>(6).map_err(|_| "Could not read users".to_string())? != 0,
         })?))
     } else {
         Ok(None)
@@ -1236,7 +1243,7 @@ pub fn user_for_token(conn: &Connection, token: &str) -> Result<Option<User>, St
     let now = now_secs();
     let mut stmt = conn
         .prepare(
-            "SELECT u.id, u.username, u.password_hash, u.is_admin, u.read_only, u.folder_limited
+            "SELECT u.id, u.username, u.password_hash, u.is_admin, u.read_only, u.folder_limited, u.totp_secret IS NOT NULL
              FROM sessions s
              JOIN users u ON u.id = s.user_id
              WHERE s.token_hash = ?1 AND s.expires_at > ?2",
@@ -1262,6 +1269,7 @@ pub fn user_for_token(conn: &Connection, token: &str) -> Result<Option<User>, St
             read_only: row.get::<_, i64>(4).map_err(|_| "Could not read the session".to_string())? != 0,
             limited: row.get::<_, i64>(5).map_err(|_| "Could not read the session".to_string())? != 0,
             folders: Vec::new(),
+            two_factor: row.get::<_, i64>(6).map_err(|_| "Could not read the session".to_string())? != 0,
         })?))
     } else {
         Ok(None)

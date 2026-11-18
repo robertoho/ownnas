@@ -3018,6 +3018,10 @@ dialog { color: var(--text); }
 }
 .theme-card strong { font-size: 0.88rem; }
 .theme-card .muted { font-size: 0.75rem; }
+.two-factor-rule { display: grid; gap: 0.3rem; margin: 0.6rem 0 0.9rem; }
+.two-factor-rule label { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; font-weight: 600; }
+.two-factor-rule select { font-weight: normal; }
+.two-factor-rule p { margin: 0; font-size: 0.9em; }
 .users-table {
   width: 100%;
   border-collapse: collapse;

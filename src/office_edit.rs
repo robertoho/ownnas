@@ -34,7 +34,7 @@ fn rewrite_part(bytes: &[u8], part: &str, change: impl FnOnce(&str) -> Result<St
     let mut out = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     for index in 0..archive.len() {
         let entry = archive.by_index_raw(index).map_err(|_| "Could not read the document".to_string())?;
-        if entry.name() == part {
+        if entry.name().is_ok_and(|name| name == part) {
             let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
             drop(entry);
             out.start_file(part, options).map_err(|_| "Could not write the document".to_string())?;

@@ -1,0 +1,27 @@
+name: Dependency audit
+
+# Known security problems in the crates OwnNAS uses (the RustSec advisory database). New
+# advisories appear without any change here, so this also runs every Monday.
+on:
+  push:
+    branches: ["**"]
+    paths: ["Cargo.lock", "**/Cargo.toml", ".github/workflows/audit.yml"]
+  pull_request:
+    paths: ["Cargo.lock", "**/Cargo.toml"]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Fails on a vulnerability. Unmaintained or unsound crates are reported but do not fail.
+      - name: Audit Cargo.lock
+        run: cargo audit

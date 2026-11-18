@@ -3128,6 +3128,8 @@ let knownUsers = new Map();
 async function loadUsers() {
   const data = await api("/api/users");
   const users = data.users || [];
+  $("two-factor-rule").value = data.twoFactorRule || "nobody";
+  $("two-factor-rule").dataset.saved = $("two-factor-rule").value;
   knownUsers = new Map(users.map((user) => [user.username, user]));
   const host = $("users-list");
   if (!users.length) {
@@ -6396,6 +6398,9 @@ async function boot() {
   refreshWorkspaceCount();
   refreshAgentLaunchers();
   pollHealthAlerts().catch(() => {});
+  if (state.me.twoFactorRequired && !state.me.twoFactor) {
+    toast("Your account must use two-factor sign-in: turn it on with the shield button, or you cannot sign in from outside your network.", true);
+  }
   if (!healthTimer) healthTimer = setInterval(() => pollHealthAlerts().catch(() => {}), 10 * 60 * 1000);
   pollTrashReminder();
   // Things cross the month mark as days go by.
@@ -6882,14 +6887,34 @@ function showTwoFactorStatus(status) {
         const made = await api("/api/two-factor/recovery", { method: "POST", json: { accountPassword: password } });
         showRecoveryCodes(made.recoveryCodes, "New recovery codes. The old ones no longer work.");
       })) }, "New recovery codes…"),
-      twoFactorPart("button", { type: "button", class: "danger", onclick: () => body.replaceChildren(passwordStep("Your account password", "Turn off", async (password) => {
+      // An account that must use it cannot turn it off (the server refuses too).
+      state.me && state.me.twoFactorRequired ? null : twoFactorPart("button", { type: "button", class: "danger", onclick: () => body.replaceChildren(passwordStep("Your account password", "Turn off", async (password) => {
         await api("/api/two-factor/disable", { method: "POST", json: { accountPassword: password } });
         toast("Two-factor sign-in is off");
         showTwoFactorStatus({ enabled: false });
       })) }, "Turn off…"),
     ),
+    ...(state.me && state.me.twoFactorRequired ? [twoFactorPart("p", { class: "muted" }, "An administrator requires it for this account, so it cannot be turned off.")] : []),
   );
 }
+
+$("two-factor-rule").addEventListener("change", async () => {
+  const select = $("two-factor-rule");
+  select.disabled = true;
+  try {
+    const done = await api("/api/users/two-factor-rule", { method: "POST", json: { rule: select.value } });
+    select.dataset.saved = done.twoFactorRule;
+    const who = { nobody: "No account", admins: "Administrators", everyone: "Every account" }[done.twoFactorRule];
+    toast(done.twoFactorRule === "nobody" ? "Two-factor sign-in is no longer required" : `${who} must use two-factor sign-in from outside your network`);
+    state.me.twoFactorRequired = done.twoFactorRule === "everyone" || (done.twoFactorRule === "admins" && state.me.admin);
+    await loadUsers();
+  } catch (err) {
+    select.value = select.dataset.saved || "nobody";
+    toast(err.message, true);
+  } finally {
+    select.disabled = false;
+  }
+});
 
 function showTwoFactorScan(setup) {
   const body = $("two-factor-body");

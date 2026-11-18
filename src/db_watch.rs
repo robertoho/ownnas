@@ -113,8 +113,9 @@ pub fn log_to(data_dir: &std::path::Path) {
 }
 
 /// Follows what `conn` runs, and lets `open_reads` ask SQLite about it.
-pub fn watch(conn: &Connection) {
-    conn.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT | TraceEventCodes::SQLITE_TRACE_PROFILE, Some(traced));
+pub fn watch(conn: &mut Connection) {
+    // Only for diagnosing slow or held reads: without it the connection works the same.
+    let _ = conn.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT | TraceEventCodes::SQLITE_TRACE_PROFILE, Some(traced));
     // SAFETY: the handle stays valid until the connection closes, and SQLite calls `closing`
     // while closing it, which takes it out of the list before it goes away.
     unsafe {
@@ -320,8 +321,8 @@ mod tests {
 
     #[test]
     fn finds_a_read_left_open() {
-        let conn = Connection::open_in_memory().unwrap();
-        watch(&conn);
+        let mut conn = Connection::open_in_memory().unwrap();
+        watch(&mut conn);
         conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1), (2);").unwrap();
         let mut stmt = conn.prepare("SELECT x FROM t /* held-open test */").unwrap();
         let mut rows = stmt.query([]).unwrap();

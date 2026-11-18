@@ -74,7 +74,9 @@ pub fn list(path: &Path, name: &str, limit: usize) -> Result<(Vec<Entry>, bool),
             let mut zip = open_zip(path)?;
             for index in 0..zip.len() {
                 let Ok(file) = zip.by_index_raw(index) else { continue };
-                if !push(Entry { name: file.name().to_string(), size: file.size(), dir: file.is_dir() }) {
+                // A name that is not valid text cannot be shown (nor extracted).
+                let Ok(name) = file.name() else { continue };
+                if !push(Entry { name: name.into_owned(), size: file.size(), dir: file.is_dir() }) {
                     break;
                 }
             }
@@ -336,7 +338,7 @@ fn unpack(path: &Path, name: &str, out: &mut Unpack) -> Result<(), FileError> {
                     zip::result::ZipError::UnsupportedArchive(_) => FileError::Rejected("This zip is protected by a password, which OwnNAS cannot open"),
                     _ => FileError::Rejected("The zip file is damaged"),
                 })?;
-                let entry = file.name().to_string();
+                let entry = file.name().map_err(|_| FileError::Rejected("The zip file is damaged"))?.into_owned();
                 if file.is_dir() {
                     out.folder(&entry)?;
                 } else if !file.is_symlink() {
