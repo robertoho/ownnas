@@ -33,11 +33,22 @@ pub struct Changes {
     watching: std::sync::atomic::AtomicBool,
     /// Kept alive for as long as the feed is.
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
+    /// Why the folder is not watched: the watcher's error, or turned off (`--no-watch`).
+    problem: Mutex<Option<Unwatched>>,
     /// Told of each change too (`None`: changes were missed).
     listener: Mutex<Option<Listener>>,
 }
 
 type Listener = Box<dyn Fn(Option<&str>) + Send + Sync>;
+
+/// Why the shared folder is not watched (for Health).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unwatched {
+    /// Watching failed, with the system's reason.
+    Failed(String),
+    /// `--no-watch`.
+    TurnedOff,
+}
 
 /// What a client asking for changes gets.
 #[derive(Debug, PartialEq, Eq)]
@@ -58,6 +69,7 @@ impl Changes {
             wake: tokio::sync::Notify::new(),
             watching: std::sync::atomic::AtomicBool::new(false),
             watcher: Mutex::new(None),
+            problem: Mutex::new(None),
             listener: Mutex::new(None),
         })
     }
@@ -90,11 +102,32 @@ impl Changes {
             Ok(watcher) => {
                 *self.watcher.lock().unwrap_or_else(|err| err.into_inner()) = Some(watcher);
                 self.watching.store(true, std::sync::atomic::Ordering::Relaxed);
+                *self.problem.lock().unwrap_or_else(|err| err.into_inner()) = None;
             }
             Err(err) => {
-                crate::db_watch::log(&format!("sync clients will not hear of changes at once: the shared folder could not be watched ({err})"));
+                *self.problem.lock().unwrap_or_else(|err| err.into_inner()) = Some(Unwatched::Failed(err.to_string()));
+                let hint = if cfg!(target_os = "linux") {
+                    " On Linux this is usually too many folders for the system's limit: raise fs.inotify.max_user_watches and restart OwnNAS."
+                } else {
+                    ""
+                };
+                crate::db_watch::log(&format!(
+                    "the shared folder could not be watched ({err}): sync clients and search hear of changes from looks through the folders instead, seconds after changes made through OwnNAS and minutes after others.{hint}"
+                ));
             }
         }
+    }
+
+    /// Stops watching the shared folder (`--no-watch`): changes then come from the name index.
+    pub fn stop_watching(&self) {
+        self.watcher.lock().unwrap_or_else(|err| err.into_inner()).take();
+        self.watching.store(false, std::sync::atomic::Ordering::Relaxed);
+        *self.problem.lock().unwrap_or_else(|err| err.into_inner()) = Some(Unwatched::TurnedOff);
+    }
+
+    /// Why the shared folder is not watched, if it is not (and was asked to be).
+    pub fn unwatched(&self) -> Option<Unwatched> {
+        self.problem.lock().unwrap_or_else(|err| err.into_inner()).clone()
     }
 
     /// Has `listener` told of every change from now on, as the feed hears of it.

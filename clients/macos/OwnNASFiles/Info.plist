@@ -42,6 +42,14 @@
 				<key>NSExtensionFileProviderActionName</key>
 				<string>Keep Online Only</string>
 			</dict>
+			<dict>
+				<key>NSExtensionFileProviderActionActivationRule</key>
+				<string>fileproviderItems.@count &gt; 0</string>
+				<key>NSExtensionFileProviderActionIdentifier</key>
+				<string>app.ownnas.refresh</string>
+				<key>NSExtensionFileProviderActionName</key>
+				<string>Refresh</string>
+			</dict>
 		</array>
 		<key>NSExtensionFileProviderSupportsEnumeration</key>
 		<true/>

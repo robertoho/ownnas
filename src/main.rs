@@ -199,6 +199,11 @@ struct ServeArgs {
     /// X-Forwarded-Proto), besides this machine: addresses or networks, such as 172.17.0.0/16
     #[arg(long, env = "OWNNAS_TRUSTED_PROXY", value_name = "ADDRESSES", value_delimiter = ',')]
     trusted_proxy: Vec<String>,
+    /// Do not watch the shared folder for changes, for folders on a network file system (NFS,
+    /// SMB), where watching hears nothing. Sync clients and search then hear of changes from
+    /// looks through the folders: seconds after changes made through OwnNAS, minutes after others
+    #[arg(long, env = "OWNNAS_NO_WATCH", action = clap::ArgAction::SetTrue)]
+    no_watch: bool,
     /// Open a browser window on this computer after the server starts
     #[arg(long, action = clap::ArgAction::SetTrue)]
     open: bool,
@@ -468,6 +473,9 @@ fn serve(args: ServeArgs) -> Result<(), String> {
     app_state.supervisor_restart = args.restart_by_supervisor;
     app_state.https = args.tls_cert.is_some();
     app_state.trusted_proxies = guard::parse_trusted(&args.trusted_proxy)?;
+    if args.no_watch {
+        app_state.changes.stop_watching();
+    }
     let state = Arc::new(app_state);
     state.start_media_index();
     state.nas_backup.start_scheduler(state.root.clone(), state.data_dir(), state.db_path.clone());

@@ -174,10 +174,17 @@ final class MacHub: ObservableObject {
                     let connection = server!
                     let asked = cursor
                     let feed = try await Task.detached { try connection.changes(cursor: asked, waitSeconds: 25) }.value
+                    if !feed.changes.isEmpty || feed.expired || (!feed.watching && !feed.scanning) {
+                        feedLog.notice("\(saved.id, privacy: .public): \(feed.changes.count) changes from \(asked.isEmpty ? "the start" : asked, privacy: .public) to \(feed.cursor, privacy: .public)\(feed.expired ? ", expired" : "", privacy: .public)\(feed.watching ? "" : feed.scanning ? ", found by the server looking through its folders" : ", the server is not watching its folder", privacy: .public)")
+                    }
                     if !asked.isEmpty && (feed.expired || !feed.changes.isEmpty) { self?.tellFinder(saved.id) }
                     cursor = feed.cursor
                     if feed.watching {
                         self?.status[saved.id] = "Up to date"
+                    } else if feed.scanning {
+                        // The server finds changes by looking through its folders: those made
+                        // through OwnNAS come in seconds, those made on its disk in minutes.
+                        self?.status[saved.id] = "Up to date (the server cannot watch its folder: changes made on its disk take up to 5 minutes)"
                     } else {
                         // The server waited for nothing: changes there are not told.
                         self?.status[saved.id] = "Up to date (the server cannot watch its folder: Finder looks for changes every minute)"
@@ -196,6 +203,7 @@ final class MacHub: ObservableObject {
                     return
                 } catch {
                     server = nil
+                    feedLog.error("\(saved.id, privacy: .public): the change feed failed: \(userMessage(error), privacy: .public)")
                     self?.status[saved.id] = "Cannot reach the server: \(userMessage(error))"
                     try? await Task.sleep(for: .seconds(15))
                 }
@@ -203,9 +211,25 @@ final class MacHub: ObservableObject {
         }
     }
 
+    /// Lists every folder Finder has of this server again (Refresh in Finder in the menu).
+    func refresh(_ id: String) {
+        store.requestRefresh(id)
+        tellFinder(id)
+    }
+
     private func tellFinder(_ id: String) {
-        guard let domain = domain(id) else { return }
-        NSFileProviderManager(for: domain)?.signalEnumerator(for: .workingSet) { _ in }
+        guard let domain = domain(id) else {
+            feedLog.error("\(id, privacy: .public): no Finder location to tell of changes")
+            return
+        }
+        guard let manager = NSFileProviderManager(for: domain) else {
+            feedLog.error("\(id, privacy: .public): Finder's location could not be reached")
+            return
+        }
+        manager.signalEnumerator(for: .workingSet) { error in
+            if let error { feedLog.error("\(id, privacy: .public): Finder was not told of changes: \(error.localizedDescription, privacy: .public)") }
+            else { feedLog.notice("\(id, privacy: .public): told Finder of changes") }
+        }
     }
 
     // MARK: The app
@@ -232,6 +256,9 @@ final class MacHub: ObservableObject {
         window.makeKeyAndOrderFront(nil)
     }
 }
+
+/// What the change feed brought and what Finder was told (`log stream --predicate 'subsystem == "app.ownnas.mac"'`).
+let feedLog = Logger(subsystem: "app.ownnas.mac", category: "changes")
 
 /// A message for a failed call, in words for people.
 func userMessage(_ error: Error) -> String {

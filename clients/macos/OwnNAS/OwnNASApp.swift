@@ -31,6 +31,7 @@ struct MenuContent: View {
             Section(server.name) {
                 Text(hub.status[server.id] ?? "Connecting…")
                 Button("Open in Finder") { hub.openInFinder(server.id) }
+                Button("Refresh in Finder") { hub.refresh(server.id) }
                 Button("Sign in again…") { hub.showSignIn(server) }
                 Button("Sign out of \(server.host)") { hub.signOut(server.id) }
             }

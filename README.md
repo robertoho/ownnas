@@ -174,7 +174,20 @@ Ask without a cursor to start from now. `"expired": true` means list everything 
 server restarted, or changes were missed). A path changed again after a client may have read its
 last change is told again, so a file made and then renamed or deleted is never left behind. A watcher on the shared folder feeds it, so changes
 made on the server's disk directly show up too; `"watching": false` means it could not be
-started (on Linux, raise `fs.inotify.max_user_watches` for very large folders).
+started. On Linux that is usually more folders than the system lets one user watch: raise the
+limit and restart OwnNAS. **Settings › Health** shows whether the folder is watched, and on Linux
+the limit against how many folders the library has, with this command (sized for the library)
+when it is too low; administrators also get a warning over the files:
+
+```bash
+echo fs.inotify.max_user_watches=1048576 | sudo tee /etc/sysctl.d/90-ownnas.conf && sudo sysctl --system
+```
+
+Without the watcher, changes still reach clients (`"scanning": true`): the search index looks
+through the folders that changed a few seconds after each change made through OwnNAS (the web
+app, the phone and desktop apps), and through every folder every five minutes, which catches
+changes made on the disk. `--no-watch` (`OWNNAS_NO_WATCH=1`) works this way on purpose, for a
+shared folder on a network file system (NFS, SMB), where a watcher hears nothing.
 
 ## Terminals in the browser
 

@@ -18,7 +18,14 @@ app running (**Open at login**). Finder does not look for changes in a folder it
 shown, not even when you open it again, so when the feed cannot say what changed (the server
 restarted or missed changes) the extension lists every folder Finder has shown again, adding
 what is new and removing what is gone. A server that cannot watch its folder, or is from before
-the change feed, is looked at that way every minute.
+the change feed, is looked at that way every minute. A server that cannot watch its folder but
+finds changes by looking through it (`"scanning"` in the feed) sends them as usual: those made
+through OwnNAS arrive within seconds, those made on its disk within five minutes.
+
+**Refresh** in Finder's menu lists the selected folder (or the folder a selected file is in) again
+from the server, with what Finder has inside it; **Refresh in Finder** in the menu bar does it
+for every folder of that server. What the app hears from the change feed and tells Finder is
+logged: `log stream --predicate 'subsystem == "app.ownnas.mac" OR subsystem == "app.ownnas.files"'`.
 
 **About OwnNAS** in the menu shows the app's version and build, and the address and version of
 each server it is signed in to (asked for each time the window opens). **Copy Details** puts it

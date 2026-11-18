@@ -38,6 +38,18 @@ final class ServerStore {
         defaults.set(try? JSONEncoder().encode(servers), forKey: listKey)
     }
 
+    /// The app asks the extension to list every folder of a server's location again (Refresh in
+    /// Finder in the Mac menu bar); the extension takes the request when it next hears of changes.
+    func requestRefresh(_ id: String) {
+        defaults.set(true, forKey: "refresh.\(id)")
+    }
+
+    func takeRefreshRequest(_ id: String) -> Bool {
+        guard defaults.bool(forKey: "refresh.\(id)") else { return false }
+        defaults.removeObject(forKey: "refresh.\(id)")
+        return true
+    }
+
     /// Moves what the app saved before it shared with the extension: the server list into the
     /// App Group, and the tokens into the shared Keychain group. Once.
     func shareWithExtension() {

@@ -4388,9 +4388,9 @@ body.is-notes .app > .explorer-status-bar { display: none; }
 .backup-dir:hover { background: color-mix(in srgb, var(--text) 8%, transparent); }
 .backup-file { display: flex; justify-content: space-between; gap: 1rem; padding: 0.3rem 0.4rem !important; font-size: 0.9rem; }
 .health-settings h3:first-child { margin-top: 0.2rem; }
-.health-list { display: grid; gap: 0.5rem; }
+.health-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0.5rem; }
 .health-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.6rem; }
-.health-item { border: 1px solid var(--line); border-radius: 10px; padding: 0.55rem 0.75rem; display: grid; gap: 0.3rem; }
+.health-item { border: 1px solid var(--line); border-radius: 10px; padding: 0.55rem 0.75rem; display: grid; grid-template-columns: minmax(0, 1fr); gap: 0.3rem; }
 .health-item p { margin: 0; overflow-wrap: anywhere; }
 .health-head { display: flex; align-items: center; justify-content: space-between; gap: 0.6rem; flex-wrap: wrap; }
 .health-tags { display: flex; gap: 0.3rem; flex-wrap: wrap; }
@@ -4405,6 +4405,8 @@ body.is-notes .app > .explorer-status-bar { display: none; }
 .state-full { color: var(--danger); }
 .state-unknown { color: var(--muted); }
 .health-warning { color: var(--danger); font-size: 0.9em; }
+.health-command { display: flex; align-items: center; gap: 0.5rem; }
+.health-command code { flex: 1; min-width: 0; overflow-x: auto; white-space: pre; padding: 0.35rem 0.5rem; border-radius: 6px; background: var(--bg-3); font-size: 0.82rem; }
 .health-system { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 0.9rem; margin: 0; font-size: 0.92rem; }
 .health-system dd { margin: 0; overflow-wrap: anywhere; }
 .health-sensors { display: flex; flex-wrap: wrap; gap: 0.4rem; }

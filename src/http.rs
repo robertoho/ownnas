@@ -169,12 +169,25 @@ impl AppState {
             .flatten()
             .find_map(|root| data.strip_prefix(&root).ok().map(|rel| rel.to_string_lossy().replace('\\', "/")))
             .filter(|rel| !rel.is_empty());
+        let own_data = move |rel: &str| own.as_deref().is_some_and(|own| rel == own || rel.starts_with(&format!("{own}/")));
+        let ours = own_data.clone();
         self.changes.on_change(move |rel| {
-            if rel.is_some_and(|rel| own.as_deref().is_some_and(|own| rel == own || rel.starts_with(&format!("{own}/")))) {
+            if rel.is_some_and(&ours) {
                 return;
             }
             if let Some(index) = index.upgrade() {
                 index.changed_on_disk(rel);
+            }
+        });
+        // When the shared folder cannot be watched, sync clients hear of changes from the index
+        // instead: it looks through changed folders a few seconds after each change made through
+        // OwnNAS, and through everything every few minutes (for changes made on the disk).
+        let feed = std::sync::Arc::downgrade(&self.changes);
+        self.file_index.on_found(move |rel| {
+            if let Some(feed) = feed.upgrade() {
+                if !feed.watching() && !own_data(rel) {
+                    feed.record(rel.to_string());
+                }
             }
         });
         // And so does reading the words inside files, after each scan of the names.
@@ -7364,7 +7377,9 @@ struct ChangesQuery {
 
 /// What changed in the shared folder since the client's cursor: each path with what is there
 /// now (or `deleted`), and the cursor to ask from next. `expired` means the client must list
-/// everything again (the server restarted, or changes were missed).
+/// everything again (the server restarted, or changes were missed). `watching` false means the
+/// folder could not be watched; `scanning` then says the changes still come, found by the name
+/// index: a few seconds after changes made through OwnNAS, minutes after ones made on the disk.
 async fn sync_changes(
     State(state): State<std::sync::Arc<AppState>>,
     headers: HeaderMap,
@@ -7374,9 +7389,11 @@ async fn sync_changes(
     let cursor = (!query.cursor.is_empty()).then_some(query.cursor.as_str());
     let since = state.changes.wait(cursor, Duration::from_secs(query.wait.min(55))).await;
     let watching = state.changes.watching();
+    // Without watching, the index's scans find the changes: once it is complete.
+    let scanning = !watching && state.file_index.ready();
     let (cursor, paths) = match since {
         crate::changes::Since::Expired { cursor } => {
-            return Ok(Json(json!({ "cursor": cursor, "expired": true, "watching": watching, "changes": [] })));
+            return Ok(Json(json!({ "cursor": cursor, "expired": true, "watching": watching, "scanning": scanning, "changes": [] })));
         }
         crate::changes::Since::Changed { cursor, paths } => (cursor, paths),
     };
@@ -7397,7 +7414,7 @@ async fn sync_changes(
     })
     .await
     .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not read the changes"))?;
-    Ok(Json(json!({ "cursor": cursor, "expired": false, "watching": watching, "changes": changes })))
+    Ok(Json(json!({ "cursor": cursor, "expired": false, "watching": watching, "scanning": scanning, "changes": changes })))
 }
 
 async fn sync_download(
@@ -9383,12 +9400,40 @@ async fn health_report(
             "sensors": crate::health::sensors(),
             "system": crate::health::system(),
             "database": db::connect(&worker.db_path).map(|conn| db::file_report(&conn, &worker.db_path)).unwrap_or_default(),
+            "watching": watch_report(&worker),
             "checkedAt": db::now_secs(),
         })
     })
     .await
     .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not check the computer's health"))?;
     Ok(Json(report))
+}
+
+/// Whether OwnNAS hears of changes in the shared folder as they happen (Settings › Health): if
+/// not, why, and on Linux the limit on watched folders against how many the library has.
+fn watch_report(state: &AppState) -> serde_json::Value {
+    let unwatched = state.changes.unwatched();
+    let limits = crate::health::watch_limits();
+    let folders = db::connect(&state.db_path).ok().map(|conn| crate::file_index::folder_count(&conn)).filter(|_| state.file_index.ready());
+    let near_limit = match (&limits, folders) {
+        (Some(limits), Some(folders)) => folders.saturating_mul(10) >= limits.max_user_watches.saturating_mul(9),
+        _ => false,
+    };
+    let level = match &unwatched {
+        Some(crate::changes::Unwatched::Failed(_)) => "low",
+        _ if near_limit => "low",
+        _ => "ok",
+    };
+    json!({
+        "watching": state.changes.watching(),
+        "turnedOff": unwatched == Some(crate::changes::Unwatched::TurnedOff),
+        "error": match unwatched { Some(crate::changes::Unwatched::Failed(reason)) => Some(reason), _ => None },
+        "scanning": !state.changes.watching() && state.file_index.ready(),
+        "folders": folders,
+        "limits": limits,
+        "suggested": limits.as_ref().map(|limits| crate::health::suggested_watches(folders.unwrap_or(0)).max(limits.max_user_watches)),
+        "level": level,
+    })
 }
 
 /// What needs attention now: a disk OwnNAS uses nearly full, or a drive reporting trouble (as
@@ -9419,9 +9464,12 @@ async fn health_alerts(State(state): State<std::sync::Arc<AppState>>, headers: H
             let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
             (crate::nas_backup::load_config(&conn), crate::nas_backup::load_state(&conn))
         };
-        // Only administrators can do something about backups.
+        // Only administrators can do something about backups, or the system's limits.
         if is_admin {
             alerts.extend(crate::nas_backup::alert(&config, &backup, db::now_secs()));
+            if let Some(crate::changes::Unwatched::Failed(reason)) = worker.changes.unwatched() {
+                alerts.push(json!({ "level": "low", "kind": "watch", "error": reason, "linux": cfg!(target_os = "linux") }));
+            }
         }
         alerts
     })

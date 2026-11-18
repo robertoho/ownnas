@@ -169,6 +169,49 @@ pub fn sensors() -> Vec<Sensor> {
     out
 }
 
+/// Linux's limits on watching folders for changes (`fs.inotify`): how many folders one user may
+/// watch, and how many of them this OwnNAS watches now. `None` elsewhere: macOS and Windows have
+/// no such limit.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchLimits {
+    pub max_user_watches: u64,
+    pub max_user_instances: u64,
+    /// Folders this process watches (its inotify watches).
+    pub in_use: u64,
+}
+
+pub fn watch_limits() -> Option<WatchLimits> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let read = |name: &str| std::fs::read_to_string(format!("/proc/sys/fs/inotify/{name}")).ok()?.trim().parse::<u64>().ok();
+    Some(WatchLimits {
+        max_user_watches: read("max_user_watches")?,
+        max_user_instances: read("max_user_instances")?,
+        in_use: inotify_watches_in_use(),
+    })
+}
+
+/// Counts the `inotify wd:` lines of this process's inotify descriptors.
+fn inotify_watches_in_use() -> u64 {
+    let Ok(fds) = std::fs::read_dir("/proc/self/fdinfo") else { return 0 };
+    fds.flatten()
+        .filter_map(|fd| std::fs::read_to_string(fd.path()).ok())
+        .map(|info| watches_in(&info))
+        .sum()
+}
+
+/// The watches listed in one descriptor's `/proc/self/fdinfo` entry (none for other kinds).
+fn watches_in(fdinfo: &str) -> u64 {
+    fdinfo.lines().filter(|line| line.starts_with("inotify wd:")).count() as u64
+}
+
+/// A limit with room for `folders`: twice as many, and never under a million.
+pub fn suggested_watches(folders: u64) -> u64 {
+    folders.saturating_mul(2).max(1 << 20).next_power_of_two()
+}
+
 /// Memory, processor, and how long the computer has been up.
 pub fn system() -> Value {
     let mut sys = sysinfo::System::new();
@@ -398,5 +441,16 @@ mod tests {
         assert!(found.first().is_some_and(|volume| volume.holds == ["library", "data"]), "{found:?}");
         let _ = system();
         let _ = sensors();
+    }
+
+    #[test]
+    fn folder_watch_limits() {
+        let fdinfo = "pos:\t0\nflags:\t02004000\nmnt_id:\t15\ninotify wd:2 ino:1a sdev:803 mask:fce ignored_mask:0 fhandle-bytes:8\ninotify wd:1 ino:2 sdev:803 mask:fce ignored_mask:0 fhandle-bytes:8\n";
+        assert_eq!(watches_in(fdinfo), 2);
+        assert_eq!(watches_in("pos:\t0\nflags:\t02\n"), 0, "a file, not an inotify descriptor");
+        assert_eq!(suggested_watches(98_213), 1 << 20, "at least a million");
+        assert_eq!(suggested_watches(900_000), 1 << 21, "twice the folders, rounded up");
+        // Linux only; elsewhere there is no such limit.
+        assert_eq!(watch_limits().is_some(), cfg!(target_os = "linux") && std::path::Path::new("/proc/sys/fs/inotify").exists());
     }
 }

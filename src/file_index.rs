@@ -7,6 +7,9 @@
 //! watcher on the shared folder sees, by looking through only the folders they were in. A scan
 //! every few minutes catches what the watcher missed, and any folder can be read again in full
 //! on request.
+//!
+//! What a scan finds added, changed, or gone is told to `on_found`'s listener: when the shared
+//! folder cannot be watched, that is how sync clients hear of changes.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -77,7 +80,11 @@ pub struct FileIndex {
     /// Folders changed since the last look, waiting for things to settle ("" is the library).
     pending: Mutex<Vec<String>>,
     stop: AtomicBool,
+    /// Told of each path a scan finds added, changed, or gone.
+    found: Mutex<Option<Found>>,
 }
+
+type Found = Box<dyn Fn(&str) + Send + Sync>;
 
 impl Default for FileIndex {
     fn default() -> Self {
@@ -88,6 +95,7 @@ impl Default for FileIndex {
             settling: AtomicBool::new(false),
             pending: Mutex::new(Vec::new()),
             stop: AtomicBool::new(false),
+            found: Mutex::new(None),
         }
     }
 }
@@ -114,6 +122,12 @@ impl FileIndex {
         self.push(job);
         // A scan of part of the library would only be redone: stop it and start this one.
         self.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Has `listener` told of each path a scan finds added, changed, or gone (as a path relative
+    /// to the library). Not while the index is first being built: everything would be new.
+    pub fn on_found(&self, listener: impl Fn(&str) + Send + Sync + 'static) {
+        *self.found.lock().unwrap_or_else(|err| err.into_inner()) = Some(Box::new(listener));
     }
 
     /// Looks for changes a moment from now: after a change made through OwnNAS.
@@ -218,6 +232,15 @@ impl FileIndex {
                 std::thread::sleep(rest);
             }
         };
+        // Before the index is complete, what a scan adds was there all along.
+        let telling = self.ready();
+        let found = |rel: &str| {
+            if telling {
+                if let Some(listener) = self.found.lock().unwrap_or_else(|err| err.into_inner()).as_ref() {
+                    listener(rel);
+                }
+            }
+        };
         let result = open(db_path).and_then(|conn| {
             // A folder new to the index is looked at from the nearest one it has, which then
             // adds it as one of its own.
@@ -225,7 +248,7 @@ impl FileIndex {
             while !from.is_empty() && !indexed_folder(&conn, from) {
                 from = from.rsplit_once('/').map_or("", |(parent, _)| parent);
             }
-            let finished = scan(&conn, root, from, job.full, &progress, &pace, &|| self.stop.load(Ordering::SeqCst))?;
+            let finished = scan(&conn, root, from, job.full, &progress, &pace, &|| self.stop.load(Ordering::SeqCst), &found)?;
             if finished && job.rel.is_empty() {
                 crate::db::set_setting(&conn, SETTING_COMPLETE, Some("1"))?;
             }
@@ -291,7 +314,9 @@ struct Entry {
 }
 
 /// Brings the index in line with the library under `start`. Folders whose modified time is the
-/// one indexed are not read again, unless `full`. Returns false when asked to stop part way.
+/// one indexed are not read again, unless `full`. Each path found added, changed, or gone is
+/// told to `found`. Returns false when asked to stop part way.
+#[allow(clippy::too_many_arguments)]
 fn scan(
     conn: &Connection,
     root: &Path,
@@ -300,6 +325,7 @@ fn scan(
     progress: &dyn Fn(u64, u64),
     pace: &dyn Fn(Instant),
     stop: &dyn Fn() -> bool,
+    found_change: &dyn Fn(&str),
 ) -> Result<bool, String> {
     let sql = |err: rusqlite::Error| err.to_string();
     let mut queue = VecDeque::from([start.to_string()]);
@@ -327,7 +353,9 @@ fn scan(
         let Ok(meta) = full_path.symlink_metadata() else {
             // Gone: forget it and everything that was in it.
             start_writing!();
-            forget(&tx, &rel)?;
+            if forget(&tx, &rel)? {
+                found_change(&rel);
+            }
             continue;
         };
         if !meta.is_dir() || meta.file_type().is_symlink() {
@@ -377,6 +405,7 @@ fn scan(
             for (path, was_dir) in &known {
                 if !present.contains(&(path.as_str(), *was_dir)) {
                     forget(&tx, path)?;
+                    found_change(path);
                 }
             }
             {
@@ -393,7 +422,9 @@ fn scan(
                     let name = name_of(&entry.rel);
                     // A new folder gets no time, so it is read in turn.
                     let mtime = if entry.dir { -1 } else { entry.mtime };
-                    stmt.execute(params![entry.rel, rel, name.to_lowercase(), entry.dir, entry.size, mtime, entry.kind]).map_err(sql)?;
+                    if stmt.execute(params![entry.rel, rel, name.to_lowercase(), entry.dir, entry.size, mtime, entry.kind]).map_err(sql)? > 0 {
+                        found_change(&entry.rel);
+                    }
                 }
             }
             // The folder's own row keeps the time it had when read: changed later, it is read again.
@@ -418,18 +449,23 @@ fn scan(
     Ok(true)
 }
 
-/// Removes `rel` and everything under it from the index.
-fn forget(conn: &Connection, rel: &str) -> Result<(), String> {
+/// Removes `rel` and everything under it from the index. Returns whether it had any of it.
+fn forget(conn: &Connection, rel: &str) -> Result<bool, String> {
     if rel.is_empty() {
-        conn.execute("DELETE FROM file_index", []).map_err(|err| err.to_string())?;
-        return Ok(());
+        return Ok(conn.execute("DELETE FROM file_index", []).map_err(|err| err.to_string())? > 0);
     }
-    conn.execute(
-        "DELETE FROM file_index WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
-        [rel],
-    )
-    .map_err(|err| err.to_string())?;
-    Ok(())
+    let removed = conn
+        .execute(
+            "DELETE FROM file_index WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+            [rel],
+        )
+        .map_err(|err| err.to_string())?;
+    Ok(removed > 0)
+}
+
+/// How many folders the index has (the library's, once it is complete).
+pub fn folder_count(conn: &Connection) -> u64 {
+    conn.query_row("SELECT count(*) FROM file_index WHERE dir = 1", [], |row| row.get::<_, i64>(0)).map_or(0, |n| n.max(0) as u64)
 }
 
 /// A file or folder whose name has the search in it.
@@ -548,9 +584,18 @@ mod tests {
     }
 
     fn scan_all(library: &Library, start: &str, full: bool) -> (u64, u64) {
+        scan_telling(library, start, full).0
+    }
+
+    /// Also what the scan found added, changed, or gone, in order.
+    fn scan_telling(library: &Library, start: &str, full: bool) -> ((u64, u64), Vec<String>) {
         let counts = std::cell::Cell::new((0, 0));
-        assert!(scan(&library.conn, &library.root.join("lib"), start, full, &|f, r| counts.set((f, r)), &|_| {}, &|| false).unwrap());
-        counts.get()
+        let found = std::cell::RefCell::new(Vec::new());
+        let tell = |rel: &str| found.borrow_mut().push(rel.to_string());
+        assert!(scan(&library.conn, &library.root.join("lib"), start, full, &|f, r| counts.set((f, r)), &|_| {}, &|| false, &tell).unwrap());
+        let mut found = found.into_inner();
+        found.sort();
+        (counts.get(), found)
     }
 
     fn names(library: &Library, query: &str, rel: &str) -> Vec<String> {
@@ -586,8 +631,15 @@ mod tests {
         next_second();
         fs::rename(lib.join("docs/old"), lib.join("docs/archive")).unwrap();
         fs::write(lib.join("iPod/new photo cache.jpg"), b"x").unwrap();
-        let (_, read) = scan_all(&library, "", false);
+        let ((_, read), found) = scan_telling(&library, "", false);
         assert_eq!(read, 3, "docs, iPod, and the renamed folder");
+        // What sync clients are told when the folder cannot be watched: a move is the old path
+        // gone and the new one (and what is in it) added.
+        assert_eq!(found, ["docs/archive", "docs/archive/photo cache notes.txt", "docs/old", "iPod/new photo cache.jpg"]);
+        assert!(scan_telling(&library, "", false).1.is_empty(), "nothing new the next time");
+        next_second();
+        fs::write(lib.join("iPod/new photo cache.jpg"), b"longer").unwrap();
+        assert_eq!(scan_telling(&library, "iPod", true).1, ["iPod/new photo cache.jpg"], "a file changed in place, seen when its folder is read");
         assert_eq!(names(&library, "photo cache", ""), ["iPod/iPod Photo Cache", "iPod/new photo cache.jpg", "docs/archive/photo cache notes.txt"]);
 
         // A full scan of one folder reads it whether or not its time changed.
@@ -595,8 +647,21 @@ mod tests {
         assert_eq!((folders, read), (2, 2));
 
         fs::remove_dir_all(lib.join("docs")).unwrap();
-        scan_all(&library, "", false);
+        assert_eq!(scan_telling(&library, "", false).1, ["docs"], "a folder gone is told once, not with each thing in it");
         assert_eq!(names(&library, "notes", ""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_move_between_folders_is_told_at_both_ends() {
+        let library = library();
+        let lib = library.root.join("lib");
+        fs::create_dir_all(lib.join("Inbox")).unwrap();
+        fs::create_dir_all(lib.join("Archive/2025")).unwrap();
+        fs::write(lib.join("Inbox/report.txt"), b"hi").unwrap();
+        scan_all(&library, "", false);
+        next_second();
+        fs::rename(lib.join("Inbox/report.txt"), lib.join("Archive/2025/report.txt")).unwrap();
+        assert_eq!(scan_telling(&library, "", false).1, ["Archive/2025/report.txt", "Inbox/report.txt"]);
     }
 
     #[test]

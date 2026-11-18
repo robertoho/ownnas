@@ -240,6 +240,11 @@ pub struct Changes {
     pub expired: bool,
     /// False when the server cannot watch its folder: changes made on its disk are not seen.
     pub watching: bool,
+    /// When not watching: the server still finds changes by looking through its folders (within
+    /// seconds for changes made through OwnNAS, minutes for ones made on its disk), so they come
+    /// in `changes` as usual. False from servers that cannot: then the client must look itself.
+    #[serde(default)]
+    pub scanning: bool,
     pub changes: Vec<Change>,
 }
 

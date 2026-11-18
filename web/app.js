@@ -6460,6 +6460,7 @@ async function refreshHealth(fresh) {
   }) : [healthNode("p", "muted", "No drive reports were found.")]));
   $("health-drives-note").textContent = data.drivesNote || "";
   renderDatabaseHealth(data.database || []);
+  renderWatchHealth(data.watching);
   const system = data.system || {};
   const facts = [];
   if (system.host) facts.push(["Name", system.host]);
@@ -6485,6 +6486,61 @@ async function refreshHealth(fresh) {
 $("health-refresh").addEventListener("click", () => refreshHealth(true).catch((err) => toast(err.message, true)));
 
 const WAL_WARN = 1024 ** 3;
+
+/// Whether the shared folder is watched for changes; if not, why, and on Linux how many folders
+/// the system lets OwnNAS watch against how many the library has, with the command that fixes it.
+function renderWatchHealth(watch) {
+  if (!watch) {
+    $("health-watch").replaceChildren();
+    return;
+  }
+  const row = healthNode("div", `health-item level-${watch.level}`);
+  const head = healthNode("div", "health-head");
+  const stateText = watch.watching ? "Watching" : watch.turnedOff ? "Turned off" : "Not watching";
+  head.append(healthNode("strong", "", "Shared folder"), healthNode("span", `health-state state-${watch.watching ? watch.level : "low"}`, stateText));
+  row.append(head);
+  const facts = [];
+  if (watch.folders != null) facts.push(`${Number(watch.folders).toLocaleString()} folders`);
+  if (watch.limits) {
+    facts.push(`the system lets one user watch ${Number(watch.limits.maxUserWatches).toLocaleString()} (fs.inotify.max_user_watches)`);
+    if (watch.watching) facts.push(`${Number(watch.limits.inUse).toLocaleString()} watched by OwnNAS now`);
+  }
+  if (facts.length) row.append(healthNode("p", "muted", `${facts.join(" · ")}.`));
+  if (!watch.watching) {
+    const later = watch.scanning
+      ? "Changes still arrive, found by looking through the folders: a few seconds after ones made through OwnNAS, up to 5 minutes after ones made on the disk."
+      : "Changes made on the disk reach search and the sync apps only when they look again.";
+    if (watch.turnedOff) {
+      row.append(healthNode("p", "muted", `Turned off with --no-watch (for a shared folder on a network file system). ${later}`));
+    } else {
+      row.append(healthNode("p", "health-warning", `OwnNAS could not watch the shared folder${watch.error ? ` (${watch.error})` : ""}. ${later}`));
+    }
+  }
+  const tooMany = watch.limits && watch.folders != null && watch.folders * 10 >= watch.limits.maxUserWatches * 9;
+  if (watch.limits && watch.suggested && ((!watch.watching && !watch.turnedOff) || tooMany)) {
+    const why = watch.watching
+      ? "The library is close to the number of folders the system lets one user watch: folders added past it are not watched."
+      : "On Linux this is usually more folders than the system lets one user watch.";
+    row.append(healthNode("p", "", `${why} On the server, raise the limit, then restart OwnNAS:`));
+    const command = `echo fs.inotify.max_user_watches=${watch.suggested} | sudo tee /etc/sysctl.d/90-ownnas.conf && sudo sysctl --system`;
+    const line = healthNode("div", "health-command");
+    const code = healthNode("code", "", command);
+    const copy = healthNode("button", "", "Copy");
+    copy.type = "button";
+    copy.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(command);
+        toast("Command copied");
+      } catch {
+        toast("Could not copy: select the command instead", true);
+      }
+    });
+    line.append(code, copy);
+    row.append(line);
+    row.append(healthNode("p", "muted", "Each watched folder takes about 1 KB of the system's memory, only while watched."));
+  }
+  $("health-watch").replaceChildren(row);
+}
 
 function renderDatabaseHealth(files) {
   const labels = { data: "Your data", index: "Indexes" };
@@ -6551,6 +6607,7 @@ async function pollHealthAlerts() {
   }
   const texts = alerts.map((alert) => {
     if (alert.kind === "database") return `OwnNAS's database log (${alert.name}) has grown to ${formatSize(alert.size, false)}.${alert.indexingHeld ? " Indexing is paused until it can be emptied." : ""}${alert.holders?.length ? ` ${alert.holders.join(" and ")} has the database open, which stops that: close it, or keep it away from OwnNAS's data folder.` : ""}`;
+    if (alert.kind === "watch") return `OwnNAS cannot watch the shared folder for changes${alert.linux ? " (on Linux, usually too many folders for the system's limit)" : ""}: changes made on the server's disk take up to 5 minutes to show in search and the sync apps.`;
     if (alert.kind === "disk") return `The disk with ${alert.what} is ${alert.level === "full" ? "nearly full" : "getting full"}: ${formatSize(alert.free, false)} free (${Math.round((alert.free / (alert.total || 1)) * 100)}%).`;
     if (alert.kind === "backup") {
       const since = alert.lastSuccess ? ` The last one that worked was on ${new Date(alert.lastSuccess * 1000).toLocaleDateString()}.` : "";
