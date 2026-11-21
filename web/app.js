@@ -1035,6 +1035,7 @@ async function showListing(path, options, gen) {
   if (changedFolder || options.resetSearch) resetSearch();
   state.path = data.path || "";
   state.entries = data.entries || [];
+  state.note = data.note || null;
   state.truncated = !!data.truncated;
   state.total = data.total || state.entries.length;
   if (data.rootName) state.me.rootName = data.rootName;
@@ -1052,6 +1053,7 @@ async function showListing(path, options, gen) {
   if (!options.keepPreview) closePreview(true);
   renderCrumbs();
   syncUndo();
+  renderFolderNote();
   renderFiles();
   refreshStorage().catch(() => {});
   refreshAgentMarks().catch(() => {});
@@ -1287,6 +1289,7 @@ const MENU_ICONS = {
   mkdir: `${ICON_FOLDER} M8 8v5 M5.5 10.5H10.5`,
   folderWith: `${ICON_FOLDER} M8 8v5 M5.5 10.5H10.5`,
   newfile: `${ICON_FILE} M8 8v4 M6 10h4`,
+  describeFolder: "M3 4.5h10 M3 8h10 M3 11.5h6",
   folderAppearance: "M8 2a6 6 0 1 0 0 12c1 0 1.5-.6 1.5-1.4 0-.9-.8-1.1-.8-2 0-.8.7-1.3 1.6-1.3H12a2.5 2.5 0 0 0 2.5-2.5C14.5 4.3 11.6 2 8 2z M5 7.5h.01 M7 4.75h.01 M10 5h.01",
   protect: ICON_LOCK,
   protectMenu: ICON_LOCK,
@@ -1750,6 +1753,7 @@ function openSelectionMenu(x, y, pasteInto) {
       buttons.push(`<button type="button" data-menu="uploadsLog">Recent uploads…</button>`);
     }
     if (write && customizableFolder({ path: state.path, dir: true, kind: 'folder' })) buttons.push('<button type="button" data-menu="folderAppearance">Customize folder…</button>');
+    if (write && customizableFolder({ path: state.path, dir: true, kind: 'folder' })) buttons.push('<button type="button" data-menu="describeFolder">Describe this folder…</button>');
     if (state.me && state.me.admin && state.workspaceCount && state.path && !inTrash) buttons.push(`<button type="button" data-menu="showFolderInWorkspace">Show this folder in workspace…</button>`);
     if (write && !inTrash) buttons.push(`<button type="button" data-menu="sortFolder" title="Into sub-folders by date, kind, extension…">Sort into folders…</button>`);
     buttons.push(`<button type="button" data-menu="downloadZip">Download folder zip</button>`);
@@ -1799,6 +1803,7 @@ function openSelectionMenu(x, y, pasteInto) {
     if (one && !one.dir) buttons.push(`<button type="button" data-menu="versions">Versions…</button>`);
     if (one && canFindSimilar(one)) buttons.push(`<button type="button" data-menu="findSimilar">Find similar photos</button>`);
     if (write && entries.every(customizableFolder)) buttons.push(`<button type="button" data-menu="folderAppearance">${entries.length === 1 ? 'Customize folder…' : 'Customize folders…'}</button>`);
+    if (write && one && customizableFolder(one)) buttons.push(`<button type="button" data-menu="describeFolder">Describe this folder…</button>`);
     if (write && entries.length && !allInTrash) {
       if (entries.every((entry) => entry.protected === "self" || entry.protected === "contents")) {
         buttons.push(`<button type="button" data-menu="unprotect">Allow deletion</button>`);
@@ -2216,6 +2221,7 @@ async function refreshIndexing() {
   $("index-speed-admin").hidden = admin;
   $("files-index-status").textContent = describeFilesIndex(data.files);
   $("text-index-status").textContent = describeTextIndex(data.text);
+  refreshAskSettings().catch(() => {});
   $("index-status").textContent = describeIndexStatus(data.media);
   clearTimeout(indexingTimer);
   if (!$("settings").hidden && !$("settings-indexing").hidden) {
@@ -5279,14 +5285,6 @@ function joinRel(parent, name) {
   return parent ? `${parent}/${name}` : name;
 }
 
-async function createFolder() {
-  const name = (await askText("New folder", "Folder name", "New folder", "Create") || "").trim();
-  if (!name) return;
-  await api("/api/mkdir", { method: "POST", json: { path: state.path, name } });
-  toast("Folder created");
-  invalidateFolderSizes();
-  await load(state.path);
-}
 
 const NEW_FILE_KINDS = {
   docx: { label: "Word document", ext: "docx", defaultName: "Untitled" },
@@ -7274,6 +7272,7 @@ function runMenuAction(button, entries, pasteInto) {
   const action = button.getAttribute("data-menu");
   const one = entries.length === 1 ? entries[0] : null;
   if (action === "folderAppearance") customizeFolders(entries).catch(err => toast(err.message, true));
+  if (action === "describeFolder") describeFolder(one ? one.path : state.path).catch((err) => toast(err.message, true));
   if (action === "protect") setProtection(entries, true, format === "contents").catch((err) => toast(err.message, true));
   if (action === "unprotect") setProtection(entries, false).catch((err) => toast(err.message, true));
   if (action === "open" && one) openEntry(one).catch((err) => toast(err.message, true));
@@ -10018,6 +10017,7 @@ function resetSearch() {
 
 function clearDeepSearch() {
   state.searchHits = [];
+  showAskMode(false);
   const panel = $("search-panel");
   if (panel) panel.hidden = true;
   const box = $("search-results");
@@ -10033,8 +10033,8 @@ function syncSearchHint() {
   if (!hint) return;
   const ocr = !!(state.me && state.me.ocr);
   hint.innerHTML = ocr
-    ? `Searching this folder and below for partial file and folder names, tags, and text in documents (including PDFs and OCR’d images). Press Enter. Use <code>tag:family</code> for an exact tag, <code>size:&gt;100MB</code> or <code>size:10MB..1GB</code> for files by size.`
-    : `Searching this folder and below for partial file and folder names, tags, and text in documents (including PDFs). Install <code>tesseract</code> for image OCR (<button type="button" class="link-button" data-open-helpers>check what is installed</button>). Press Enter. Use <code>tag:family</code> for an exact tag, <code>size:&gt;100MB</code> or <code>size:10MB..1GB</code> for files by size.`;
+    ? `Searching this folder and below for partial file and folder names, folder descriptions, tags, and text in documents (including PDFs and OCR’d images). Press Enter. Use <code>tag:family</code> for an exact tag, <code>size:&gt;100MB</code> or <code>size:10MB..1GB</code> for files by size.`
+    : `Searching this folder and below for partial file and folder names, folder descriptions, tags, and text in documents (including PDFs). Install <code>tesseract</code> for image OCR (<button type="button" class="link-button" data-open-helpers>check what is installed</button>). Press Enter. Use <code>tag:family</code> for an exact tag, <code>size:&gt;100MB</code> or <code>size:10MB..1GB</code> for files by size.`;
 }
 
 $("search-hint").addEventListener("click", (event) => {
@@ -10068,6 +10068,7 @@ async function runDeepSearch() {
   const panel = $("search-panel");
   const box = $("search-results");
   panel.hidden = false;
+  showAskMode(false);
   syncSearchHint();
   box.replaceChildren(loadingStatus("Searching…"));
   try {
@@ -10114,6 +10115,7 @@ function renderSearchHits() {
       const folder = parentPath(hit.path);
       const extras = [];
       if (hit.matchedTag) extras.push(`<span class="tag-chip mini">#${esc(hit.matchedTag)}</span>`);
+      if (hit.description) extras.push(`<span class="search-hit-description${hit.matchedDescription ? " matched" : ""}" title="${esc(hit.description)}">${esc(hit.description)}</span>`);
       if (hit.matchedContent) extras.push(`<span class="search-hit-snippet" title="${esc(hit.matchedContent)}">${esc(hit.matchedContent)}</span>`);
       const model = kind === "model3d" ? `<span class="model-thumbnail" data-model-path="${esc(hit.path)}" data-model-name="${esc(name)}" data-model-modified="${hit.modified || 0}" data-model-size="${hit.size || 0}"><span class="glyph kind-model3d" aria-hidden="true">${typeIcon("model3d")}</span></span>` : "";
       const image = !hit.dir && (kind === "image" || kind === "video" || kind === "svg")
@@ -10503,3 +10505,237 @@ window.addEventListener("beforeunload", event => { if (state.editor?.dirty) { ev
 
 // Moving thumbnails for Live and Motion Photos, in the Gallery and the file list.
 import("/assets/motion-thumbs.js").then((module) => module.start()).catch(() => {});
+
+// ---- Folder descriptions and Ask (folder_notes.rs, folder_ask.rs) ----
+
+/// A folder that can have a description: inside the library, outside the Trash.
+function describableFolder(path) {
+  return !!path && !inTrashPath(path);
+}
+
+/// The New folder and Describe dialog. `create` asks for a name too. Resolves to
+/// { name, description, leaveOut } or null when cancelled.
+function folderNoteDialog({ create = false, path = "", name = "", description = "", leaveOut = false, inherited = null } = {}) {
+  const dialog = $("folder-note-dialog");
+  $("folder-note-title").textContent = create ? "New folder" : `Describe “${path.split("/").pop()}”`;
+  $("folder-note-name-row").hidden = !create;
+  $("folder-note-name").value = name;
+  $("folder-note-name").required = create;
+  $("folder-note-text").value = description;
+  $("folder-note-leave").checked = leaveOut;
+  $("folder-note-suggest").hidden = create;
+  $("folder-note-ok").textContent = create ? "Create" : "Save";
+  const hint = $("folder-note-inherited");
+  hint.hidden = !inherited;
+  hint.textContent = inherited ? `Without one, it belongs to “${libraryPath(inherited.path)}”: ${inherited.description}` : "";
+  const suggest = async () => {
+    const button = $("folder-note-suggest");
+    button.disabled = true;
+    try {
+      const { draft } = await api(`/api/folder-note/suggest?path=${encodeURIComponent(path)}`);
+      if (!draft) { toast("Nothing to suggest from yet: the folder is empty or not indexed"); return; }
+      const box = $("folder-note-text");
+      box.value = box.value.trim() ? `${box.value.trim()}\n${draft}` : draft;
+      box.focus();
+    } catch (err) {
+      toast(err.message, true);
+    } finally {
+      button.disabled = false;
+    }
+  };
+  $("folder-note-suggest").onclick = () => { suggest(); };
+  dialog.returnValue = "";
+  dialog.showModal();
+  (create ? $("folder-note-name") : $("folder-note-text")).focus();
+  if (create) $("folder-note-name").select();
+  return new Promise((resolve) => {
+    dialog.addEventListener("close", () => {
+      if (dialog.returnValue !== "ok") { resolve(null); return; }
+      resolve({ name: $("folder-note-name").value.trim(), description: $("folder-note-text").value.trim(), leaveOut: $("folder-note-leave").checked });
+    }, { once: true });
+  });
+}
+
+async function createFolder() {
+  const answer = await folderNoteDialog({ create: true, name: "New folder" });
+  if (!answer || !answer.name) return;
+  await api("/api/mkdir", { method: "POST", json: { path: state.path, name: answer.name, description: answer.description || null } });
+  const made = joinRel(state.path, answer.name);
+  if (answer.leaveOut) await api("/api/folder-note", { method: "POST", json: { path: made, leaveOut: true } }).catch(() => {});
+  toast(answer.description ? "Folder created and described" : "Folder created");
+  invalidateFolderSizes();
+  await load(state.path);
+}
+
+/// Describe this folder…: writes or changes its description, and whether Ask leaves it out.
+async function describeFolder(path) {
+  const note = await api(`/api/folder-note?path=${encodeURIComponent(path)}`);
+  if (!note.canEdit) { toast("This account cannot change this folder", true); return; }
+  const own = note.own || {};
+  const answer = await folderNoteDialog({ path, description: own.description || "", leaveOut: !!own.leaveOut, inherited: note.inherited });
+  if (!answer) return;
+  await api("/api/folder-note", { method: "POST", json: { path, description: answer.description, leaveOut: answer.leaveOut } });
+  toast(answer.description ? "Description saved" : "Description removed");
+  await load(state.path, { keepSelection: true, keepPreview: true });
+}
+
+/// The top of the folder view: its description, or the one it belongs to above it.
+function renderFolderNote() {
+  const box = $("folder-note");
+  const note = state.note;
+  const own = note && note.own && note.own.description ? note.own : null;
+  const inherited = !own && note && note.inherited ? note.inherited : null;
+  const leftOut = note && note.leftOutBy;
+  const write = state.me && !state.me.readonly && describableFolder(state.path);
+  if (!own && !inherited && !leftOut) {
+    box.hidden = true;
+    box.replaceChildren();
+    return;
+  }
+  box.hidden = false;
+  const parts = [];
+  if (own) parts.push(`<p class="folder-note-text">${esc(own.description)}</p>`);
+  if (inherited) parts.push(`<p class="folder-note-text folder-note-from">Part of <button type="button" class="link-button" data-note-go="${esc(inherited.path)}">${esc(libraryPath(inherited.path))}</button>: ${esc(inherited.description)}</p>`);
+  const meta = [];
+  if (leftOut) meta.push(leftOut === state.path ? "Left out of Ask" : `Left out of Ask with “${esc(libraryPath(leftOut))}”`);
+  if (own && own.updatedBy) meta.push(`Described by ${esc(own.updatedBy)}, ${esc(formatDate(own.updatedAt))}`);
+  if (write) meta.push(`<button type="button" class="link-button" data-note-edit>${own ? "Edit" : "Describe this folder…"}</button>`);
+  if (meta.length) parts.push(`<p class="folder-note-meta muted">${meta.join(" · ")}</p>`);
+  box.innerHTML = parts.join("");
+}
+
+$("folder-note").addEventListener("click", (event) => {
+  const goTo = event.target.closest("[data-note-go]");
+  if (goTo) { go(goTo.dataset.noteGo).catch((err) => toast(err.message, true)); return; }
+  if (event.target.closest("[data-note-edit]")) describeFolder(state.path).catch((err) => toast(err.message, true));
+});
+
+/// Ask: the question in the search box, answered with described folders and files in them.
+async function runAsk() {
+  const q = ($("search").value || "").trim();
+  if (!q) {
+    focusSearch();
+    toast("Type a question in the search box, then choose Ask");
+    return;
+  }
+  if (state.searchController) state.searchController.abort();
+  const controller = new AbortController();
+  state.searchController = controller;
+  $("search-panel").hidden = false;
+  showAskMode(true);
+  $("search-hint").textContent = "";
+  const box = $("search-results");
+  box.replaceChildren(loadingStatus("Looking through the described folders…"));
+  try {
+    const data = await api(`/api/ask?path=${encodeURIComponent(state.path)}&q=${encodeURIComponent(q)}`, { signal: controller.signal });
+    if (state.searchController !== controller) return;
+    renderAsk(data);
+  } catch (err) {
+    if (state.searchController !== controller) return;
+    box.innerHTML = `<span class="search-message muted">${esc(isCancelError(err) ? "Cancelled" : (err.message || "Ask failed"))}</span>`;
+  } finally {
+    if (state.searchController === controller) state.searchController = null;
+  }
+}
+
+function renderAsk(data) {
+  const folders = data.folders || [];
+  state.searchHits = [];
+  for (const folder of folders) {
+    state.searchHits.push({ path: folder.path, name: folder.name, dir: true, kind: "folder" });
+    for (const file of folder.files) state.searchHits.push({ ...file, dir: false });
+  }
+  $("search-hint").textContent = data.byMeaning
+    ? "Described folders closest in meaning to the question, with the files in each that fit it best."
+    : `Described folders whose description or files have the question’s words.${data.modelOn ? " Matching by meaning starts once the model is downloaded." : " An administrator can turn on matching by meaning in Settings → Indexing → Ask."}`;
+  const box = $("search-results");
+  if (!folders.length) {
+    box.innerHTML = `<span class="search-message muted">No described folder matches. Describe folders from their right-click menu (Describe this folder…) so Ask can find them.</span>`;
+    return;
+  }
+  box.innerHTML = folders.map((folder) => {
+    const where = parentPath(folder.path) || (state.me && state.me.rootName) || "Library";
+    const files = folder.files.map((file) => `<li><button type="button" class="ask-file" data-hit="${esc(file.path)}" data-dir="0" title="${esc(file.path)}">
+        <span class="glyph kind-${esc(file.kind || "file")}" aria-hidden="true">${entryIcon({ ...file, dir: false })}</span>
+        <span class="ask-file-name">${esc(file.name)}</span>
+        <span class="ask-file-where muted">${esc(parentPath(file.path).slice(folder.path.length + 1))}</span>
+        ${file.snippet ? `<span class="search-hit-snippet">${esc(file.snippet)}</span>` : ""}
+      </button></li>`).join("");
+    return `<section class="ask-folder">
+      <button type="button" class="ask-folder-head" data-hit="${esc(folder.path)}" data-dir="1" title="Open ${esc(folder.path)}">
+        <span class="glyph kind-folder" aria-hidden="true">${entryIcon({ path: folder.path, name: folder.name, dir: true, kind: "folder" })}</span>
+        <span class="ask-folder-name">${esc(folder.name)}</span>
+        <span class="ask-folder-where muted">${esc(where)}</span>
+      </button>
+      <p class="ask-folder-description">${esc(folder.description)}</p>
+      ${files ? `<ul class="ask-files">${files}</ul>` : ""}
+    </section>`;
+  }).join("");
+}
+
+$("ask-btn").addEventListener("click", () => { runAsk(); });
+
+/// The results panel as Ask's answer (one folder under another, no sorting) or as search's.
+function showAskMode(on) {
+  const title = $("search-panel-title");
+  if (!title) return;
+  title.textContent = on ? "Ask" : "Search results";
+  $("search-results").classList.toggle("ask-results", on);
+  $("search-sort").closest("label").hidden = on;
+}
+
+// Settings → Indexing → Ask: matching by meaning, and the languages (which choose the model).
+async function refreshAskSettings() {
+  const data = await api("/api/ask/settings");
+  const admin = !!data.canChange;
+  $("ask-model").checked = data.enabled;
+  $("ask-model").disabled = !admin || !data.available;
+  $("ask-admin").hidden = admin;
+  const model = data.model;
+  const other = data.models.find((candidate) => candidate.id !== model.id);
+  $("ask-model-info").textContent = data.available
+    ? ` For the languages below: ${model.name}, ${megabytes(model.size)} to download once; understands ${model.languages}. ${model.why} (${other.name}, ${megabytes(other.size)}, is used ${other.multilingual ? "when any language besides English is on" : "when only English is on"}.)`
+    : " Not available on this device: Ask goes by the words of the question.";
+  const index = data.index || {};
+  let line = "";
+  if (data.enabled && data.download && data.download.downloading) line = `Downloading ${model.name}… ${Math.round(100 * (data.download.done || 0) / (data.download.total || 1))}%`;
+  else if (data.enabled && data.download && data.download.error) line = `The download stopped: ${data.download.error}`;
+  else if (data.enabled && !data.ready) line = "Waiting for the model…";
+  else if (data.enabled) line = index.working ? `Reading descriptions… ${index.ready} of ${index.described}` : `${index.ready} of ${index.described} described folders ready${index.error ? ` (${index.error})` : ""}.`;
+  $("ask-state").textContent = line;
+  const list = $("ask-language-list");
+  // Built again only when it changes, so a refresh never takes a click away.
+  const key = `${admin}:${data.languages.join(",")}`;
+  if (list.dataset.key !== key) {
+    list.dataset.key = key;
+    list.replaceChildren(...data.offered.map((language) => {
+    const label = document.createElement("label");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = language.code;
+    input.checked = data.languages.includes(language.code);
+    input.disabled = !admin;
+    label.append(input, ` ${language.name}`);
+    return label;
+  }));
+  }
+  clearTimeout(refreshAskSettings.timer);
+  if (!$("settings").hidden && !$("settings-indexing").hidden && data.enabled && (!data.ready || index.working)) {
+    refreshAskSettings.timer = setTimeout(() => refreshAskSettings().catch(() => {}), 1500);
+  }
+}
+
+async function saveAskSettings(change) {
+  try {
+    await api("/api/ask/settings", { method: "POST", json: change });
+  } catch (err) {
+    toast(err.message, true);
+  }
+  refreshAskSettings().catch(() => {});
+}
+
+$("ask-model").addEventListener("change", (event) => saveAskSettings({ enabled: event.target.checked }));
+$("ask-language-list").addEventListener("change", () => {
+  const languages = [...$("ask-language-list").querySelectorAll("input:checked")].map((input) => input.value);
+  saveAskSettings({ languages: languages.length ? languages : ["en"] });
+});

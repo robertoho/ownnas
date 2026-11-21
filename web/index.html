@@ -147,6 +147,7 @@
             <path d="M10.5 10.5 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
           </svg>
         </button>
+        <button id="ask-btn" class="ask-btn" type="button" title="Ask which folder holds something, in plain language (descriptions of folders)" aria-label="Ask which folder holds something">Ask</button>
       </div>
       <div class="toolbar-controls">
         <label class="sort-label">Sort
@@ -298,7 +299,7 @@
       <section id="search-panel" class="search-panel" hidden>
         <div class="search-panel-head">
           <div>
-            <strong>Search results</strong>
+            <strong id="search-panel-title">Search results</strong>
             <p id="search-hint" class="muted search-hint"></p>
           </div>
           <div class="search-panel-actions">
@@ -316,6 +317,8 @@
         </div>
         <div id="search-results" class="search-results"></div>
       </section>
+
+      <div id="folder-note" class="folder-note" hidden></div>
 
       <div id="health-alert" class="health-alert" role="alert" hidden>
         <span id="health-alert-text"></span>
@@ -501,6 +504,16 @@
       <h3>Words inside files</h3>
       <p class="muted">OwnNAS also reads the words in text files, PDFs, Word, Excel, PowerPoint, OpenDocument and Pages files, e-books, and emails (and, when tesseract is installed, photos and scans), so a search finds them by what they say. It reads new and changed files after each look for changes. Until a file is read, a search reads it as it goes, which is slower.</p>
       <p id="text-index-status" class="index-status"></p>
+      <h3 id="ask-heading">Ask</h3>
+      <p class="muted">Ask, beside the search box, answers a question in plain language (“where are the car wash permits from 2021?”) with the described folders that match it best, and the files in them that fit. Describe folders from their right-click menu, or when you make them. With matching by meaning on, a small model on this computer compares questions and descriptions (no chatbot; nothing leaves the server); otherwise Ask goes by the words of the question.</p>
+      <label class="smart-option"><input type="checkbox" id="ask-model">
+        <span><strong>Match questions by meaning</strong><span id="ask-model-info" class="muted"></span><span id="ask-state" class="smart-state"></span></span>
+      </label>
+      <fieldset id="ask-languages" class="ask-languages">
+        <legend>Languages of descriptions and questions</legend>
+        <div id="ask-language-list" class="ask-language-list"></div>
+      </fieldset>
+      <p id="ask-admin" class="muted" hidden>Only an administrator can change these.</p>
       <h3>Photos and videos</h3>
       <p id="index-status" class="muted index-status"></p>
       <button id="index-rescan" type="button">Reindex everything</button>
@@ -664,6 +677,25 @@
       <div class="dialog-actions">
         <button id="text-cancel" value="cancel" type="submit" formnovalidate>Cancel</button>
         <button id="text-ok" value="ok" type="submit">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="folder-note-dialog" class="folder-note-dialog">
+    <form method="dialog" id="folder-note-form">
+      <h3 id="folder-note-title">Describe this folder</h3>
+      <label id="folder-note-name-row">Folder name<input id="folder-note-name" autocomplete="off"></label>
+      <label for="folder-note-text">Description (optional)</label>
+      <textarea id="folder-note-text" rows="4" maxlength="2000" placeholder="What it holds: the subject, for whom, which years…"></textarea>
+      <p class="muted folder-note-help">Search and Ask find the folder by these words. The folders inside it need no description of their own: they belong to this one.</p>
+      <p id="folder-note-inherited" class="muted folder-note-inherited" hidden></p>
+      <div class="folder-note-tools">
+        <button id="folder-note-suggest" type="button" title="A draft from the subfolders, file names and kinds, and the words most found in its files">Suggest</button>
+        <label class="folder-note-leave"><input type="checkbox" id="folder-note-leave"> Leave out of Ask <span class="muted">(it and everything in it, for noise or private folders)</span></label>
+      </div>
+      <div class="dialog-actions">
+        <button value="cancel" type="submit" formnovalidate>Cancel</button>
+        <button id="folder-note-ok" value="ok" type="submit">Save</button>
       </div>
     </form>
   </dialog>

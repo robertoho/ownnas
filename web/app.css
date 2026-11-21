@@ -4962,3 +4962,35 @@ body.is-remotes .app > .explorer-status-bar { display: none; }
 /* The Refresh button turns while the folder is listed again. */
 #refresh-btn.is-spinning svg { animation: refresh-spin 0.7s linear infinite; }
 @keyframes refresh-spin { to { transform: rotate(360deg); } }
+
+/* Folder descriptions and Ask */
+.ask-btn { flex: 0 0 auto; height: 2.15rem; padding: 0 0.8rem; font-size: 0.85rem; white-space: nowrap; }
+.folder-note { margin: 0 0 0.9rem; padding: 0.65rem 0.85rem; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 8px; background: var(--bg-2); }
+.folder-note p { margin: 0; }
+.folder-note-text { white-space: pre-line; line-height: 1.45; }
+.folder-note-from { color: var(--muted); }
+.folder-note-meta { margin-top: 0.35rem !important; font-size: 0.8rem; }
+.folder-note-dialog { width: min(34rem, calc(100vw - 2rem)); }
+.folder-note-dialog form { display: grid; gap: 0.55rem; }
+.folder-note-dialog textarea { width: 100%; box-sizing: border-box; resize: vertical; min-height: 5.5rem; font: inherit; padding: 0.5rem; background: var(--input-bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; }
+.folder-note-help, .folder-note-inherited { margin: 0; font-size: 0.82rem; }
+.folder-note-tools { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: center; }
+.folder-note-leave { display: flex; gap: 0.4rem; align-items: baseline; font-size: 0.88rem; }
+.search-hit-description { font-size: 0.78rem; color: var(--text); opacity: 0.85; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+.search-hit-description.matched { border-left: 2px solid var(--accent); padding-left: 0.35rem; }
+.search-results.ask-results { display: block; }
+.ask-folder { padding: 0.7rem 0.8rem; border: 1px solid var(--line); border-radius: 8px; background: var(--bg-2); margin-bottom: 0.6rem; }
+.ask-folder-head, .ask-file { display: flex; gap: 0.5rem; align-items: center; justify-content: flex-start; width: 100%; height: auto; min-height: 0; text-align: left; background: none; border: 0; padding: 0.2rem 0.1rem; color: inherit; cursor: pointer; flex-wrap: wrap; }
+.ask-folder-head:hover .ask-folder-name, .ask-file:hover .ask-file-name { text-decoration: underline; }
+.ask-folder-name { font-weight: 600; }
+.ask-folder-where, .ask-file-where { font-size: 0.8rem; }
+.ask-folder-description { margin: 0.2rem 0 0.4rem 1.9rem; white-space: pre-line; line-height: 1.4; }
+.ask-files { list-style: none; margin: 0 0 0 1.9rem; padding: 0; display: grid; gap: 0.1rem; }
+.ask-file .search-hit-snippet { flex-basis: 100%; margin-left: 1.6rem; }
+.ask-folder .glyph { flex: 0 0 1.4rem; width: 1.4rem; height: 1.4rem; display: inline-flex; align-items: center; justify-content: center; }
+.ask-folder .glyph svg { width: 18px; height: 18px; }
+.ask-folder-description { text-align: left; }
+.ask-languages { border: 1px solid var(--line); border-radius: 8px; padding: 0.5rem 0.8rem 0.7rem; margin: 0.6rem 0; }
+.ask-languages legend { padding: 0 0.3rem; font-size: 0.88rem; }
+.ask-language-list label { display: flex; flex-direction: row; gap: 0.4rem; align-items: center; margin: 0; }
+.ask-language-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr)); gap: 0.25rem 0.8rem; font-size: 0.88rem; }

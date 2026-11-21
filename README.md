@@ -393,6 +393,17 @@ Right-click a folder, or the empty space inside one, and choose **Sort into fold
 - **Convert to… JPEG** works for HEIC, HEIF and AVIF photos too, keeping their details, through `sips` on a Mac or `heif-convert` (or `ffmpeg`) elsewhere.
 - The preview of a photo or video shows its **Photo details**: when and where it was taken, the camera and lens, the exposure, and every EXIF field.
 
+## Folder descriptions and Ask
+
+For a large, well-ordered library where rarely used documents are hard to find again. Give the folders that matter a description, such as "Analiza wydawanych pozwoleń na budowę myjni w okresie 2019-2025": in **New folder**, or later with **Describe this folder…** in a folder's right-click menu. **Suggest** there drafts one from the subfolders, the kinds and names of the files, and the words most found in their text (no model), for you to edit.
+
+- The description shows at the top of the folder. Folders inside it need none of their own: they belong to the nearest described folder above, which their view names. Descriptions follow renames and moves, and go to the Trash and back with their folder.
+- The search box finds folders by any word of their description, or part of a word, with or without accents ("pozwolen" finds "pozwoleń"); they come first, with the description.
+- **Ask**, beside the search box, takes a question in plain language ("where are the car wash permits from 2021?") and answers with the 3–5 described folders that match it best, each with its description and the few files inside that fit the question (picked by its words, in names and in the files' text). It is not a chatbot, and nothing leaves the server.
+- **Leave out of Ask** (in the same dialog) keeps a folder and everything in it out of Ask's answers, for noise or private folders. Accounts limited to some folders, and agent keys, are only answered with what they may see.
+- **Matching by meaning** (Settings → Indexing → Ask, administrators): a small sentence model runs on the processor and is downloaded once when this is switched on, its files checked against pinned hashes. Which one depends on the **languages** turned on (English by default): with English alone, **all-MiniLM-L6-v2** (23 MB); with any other language, **multilingual-e5-small** (135 MB, about 100 languages), so a question in Spanish finds a description written in Polish. Changing the model reads every description again, in the background at the indexing speed. With it off, Ask goes by the words of the question.
+- AI agents can use both over MCP: `ask_folders` and `folder_descriptions`.
+
 ## Notes
 
 **Notes** (the notes icon at the top) shows quick notes and checklists as cards, like Google Keep, but each note is a plain Markdown file in one library folder (`Notes` unless an administrator picks another with the folder button). So notes open in Obsidian or any editor, sync with the desktop client, keep their earlier versions, and go to the Trash like any other file.
@@ -410,7 +421,7 @@ Right-click a folder, or the empty space inside one, and choose **Sort into fold
 
 AI agents such as Claude reach the library over MCP at `https://<server>/mcp` with an agent key. An administrator makes keys in **Settings → Agents**, choosing which folders each one can use and what it can do there:
 
-- **Read:** list folders and search them (by name, words inside, tag, or size); read text, documents and PDFs (and the text read from photos); read spreadsheets and CSV files as cells; look at photos (large enough to read a photographed page); see a file's details and earlier versions; see what changed lately and what takes up space; and find photos by what they show, by similar look, by date, by album, or by the people in them.
+- **Read:** list folders and search them (by name, words inside, tag, or size); read text, documents and PDFs (and the text read from photos); read spreadsheets and CSV files as cells; look at photos (large enough to read a photographed page); see a file's details and earlier versions; see what changed lately and what takes up space; ask where something is kept, from the folders' descriptions; and find photos by what they show, by similar look, by date, by album, or by the people in them.
 - **Read and organise:** everything above, plus tagging, making folders, renaming, moving, moving to the Trash, and arranging albums. Nothing is ever deleted for good, protected files are left alone, and a key's own folders cannot be renamed, moved or put in the Trash.
 - **Read, organise and write:** everything above, plus making text files, changing a passage in one, adding rows to CSV and TSV files, and copying. Before a file changes, what it held is kept in its history.
 
