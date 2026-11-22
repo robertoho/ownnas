@@ -12004,6 +12004,23 @@ mod tests {
         }
         let cy = sign_in("cy", "longenough3").await;
         assert_eq!(status(send(&cy, "POST", "/api/gallery/dates", Some(json!({ "paths": ["Family/Photos/a.jpg"], "automatic": true }))).await.unwrap()), StatusCode::FORBIDDEN, "a read-only account");
+        // Folder descriptions and Ask: only the account's folders, whether described, searched or asked.
+        let note = |path: &str, text: &str| json!({ "path": path, "description": text });
+        assert_eq!(status(send(&ada, "POST", "/api/folder-note", Some(note("Other", "Hidden plans for the harbour project"))).await.unwrap()), StatusCode::OK);
+        assert_eq!(status(send(&ada, "POST", "/api/folder-note", Some(note("Family/Photos", "Holiday pictures from the harbour"))).await.unwrap()), StatusCode::OK);
+        assert_eq!(status(send(&bo, "GET", "/api/folder-note?path=Other", None).await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(send(&bo, "GET", "/api/folder-note/suggest?path=Other", None).await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(send(&bo, "POST", "/api/folder-note", Some(note("Other", "mine now"))).await.unwrap()), StatusCode::NOT_FOUND);
+        assert_eq!(status(send(&bo, "POST", "/api/folder-note", Some(note("Work", "read only here"))).await.unwrap()), StatusCode::FORBIDDEN);
+        assert_eq!(status(send(&cy, "POST", "/api/folder-note", Some(note("Family/Photos", "read-only account"))).await.unwrap()), StatusCode::FORBIDDEN);
+        let found = json_of(send(&bo, "GET", "/api/search?q=harbour", None).await.unwrap()).await;
+        assert!(!found.to_string().contains("Other"), "a described folder outside its folders: {found}");
+        assert!(found.to_string().contains("Family/Photos"), "its own described folder: {found}");
+        let asked = json_of(send(&bo, "GET", "/api/ask?q=harbour%20plans", None).await.unwrap()).await;
+        assert!(!asked.to_string().contains("Other") && !asked.to_string().contains("Hidden plans"), "{asked}");
+        let asked = json_of(send(&ada, "GET", "/api/ask?q=harbour%20plans", None).await.unwrap()).await;
+        assert!(asked.to_string().contains("Other"), "the whole library: {asked}");
+        assert_eq!(status(send(&bo, "POST", "/api/ask/settings", Some(json!({ "enabled": true }))).await.unwrap()), StatusCode::FORBIDDEN, "admins only");
 
         // Versions, by path and by id.
         json_of(send(&ada, "POST", "/api/write", Some(json!({ "path": "Other/secret.txt", "content": "secret 2" }))).await.unwrap()).await;
