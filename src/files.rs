@@ -1602,6 +1602,12 @@ pub struct SearchHit {
     pub matched_tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_content: Option<String>,
+    /// A folder's description (`folder_notes`), shown with it; `matched_description` when the
+    /// search found it there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub matched_description: bool,
 }
 
 #[derive(Serialize)]
@@ -1732,6 +1738,8 @@ pub fn search_listed(
             modified: modified_secs(&meta),
             matched_tag: None,
             matched_content,
+            description: None,
+            matched_description: false,
         });
     };
     for (rel, _) in &names {
@@ -1912,6 +1920,8 @@ fn walk_folder_search(
                         modified: modified_secs(&meta),
                         matched_tag: None,
                         matched_content: None,
+                        description: None,
+                        matched_description: false,
                     });
                 }
             }
@@ -1986,6 +1996,8 @@ fn walk_search(
                     modified: modified_secs(&meta),
                     matched_tag: None,
                     matched_content: content_hit,
+                    description: None,
+                    matched_description: false,
                 });
             }
             if dir && !search_skips(&name) {

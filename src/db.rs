@@ -929,6 +929,8 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         conn.execute("UPDATE media_index SET mtime = -1 WHERE date_source = 'file'", [])
             .map_err(|_| "Could not update the photo index".to_string())?;
     }
+    crate::folder_notes::ensure(conn)?;
+    crate::folder_ask::ensure(conn)?;
     // An index database deleted to be rebuilt: the name index is not complete any more.
     conn.execute(
         "DELETE FROM settings WHERE key = ?1 AND NOT EXISTS (SELECT 1 FROM file_index)",
@@ -1899,7 +1901,7 @@ pub fn rewrite_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), 
         );
     }
     // Albums keep the photos they hold, wherever they move (into the Trash and back too).
-    for (table, column) in [("album_items", "path"), ("albums", "cover_path"), ("media_index", "path"), ("timeline_hidden", "path"), ("photo_dates", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path"), ("file_hashes", "path"), ("content_text", "path"), ("file_versions", "path"), ("workspace_folders", "folder"), ("workspace_items", "path")] {
+    for (table, column) in [("album_items", "path"), ("albums", "cover_path"), ("media_index", "path"), ("timeline_hidden", "path"), ("photo_dates", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path"), ("file_hashes", "path"), ("content_text", "path"), ("file_versions", "path"), ("workspace_folders", "folder"), ("workspace_items", "path"), ("folder_notes", "path")] {
         conn.execute(
             &format!(
                 "UPDATE OR REPLACE {table} SET {column} = CASE WHEN {column} = ?1 THEN ?2 ELSE ?2 || substr({column}, length(?1) + 1) END
@@ -1926,6 +1928,14 @@ pub fn copy_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), Str
          ON CONFLICT(path) DO UPDATE SET color = excluded.color, icon = excluded.icon",
         params![from, to],
     ).map_err(|_| "Could not copy folder appearance".to_string())?;
+    conn.execute(
+        "INSERT INTO folder_notes(path, description, leave_out, updated_at, updated_by)
+         SELECT CASE WHEN path = ?1 THEN ?2 ELSE ?2 || substr(path, length(?1) + 1) END, description, leave_out, updated_at, updated_by
+         FROM folder_notes WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')
+         ON CONFLICT(path) DO NOTHING",
+        params![from, to],
+    ).map_err(|_| "Could not copy folder descriptions".to_string())?;
+    crate::folder_notes::reindex_missing(conn)?;
     let start = (from.len() + 1) as i64;
     conn.execute(
         "INSERT INTO file_tags(path, tag, created_at)
@@ -2183,6 +2193,10 @@ pub fn delete_path_meta(conn: &Connection, path: &str) -> Result<(), String> {
         "DELETE FROM folder_appearance WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
         params![path],
     ).map_err(|_| "Could not remove folder appearance".to_string())?;
+    conn.execute(
+        "DELETE FROM folder_notes WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![path],
+    ).map_err(|_| "Could not remove a folder description".to_string())?;
     conn.execute(
         "DELETE FROM agent_key_folders WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
         params![path],

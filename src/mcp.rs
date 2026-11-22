@@ -273,6 +273,7 @@ fn tools(key: &AgentKey) -> Value {
     all.extend(mcp_photos::tools());
     all.extend(mcp_files::tools());
     all.extend(crate::mcp_notes::tools());
+    all.extend(crate::mcp_ask::tools());
     if key.can_organise() {
         all.extend(mcp_organise::tools());
     }
@@ -303,6 +304,8 @@ fn output_schema(name: &str) -> Option<Value> {
     Some(match name {
         "list_folder" => object(json!({ "path": string, "more": boolean, "entries": list_of(json!({ "name": string, "path": string, "dir": boolean, "kind": string, "size": integer, "modified": integer, "tags": strings })) })),
         "search" => object(json!({ "more": boolean, "hits": list_of(json!({ "path": string })) })),
+        "ask_folders" => object(json!({ "byMeaning": boolean, "folders": list_of(json!({ "path": string, "description": string, "files": list_of(json!({ "path": string })) })) })),
+        "folder_descriptions" => object(json!({ "more": boolean, "folders": list_of(json!({ "path": string, "description": string })) })),
         "read_text" | "read_version" => object(json!({ "path": string, "offset": integer, "nextOffset": { "type": ["integer", "null"] }, "totalBytes": integer })),
         "get_info" => object(json!({ "name": string, "path": string, "dir": boolean, "kind": string, "size": { "type": ["integer", "null"] }, "modified": { "type": ["integer", "null"] }, "tags": strings, "protected": boolean })),
         "read_table" => object(json!({ "path": string, "sheet": string, "firstRow": integer, "more": boolean, "rows": { "type": "array", "items": strings }, "sheets": list_of(json!({ "name": string, "rows": integer, "columns": integer })) })),
@@ -326,6 +329,7 @@ pub fn catalog() -> Value {
     reading.extend(mcp_photos::tools());
     reading.extend(mcp_files::tools());
     reading.extend(crate::mcp_notes::tools());
+    reading.extend(crate::mcp_ask::tools());
     json!({ "read": brief(reading), "organise": brief(mcp_organise::tools()), "write": brief(crate::mcp_write::tools()) })
 }
 
@@ -510,6 +514,7 @@ async fn call_tool(state: &Arc<AppState>, key: &AgentKey, params: &Value) -> Res
             Some(outcome) => outcome,
             None if mcp_files::tools().iter().any(|tool| tool["name"] == other) => mcp_files::call(state, key, other, &args).await.unwrap_or_else(|| failed("Unknown tool")),
             None if crate::mcp_notes::tools().iter().any(|tool| tool["name"] == other) => crate::mcp_notes::call(state, key, other, &args).await.unwrap_or_else(|| failed("Unknown tool")),
+            None if crate::mcp_ask::tools().iter().any(|tool| tool["name"] == other) => crate::mcp_ask::call(state, key, other, &args).await.unwrap_or_else(|| failed("Unknown tool")),
             None => match mcp_organise::call(state, key, other, &args).await {
                 Some(outcome) => outcome,
                 None => return Err((-32602, "Unknown tool".to_string())),

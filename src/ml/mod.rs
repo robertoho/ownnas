@@ -1,9 +1,11 @@
-//! On-device machine learning for the Gallery: describing photos so they can be searched by
-//! what they show (CLIP), and finding and recognizing faces (YuNet + SFace). Everything runs on
-//! this computer; the models are downloaded once, when a feature is switched on.
+//! On-device machine learning: describing photos so they can be searched by what they show
+//! (CLIP), finding and recognizing faces (YuNet + SFace), and matching questions with folder
+//! descriptions by meaning (Ask: MiniLM or multilingual e5). Everything runs on this computer;
+//! the models are downloaded once, when a feature is switched on.
 
 pub mod clip;
 pub mod faces;
+pub mod text;
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -21,6 +23,10 @@ pub enum Feature {
     Search,
     /// Finding faces and grouping them into people.
     Faces,
+    /// Ask, with only English turned on (all-MiniLM-L6-v2).
+    AskEnglish,
+    /// Ask, with any other language turned on (multilingual-e5-small).
+    AskMultilingual,
 }
 
 impl Feature {
@@ -28,13 +34,21 @@ impl Feature {
         match self {
             Self::Search => "ml_search",
             Self::Faces => "ml_faces",
+            Self::AskEnglish | Self::AskMultilingual => crate::folder_ask::SETTING_ON,
         }
+    }
+
+    /// The download behind one of Ask's models (`folder_ask::model_for`).
+    pub fn for_text_model(model: &crate::folder_ask::TextModel) -> Self {
+        if model.multilingual { Self::AskMultilingual } else { Self::AskEnglish }
     }
 
     fn files(self) -> &'static [ModelFile] {
         match self {
             Self::Search => &SEARCH_FILES,
             Self::Faces => &FACE_FILES,
+            Self::AskEnglish => &ASK_ENGLISH_FILES,
+            Self::AskMultilingual => &ASK_MULTILINGUAL_FILES,
         }
     }
 
@@ -75,6 +89,39 @@ static FACE_FILES: [ModelFile; 2] = [
     },
 ];
 
+// Ask's sentence models, pinned to one revision each and checked against these hashes. The sizes
+// are what Settings shows (`folder_ask::TextModel`).
+// all-MiniLM-L6-v2 (Apache 2.0), as exported to ONNX and quantized by Xenova (Transformers.js).
+static ASK_ENGLISH_FILES: [ModelFile; 2] = [
+    ModelFile {
+        name: "minilm.onnx",
+        url: "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/751bff37182d3f1213fa05d7196b954e230abad9/onnx/model_quantized.onnx",
+        sha256: "afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1",
+        size: 22_972_370,
+    },
+    ModelFile {
+        name: "minilm-vocab.txt",
+        url: "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/751bff37182d3f1213fa05d7196b954e230abad9/vocab.txt",
+        sha256: "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3",
+        size: 231_508,
+    },
+];
+// multilingual-e5-small (MIT License), as exported to ONNX and quantized by Xenova.
+static ASK_MULTILINGUAL_FILES: [ModelFile; 2] = [
+    ModelFile {
+        name: "e5-small.onnx",
+        url: "https://huggingface.co/Xenova/multilingual-e5-small/resolve/761b726dd34fb83930e26aab4e9ac3899aa1fa78/onnx/model_quantized.onnx",
+        sha256: "f80102d3f2a1229f387d3c81909990d8945513e347b0eab049f7de3c6f98c193",
+        size: 118_308_185,
+    },
+    ModelFile {
+        name: "e5-tokenizer.json",
+        url: "https://huggingface.co/Xenova/multilingual-e5-small/resolve/761b726dd34fb83930e26aab4e9ac3899aa1fa78/tokenizer.json",
+        sha256: "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39",
+        size: 17_082_730,
+    },
+];
+
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Download {
@@ -101,6 +148,10 @@ pub struct Models {
     neutral: OnceLock<Vec<f32>>,
     yunet: Mutex<Slot>,
     sface: Mutex<Slot>,
+    minilm: Mutex<Slot>,
+    e5: Mutex<Slot>,
+    wordpiece: Mutex<Option<std::sync::Arc<text::WordPiece>>>,
+    unigram: Mutex<Option<std::sync::Arc<text::Unigram>>>,
 }
 
 impl Models {
@@ -115,6 +166,10 @@ impl Models {
             neutral: OnceLock::new(),
             yunet: Mutex::default(),
             sface: Mutex::default(),
+            minilm: Mutex::default(),
+            e5: Mutex::default(),
+            wordpiece: Mutex::default(),
+            unigram: Mutex::default(),
         }
     }
 
@@ -214,8 +269,15 @@ impl Models {
         for slot in match feature {
             Feature::Search => [&self.clip_vision, &self.clip_text],
             Feature::Faces => [&self.yunet, &self.sface],
+            Feature::AskEnglish => [&self.minilm, &self.minilm],
+            Feature::AskMultilingual => [&self.e5, &self.e5],
         } {
             *slot.lock().unwrap_or_else(|err| err.into_inner()) = Slot::default();
+        }
+        match feature {
+            Feature::AskEnglish => *self.wordpiece.lock().unwrap_or_else(|err| err.into_inner()) = None,
+            Feature::AskMultilingual => *self.unigram.lock().unwrap_or_else(|err| err.into_inner()) = None,
+            _ => {}
         }
         for file in feature.files() {
             let _ = std::fs::remove_file(self.dir.join(file.name));
@@ -266,6 +328,37 @@ impl Models {
         }
         let vector = self.describe_text("a photo")?;
         Ok(self.neutral.get_or_init(|| vector).clone())
+    }
+
+    /// 384 numbers for what a sentence means, with Ask's model for `feature`. e5 reads questions
+    /// and the texts they look for differently, so it is told which this is.
+    pub fn describe_sentence(&self, feature: Feature, text: &str, question: bool, threads: usize) -> Result<Vec<f32>, String> {
+        match feature {
+            Feature::AskEnglish => {
+                let tokenizer = {
+                    let mut held = self.wordpiece.lock().unwrap_or_else(|err| err.into_inner());
+                    if held.is_none() {
+                        *held = Some(Arc::new(text::WordPiece::load(&self.dir.join("minilm-vocab.txt"))?));
+                    }
+                    held.clone().expect("loaded above")
+                };
+                let ids = tokenizer.encode(text);
+                self.with_session(&self.minilm, "minilm.onnx", threads, |session| text::embed(session, &ids))
+            }
+            Feature::AskMultilingual => {
+                let tokenizer = {
+                    let mut held = self.unigram.lock().unwrap_or_else(|err| err.into_inner());
+                    if held.is_none() {
+                        *held = Some(Arc::new(text::Unigram::load(&self.dir.join("e5-tokenizer.json"))?));
+                    }
+                    held.clone().expect("loaded above")
+                };
+                let marked = format!("{}{text}", if question { "query: " } else { "passage: " });
+                let ids = tokenizer.encode(&marked);
+                self.with_session(&self.e5, "e5-small.onnx", threads, |session| text::embed(session, &ids))
+            }
+            _ => Err("Not a sentence model".into()),
+        }
     }
 
     /// The faces in a picture, each with its 128 numbers.
@@ -323,6 +416,44 @@ mod tests {
         println!("same person: {same:?}, different: {other}");
         assert!(same.iter().all(|&s| s > 0.6), "{same:?}");
         assert!(other < 0.3, "{other}");
+    }
+
+    /// With OWNNAS_TEST_MODELS holding Ask's models: questions find the description they are
+    /// about, in the same language with the English model, across languages with e5.
+    #[test]
+    fn questions_meet_descriptions_across_languages() {
+        let Some(models) = test_models() else { return };
+        let descriptions = [
+            "Urząd / Myjnie: Analiza wydawanych pozwoleń na budowę myjni w okresie 2019-2025",
+            "Firma / Kadry: Umowy o pracę, aneksy i świadectwa pracy pracowników",
+            "Firma / Księgowość: Faktury kosztowe i sprzedażowe, wyciągi bankowe",
+            "Dom / Wakacje: Zdjęcia i rezerwacje z wyjazdów wakacyjnych",
+        ];
+        let best = |feature: Feature, question: &str, texts: &[&str]| -> usize {
+            let asked = models.describe_sentence(feature, question, true, 2).unwrap();
+            let scores: Vec<f32> = texts.iter().map(|text| similarity(&asked, &models.describe_sentence(feature, text, false, 2).unwrap())).collect();
+            println!("{question}: {scores:?}");
+            scores.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0
+        };
+        if models.ready(Feature::AskMultilingual) {
+            assert_eq!(models.describe_sentence(Feature::AskMultilingual, "hello", true, 2).unwrap().len(), 384);
+            for (question, expected) in [
+                ("Where are the car wash building permits?", 0),
+                ("¿Dónde están los permisos de construcción de lavaderos de coches?", 0),
+                ("employment contracts of our staff", 1),
+                ("¿Dónde guardamos las facturas?", 2),
+                ("pozwolenia na myjnie", 0),
+                ("holiday photos and bookings", 3),
+            ] {
+                assert_eq!(best(Feature::AskMultilingual, question, &descriptions), expected, "{question}");
+            }
+        }
+        if models.ready(Feature::AskEnglish) {
+            let english = ["Permits: Car wash building permits issued 2019-2025", "Staff: Employment contracts and references", "Accounts: Purchase and sales invoices, bank statements"];
+            assert_eq!(best(Feature::AskEnglish, "where do we keep the invoices?", &english), 2);
+            assert_eq!(best(Feature::AskEnglish, "permission to build a car wash", &english), 0);
+            assert_eq!(best(Feature::AskEnglish, "job contract", &english), 1);
+        }
     }
 
     #[test]

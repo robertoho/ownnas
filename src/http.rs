@@ -126,6 +126,8 @@ pub struct AppState {
     pub file_index: std::sync::Arc<crate::file_index::FileIndex>,
     /// The words inside files, for search.
     pub text_index: std::sync::Arc<crate::text_index::TextIndex>,
+    /// Folder descriptions read by Ask's model, in the background.
+    pub ask: std::sync::Arc<crate::folder_ask::AskIndex>,
     /// Copies of files from before OwnNAS saved over them (`versions.rs`).
     pub versions: PathBuf,
     /// Files uploaded with `flush=later`, not yet made sure of on the disk.
@@ -202,6 +204,7 @@ impl AppState {
             self.file_index.clone(),
             move || media.speed(),
         );
+        ask_routes::start_ask_index(self);
     }
 }
 
@@ -226,6 +229,10 @@ impl AttemptGate {
         }
     }
 }
+
+#[path = "http_ask.rs"]
+mod ask_routes;
+pub(crate) use ask_routes::answer_question;
 
 pub fn new_state(
     root: PathBuf,
@@ -279,6 +286,7 @@ pub fn new_state(
         media: std::sync::Arc::default(),
         file_index: std::sync::Arc::default(),
         text_index: std::sync::Arc::default(),
+        ask: std::sync::Arc::default(),
         versions: crate::versions::store_dir(&data_dir),
         unflushed: std::sync::Mutex::default(),
         flushing: tokio::sync::Mutex::const_new(()),
@@ -500,6 +508,10 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/copy", post(copy_item))
         .route("/api/duplicate", post(duplicate_item))
         .route("/api/folder-appearance", get(get_folder_appearance).post(set_folder_appearance))
+        .route("/api/folder-note", get(ask_routes::get_note).post(ask_routes::set_note))
+        .route("/api/folder-note/suggest", get(ask_routes::suggest))
+        .route("/api/ask", get(ask_routes::ask))
+        .route("/api/ask/settings", get(ask_routes::settings).post(ask_routes::set_settings))
         .route("/api/protect", post(set_protection))
         .route("/api/annotations", get(get_annotations).post(ack_annotations))
         .route("/api/tags", post(add_tag).delete(remove_tag))
@@ -637,8 +649,9 @@ async fn note_changes(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    const QUIET: [&str; 9] = [
+    const QUIET: [&str; 11] = [
         "/api/login", "/api/logout", "/api/terminals", "/api/index", "/api/ml", "/api/gallery", "/api/albums", "/api/storage", "/api/agent",
+        "/api/folder-note", "/api/ask",
     ];
     let path = request.uri().path();
     let changes = request.method() != axum::http::Method::GET
@@ -926,6 +939,9 @@ struct UploadDirectoriesBody {
 struct NameBody {
     path: Option<String>,
     name: String,
+    /// For a new folder: what it holds (`folder_notes`).
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2249,6 +2265,8 @@ async fn list(
     let mut payload = serde_json::to_value(listing).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not list folder"))?;
     decorate_folder_appearance(&state, &mut payload["entries"])?;
     decorate_protection(&state, &mut payload["entries"])?;
+    ask_routes::decorate_descriptions(&state, &mut payload["entries"])?;
+    payload["note"] = ask_routes::note_for(&state, &access, payload["path"].as_str().unwrap_or_default())?;
     Ok(Json(payload))
 }
 
@@ -5789,12 +5807,22 @@ async fn mkdir(
     let parent = rel_of(&body.path);
     let name = body.name;
     let label = if parent.is_empty() { name.clone() } else { format!("{parent}/{name}") };
+    let description = body.description.as_deref().map(str::trim).filter(|text| !text.is_empty()).map(String::from);
+    if let Some(text) = &description {
+        if text.chars().count() > crate::folder_notes::MAX_DESCRIPTION {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, format!("Keep the description under {} characters", crate::folder_notes::MAX_DESCRIPTION)));
+        }
+    }
     tokio::task::spawn_blocking(move || files::make_dir(&root, &parent, &name))
         .await
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not create the folder"))?
         .map_err(ApiError::from)?;
     invalidate_sizes(&state, &rel_of(&body.path));
     record(&state, &user, "create-folder", &label);
+    if let Some(text) = description {
+        let rel = files::resolve(&state.root, &label).map(|found| found.rel).unwrap_or(label.clone());
+        ask_routes::save_description(&state, &user, &rel, Some(&text), None)?;
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -10212,6 +10240,7 @@ async fn search(
     }
     let mut payload = json!({ "hits": hits });
     decorate_folder_appearance(&state, &mut payload["hits"])?;
+    ask_routes::decorate_descriptions(&state, &mut payload["hits"])?;
     decorate_protection(&state, &mut payload["hits"])?;
     Ok(Json(payload))
 }
@@ -10332,6 +10361,8 @@ pub(crate) async fn search_hits(state: &std::sync::Arc<AppState>, rel: String, r
                     modified: meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(0),
                     matched_tag: Some(tag),
                     matched_content: None,
+                    description: None,
+                    matched_description: false,
                 });
                 if out.len() >= 100 {
                     break;
@@ -10367,6 +10398,8 @@ pub(crate) async fn search_hits(state: &std::sync::Arc<AppState>, rel: String, r
 
     if size.is_set() {
         hits.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+    } else if !needle.is_empty() && !tag_only {
+        ask_routes::add_described_folders(state, &rel, &needle, &mut hits).await?;
     }
     Ok(hits)
 }
@@ -12361,5 +12394,147 @@ mod tests {
         assert_eq!(photos_of(&timeline), ["Home/3.jpg"]);
         let (status, _) = get("/api/people?workspace=999".into()).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "a workspace that is gone is not every photo");
+    }
+
+    /// Folder descriptions written in New folder and later, found by search, shown in the
+    /// folder, and Ask answering by words (no model in tests), within what an account may see.
+    #[tokio::test]
+    async fn folders_are_described_searched_and_asked_about() {
+        let (root, data) = scratch();
+        let state = Arc::new(new_state(root.clone(), data, false, false, false, false, crate::update::UpdateConfig::default()).unwrap());
+        {
+            let conn = state.db.lock().unwrap();
+            db::create_user(&conn, "ada", "longenough").unwrap();
+            db::create_user(&conn, "bo", "longenough2").unwrap();
+        }
+        let app = router(state.clone());
+        std::fs::create_dir_all(root.join("Firma/Urząd")).unwrap();
+        std::fs::create_dir_all(root.join("Firma/Kadry")).unwrap();
+        let sign_in = |username: &'static str, password: &'static str| {
+            let app = app.clone();
+            async move {
+                let login = Request::builder().method("POST").uri("/api/login").header("content-type", "application/json").header("x-ownnas", "1")
+                    .body(Body::from(json!({ "username": username, "password": password }).to_string())).unwrap();
+                let response = app.oneshot(login).await.unwrap();
+                response.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string()
+            }
+        };
+        let ada = sign_in("ada", "longenough").await;
+        let bo = sign_in("bo", "longenough2").await;
+        let send = |cookie: &str, method: &str, uri: &str, body: Option<serde_json::Value>| {
+            let mut request = Request::builder().method(method).uri(uri).header("cookie", cookie).header("x-ownnas", "1");
+            if body.is_some() {
+                request = request.header("content-type", "application/json");
+            }
+            app.clone().oneshot(request.body(body.map_or_else(Body::empty, |body| Body::from(body.to_string()))).unwrap())
+        };
+        let call = |cookie: String, method: &'static str, uri: String, body: Option<serde_json::Value>| {
+            let response = send(&cookie, method, &uri, body);
+            async move {
+                let response = response.await.unwrap();
+                let status = response.status();
+                let bytes = body_bytes(response).await;
+                (status, serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default())
+            }
+        };
+
+        // Described when it is made, and later from its menu.
+        let (status, _) = call(ada.clone(), "POST", "/api/mkdir".into(), Some(json!({ "path": "Firma/Urząd", "name": "Myjnie", "description": "Analiza wydawanych pozwoleń na budowę myjni w okresie 2019-2025" }))).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(ada.clone(), "POST", "/api/folder-note".into(), Some(json!({ "path": "Firma/Kadry", "description": "Umowy o pracę i aneksy" }))).await;
+        assert_eq!(status, StatusCode::OK);
+        std::fs::create_dir_all(root.join("Firma/Urząd/Myjnie/2021/Wnioski")).unwrap();
+        std::fs::write(root.join("Firma/Urząd/Myjnie/2021/Wnioski/pozwolenie-krakow.txt"), "Decyzja").unwrap();
+        let (status, _) = call(ada.clone(), "POST", "/api/folder-note".into(), Some(json!({ "path": "", "description": "x" }))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "not the top of the library");
+
+        // Plain search finds the folder by any part of its description, with it.
+        let (status, found) = call(ada.clone(), "GET", "/api/search?q=pozwolen%20myjni".into(), None).await;
+        assert_eq!(status, StatusCode::OK, "{found}");
+        assert_eq!(found["hits"][0]["path"], "Firma/Urząd/Myjnie");
+        assert_eq!(found["hits"][0]["matchedDescription"], true);
+        assert!(found["hits"][0]["description"].as_str().unwrap().starts_with("Analiza"));
+
+        // The folder shows its own description; a working folder inside shows the one it belongs to.
+        let (_, listing) = call(ada.clone(), "GET", "/api/list?path=Firma%2FUrz%C4%85d%2FMyjnie".into(), None).await;
+        assert!(listing["note"]["own"]["description"].as_str().unwrap().contains("myjni"));
+        let (_, inner) = call(ada.clone(), "GET", "/api/list?path=Firma%2FUrz%C4%85d%2FMyjnie%2F2021%2FWnioski".into(), None).await;
+        assert_eq!(inner["note"]["inherited"]["path"], "Firma/Urząd/Myjnie");
+        let (_, parent) = call(ada.clone(), "GET", "/api/list?path=Firma".into(), None).await;
+        let kadry = parent["entries"].as_array().unwrap().iter().find(|entry| entry["path"] == "Firma/Kadry").unwrap();
+        assert_eq!(kadry["description"], "Umowy o pracę i aneksy", "listed folders carry their descriptions");
+
+        // A suggested draft from what the folder holds.
+        let (status, draft) = call(ada.clone(), "GET", "/api/folder-note/suggest?path=Firma%2FUrz%C4%85d%2FMyjnie".into(), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(draft["draft"].is_string());
+
+        // Ask, by words while the model is off.
+        let (status, answer) = call(ada.clone(), "GET", "/api/ask?q=Gdzie%20s%C4%85%20pozwolenia%20na%20myjnie%3F".into(), None).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["byMeaning"], false);
+        assert_eq!(answer["folders"][0]["path"], "Firma/Urząd/Myjnie");
+        let (_, settings) = call(ada.clone(), "GET", "/api/ask/settings".into(), None).await;
+        assert_eq!(settings["languages"], json!(["en"]));
+        assert_eq!(settings["model"]["id"], "all-minilm-l6-v2");
+        let (status, _) = call(bo.clone(), "POST", "/api/ask/settings".into(), Some(json!({ "languages": ["en", "pl", "es"] }))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "administrators only");
+        let (status, settings) = call(ada.clone(), "POST", "/api/ask/settings".into(), Some(json!({ "languages": ["en", "pl", "es", "zz"] }))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(settings["languages"], json!(["en", "pl", "es"]));
+        assert_eq!(settings["model"]["id"], "multilingual-e5-small", "another language needs the multilingual model");
+
+        // Left out of Ask: still searchable by name, not answered.
+        let (status, _) = call(ada.clone(), "POST", "/api/folder-note".into(), Some(json!({ "path": "Firma/Urząd/Myjnie", "leaveOut": true }))).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, answer) = call(ada.clone(), "GET", "/api/ask?q=pozwolenia%20myjnie".into(), None).await;
+        assert!(answer["folders"].as_array().unwrap().is_empty(), "{answer}");
+        call(ada.clone(), "POST", "/api/folder-note".into(), Some(json!({ "path": "Firma/Urząd/Myjnie", "leaveOut": false }))).await;
+
+        // Moved, it keeps its description.
+        let (status, _) = call(ada.clone(), "POST", "/api/move".into(), Some(json!({ "path": "Firma/Urząd/Myjnie", "dest": "Firma" }))).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, note) = call(ada.clone(), "GET", "/api/folder-note?path=Firma%2FMyjnie".into(), None).await;
+        assert!(note["own"]["description"].as_str().unwrap().starts_with("Analiza"));
+
+        // An account limited to Kadry, read-only: asks and searches there only, writes nothing.
+        let limit = json!({ "username": "bo", "folders": [{ "path": "Firma/Kadry", "readOnly": true }] });
+        let (status, _) = call(ada.clone(), "POST", "/api/users/folders".into(), Some(limit)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, answer) = call(bo.clone(), "GET", "/api/ask?q=pozwolenia%20myjnie".into(), None).await;
+        assert!(answer["folders"].as_array().unwrap().is_empty(), "{answer}");
+        let (_, answer) = call(bo.clone(), "GET", "/api/ask?q=umowy".into(), None).await;
+        assert_eq!(answer["folders"][0]["path"], "Firma/Kadry");
+        let (_, found) = call(bo.clone(), "GET", "/api/search?q=myjni".into(), None).await;
+        assert!(found["hits"].as_array().unwrap().is_empty(), "{found}");
+        let (status, _) = call(bo.clone(), "GET", "/api/folder-note?path=Firma%2FMyjnie".into(), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = call(bo.clone(), "POST", "/api/folder-note".into(), Some(json!({ "path": "Firma/Kadry", "description": "changed" }))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "read-only there");
+        let (_, note) = call(bo.clone(), "GET", "/api/folder-note?path=Firma%2FKadry".into(), None).await;
+        assert_eq!(note["canEdit"], false);
+
+        // AI agents: an agent key for Kadry only asks there and lists only its descriptions.
+        let token = {
+            let mut conn = state.db.lock().unwrap();
+            let ada_id: i64 = conn.query_row("SELECT id FROM users WHERE username = 'ada'", [], |row| row.get(0)).unwrap();
+            crate::agent_keys::create(&mut conn, &root, ada_id, "helper", "read", false, &["Firma/Kadry".to_string()], None, chrono::Utc::now().timestamp()).unwrap().1
+        };
+        let tool = |name: &'static str, arguments: serde_json::Value| {
+            let request = Request::builder().method("POST").uri("/mcp").header("authorization", format!("Bearer {token}")).header("content-type", "application/json")
+                .body(Body::from(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": arguments } }).to_string())).unwrap();
+            let response = app.clone().oneshot(request);
+            async move {
+                let bytes = body_bytes(response.await.unwrap()).await;
+                let reply: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                reply["result"]["structuredContent"].clone()
+            }
+        };
+        let answer = tool("ask_folders", json!({ "question": "umowy o pracę" })).await;
+        assert_eq!(answer["folders"][0]["path"], "Firma/Kadry", "{answer}");
+        let answer = tool("ask_folders", json!({ "question": "pozwolenia myjnie" })).await;
+        assert!(answer["folders"].as_array().unwrap().is_empty(), "{answer}");
+        let listed = tool("folder_descriptions", json!({})).await;
+        assert_eq!(listed["folders"], json!([{ "path": "Firma/Kadry", "description": "Umowy o pracę i aneksy" }]));
     }
 }
