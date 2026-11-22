@@ -533,9 +533,10 @@ fn store(conn: &Connection, found: Vec<Found>, pace: &dyn Fn(std::time::Instant)
     let now = crate::db::now_secs();
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate).map_err(|err| err.to_string())?;
     for (item, taken, moving) in rows {
-        let (taken_at, source) = match taken.at {
-            Some(at) => (at, taken.source.unwrap_or("exif")),
-            None => (item.mtime, "file"),
+        // A date set by hand wins over the file's own.
+        let (taken_at, source) = match crate::photo_dates::manual(&tx, &item.rel) {
+            Some(at) => (at, crate::photo_dates::SOURCE),
+            None => dated(&taken, &item.rel, item.mtime),
         };
         let (lat, lon) = taken.place.map_or((None, None), |(lat, lon)| (Some(lat), Some(lon)));
         tx.execute(
@@ -546,6 +547,162 @@ fn store(conn: &Connection, found: Vec<Found>, pace: &dyn Fn(std::time::Instant)
         .map_err(|err| err.to_string())?;
     }
     tx.commit().map_err(|err| err.to_string())
+}
+
+/// The date a photo or video goes under, with where it came from: the camera's ("exif", or
+/// "utc" for a video's real instant), the file name's ("name"), or the file's modified time
+/// ("file"). The first two and dates set by hand are wall clocks with no time zone, kept as UTC.
+fn dated(taken: &Taken, rel: &str, mtime: i64) -> (i64, &'static str) {
+    if let Some(at) = taken.at {
+        return (at, taken.source.unwrap_or("exif"));
+    }
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    let local = |secs: i64| chrono::DateTime::from_timestamp(secs, 0).map(|utc| utc.with_timezone(&chrono::Local).naive_local());
+    let today = local(crate::db::now_secs()).map_or_else(|| chrono::Utc::now().date_naive(), |now| now.date());
+    match date_in_name(name, today) {
+        // A name with only a day: the time the file was saved, when that is the same day.
+        Some(found) if !found.has_time => {
+            let saved = local(mtime).filter(|saved| saved.date() == found.day()).map(|saved| saved.and_utc().timestamp());
+            (saved.unwrap_or(found.at), "name")
+        }
+        Some(found) => (found.at, "name"),
+        None => (mtime, "file"),
+    }
+}
+
+/// The date a photo or video would have without one set by hand, read from the file now.
+pub fn automatic_date(full: &Path, rel: &str) -> Option<(i64, &'static str)> {
+    let meta = std::fs::metadata(full).ok()?;
+    let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs() as i64);
+    let taken = match files::kind_of(rel) {
+        "image" => read_photo(full),
+        "video" => read_video(full),
+        _ => Taken::default(),
+    };
+    Some(dated(&taken, rel, mtime))
+}
+
+/// A date in a file's name: the day, and the time when the name has one too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NameDate {
+    /// Seconds since 1970 of that wall clock, treated as UTC (like a camera's date).
+    pub at: i64,
+    pub has_time: bool,
+}
+
+impl NameDate {
+    fn day(self) -> chrono::NaiveDate {
+        chrono::DateTime::from_timestamp(self.at, 0).map_or_else(chrono::NaiveDate::default, |at| at.date_naive())
+    }
+}
+
+/// The date that phones, cameras, and apps write into file names: `IMG-20210201-WA0003`,
+/// `IMG_20210201_134502`, `PXL_20210201_134502123`, `Screenshot_2021-02-01-13-45-02`,
+/// `WhatsApp Image 2021-02-01 at 13.45.02`, `20210201134502`, or just `2021-02-01`. Strict on
+/// purpose: the date must stand on its own (a whole run of 8, 14, or 17 digits, or
+/// year-month-day with one kind of separator), fall between 1990 and `today`, and be a real day;
+/// longer or shorter runs of digits (counters, phone numbers, timestamps) are not dates.
+pub fn date_in_name(name: &str, today: chrono::NaiveDate) -> Option<NameDate> {
+    let stem = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && ext.len() <= 5 && ext.chars().all(|c| c.is_ascii_alphanumeric()) => stem,
+        _ => name,
+    };
+    // Runs of digits and of everything else, in turn.
+    let mut runs: Vec<&str> = Vec::new();
+    let mut start = 0;
+    for (at, c) in stem.char_indices().skip(1) {
+        let before = stem[..at].chars().next_back().is_some_and(|b| b.is_ascii_digit());
+        if before != c.is_ascii_digit() {
+            runs.push(&stem[start..at]);
+            start = at;
+        }
+    }
+    if !stem.is_empty() {
+        runs.push(&stem[start..]);
+    }
+    fn digits<'a>(run: Option<&&'a str>) -> Option<&'a str> {
+        run.filter(|run| run.bytes().all(|b| b.is_ascii_digit())).copied()
+    }
+    let number = |text: &str| text.parse::<u32>().ok();
+    // Letters right against the digits are fine ("IMG20210201"), unless more digits come before
+    // them in the same word ("a3f20210201…", a hash).
+    let stands_alone = |before: Option<&&str>, earlier: Option<&&str>| match before {
+        None => true,
+        Some(text) => !text.chars().all(|c| c.is_ascii_alphabetic()) || earlier.is_none(),
+    };
+    for index in 0..runs.len() {
+        let Some(run) = digits(runs.get(index)) else { continue };
+        let before = index.checked_sub(1).and_then(|i| runs.get(i));
+        let earlier = index.checked_sub(2).and_then(|i| runs.get(i));
+        if !stands_alone(before, earlier) {
+            continue;
+        }
+        let (date, mut next) = match run.len() {
+            8 | 14 | 17 => ((number(&run[..4])?, number(&run[4..6])?, number(&run[6..8])?), index + 1),
+            4 => {
+                let sep = runs.get(index + 1).copied().filter(|sep| matches!(*sep, "-" | "_" | "."));
+                match (sep, digits(runs.get(index + 2)), runs.get(index + 3), digits(runs.get(index + 4))) {
+                    (Some(sep), Some(month), Some(&again), Some(day)) if again == sep && month.len() == 2 && day.len() == 2 => {
+                        ((number(run)?, number(month)?, number(day)?), index + 5)
+                    }
+                    _ => continue,
+                }
+            }
+            _ => continue,
+        };
+        let (year, month, day) = date;
+        let Some(on) = chrono::NaiveDate::from_ymd_opt(year as i32, month, day) else { continue };
+        if year < 1990 || on > today.succ_opt().unwrap_or(today) {
+            continue;
+        }
+        // The time: in the same run (YYYYMMDDhhmmss[mmm]), or after a separator as hhmmss[mmm]
+        // or hh-mm-ss (hh.mm.ss, hh_mm_ss), with an optional AM or PM.
+        let mut time = None;
+        if run.len() >= 14 {
+            time = Some((number(&run[8..10])?, number(&run[10..12])?, number(&run[12..14])?));
+        } else if runs.get(next).is_some_and(|sep| matches!(sep.trim(), "" | "-" | "_" | "." | "T" | "at" | "_at_" | "-at-")) && runs.get(next).is_some_and(|sep| sep.len() <= 4) {
+            let first = digits(runs.get(next + 1));
+            match first {
+                Some(clock) if clock.len() == 6 || clock.len() == 9 => {
+                    time = Some((number(&clock[..2])?, number(&clock[2..4])?, number(&clock[4..6])?));
+                    next += 2;
+                }
+                Some(hour) if hour.len() <= 2 => {
+                    let sep = runs.get(next + 2).copied().filter(|sep| matches!(*sep, "-" | "_" | "." | ":"));
+                    if let (Some(sep), Some(minute), Some(&again), Some(second)) = (sep, digits(runs.get(next + 3)), runs.get(next + 4), digits(runs.get(next + 5))) {
+                        if again == sep && minute.len() == 2 && second.len() == 2 {
+                            time = Some((number(hour)?, number(minute)?, number(second)?));
+                            next += 6;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            // "1.45.02 PM" (with a space or a narrow one before it).
+            if let (Some((hour, minute, second)), Some(rest)) = (time, runs.get(next)) {
+                let rest = rest.trim_start_matches([' ', '\u{202f}', '\u{a0}']).to_ascii_uppercase();
+                if (1..=12).contains(&hour) && (rest.starts_with("AM") || rest.starts_with("PM")) {
+                    let hour = match (hour, rest.starts_with("PM")) {
+                        (12, false) => 0,
+                        (12, true) => 12,
+                        (hour, true) => hour + 12,
+                        (hour, false) => hour,
+                    };
+                    time = Some((hour, minute, second));
+                }
+            }
+        }
+        // Nor may letters and more digits follow straight on ("20210201ab3f…").
+        let after = runs.get(next).is_some_and(|text| text.chars().all(|c| c.is_ascii_alphabetic())) && runs.get(next + 1).is_some();
+        if after && time.is_none() {
+            continue;
+        }
+        let time = time.filter(|(hour, minute, second)| *hour <= 23 && *minute <= 59 && *second <= 59);
+        let (hour, minute, second) = time.unwrap_or((0, 0, 0));
+        let at = on.and_hms_opt(hour, minute, second)?.and_utc().timestamp();
+        return Some(NameDate { at, has_time: time.is_some() });
+    }
+    None
 }
 
 #[derive(Default)]
@@ -747,6 +904,57 @@ mod tests {
         assert_eq!(indexer.speed(), Speed::Medium, "medium unless chosen otherwise");
         indexer.set_speed(Speed::Slow);
         assert_eq!(indexer.status().speed, Some(Speed::Slow));
+    }
+
+    #[test]
+    fn dates_in_file_names() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 21).unwrap();
+        let at = |y, mo, d, h, mi, s| chrono::NaiveDate::from_ymd_opt(y, mo, d).unwrap().and_hms_opt(h, mi, s).unwrap().and_utc().timestamp();
+        let day = |y, mo, d| Some(NameDate { at: at(y, mo, d, 0, 0, 0), has_time: false });
+        let time = |y, mo, d, h, mi, s| Some(NameDate { at: at(y, mo, d, h, mi, s), has_time: true });
+        let found = |name: &str| date_in_name(name, today);
+        // Phones, cameras, and apps.
+        assert_eq!(found("IMG-20210201-WA0003.jpg"), day(2021, 2, 1));
+        assert_eq!(found("VID-20210201-WA0001.mp4"), day(2021, 2, 1));
+        assert_eq!(found("IMG_20210201_134502.jpg"), time(2021, 2, 1, 13, 45, 2));
+        assert_eq!(found("PXL_20210201_134502123.jpg"), time(2021, 2, 1, 13, 45, 2));
+        assert_eq!(found("PXL_20210201_134502123.MP.jpg"), time(2021, 2, 1, 13, 45, 2));
+        assert_eq!(found("Screenshot_2021-02-01-13-45-02.png"), time(2021, 2, 1, 13, 45, 2));
+        assert_eq!(found("Screenshot_20210201-134502.png"), time(2021, 2, 1, 13, 45, 2));
+        assert_eq!(found("WhatsApp Image 2021-02-01 at 13.45.02.jpeg"), time(2021, 2, 1, 13, 45, 2));
+        assert_eq!(found("Screen Shot 2021-02-01 at 1.45.02 PM.png"), time(2021, 2, 1, 13, 45, 2));
+        assert_eq!(found("Screenshot 2021-02-01 at 12.05.00\u{202f}AM.png"), time(2021, 2, 1, 0, 5, 0));
+        assert_eq!(found("photo_2021-02-01_13-45-02.jpg"), time(2021, 2, 1, 13, 45, 2));
+        assert_eq!(found("signal-2021-02-01-134502.jpg"), time(2021, 2, 1, 13, 45, 2));
+        assert_eq!(found("20210201_134502.jpg"), time(2021, 2, 1, 13, 45, 2));
+        assert_eq!(found("20210201134502.jpg"), time(2021, 2, 1, 13, 45, 2));
+        assert_eq!(found("IMG20210201134502.jpg"), time(2021, 2, 1, 13, 45, 2));
+        assert_eq!(found("VID_20210201_134502~2.mp4"), time(2021, 2, 1, 13, 45, 2));
+        // Just a date in the name.
+        assert_eq!(found("20210201.jpg"), day(2021, 2, 1));
+        assert_eq!(found("Beach 2021-02-01.jpg"), day(2021, 2, 1));
+        assert_eq!(found("trip_2021.02.01_3.jpg"), day(2021, 2, 1));
+        assert_eq!(found("IMG_20210201_999999.jpg"), day(2021, 2, 1), "not a time: only the day");
+        // Not dates: impossible days, too early or later than today, other runs of digits.
+        assert_eq!(found("IMG-20210230-WA0001.jpg"), None);
+        assert_eq!(found("IMG-20211301-WA0001.jpg"), None);
+        assert_eq!(found("IMG-19891231-WA0001.jpg"), None);
+        assert_eq!(found("IMG-20270101-WA0001.jpg"), None);
+        assert_eq!(found("2021-02-01_99.jpg"), day(2021, 2, 1));
+        assert_eq!(found("2021-02_01.jpg"), None, "mixed separators");
+        assert_eq!(found("DSC01234.JPG"), None);
+        assert_eq!(found("IMG_4021.HEIC"), None);
+        assert_eq!(found("1612183502123.jpg"), None, "a timestamp in milliseconds");
+        assert_eq!(found("FB_IMG_1612183502123.jpg"), None);
+        assert_eq!(found("202102011.jpg"), None, "nine digits");
+        assert_eq!(found("+3120210201.jpg"), None, "a phone number");
+        assert_eq!(found("a3f20210201bc.jpg"), None, "inside a hash");
+        assert_eq!(found("20210201ab3f.jpg"), None);
+        assert_eq!(found("e3b0c442 98fc1c14.jpg"), None);
+        assert_eq!(found("holiday.jpg"), None);
+        assert_eq!(found(""), None);
+        // A date the day after today still counts (time zones).
+        assert_eq!(found("IMG_20261122_010000.jpg"), time(2026, 11, 22, 1, 0, 0));
     }
 
     #[test]

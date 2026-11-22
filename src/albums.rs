@@ -344,7 +344,8 @@ pub struct MediaItem {
     pub path: String,
     pub kind: Option<String>,
     pub taken_at: Option<i64>,
-    /// "exif" (a local date and time, with no time zone) or "file" (a Unix time).
+    /// "exif" (the camera's), "name" (the file name's), or "manual" (set by hand): a local date
+    /// and time with no time zone, kept as UTC. "utc" or "file" (the file's date): a Unix time.
     pub date_source: Option<String>,
     pub width: Option<i64>,
     pub height: Option<i64>,

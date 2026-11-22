@@ -557,6 +557,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/faces/in", get(faces_in_photo))
         .route("/api/gallery/settings", get(gallery_settings).post(set_gallery_settings))
         .route("/api/gallery/hidden", get(gallery_hidden).post(set_gallery_hidden).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
+        .route("/api/gallery/dates", post(set_gallery_dates).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
         .route("/api/gallery/tag", get(gallery_tag))
         .route("/api/albums", get(get_album).post(create_album).patch(update_album).delete(delete_album))
         .route("/api/albums/tree", get(album_tree))
@@ -3634,6 +3635,75 @@ async fn set_gallery_hidden(
     Ok(Json(json!({ "changed": changed })))
 }
 
+#[derive(Deserialize)]
+struct DatesBody {
+    paths: Vec<String>,
+    /// The date and time to give them all, as the clock showed it: "2021-02-01T13:45[:02]".
+    at: Option<String>,
+    /// Seconds to move each one by, from the date it has now (negative: earlier).
+    shift: Option<i64>,
+    /// Back to their own dates (the camera's, the file name's, or the file's).
+    #[serde(default)]
+    automatic: bool,
+    /// Undoing: the date each had set by hand before (`null`: its own), as a change answered.
+    restore: Option<Vec<Option<i64>>>,
+}
+
+/// Sets the date of photos and videos by hand, moves them by an amount, or gives them back their
+/// own. Kept in OwnNAS's database; the files are not touched (photo_dates.rs says why).
+async fn set_gallery_dates(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<DatesBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_write(&state)?;
+    let bad = |message: &str| ApiError::new(StatusCode::BAD_REQUEST, message);
+    let change = match (body.at.as_deref(), body.shift, body.automatic, body.restore) {
+        (Some(at), None, false, None) => {
+            let at = at.trim();
+            let parsed = chrono::NaiveDateTime::parse_from_str(at, "%Y-%m-%dT%H:%M:%S")
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(at, "%Y-%m-%dT%H:%M"))
+                .or_else(|_| chrono::NaiveDate::parse_from_str(at, "%Y-%m-%d").map(|day| day.and_time(chrono::NaiveTime::MIN)))
+                .map_err(|_| bad("Give the date as 2021-02-01T13:45"))?;
+            crate::photo_dates::Change::At(parsed.and_utc().timestamp())
+        }
+        (None, Some(0), false, None) => return Err(bad("Choose how much to move them by")),
+        (None, Some(shift), false, None) => crate::photo_dates::Change::Shift(shift),
+        (None, None, true, None) => crate::photo_dates::Change::Automatic,
+        (None, None, false, Some(restore)) => crate::photo_dates::Change::Restore(restore),
+        _ => return Err(bad("Choose one: a date, an amount to move them by, or their own dates")),
+    };
+    let mut paths = Vec::new();
+    for raw in &body.paths {
+        let target = files::resolve(&state.root, raw.trim().trim_start_matches('/'))?;
+        if !target.full.is_file() || !matches!(files::kind_of(&target.rel), "image" | "video") {
+            return Err(bad("Only photos and videos can have their dates changed"));
+        }
+        if !paths.contains(&target.rel) {
+            paths.push(target.rel);
+        }
+    }
+    let worker = state.clone();
+    let by = user.username.clone();
+    let (done, items) = tokio::task::spawn_blocking(move || -> Result<_, String> {
+        let done = crate::photo_dates::change(&worker.db, &worker.root, &paths, &change, &by)?;
+        let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
+        let items = crate::albums::media_items(&conn, &done.paths).map_err(|_| "Could not read the new dates".to_string())?;
+        Ok((done, items))
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not change the dates"))?
+    .map_err(|err| bad(&err))?;
+    record(&state, &user, "photos-date", &format!("{} photos", done.paths.len()));
+    Ok(Json(json!({
+        "changed": done.paths.len(),
+        "items": gallery_items(&state, items, false),
+        "undo": { "paths": done.paths, "restore": done.before },
+    })))
+}
+
 async fn gallery_status(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
     require_user(&state, &headers)?;
     Ok(Json(state.media.status()))
@@ -3952,11 +4022,11 @@ async fn workspace_membership(
 
 // ---- Sorting a folder's files into sub-folders by date, kind, extension… (sort_folder.rs) ----
 
-/// The dates photos and videos under `folder` were taken, as their own clock says (sorting uses
-/// the file's own date for the others).
+/// The dates photos and videos under `folder` were taken, as their own clock says (the camera's,
+/// the file name's, or one set by hand; sorting uses the file's own date for the others).
 pub(crate) fn taken_dates(state: &AppState, folder: &str) -> std::collections::HashMap<String, i64> {
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-    let Ok(mut stmt) = conn.prepare("SELECT path, taken_at FROM media_index WHERE date_source = 'exif' AND (?1 = '' OR (path >= ?1 || '/' AND path < ?1 || '0'))") else {
+    let Ok(mut stmt) = conn.prepare("SELECT path, taken_at FROM media_index WHERE date_source IN ('exif', 'name', 'manual') AND (?1 = '' OR (path >= ?1 || '/' AND path < ?1 || '0'))") else {
         return Default::default();
     };
     let rows = stmt.query_map([folder], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)));
@@ -11881,6 +11951,26 @@ mod tests {
         assert_eq!(status(send(&bo, "GET", "/api/gallery/details?path=Other%2Fsecret.jpg", None).await.unwrap()), StatusCode::NOT_FOUND);
         assert_eq!(status(send(&bo, "GET", "/api/gallery/similar?path=Other%2Fsecret.jpg", None).await.unwrap()), StatusCode::NOT_FOUND);
         assert_eq!(status(send(&bo, "POST", "/api/gallery/hidden", Some(json!({ "paths": ["Other/secret.jpg"], "hidden": true }))).await.unwrap()), StatusCode::NOT_FOUND);
+        // Dates set by hand: in its read-write folders only.
+        let date = |path: &str| json!({ "paths": [path], "at": "2021-02-01T13:45" });
+        assert_eq!(status(send(&bo, "POST", "/api/gallery/dates", Some(date("Other/secret.jpg"))).await.unwrap()), StatusCode::NOT_FOUND);
+        std::fs::write(root.join("Work/scan.jpg"), "photo w").unwrap();
+        assert_eq!(status(send(&bo, "POST", "/api/gallery/dates", Some(date("Work/scan.jpg"))).await.unwrap()), StatusCode::FORBIDDEN);
+        assert_eq!(status(send(&bo, "POST", "/api/gallery/dates", Some(date("Family/Photos/a.jpg"))).await.unwrap()), StatusCode::OK);
+        assert_eq!(status(send(&bo, "POST", "/api/gallery/dates", Some(date("Family/Private/diary.txt"))).await.unwrap()), StatusCode::NOT_FOUND);
+        let set = json_of(send(&ada, "POST", "/api/gallery/dates", Some(json!({ "paths": ["Family/Photos/a.jpg"], "shift": 3600 }))).await.unwrap()).await;
+        assert_eq!(set["items"][0]["takenAt"], 1_612_187_100 + 3600, "{set}");
+        assert_eq!(set["items"][0]["dateSource"], "manual");
+        assert_eq!(set["undo"], json!({ "paths": ["Family/Photos/a.jpg"], "restore": [1_612_187_100] }));
+        assert_eq!(status(send(&ada, "POST", "/api/gallery/dates", Some(json!({ "paths": ["Work/plan.txt"], "automatic": true }))).await.unwrap()), StatusCode::BAD_REQUEST, "not a photo");
+        assert_eq!(status(send(&ada, "POST", "/api/gallery/dates", Some(json!({ "paths": ["Family/Photos/a.jpg"], "at": "1 Feb", "shift": 60 }))).await.unwrap()), StatusCode::BAD_REQUEST, "one change at a time");
+        {
+            let conn = state.db.lock().unwrap();
+            db::create_user(&conn, "cy", "longenough3").unwrap();
+            db::set_user_read_only(&conn, "cy", true).unwrap();
+        }
+        let cy = sign_in("cy", "longenough3").await;
+        assert_eq!(status(send(&cy, "POST", "/api/gallery/dates", Some(json!({ "paths": ["Family/Photos/a.jpg"], "automatic": true }))).await.unwrap()), StatusCode::FORBIDDEN, "a read-only account");
 
         // Versions, by path and by id.
         json_of(send(&ada, "POST", "/api/write", Some(json!({ "path": "Other/secret.txt", "content": "secret 2" }))).await.unwrap()).await;

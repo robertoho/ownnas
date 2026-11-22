@@ -104,7 +104,7 @@ pub fn date_fixes(conn: &Connection, root: &Path, folder: &str) -> Result<Vec<Da
     let mut stmt = conn
         .prepare(
             "SELECT f.path, f.mtime FROM file_index f LEFT JOIN media_index m ON m.path = f.path
-             WHERE f.dir = 0 AND f.kind IN ('image', 'video') AND (m.date_source IS NULL OR m.date_source <> 'exif')
+             WHERE f.dir = 0 AND f.kind IN ('image', 'video') AND (m.date_source IS NULL OR m.date_source NOT IN ('exif', 'manual'))
                AND (?1 = '' OR (f.path >= ?1 || '/' AND f.path < ?1 || '0')) AND f.path NOT LIKE '.%' AND f.path NOT LIKE '%/.%'
              ORDER BY f.path LIMIT ?2",
         )

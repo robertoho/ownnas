@@ -80,7 +80,8 @@ fun MediaItem.day(): String? = takenAt?.let { Instant.ofEpochSecond(it).atOffset
 /** When it was taken, for showing: camera dates are local times stored as UTC. */
 fun MediaItem.takenLabel(): String? {
     val at = takenAt ?: return null
-    val zone = if (dateSource == "exif") ZoneOffset.UTC else ZoneId.systemDefault()
+    // The camera's, the file name's, or one set by hand: a wall clock with no zone, kept as UTC.
+    val zone = if (dateSource == "exif" || dateSource == "name" || dateSource == "manual") ZoneOffset.UTC else ZoneId.systemDefault()
     return Instant.ofEpochSecond(at).atZone(zone).format(DateTimeFormatter.ofLocalizedDateTime(FormatStyle.MEDIUM, FormatStyle.SHORT))
 }
 

@@ -134,6 +134,8 @@ pub fn details(db: &std::sync::Mutex<Connection>, rel: &str, full: &Path) -> Val
         if let Some(taken) = taken {
             let from = match source.as_deref() {
                 Some("exif") => " (from the camera)",
+                Some("name") => " (from the file name)",
+                Some("manual") => " (set by hand)",
                 _ => "",
             };
             // A camera's date is its own wall clock; a file's date is a real moment.

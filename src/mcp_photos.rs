@@ -137,7 +137,7 @@ async fn places(state: &Arc<AppState>, key: &AgentKey, path: &str) -> Result<age
 
 pub fn photo_json(item: &MediaItem) -> Value {
     let taken = item.taken_at.map(|at| match item.date_source.as_deref() {
-        Some("exif") => crate::photo_details::wall_clock(at),
+        Some("exif" | "name" | "manual") => crate::photo_details::wall_clock(at),
         _ => format!("{} UTC", crate::photo_details::wall_clock(at)),
     });
     json!({ "path": item.path, "kind": item.kind, "taken": taken, "width": item.width, "height": item.height, "size": item.size })

@@ -55,6 +55,7 @@ mod music;
 mod nas_backup;
 mod map_tiles;
 mod pdf_ops;
+mod photo_dates;
 mod photo_details;
 mod photo_formats;
 mod terminal;

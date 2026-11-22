@@ -25,14 +25,18 @@ const number = (n) => Number(n).toLocaleString();
 /// Photos the server can make smaller (not GIFs, HEIC, or videos).
 const resizable = (path) => /\.(jpe?g|png|webp|bmp|tiff?)$/i.test(path);
 const nameOf = (path) => path.split("/").pop();
+/// Photos and videos can have their dates set by hand (not drawings).
+const datable = (item) => !item.missing && (item.kind === "image" || item.kind === "video");
 const plural = (n, one, many = `${one}s`) => `${number(n)} ${n === 1 ? one : many}`;
 
 /// Camera dates have no time zone (stored as UTC); file dates are real instants.
+const WALL_CLOCK = new Set(["exif", "name", "manual"]);
 function dateParts(item) {
   if (item.takenAt === null || item.takenAt === undefined) return null;
   const date = new Date(item.takenAt * 1000);
-  // "exif": a camera's local time with no zone, kept as UTC. "utc" and "file": real instants.
-  const timeZone = item.dateSource === "exif" ? "UTC" : undefined;
+  // "exif", "name" (from the file name), "manual" (set by hand): a local time with no zone, kept
+  // as UTC. "utc" and "file": real instants.
+  const timeZone = WALL_CLOCK.has(item.dateSource) ? "UTC" : undefined;
   const pick = (options) => new Intl.DateTimeFormat(undefined, { ...options, timeZone }).format(date);
   const key = (options) => new Intl.DateTimeFormat("en-CA", { ...options, timeZone }).format(date);
   return {
@@ -466,6 +470,7 @@ export function mountGallery(root, ctx) {
       write && pickedHere(picked).length ? button(`Remove from “${workspaceName(workspace)}”`, () => removeFromWorkspace(pickedHere(picked))) : null,
       write && present.length ? button("Tag…", () => ctx.tag(present)) : null,
       write && present.length && present.every(resizable) ? button("Resize…", () => ctx.resize(present)) : null,
+      write && present.length && picked.every(datable) ? button("Set date…", () => setDates(picked)) : null,
       write && ctx.canConvertVideos() && present.length && picked.every((item) => item.kind === "video") ? button("Convert video…", () => ctx.convertVideos(present, "format")) : null,
       present.length ? button("Download", () => ctx.download(present)) : null,
       present.length === 1 ? button("Show in folder", () => ctx.showInFolder(present[0])) : null,
@@ -721,6 +726,34 @@ export function mountGallery(root, ctx) {
     } catch (err) {
       ctx.toast(err.message, true);
     }
+  }
+
+  /// Sets the date of photos by hand, or moves them by an amount (kept by OwnNAS, the files are
+  /// not changed). Photos then shows the day they went to.
+  async function setDates(picked) {
+    const items = picked.filter(datable);
+    if (!items.length) return;
+    try {
+      await ctx.setDates(items.map((item) => item.path), { items, changed: showChangedDates });
+    } catch (err) {
+      ctx.toast(err.message, true);
+    }
+  }
+
+  function showChangedDates(changed) {
+    const photos = route.tab === "photos";
+    show(location.hash);
+    const day = photos && changed.length ? dateParts(changed[0])?.day : null;
+    if (!day) return;
+    const mine = generation;
+    const until = Date.now() + 5000;
+    const look = () => {
+      if (stale(mine)) return;
+      const section = body.querySelector(`.gallery-day[data-day="${day}"]`);
+      if (section) section.scrollIntoView({ block: "start" });
+      else if (Date.now() < until) setTimeout(look, 100);
+    };
+    look();
   }
 
   /// Takes photos out of the timeline in place, without reloading it.
@@ -1198,6 +1231,7 @@ export function mountGallery(root, ctx) {
       },
       write && paths.length && { label: "Tag…", icon: "bulkTag", run: () => ctx.tag(paths) },
       write && paths.length && paths.every(resizable) && { label: "Resize…", icon: "resize", run: () => ctx.resize(paths) },
+      write && present.length && picked.every(datable) && { label: picked.length === 1 ? "Set date…" : `Set date of ${number(picked.length)}…`, icon: "photoDate", run: () => setDates(present) },
       write && ctx.canConvertVideos() && present.length && present.every((entry) => entry.kind === "video") && { label: "Convert video…", icon: "convertVideo", run: () => ctx.convertVideos(paths, "format") },
       paths.length && { label: "Download", icon: "download", run: () => ctx.download(paths) },
       one && !one.missing && { label: "Show in folder", icon: "folder", run: () => ctx.showInFolder(one.path) },

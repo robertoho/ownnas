@@ -788,6 +788,14 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             hidden_at INTEGER NOT NULL,
             hidden_by TEXT NOT NULL DEFAULT ''
         );
+        -- Dates set by hand in the Gallery (photo_dates.rs): a wall clock kept as UTC, which wins
+        -- over the camera's and the file name's. Here, not in the rebuildable photo index.
+        CREATE TABLE IF NOT EXISTS photo_dates (
+            path TEXT PRIMARY KEY,
+            taken_at INTEGER NOT NULL,
+            set_at INTEGER NOT NULL,
+            set_by TEXT NOT NULL DEFAULT ''
+        );
         CREATE TABLE IF NOT EXISTS image_versions (
             sha256 TEXT NOT NULL,
             parent TEXT NOT NULL,
@@ -915,6 +923,12 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         conn.execute("UPDATE media_index SET mtime = -1", [])
             .map_err(|_| "Could not update the photo index".to_string())?;
     }
+    if version < 15 {
+        // Photos and videos without a date inside can now take the one in their names
+        // (IMG-20210201-WA0003.jpg): read those again on the next scan (only those).
+        conn.execute("UPDATE media_index SET mtime = -1 WHERE date_source = 'file'", [])
+            .map_err(|_| "Could not update the photo index".to_string())?;
+    }
     // An index database deleted to be rebuilt: the name index is not complete any more.
     conn.execute(
         "DELETE FROM settings WHERE key = ?1 AND NOT EXISTS (SELECT 1 FROM file_index)",
@@ -922,7 +936,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|_| "Could not update the settings".to_string())?;
     conn.execute(
-        "INSERT INTO settings(key, value) VALUES('schema_version', '14')
+        "INSERT INTO settings(key, value) VALUES('schema_version', '15')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )
@@ -1885,7 +1899,7 @@ pub fn rewrite_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), 
         );
     }
     // Albums keep the photos they hold, wherever they move (into the Trash and back too).
-    for (table, column) in [("album_items", "path"), ("albums", "cover_path"), ("media_index", "path"), ("timeline_hidden", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path"), ("file_hashes", "path"), ("content_text", "path"), ("file_versions", "path"), ("workspace_folders", "folder"), ("workspace_items", "path")] {
+    for (table, column) in [("album_items", "path"), ("albums", "cover_path"), ("media_index", "path"), ("timeline_hidden", "path"), ("photo_dates", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path"), ("file_hashes", "path"), ("content_text", "path"), ("file_versions", "path"), ("workspace_folders", "folder"), ("workspace_items", "path")] {
         conn.execute(
             &format!(
                 "UPDATE OR REPLACE {table} SET {column} = CASE WHEN {column} = ?1 THEN ?2 ELSE ?2 || substr({column}, length(?1) + 1) END
@@ -1951,6 +1965,14 @@ pub fn copy_path_meta(conn: &Connection, from: &str, to: &str) -> Result<(), Str
         params![from, to, start],
     )
     .map_err(|_| "Could not copy fingerprints".to_string())?;
+    // A date set by hand is the copy's too.
+    conn.execute(
+        "INSERT OR REPLACE INTO photo_dates(path, taken_at, set_at, set_by)
+         SELECT CASE WHEN path = ?1 THEN ?2 ELSE ?2 || substr(path, length(?1) + 1) END, taken_at, set_at, set_by
+         FROM photo_dates WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+        params![from, to],
+    )
+    .map_err(|_| "Could not copy the photo dates".to_string())?;
     // The copy shows in the timeline right away; it is not added to the original's albums.
     conn.execute(
         "INSERT OR REPLACE INTO media_index(path, kind, size, mtime, taken_at, date_source, width, height, indexed_at, lat, lon, motion)
@@ -2203,7 +2225,7 @@ pub fn delete_path_meta(conn: &Connection, path: &str) -> Result<(), String> {
         params![path],
     )
     .map_err(|_| "Could not remove recent files".to_string())?;
-    for (table, column) in [("album_items", "path"), ("media_index", "path"), ("timeline_hidden", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path"), ("file_hashes", "path"), ("content_text", "path"), ("file_versions", "path"), ("workspace_folders", "folder"), ("workspace_items", "path")] {
+    for (table, column) in [("album_items", "path"), ("media_index", "path"), ("timeline_hidden", "path"), ("photo_dates", "path"), ("image_vectors", "path"), ("face_scans", "path"), ("faces", "path"), ("file_hashes", "path"), ("content_text", "path"), ("file_versions", "path"), ("workspace_folders", "folder"), ("workspace_items", "path")] {
         conn.execute(
             &format!("DELETE FROM {table} WHERE {column} = ?1 OR ({column} >= ?1 || '/' AND {column} < ?1 || '0')"),
             params![path],

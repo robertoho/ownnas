@@ -366,6 +366,7 @@ pub const ROUTES: &[(&str, &str, Fields)] = {
         ("POST", "/api/gallery/similar", &[("q:path", Read)]),
         ("GET", "/api/gallery/hidden", &[]),
         ("POST", "/api/gallery/hidden", &[("b:paths[]", Write)]),
+        ("POST", "/api/gallery/dates", &[("b:paths[]", Write)]),
         ("GET", "/api/gallery/tag", &[]),
         ("GET", "/api/tags/all", &[]),
         ("GET", "/api/people", &[]),

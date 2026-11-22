@@ -61,6 +61,7 @@ pub mod music;
 pub mod nas_backup;
 pub mod map_tiles;
 pub mod pdf_ops;
+pub mod photo_dates;
 pub mod photo_details;
 pub mod photo_formats;
 pub mod terminal;

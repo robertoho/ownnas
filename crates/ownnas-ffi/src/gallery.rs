@@ -17,8 +17,9 @@ pub struct MediaItem {
     /// "image", "video", or "svg" (absent when the photo is not indexed yet).
     #[serde(default)]
     pub kind: Option<String>,
-    /// When it was taken, in seconds. For `date_source` "exif" it is the camera's local time,
-    /// stored as if it were UTC (show it in UTC); for "file" it is a real instant.
+    /// When it was taken, in seconds. For `date_source` "exif" (the camera's), "name" (the file
+    /// name's), and "manual" (set by hand) it is a local time stored as if it were UTC (show it in
+    /// UTC); for "utc" and "file" it is a real instant.
     #[serde(default)]
     pub taken_at: Option<i64>,
     #[serde(default)]

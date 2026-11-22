@@ -1320,6 +1320,7 @@ const MENU_ICONS = {
   delete: ICON_TRASH,
   deleteBlock: `${ICON_TRASH} M10.5 10.5l4 4 M14.5 10.5l-4 4`,
   resize: "M2.5 6.5v-4h4 M2.5 2.5l4.5 4.5 M13.5 9.5v4h-4 M13.5 13.5L9 9",
+  photoDate: "M2.5 3.5h11v10h-11z M2.5 6.5h11 M5.5 2v3 M10.5 2v3 M5 9h1.5 M8.25 9h1.5 M5 11.25h1.5",
   convertVideo: "M2.5 4h7a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z M10.5 7l4-2v6l-4-2",
   paste: "M5.5 3h-1a1 1 0 0 0-1 1v9.5a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1V4a1 1 0 0 0-1-1h-1 M6 2h4v2H6z",
   restore: "M3 8a5 5 0 1 0 1.5-3.55 M2.5 2.5v2.5H5",
@@ -1872,6 +1873,9 @@ function openSelectionMenu(x, y, pasteInto) {
     }
     if (write && entries.length && !allInTrash && entries.every((entry) => !entry.dir)) {
       buttons.push(`<button type="button" data-menu="renameMany" title="By date, numbers, find and replace, or case">Rename by pattern…</button>`);
+    }
+    if (write && entries.length && !allInTrash && entries.every((entry) => !entry.dir && ["image", "video"].includes(entry.kind))) {
+      buttons.push(`<button type="button" data-menu="photoDate" title="The day it shows on in the Gallery: a date and time, or moved by an amount">Set date in Gallery…</button>`);
     }
     if (write && entries.length && entries.every((entry) => !entry.dir && ["image", "video"].includes(entry.kind))) {
       buttons.push(`<button type="button" data-menu="deleteBlock" class="danger">Delete, never back up again…</button>`);
@@ -2773,6 +2777,7 @@ async function gallery() {
       decorateMenu: (menu) => decorateMenu(menu),
       deleteAndBlock,
       resize: (paths) => resizeImages(paths),
+      setDates: (paths, options) => openPhotoDateDialog(paths, options),
       convertVideos: (paths, focus) => convertVideos(paths, focus),
       canConvertVideos: () => !!(state.me && state.me.ffmpeg),
       findSimilar: (path) => findSimilar(path).catch((err) => toast(err.message, true)),
@@ -7327,6 +7332,7 @@ function runMenuAction(button, entries, pasteInto) {
   if (action === "showInWorkspace") gallery().then((api) => api.showInWorkspaces(entries.map((entry) => entry.path))).catch((err) => toast(err.message, true));
   if (action === "sortFolder") openSortDialog(one && one.dir ? one.path : state.path);
   if (action === "renameMany") openRenameDialog(entries.map((entry) => entry.path));
+  if (action === "photoDate") openPhotoDateDialog(entries.map((entry) => entry.path)).catch((err) => toast(err.message, true));
   if (action === "nearDuplicates") openNearDuplicates(one && one.dir ? one.path : state.path);
   if (action === "tidy") openTidyDialog(one && one.dir ? one.path : state.path);
   if (action === "showFolderInWorkspace") {
@@ -7673,7 +7679,7 @@ function openTidyDialog(folder) {
         const { fixes } = await api(`/api/cleanup/dates?path=${encodeURIComponent(folder)}`);
         if (tab !== name) return;
         body.innerHTML = fixes.length
-          ? `<p class="muted">Photos and videos with no date taken inside, whose name says another day than the file's date (often the day they were copied). Fixing gives the file the date in its name, so it shows on that day in the Gallery.</p>${checklist(fixes, (fix) => `<span class="tidy-name">${esc(inside(fix.path))}</span><span class="muted">${calendarText(fix.now)} → <strong>${calendarText(fix.fromName)}</strong></span>`, true)}`
+          ? `<p class="muted">Photos and videos with no date taken inside, whose name says another day than the file's date (often the day they were copied). The Gallery already shows them on the day in their names; fixing gives the files that date too, for other apps and computers.</p>${checklist(fixes, (fix) => `<span class="tidy-name">${esc(inside(fix.path))}</span><span class="muted">${calendarText(fix.now)} → <strong>${calendarText(fix.fromName)}</strong></span>`, true)}`
           : `<p class="muted">No photo dates to fix here.</p>`;
         action = { label: (count) => `Fix ${count} date${count === 1 ? "" : "s"}`, run: async () => {
           const result = await api("/api/cleanup/dates", { method: "POST", json: { paths: ticked() } });
@@ -7951,6 +7957,123 @@ function openRenameDialog(paths) {
   dialog.addEventListener("close", () => dialog.remove());
   dialog.showModal();
   preview();
+}
+
+// ---- Dates set by hand for photos and videos (kept by OwnNAS; the files are not changed) ----
+
+/// A photo's date as it shows, for a date-and-time field ("2021-02-01T13:45:02"). Camera, file
+/// name, and hand-set dates are wall clocks kept as UTC; the others are real moments.
+function photoDateValue(item) {
+  if (!item || item.takenAt === null || item.takenAt === undefined) return "";
+  const ms = item.takenAt * 1000;
+  const wall = ["exif", "name", "manual"].includes(item.dateSource);
+  return new Date(wall ? ms : ms - new Date(ms).getTimezoneOffset() * 60_000).toISOString().slice(0, 19);
+}
+
+const DATE_SHIFT_UNITS = [["60", "minutes"], ["3600", "hours"], ["86400", "days"], ["604800", "weeks"]];
+
+/// Sets the date of photos and videos, moves them by an amount, or gives them back their own.
+/// `items` (from the Gallery) give the date to start from; `changed(items)` is told the new dates,
+/// and again after an undo. Resolves true when something changed.
+function openPhotoDateDialog(paths, { items = [], changed = () => {} } = {}) {
+  if (!paths.length) return Promise.resolve(false);
+  const one = paths.length === 1;
+  const what = one ? `“${paths[0].split("/").pop()}”` : `${paths.length} photos and videos`;
+  const start = photoDateValue(items.find((item) => item.path === paths[0]) || items[0]);
+  const dialog = document.createElement("dialog");
+  dialog.className = "sort-dialog photo-date-dialog";
+  dialog.innerHTML = `<form method="dialog">
+    <h3>Set the date of ${esc(what)}</h3>
+    <p class="muted">OwnNAS keeps the new date and shows ${one ? "it" : "them"} on that day in Photos, Places, and Memories. The ${one ? "file is" : "files are"} not changed, and you can undo it.</p>
+    <label class="sort-check"><input type="radio" name="photo-date-mode" value="at" checked> ${one ? "This date and time" : "All on this date and time"}</label>
+    <div class="photo-date-row" data-date="at-row">
+      <input type="datetime-local" step="1" data-date="at" value="${esc(start)}" max="${esc(new Date(Date.now() + 86_400_000).toISOString().slice(0, 16))}" aria-label="Date and time">
+    </div>
+    <label class="sort-check"><input type="radio" name="photo-date-mode" value="shift"> ${one ? "Move it" : "Move each"} by an amount, for a camera whose clock was wrong</label>
+    <div class="photo-date-row" data-date="shift-row">
+      <input type="number" min="1" step="1" value="1" data-date="amount" aria-label="How much">
+      <select data-date="unit" aria-label="Unit">${DATE_SHIFT_UNITS.map(([value, label]) => `<option value="${value}"${value === "3600" ? " selected" : ""}>${label}</option>`).join("")}</select>
+      <select data-date="direction" aria-label="Later or earlier"><option value="1">later</option><option value="-1">earlier</option></select>
+    </div>
+    <label class="sort-check"><input type="radio" name="photo-date-mode" value="automatic"> Back to ${one ? "its" : "their"} own date (from the camera, the file name, or the file)</label>
+    <p class="sort-problem" data-date="problem" hidden></p>
+    <div class="dialog-actions">
+      <span class="spacer"></span>
+      <button value="cancel" type="submit">Cancel</button>
+      <button type="button" class="primary" data-date="apply">Set date</button>
+    </div>
+  </form>`;
+  document.body.append(dialog);
+  const field = (name) => dialog.querySelector(`[data-date="${name}"]`);
+  const mode = () => dialog.querySelector('input[name="photo-date-mode"]:checked').value;
+  const request = () => {
+    if (mode() === "at") return field("at").value ? { at: field("at").value } : null;
+    if (mode() === "shift") {
+      const amount = Math.round(Number(field("amount").value));
+      return amount > 0 ? { shift: amount * Number(field("unit").value) * Number(field("direction").value) } : null;
+    }
+    return { automatic: true };
+  };
+  const paint = () => {
+    for (const row of ["at", "shift"]) dialog.querySelector(`[data-date="${row}-row"]`).classList.toggle("is-off", mode() !== row);
+    field("apply").disabled = !request();
+    field("apply").textContent = mode() === "automatic" ? "Use own date" : mode() === "shift" ? "Move" : "Set date";
+  };
+  dialog.addEventListener("input", paint);
+  dialog.addEventListener("change", paint);
+  // Typing in a row chooses it.
+  for (const [name, value] of [["at", "at"], ["amount", "shift"], ["unit", "shift"], ["direction", "shift"]]) {
+    field(name).addEventListener("focus", () => { dialog.querySelector(`input[name="photo-date-mode"][value="${value}"]`).checked = true; paint(); });
+  }
+  return new Promise((resolve) => {
+    let done = false;
+    field("apply").addEventListener("click", async () => {
+      const wanted = request();
+      if (!wanted) return;
+      field("apply").disabled = true;
+      field("problem").hidden = true;
+      try {
+        const answer = await api("/api/gallery/dates", { method: "POST", json: { paths, ...wanted } });
+        done = true;
+        dialog.close();
+        changed(answer.items || []);
+        offerPhotoDateUndo(answer, changed);
+      } catch (err) {
+        field("problem").textContent = err.message;
+        field("problem").hidden = false;
+        paint();
+      }
+    });
+    dialog.addEventListener("close", () => { dialog.remove(); resolve(done); });
+    paint();
+    dialog.showModal();
+    if (!start) field("at").focus();
+  });
+}
+
+/// Says the dates changed, with Undo (each photo back to the date it had) until dismissed.
+function offerPhotoDateUndo(answer, changed) {
+  const id = `photo-dates-${Date.now()}`;
+  const count = answer.changed;
+  upsertJob(id, {
+    title: `Changed the date of ${count} photo${count === 1 ? "" : "s"}`,
+    detail: "The files are not changed",
+    percent: 100,
+    actions: [
+      { label: "Undo", run: async () => {
+        try {
+          const back = await api("/api/gallery/dates", { method: "POST", json: answer.undo });
+          removeJob(id);
+          toast(`Put back the date of ${back.changed} photo${back.changed === 1 ? "" : "s"}`);
+          changed(back.items || []);
+        } catch (err) {
+          toast(err.message, true);
+        }
+      } },
+      { label: "Dismiss", run: () => removeJob(id) },
+    ],
+  });
+  openJobsPanel();
 }
 
 // ---- Notes in the Markdown editor: [[links]], their completion, and pasted pictures ----
