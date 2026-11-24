@@ -8,8 +8,9 @@
 //! every few minutes catches what the watcher missed, and any folder can be read again in full
 //! on request.
 //!
-//! What a scan finds added, changed, or gone is told to `on_found`'s listener: when the shared
-//! folder cannot be watched, that is how sync clients hear of changes.
+//! What a scan finds added, changed, or gone is told to `on_found`'s listeners: when the shared
+//! folder cannot be watched, that is how sync clients hear of changes, and it is how reading the
+//! words inside files knows which ones to read again.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -81,7 +82,7 @@ pub struct FileIndex {
     pending: Mutex<Vec<String>>,
     stop: AtomicBool,
     /// Told of each path a scan finds added, changed, or gone.
-    found: Mutex<Option<Found>>,
+    found: Mutex<Vec<Found>>,
 }
 
 type Found = Box<dyn Fn(&str) + Send + Sync>;
@@ -95,7 +96,7 @@ impl Default for FileIndex {
             settling: AtomicBool::new(false),
             pending: Mutex::new(Vec::new()),
             stop: AtomicBool::new(false),
-            found: Mutex::new(None),
+            found: Mutex::new(Vec::new()),
         }
     }
 }
@@ -124,10 +125,10 @@ impl FileIndex {
         self.stop.store(true, Ordering::SeqCst);
     }
 
-    /// Has `listener` told of each path a scan finds added, changed, or gone (as a path relative
+    /// Has `listener` (as well as any before it) told of each path a scan finds added, changed, or gone (as a path relative
     /// to the library). Not while the index is first being built: everything would be new.
     pub fn on_found(&self, listener: impl Fn(&str) + Send + Sync + 'static) {
-        *self.found.lock().unwrap_or_else(|err| err.into_inner()) = Some(Box::new(listener));
+        self.found.lock().unwrap_or_else(|err| err.into_inner()).push(Box::new(listener));
     }
 
     /// Looks for changes a moment from now: after a change made through OwnNAS.
@@ -236,7 +237,7 @@ impl FileIndex {
         let telling = self.ready();
         let found = |rel: &str| {
             if telling {
-                if let Some(listener) = self.found.lock().unwrap_or_else(|err| err.into_inner()).as_ref() {
+                for listener in self.found.lock().unwrap_or_else(|err| err.into_inner()).iter() {
                     listener(rel);
                 }
             }

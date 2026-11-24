@@ -1,11 +1,14 @@
 //! The words inside files (text, PDFs, documents, books, emails, and photos read with OCR), read
 //! in the background into the database so a search finds them at once. It follows the search
-//! index of names (`file_index`): after each of its scans, files that are new or changed since
-//! they were read are read again, at the indexing speed chosen in Settings.
+//! index of names (`file_index`): after a scan that found something added, changed, or gone, the
+//! files there that are new or changed since they were read are read again, at the indexing speed
+//! chosen in Settings. Only at start, and after Reindex of the whole library, does it look
+//! through every file name.
 //!
 //! The text lives in `content_text`, and an SQLite full-text index over it in `content_fts`
 //! (trigram, so any part of a word matches, as names do).
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,7 +23,7 @@ use crate::media_index::Speed;
 const MAX_TEXT: usize = 1024 * 1024;
 /// Text files larger than this are read only this far.
 const MAX_TEXT_FILE: u64 = 2 * 1024 * 1024;
-/// Files picked at a time. Finding them reads the whole name index, so not too few.
+/// Files picked at a time. Finding them in the whole library reads every file name, so not too few.
 const BATCH: usize = 2000;
 /// Words read are written to the database this many files at a time, or after `STORE_AFTER`:
 /// each write adds to the search index's own pages, and fewer, larger writes keep the
@@ -46,11 +49,76 @@ pub struct Status {
     pub available: bool,
 }
 
-#[derive(Default)]
 pub struct TextIndex {
     status: Mutex<Status>,
-    /// Set to read everything again (or a folder, after Reindex) without waiting for a scan.
+    /// Set to read again (after Reindex) without waiting for a scan, or to stop a pass part way.
     wake: AtomicBool,
+    /// What to look through for files to read: the whole library at first, then only what the
+    /// name index's scans find added, changed, or gone (looking through every file name takes
+    /// seconds on a large library, so it is not done after each scan).
+    changed: Mutex<Changed>,
+}
+
+#[derive(Default)]
+struct Changed {
+    all: bool,
+    paths: BTreeSet<String>,
+}
+
+impl Changed {
+    fn any(&self) -> bool {
+        self.all || !self.paths.is_empty()
+    }
+
+    fn add(&mut self, rel: &str) {
+        if self.all {
+            return;
+        }
+        if rel.is_empty() || self.paths.len() >= MAX_CHANGED {
+            self.all = true;
+            self.paths.clear();
+        } else {
+            self.paths.insert(rel.to_string());
+        }
+    }
+
+    fn put_back(&mut self, taken: Changed) {
+        if taken.all {
+            self.all = true;
+            self.paths.clear();
+        }
+        for path in taken.paths {
+            self.add(&path);
+        }
+    }
+
+    /// Where to look: `None` for the whole library, else the paths with none inside another.
+    fn scopes(&self) -> Vec<Option<String>> {
+        if self.all {
+            return vec![None];
+        }
+        let mut kept: Vec<String> = Vec::new();
+        for path in &self.paths {
+            if kept.last().is_some_and(|last| path.strip_prefix(last.as_str()).is_some_and(|rest| rest.starts_with('/'))) {
+                continue;
+            }
+            kept.push(path.clone());
+        }
+        kept.into_iter().map(Some).collect()
+    }
+}
+
+/// More changes than this between passes: the whole library is looked through instead.
+const MAX_CHANGED: usize = 5000;
+
+impl Default for TextIndex {
+    fn default() -> Self {
+        Self {
+            status: Mutex::default(),
+            wake: AtomicBool::new(false),
+            changed: Mutex::new(Changed { all: true, paths: BTreeSet::new() }),
+        }
+    }
 }
 
 /// Creates the full-text table. Returns false when SQLite was built without FTS5.
@@ -77,10 +145,16 @@ impl TextIndex {
                 params![rel],
             );
         }
+        self.changed(rel);
         self.wake.store(true, Ordering::SeqCst);
     }
 
-    /// Reads in a background thread after each scan of the name index.
+    /// `rel` was added, changed, or is gone: look there in the next pass.
+    fn changed(&self, rel: &str) {
+        self.changed.lock().unwrap_or_else(|err| err.into_inner()).add(rel);
+    }
+
+    /// Reads in a background thread after each scan of the name index that found something.
     pub fn start(
         self: &Arc<Self>,
         db_path: PathBuf,
@@ -99,34 +173,42 @@ impl TextIndex {
         if !available {
             return;
         }
+        let told = Arc::downgrade(self);
+        names.on_found(move |rel| {
+            if let Some(index) = told.upgrade() {
+                index.changed(rel);
+            }
+        });
         let index = self.clone();
         std::thread::Builder::new()
             .name("ownnas-text-index".into())
-            .spawn(move || {
-                let mut last_scan = None;
-                loop {
-                    let scan = names.status();
-                    let woken = index.wake.swap(false, Ordering::SeqCst);
-                    if scan.ready && !scan.scanning && (woken || scan.finished_at != last_scan) {
-                        last_scan = scan.finished_at;
-                        index.run(&db_path, &root, &cache_dir, ocr, &speed);
+            .spawn(move || loop {
+                let scan = names.status();
+                index.wake.store(false, Ordering::SeqCst);
+                let pending = index.changed.lock().unwrap_or_else(|err| err.into_inner()).any();
+                if scan.ready && !scan.scanning && pending {
+                    let taken = std::mem::take(&mut *index.changed.lock().unwrap_or_else(|err| err.into_inner()));
+                    if let Err(taken) = index.run(&db_path, &root, &cache_dir, ocr, &speed, taken) {
+                        // Tried again after a while, with whatever has changed since.
+                        index.changed.lock().unwrap_or_else(|err| err.into_inner()).put_back(taken);
+                        std::thread::sleep(Duration::from_secs(60));
                     }
-                    std::thread::sleep(Duration::from_secs(5));
                 }
+                std::thread::sleep(Duration::from_secs(5));
             })
             .expect("could not start the text index thread");
     }
 
-    fn run(&self, db_path: &Path, root: &Path, cache_dir: &Path, ocr: bool, speed: &dyn Fn() -> Speed) {
+    /// One pass through `taken`; gives it back when the pass failed or was stopped part way.
+    fn run(&self, db_path: &Path, root: &Path, cache_dir: &Path, ocr: bool, speed: &dyn Fn() -> Speed, taken: Changed) -> Result<(), Changed> {
+        {
+            let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());
+            status.done = 0;
+            status.waiting = 0;
+            status.error = None;
+        }
+        let mut stopped = false;
         let result = crate::db::connect(db_path).map_err(|err| err.to_string()).and_then(|conn| {
-            let waiting = count_waiting(&conn, ocr)?;
-            {
-                let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());
-                status.reading = waiting > 0;
-                status.done = 0;
-                status.waiting = waiting;
-                status.error = None;
-            }
             let mut read: Vec<(Waiting, String)> = Vec::new();
             let mut first_read = Instant::now();
             let flush = |read: &mut Vec<(Waiting, String)>| -> Result<(), String> {
@@ -141,36 +223,57 @@ impl TextIndex {
                 read.clear();
                 Ok(())
             };
-            // Files that failed are kept (with no text), so a batch never comes back the same.
-            loop {
-                let batch = waiting_files(&conn, ocr, BATCH)?;
-                if batch.is_empty() {
-                    break;
+            'scopes: for scope in taken.scopes() {
+                let scope = scope.as_deref();
+                // Files that failed are kept (with no text), so a batch never comes back the same.
+                let mut first = true;
+                loop {
+                    let batch = waiting_files(&conn, ocr, scope, BATCH)?;
+                    let last = batch.len() < BATCH;
+                    {
+                        let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());
+                        if first && !last && scope.is_none() {
+                            // Many waiting: how many, for the progress shown in Settings.
+                            drop(status);
+                            let waiting = count_waiting(&conn, ocr)?;
+                            status = self.status.lock().unwrap_or_else(|err| err.into_inner());
+                            status.waiting = status.waiting.max(status.done + waiting);
+                        } else if first || scope.is_some() {
+                            status.waiting = status.waiting.max(status.done + read.len() as u64 + batch.len() as u64);
+                        }
+                        status.reading = status.waiting > status.done;
+                    }
+                    first = false;
+                    for file in batch {
+                        let started = Instant::now();
+                        self.status.lock().unwrap_or_else(|err| err.into_inner()).current = Some(file.path.clone());
+                        let text = read_text(&root.join(&file.path), &file.path, &file.kind, cache_dir, ocr).unwrap_or_default();
+                        if read.is_empty() {
+                            first_read = Instant::now();
+                        }
+                        read.push((file, text));
+                        if read.len() >= STORE_EVERY || first_read.elapsed() >= STORE_AFTER {
+                            flush(&mut read)?;
+                        }
+                        let rest = speed().rest(started.elapsed());
+                        if !rest.is_zero() {
+                            std::thread::sleep(rest);
+                        }
+                        if self.wake.load(Ordering::SeqCst) {
+                            // Reindex asked for: start over with what it cleared.
+                            flush(&mut read)?;
+                            stopped = true;
+                            break 'scopes;
+                        }
+                    }
+                    flush(&mut read)?;
+                    // Files changed while these were read are told by the next scan.
+                    if last {
+                        break;
+                    }
                 }
-                for file in batch {
-                    let started = Instant::now();
-                    self.status.lock().unwrap_or_else(|err| err.into_inner()).current = Some(file.path.clone());
-                    let text = read_text(&root.join(&file.path), &file.path, &file.kind, cache_dir, ocr).unwrap_or_default();
-                    if read.is_empty() {
-                        first_read = Instant::now();
-                    }
-                    read.push((file, text));
-                    if read.len() >= STORE_EVERY || first_read.elapsed() >= STORE_AFTER {
-                        flush(&mut read)?;
-                    }
-                    let rest = speed().rest(started.elapsed());
-                    if !rest.is_zero() {
-                        std::thread::sleep(rest);
-                    }
-                    if self.wake.load(Ordering::SeqCst) {
-                        // Reindex asked for: start over with what it cleared.
-                        flush(&mut read)?;
-                        return Ok(conn);
-                    }
-                }
-                flush(&mut read)?;
+                forget_gone(&conn, root, scope)?;
             }
-            forget_gone(&conn, root)?;
             Ok(conn)
         });
         let mut status = self.status.lock().unwrap_or_else(|err| err.into_inner());
@@ -180,8 +283,16 @@ impl TextIndex {
             Ok(conn) => {
                 status.files = conn.query_row("SELECT count(*) FROM content_text", [], |row| row.get::<_, i64>(0)).unwrap_or(0) as u64;
                 status.finished_at = Some(crate::db::now_secs());
+                drop(status);
+                if stopped {
+                    self.changed.lock().unwrap_or_else(|err| err.into_inner()).put_back(taken);
+                }
+                Ok(())
             }
-            Err(err) => status.error = Some(err),
+            Err(err) => {
+                status.error = Some(err);
+                Err(taken)
+            }
         }
     }
 }
@@ -200,6 +311,7 @@ fn readable_sql(ocr: bool) -> String {
     format!("f.dir = 0 AND f.size > 0 AND (f.kind IN ('text', 'pdf'){image} OR {})", names.join(" OR "))
 }
 
+/// Looks at every file name in the library: seconds on a large one.
 fn count_waiting(conn: &Connection, ocr: bool) -> Result<u64, String> {
     let sql = format!(
         "SELECT count(*) FROM file_index f LEFT JOIN content_text c ON c.path = f.path
@@ -209,19 +321,23 @@ fn count_waiting(conn: &Connection, ocr: bool) -> Result<u64, String> {
     conn.query_row(&sql, [], |row| row.get::<_, i64>(0)).map(|n| n as u64).map_err(|err| err.to_string())
 }
 
-/// Files not read yet, or changed since: documents and text before photos (OCR is slow).
-fn waiting_files(conn: &Connection, ocr: bool, limit: usize) -> Result<Vec<Waiting>, String> {
+/// Files not read yet, or changed since, at or under `scope` (`None`: the whole library, which
+/// looks at every file name): documents and text before photos (OCR is slow).
+fn waiting_files(conn: &Connection, ocr: bool, scope: Option<&str>, limit: usize) -> Result<Vec<Waiting>, String> {
+    let within = if scope.is_some() { "(f.path = ?2 OR (f.path >= ?2 || '/' AND f.path < ?2 || '0')) AND" } else { "" };
     let sql = format!(
         "SELECT f.path, f.kind, f.size, f.mtime FROM file_index f LEFT JOIN content_text c ON c.path = f.path
-         WHERE {} AND (c.path IS NULL OR c.size != f.size OR c.mtime != f.mtime)
+         WHERE {within} {} AND (c.path IS NULL OR c.size != f.size OR c.mtime != f.mtime)
          ORDER BY f.kind = 'image', f.path LIMIT ?1",
         readable_sql(ocr)
     );
     let mut stmt = conn.prepare(&sql).map_err(|err| err.to_string())?;
-    let rows = stmt
-        .query_map(params![limit as i64], |row| Ok(Waiting { path: row.get(0)?, kind: row.get(1)?, size: row.get(2)?, mtime: row.get(3)? }))
-        .map_err(|err| err.to_string())?;
-    Ok(rows.filter_map(Result::ok).collect())
+    let row = |row: &rusqlite::Row| Ok(Waiting { path: row.get(0)?, kind: row.get(1)?, size: row.get(2)?, mtime: row.get(3)? });
+    let found: Vec<Waiting> = match scope {
+        Some(scope) => stmt.query_map(params![limit as i64, scope], row).map_err(|err| err.to_string())?.filter_map(Result::ok).collect(),
+        None => stmt.query_map(params![limit as i64], row).map_err(|err| err.to_string())?.filter_map(Result::ok).collect(),
+    };
+    Ok(found)
 }
 
 /// The words in one file, or `None` when it has none that can be read.
@@ -276,18 +392,20 @@ fn store(conn: &Connection, read: &[(Waiting, String)]) -> Result<(), String> {
     tx.commit().map_err(|err| err.to_string())
 }
 
-/// Drops the words of files that are gone. One moved through OwnNAS keeps its words (they move
-/// with it), even before the name index has seen it in its new place.
-fn forget_gone(conn: &Connection, root: &Path) -> Result<(), String> {
+/// Drops the words of files that are gone, at or under `scope` (`None`: anywhere). One moved
+/// through OwnNAS keeps its words (they move with it), even before the name index has seen it in
+/// its new place.
+fn forget_gone(conn: &Connection, root: &Path, scope: Option<&str>) -> Result<(), String> {
+    let within = if scope.is_some() { "(c.path = ?1 OR (c.path >= ?1 || '/' AND c.path < ?1 || '0')) AND" } else { "" };
     let mut stmt = conn
-        .prepare("SELECT path FROM content_text WHERE path NOT IN (SELECT path FROM file_index)")
+        .prepare(&format!("SELECT c.path FROM content_text c WHERE {within} NOT EXISTS (SELECT 1 FROM file_index f WHERE f.path = c.path)"))
         .map_err(|err| err.to_string())?;
-    let gone: Vec<String> = stmt
-        .query_map([], |row| row.get(0))
-        .map_err(|err| err.to_string())?
-        .filter_map(Result::ok)
-        .filter(|path: &String| !root.join(path).is_file())
-        .collect();
+    let path = |row: &rusqlite::Row| row.get::<_, String>(0);
+    let known: Vec<String> = match scope {
+        Some(scope) => stmt.query_map(params![scope], path).map_err(|err| err.to_string())?.filter_map(Result::ok).collect(),
+        None => stmt.query_map([], path).map_err(|err| err.to_string())?.filter_map(Result::ok).collect(),
+    };
+    let gone: Vec<String> = known.into_iter().filter(|path| !root.join(path).is_file()).collect();
     for path in gone {
         conn.execute("DELETE FROM content_text WHERE path = ?1", params![path]).map_err(|err| err.to_string())?;
     }
@@ -379,6 +497,55 @@ mod tests {
         assert_eq!(paths("", "50%"), ["Home/notes.txt"]);
         assert!(paths("Work", "invoice").is_empty(), "only under the folder");
         assert_eq!(search(&conn, "", "ñandú", 10).unwrap()[0].snippet.as_deref().map(|s| s.contains("Ñandú")), Some(true));
+    }
+
+    #[test]
+    fn looks_only_where_a_scan_found_changes() {
+        let mut changed = Changed::default();
+        assert!(!changed.any());
+        for path in ["Work/b.txt", "Work", "Workshop/c.txt", "Home/a.txt"] {
+            changed.add(path);
+        }
+        assert_eq!(changed.scopes(), [Some("Home/a.txt".to_string()), Some("Work".into()), Some("Workshop/c.txt".into())], "one inside another is looked at once");
+        changed.add("");
+        assert_eq!(changed.scopes(), [None], "the whole library");
+        let mut many = Changed::default();
+        for n in 0..=MAX_CHANGED {
+            many.add(&format!("f{n}"));
+        }
+        assert!(many.all && many.paths.is_empty(), "too many: the whole library");
+        assert!(TextIndex::default().changed.lock().unwrap().all, "everything at first");
+
+        let conn = conn();
+        let file = |path: &str, mtime: i64| {
+            conn.execute(
+                "INSERT OR REPLACE INTO file_index(path, parent, name_lower, dir, size, mtime, kind) VALUES (?1, '', lower(?1), 0, 10, ?2, 'text')",
+                params![path, mtime],
+            )
+            .unwrap();
+        };
+        file("Work/a.txt", 1);
+        file("Work/Old/b.txt", 1);
+        file("Workshop/c.txt", 1);
+        file("Home/report.docx", 1);
+        let waiting = |scope: Option<&str>| waiting_files(&conn, false, scope, 100).unwrap().into_iter().map(|file| file.path).collect::<Vec<_>>();
+        assert_eq!(waiting(None), ["Home/report.docx", "Work/Old/b.txt", "Work/a.txt", "Workshop/c.txt"]);
+        assert_eq!(waiting(Some("Work")), ["Work/Old/b.txt", "Work/a.txt"], "not the folder next to it");
+        assert_eq!(waiting(Some("Work/a.txt")), ["Work/a.txt"]);
+        store(&conn, &[(Waiting { path: "Work/a.txt".into(), kind: "text".into(), size: 10, mtime: 1 }, "x".into())]).unwrap();
+        assert_eq!(waiting(Some("Work")), ["Work/Old/b.txt"], "read already");
+        file("Work/a.txt", 2);
+        assert_eq!(waiting(Some("Work")), ["Work/Old/b.txt", "Work/a.txt"], "changed since");
+
+        // Words of a file gone go when its place is looked at, or the whole library is.
+        add(&conn, "Gone/x.txt", "text", "gone");
+        add(&conn, "Elsewhere/y.txt", "text", "gone too");
+        let root = std::env::temp_dir();
+        forget_gone(&conn, &root, Some("Gone")).unwrap();
+        assert_eq!(search(&conn, "", "gone", 10).unwrap().len(), 1);
+        forget_gone(&conn, &root, None).unwrap();
+        assert!(search(&conn, "", "gone", 10).unwrap().is_empty());
+        assert_eq!(waiting(Some("Work/a.txt")), ["Work/a.txt"], "files still there keep theirs");
     }
 
     #[test]
