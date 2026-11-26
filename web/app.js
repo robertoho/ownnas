@@ -2627,7 +2627,7 @@ function syncTerminalButton() {
 
 // Page-wide shortcuts: ⇧⌘ and a key on Macs, Ctrl+Shift elsewhere. Terminals forward them
 // too (terminal.js), so they work wherever the keyboard is.
-const PAGE_SHORTCUTS = { KeyK: "shortcuts", KeyL: "terminals", KeyE: "new-terminal", KeyU: "hide-terminal", KeyX: "close-terminal", Enter: "expand-terminal" };
+const PAGE_SHORTCUTS = { KeyK: "shortcuts", KeyH: "library", KeyL: "terminals", KeyE: "new-terminal", KeyU: "hide-terminal", KeyX: "close-terminal", Enter: "expand-terminal" };
 const TILE_MOVES = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
 
 function shortcutLabel(key) {
@@ -2658,6 +2658,11 @@ function runShortcut(name, from = "") {
   if (!state.me || $("app-view").hidden) return;
   if (name === "shortcuts") {
     showShortcuts();
+    return;
+  }
+  // ⇧⌘H, as Home in Finder: the library's top folder, as the OwnNAS button at the top does.
+  if (name === "library") {
+    $("brand-home").click();
     return;
   }
   // ⇧⌘↵ outside a terminal expands (or collapses) the open preview.
@@ -2705,6 +2710,7 @@ function showShortcuts() {
       terminal && [`${selectLabel(1)} … ${selectLabel(9)}`, "Go to the terminal with that number"],
     ]],
     ["Files", [
+      [shortcutLabel("H"), "Go to the library's top folder"],
       ["Type", "Filter this folder"],
       ["← ↑ ↓ →", "Move the selection (with Shift to extend it)"],
       [`Enter, ${commandLabel("↓")}`, "Open"],
@@ -7047,6 +7053,7 @@ $("refresh-btn").addEventListener("click", () => {
     .finally(() => button.classList.remove("is-spinning"));
 });
 
+$("brand-home").title = `Go to library root (${shortcutLabel("H")})`;
 $("brand-home").addEventListener("click", () => {
   go("").catch((err) => toast(err.message, true));
 });

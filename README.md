@@ -550,7 +550,9 @@ selected size is remembered in the browser and also applies on mobile.
 
 On macOS, Command+Up opens the parent folder and Command+Down opens the
 selected folder or previews the selected file. These shortcuts leave text
-inputs, editors, and dialogs alone.
+inputs, editors, and dialogs alone. **⇧⌘H** (Ctrl+Shift+H off a Mac) goes
+to the library's top folder from anywhere, as Home does in Finder and as
+the OwnNAS button at the top does.
 
 Explorer browsing additions:
 
