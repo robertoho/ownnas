@@ -428,11 +428,15 @@ final class FolderEnumerator: NSObject, NSFileProviderEnumerator {
                 return
             }
             do {
-                let folder = try provider.call { try provider.server().list(path: path) }
+                // In pages: the system takes at most 20,000 items at a time, and a folder of
+                // photos can hold more. A page is how many of its items were told before it.
+                let start = String(data: page.rawValue, encoding: .utf8).flatMap { Int($0) } ?? 0
+                let entries = try provider.call { try provider.server().list(path: path) }.entries.sorted { $0.name < $1.name }
                 let writable = provider.writable()
-                provider.ids.listed(path, names: Set(folder.entries.map(\.name)))
-                observer.didEnumerate(folder.entries.map { FileItem($0, writable: writable, ids: provider.ids) })
-                observer.finishEnumerating(upTo: nil)
+                if start == 0 { provider.ids.listed(path, names: Set(entries.map(\.name))) }
+                let end = min(entries.count, start + ChangeFeed.batch)
+                if start < end { observer.didEnumerate(entries[start..<end].map { FileItem($0, writable: writable, ids: provider.ids) }) }
+                observer.finishEnumerating(upTo: end < entries.count ? NSFileProviderPage(Data("\(end)".utf8)) : nil)
             } catch {
                 observer.finishEnumeratingWithError(FileProviderExtension.fileError(error))
             }
@@ -471,8 +475,9 @@ final class WorkingSet: NSObject, NSFileProviderEnumerator {
                 return
             }
             do {
-                try ChangeFeed.relist(provider) { items, _ in observer.didEnumerate(items) }
-                observer.finishEnumerating(upTo: nil)
+                let from = try? JSONDecoder().decode(ChangeFeed.Place.self, from: page.rawValue)
+                let next = try ChangeFeed.relist(provider, from: from) { items, _ in observer.didEnumerate(items) }
+                observer.finishEnumerating(upTo: try next.map { NSFileProviderPage(try JSONEncoder().encode($0)) })
             } catch {
                 observer.finishEnumeratingWithError(FileProviderExtension.fileError(error))
             }
@@ -494,7 +499,49 @@ let changeLog = Logger(subsystem: "app.ownnas.files", category: "changes")
 
 /// The server's change feed (`/api/sync/changes`): an anchor is the server's cursor, and the
 /// changes after it are told to the system as items updated or deleted.
+///
+/// The system takes at most 20,000 items between one anchor and the next, and stops the extension
+/// when it is given more (a folder of photos can hold that many). So what is told goes in batches
+/// of `batch`: when the folders are listed again, the anchor also says where that got to, and the
+/// system asks again from there (`moreComing`) until it is done.
 enum ChangeFeed {
+    /// The most items told to the system at a time.
+    static let batch = 10_000
+
+    /// Where listing folders again got to: the folder, and how many of its items were told.
+    struct Place: Codable, Equatable {
+        var folder: String
+        var told: Int
+    }
+
+    /// What an anchor says: the feed's cursor, and folders being listed again (`tops` and what
+    /// is inside them, from `from`) before the changes after the cursor are told. An anchor with
+    /// nothing being listed is the cursor alone, as it always was.
+    struct Anchor: Codable {
+        var cursor: String
+        var tops: [String]? = nil
+        var from: Place? = nil
+
+        init(cursor: String, tops: [String]? = nil, from: Place? = nil) {
+            self.cursor = cursor
+            self.tops = tops
+            self.from = from
+        }
+
+        init(_ anchor: NSFileProviderSyncAnchor) {
+            if anchor.rawValue.first == UInt8(ascii: "{"), let decoded = try? JSONDecoder().decode(Anchor.self, from: anchor.rawValue) {
+                self = decoded
+            } else {
+                self.init(cursor: String(data: anchor.rawValue, encoding: .utf8) ?? "")
+            }
+        }
+
+        var encoded: NSFileProviderSyncAnchor {
+            if tops == nil { return NSFileProviderSyncAnchor(Data(cursor.utf8)) }
+            return NSFileProviderSyncAnchor((try? JSONEncoder().encode(self)) ?? Data(cursor.utf8))
+        }
+    }
+
     static func anchor(_ provider: FileProviderExtension?, _ completion: @escaping (NSFileProviderSyncAnchor?) -> Void) {
         Task.detached {
             let cursor = provider.flatMap { provider in try? provider.call { try provider.server().changes(cursor: "", waitSeconds: 0) }.cursor }
@@ -510,44 +557,45 @@ enum ChangeFeed {
                 return
             }
             do {
+                var state = Anchor(anchor)
                 #if os(macOS)
                 // Told first: the rest can end early, and a choice should not wait for a change.
-                if folder == nil {
+                if folder == nil, state.tops == nil {
                     let chosen = provider.takePolicyChanges().compactMap { path in
                         path.isEmpty ? FileItem.root(name: provider.rootName, writable: provider.writable(), ids: provider.ids) : try? provider.lookUp(path)
                     }
                     if !chosen.isEmpty { observer.didUpdate(chosen) }
                     // Refresh: those folders (and what the system has inside them) listed again.
                     let refreshes = provider.takeRefreshes()
-                    if !refreshes.isEmpty {
-                        try relist(provider, under: refreshes) { items, gone in
-                            if !gone.isEmpty { observer.didDeleteItems(withIdentifiers: gone) }
-                            if !items.isEmpty { observer.didUpdate(items) }
-                        }
-                    }
+                    if !refreshes.isEmpty { state = Anchor(cursor: state.cursor, tops: refreshes) }
                 }
                 #endif
-                let cursor = String(data: anchor.rawValue, encoding: .utf8) ?? ""
+                if folder == nil, state.tops != nil {
+                    try relistChanges(provider, state, to: observer)
+                    return
+                }
+                let cursor = state.cursor
                 let feed: Changes
                 do {
                     feed = try provider.call { try provider.server().changes(cursor: cursor, waitSeconds: 0) }
                 } catch ClientError.NotFound {
                     // A server from before the change feed: what the system has is listed again.
                     if folder != nil { observer.finishEnumeratingWithError(NSFileProviderError(.syncAnchorExpired)) }
-                    else { try relistChanges(provider, to: observer, upTo: anchor) }
+                    else { try relistChanges(provider, Anchor(cursor: cursor, tops: [""]), to: observer) }
                     return
                 }
                 changeLog.notice("changes\(folder.map { " in \"\($0)\"" } ?? "", privacy: .public) from \(cursor, privacy: .public): \(feed.changes.count) to \(feed.cursor, privacy: .public)\(feed.expired ? ", expired" : "", privacy: .public)\(feed.watching ? "" : feed.scanning ? ", found by looking" : ", not watching", privacy: .public)")
                 // A server that cannot watch its folder may still find changes by looking through
-                // it (`scanning`): they come in the feed as usual.
-                if feed.expired || (!feed.watching && !feed.scanning) {
+                // it (`scanning`): they come in the feed as usual. More changes than one batch
+                // holds are told by listing the folders again, a batch at a time.
+                if feed.expired || (!feed.watching && !feed.scanning) || feed.changes.count > batch {
                     // The feed cannot say what changed: the server restarted or missed changes
                     // (the cursor expired), or it cannot watch its folder. A folder starts over;
                     // everything the system has is listed again. (Only asking the system to start
                     // over would not do on the Mac: it lists only the working set again, never
                     // the folders it already has.)
                     if folder != nil { observer.finishEnumeratingWithError(NSFileProviderError(.syncAnchorExpired)) }
-                    else { try relistChanges(provider, to: observer, upTo: NSFileProviderSyncAnchor(Data(feed.cursor.utf8))) }
+                    else { try relistChanges(provider, Anchor(cursor: feed.cursor, tops: [""]), to: observer) }
                     return
                 }
                 let writable = provider.writable()
@@ -583,41 +631,67 @@ enum ChangeFeed {
         }
     }
 
-    /// Tells the system what is in every folder it has, and what it has that is gone, then moves
-    /// it to `anchor` (taken before listing, so a change made meanwhile comes again next time).
-    private static func relistChanges(_ provider: FileProviderExtension, to observer: NSFileProviderChangeObserver, upTo anchor: NSFileProviderSyncAnchor) throws {
-        try relist(provider) { items, gone in
+    /// Tells the system the next batch of what is in the folders `state` lists again, and what it
+    /// has there that is gone. Until all are told, the anchor says where that got to and the system
+    /// asks again at once; then it moves to the cursor (taken before listing, so a change made
+    /// meanwhile comes again next time).
+    private static func relistChanges(_ provider: FileProviderExtension, _ state: Anchor, to observer: NSFileProviderChangeObserver) throws {
+        let next = try relist(provider, under: state.tops ?? [""], from: state.from) { items, gone in
             if !gone.isEmpty { observer.didDeleteItems(withIdentifiers: gone) }
             if !items.isEmpty { observer.didUpdate(items) }
         }
-        observer.finishEnumeratingChanges(upTo: anchor, moreComing: false)
+        if let next {
+            observer.finishEnumeratingChanges(upTo: Anchor(cursor: state.cursor, tops: state.tops, from: next).encoded, moreComing: true)
+        } else {
+            // Done: what changed after the cursor comes next.
+            observer.finishEnumeratingChanges(upTo: Anchor(cursor: state.cursor).encoded, moreComing: true)
+        }
     }
 
-    /// Lists every folder the system has again, a folder at a time: what is in it now, and the
-    /// identifiers of what the system has that is no longer there (a folder gone takes what was
-    /// inside it along).
-    static func relist(_ provider: FileProviderExtension, under tops: [String] = [""], report: ([NSFileProviderItem], [NSFileProviderItemIdentifier]) -> Void) throws {
+    /// Lists every folder the system has under `tops` again, a folder at a time, from `from` on:
+    /// what is in it now, and the identifiers of what the system has that is no longer there (a
+    /// folder gone takes what was inside it along). Stops after about `batch` items and returns
+    /// where it got to, or nil when it is done.
+    static func relist(_ provider: FileProviderExtension, under tops: [String] = [""], from: Place? = nil, report: ([NSFileProviderItem], [NSFileProviderItemIdentifier]) -> Void) throws -> Place? {
         let writable = provider.writable()
         let started = Date()
         var listed = 0
+        var told = 0
         let inside = { (folder: String) in tops.contains { $0.isEmpty || folder == $0 || folder.hasPrefix($0 + "/") } }
         for folder in provider.ids.visitedFolders() where inside(folder) {
+            // Folders before where the last batch ended were told then (the list is sorted).
+            if let from, folder < from.folder { continue }
             // Inside a folder found gone a moment ago.
             if !provider.ids.visited(folder) { continue }
+            let skip = from?.folder == folder ? from?.told ?? 0 : 0
+            if told >= batch {
+                changeLog.notice("Listed \(listed) folders again in \(Date().timeIntervalSince(started), format: .fixed(precision: 1)) s, more to come")
+                return Place(folder: folder, told: skip)
+            }
             let entries: [Entry]
             do {
-                entries = try provider.call { try provider.server().list(path: folder) }.entries
+                entries = try provider.call { try provider.server().list(path: folder) }.entries.sorted { $0.name < $1.name }
             } catch ClientError.NotFound where !folder.isEmpty {
                 let id = provider.ids.known(folder)
                 provider.ids.removed(folder)
                 report([], id.map { [$0] } ?? [])
+                told += 1
                 continue
             }
-            let gone = provider.ids.listed(folder, names: Set(entries.map(\.name)))
-            report(entries.map { FileItem($0, writable: writable, ids: provider.ids) }, gone)
+            // What is gone is found once, with the folder's first batch.
+            let gone = skip == 0 ? provider.ids.listed(folder, names: Set(entries.map(\.name))) : []
+            let end = min(entries.count, skip + max(batch - told - gone.count, 0))
+            let items = skip < end ? entries[skip..<end].map { FileItem($0, writable: writable, ids: provider.ids) } : []
+            report(items, gone)
+            told += gone.count + items.count
             listed += 1
+            if end < entries.count {
+                changeLog.notice("Listed \(listed) folders again in \(Date().timeIntervalSince(started), format: .fixed(precision: 1)) s, more to come")
+                return Place(folder: folder, told: end)
+            }
         }
         changeLog.notice("Listed \(listed) folders again in \(Date().timeIntervalSince(started), format: .fixed(precision: 1)) s")
+        return nil
     }
 }
 
