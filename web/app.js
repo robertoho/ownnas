@@ -7423,7 +7423,7 @@ $("menu-sub").addEventListener("click", (event) => {
 
 // Capture outside clicks before file/menu handlers stop propagation.
 document.addEventListener("pointerdown", (event) => {
-  if (!$("search-panel").hidden && !event.target.closest("#search-panel, .search-wrap")) {
+  if (!$("search-panel").hidden && (!event.target.closest("#search-panel, .search-wrap") || event.target.closest("#library-btn"))) {
     clearDeepSearch();
   }
 }, true);
