@@ -97,4 +97,4 @@ members = ["clients/cli", "clients/desktop", "clients/linux", "clients/windows",
 # The release version: the server, the clients (`version.workspace = true` in theirs) and the Mac
 # and iPhone apps (clients/apple-version.sh) all take it from here. A release changes only this.
 [workspace.package]
-version = "0.9.14"
+version = "0.9.15"
