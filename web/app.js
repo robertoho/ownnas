@@ -2714,7 +2714,8 @@ function showShortcuts() {
       ["Type", "Filter this folder"],
       ["← ↑ ↓ →", "Move the selection (with Shift to extend it)"],
       [`Enter, ${commandLabel("↓")}`, "Open"],
-      [commandLabel("↑"), "Go to the parent folder"],
+      ["F2", "Rename"],
+      [IS_MAC ? commandLabel("↑") : `${commandLabel("↑")}, Alt+↑`, "Go to the parent folder"],
       [commandLabel("A"), "Select everything"],
       [`${commandLabel("C")}, ${commandLabel("X")}, ${commandLabel("V")}`, "Copy, cut, paste"],
       [IS_MAC ? "⌘⌫, Delete" : "Delete", "Delete the selection"],
@@ -8605,8 +8606,12 @@ window.addEventListener("keydown", (event) => {
     search.dispatchEvent(new Event("input", { bubbles: true }));
     return;
   }
-  if (event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey
-      && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+  // ⌘↑ and ⌘↓ on Macs, Ctrl+↑ and Ctrl+↓ elsewhere (and Alt+↑ for the parent folder, as in
+  // Windows Explorer).
+  const folderKey = IS_MAC
+    ? event.metaKey && !event.ctrlKey && !event.altKey
+    : (event.ctrlKey && !event.metaKey && !event.altKey) || (event.altKey && !event.ctrlKey && !event.metaKey && event.key === "ArrowUp");
+  if (folderKey && !event.shiftKey && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
     if (!state.me || $("app-view").hidden || !$("settings").hidden || !$("library").hidden) return;
     event.preventDefault();
     if (event.repeat) return;
@@ -8665,6 +8670,13 @@ window.addEventListener("keydown", (event) => {
     if (entries.length !== 1) return;
     event.preventDefault();
     openEntry(entries[0]).catch((err) => toast(err.message, true));
+  }
+  // F2 renames, as in Windows Explorer (and in Remotes).
+  if (event.key === "F2" && !command && state.me && !state.me.readonly) {
+    const entries = selectedEntries();
+    if (entries.length !== 1) return;
+    event.preventDefault();
+    renameEntry(entries[0]).catch((err) => toast(err.message, true));
   }
 });
 

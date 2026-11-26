@@ -548,9 +548,11 @@ ask for it once on the next interactive start.
 In Icons and Masonry views, use the bottom status bar Size slider to resize tiles. The
 selected size is remembered in the browser and also applies on mobile.
 
-On macOS, Command+Up opens the parent folder and Command+Down opens the
-selected folder or previews the selected file. These shortcuts leave text
-inputs, editors, and dialogs alone. **⇧⌘H** (Ctrl+Shift+H off a Mac) goes
+Command+Up (Ctrl+Up or Alt+Up off a Mac) opens the parent folder and
+Command+Down (Ctrl+Down) opens the selected folder or previews the selected
+file. These shortcuts leave text inputs, editors, and dialogs alone. The
+page tells a Mac from other computers and shows each shortcut with the keys
+of the one in use (⇧⌘K lists them). **⇧⌘H** (Ctrl+Shift+H off a Mac) goes
 to the library's top folder from anywhere, as Home does in Finder and as
 the OwnNAS button at the top does.
 
