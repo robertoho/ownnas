@@ -690,9 +690,82 @@ pub fn stop_transfer(user: i64, id: u64) -> bool {
     }
 }
 
+// ---- Connecting Google Drive from the page ----
+
+/// The token in what `rclone authorize "drive" …` printed on a computer with a browser: the
+/// whole output pasted, or just the part between its arrows. Older rclones print the token's
+/// JSON; newer ones a base64 blob holding it.
+pub fn drive_token(pasted: &str) -> Result<String, String> {
+    let mut text = pasted.trim();
+    if let Some((_, after)) = text.split_once("--->") {
+        text = after.split("<---").next().unwrap_or(after).trim();
+    }
+    let bad = || "That is not what rclone authorize printed. Paste the text between its arrows (--->  <---).".to_string();
+    let parsed: Value = if text.starts_with('{') {
+        serde_json::from_str(text).map_err(|_| bad())?
+    } else {
+        let standard: String = text.chars().filter(|c| !c.is_whitespace()).map(|c| match c { '-' => '+', '_' => '/', c => c }).collect();
+        let bytes = crate::http::base64_decode(&standard).map_err(|_| bad())?;
+        serde_json::from_slice(&bytes).map_err(|_| bad())?
+    };
+    // A blob holds the token as a string of JSON under "token".
+    let token: Value = match parsed.get("token") {
+        Some(Value::String(inner)) => serde_json::from_str(inner).map_err(|_| bad())?,
+        Some(inner @ Value::Object(_)) => inner.clone(),
+        _ => parsed,
+    };
+    if token.get("access_token").and_then(Value::as_str).is_none_or(str::is_empty) && token.get("refresh_token").and_then(Value::as_str).is_none_or(str::is_empty) {
+        return Err(bad());
+    }
+    Ok(token.to_string())
+}
+
+/// Adds Google Drive to rclone's config as `name`, signed in with `token` and seeing only the
+/// files rclone makes there (`drive.file`), or signs an existing Google Drive remote in again.
+/// `client` is a Google API client of the user's own (id and secret), if they made one.
+pub fn connect_drive(endpoint: &Endpoint, name: &str, token: &str, client: Option<(&str, &str)>) -> Result<bool, String> {
+    if !valid_name(name) {
+        return Err("Give the connection a name of letters and digits, such as gdrive".into());
+    }
+    let existing = remotes(endpoint)?.into_iter().find(|remote| remote.name == name);
+    if existing.as_ref().is_some_and(|remote| remote.kind != "drive") {
+        return Err(format!("rclone already has a remote called “{name}” that is not Google Drive. Choose another name."));
+    }
+    let mut parameters = json!({ "token": token });
+    if let Some((id, secret)) = client {
+        parameters["client_id"] = json!(id);
+        parameters["client_secret"] = json!(secret);
+    }
+    // Without questions: rclone then only writes the settings (it would ask whether to refresh
+    // the token, and about shared drives, which are not wanted here).
+    let opt = json!({ "nonInteractive": true, "obscure": true });
+    if existing.is_some() {
+        endpoint.call("config/update", json!({ "name": name, "parameters": parameters, "opt": opt }))?;
+        Ok(false)
+    } else {
+        parameters["scope"] = json!("drive.file");
+        endpoint.call("config/create", json!({ "name": name, "type": "drive", "parameters": parameters, "opt": opt }))?;
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tokens_from_rclone_authorize() {
+        let token = r#"{"access_token":"ya29.x","token_type":"Bearer","refresh_token":"1//y","expiry":"2026-11-26T18:00:00Z"}"#;
+        let parsed = |text: &str| drive_token(text).map(|t| serde_json::from_str::<Value>(&t).unwrap()["refresh_token"].as_str().unwrap().to_string());
+        assert_eq!(parsed(token).as_deref(), Ok("1//y"), "the token's JSON");
+        let output = format!("Paste the following into your remote machine --->\n{token}\n<---End paste");
+        assert_eq!(parsed(&output).as_deref(), Ok("1//y"), "the whole output pasted");
+        // A blob: base64 (URL-safe, no padding) of {"token": "<the token's JSON>"}.
+        let blob = crate::oauth::base64url_for_tests(json!({ "token": token }).to_string().as_bytes());
+        assert_eq!(parsed(&format!("--->\n{blob}\n<---End paste")).as_deref(), Ok("1//y"));
+        assert!(drive_token("hello").is_err());
+        assert!(drive_token(r#"{"token_type":"Bearer"}"#).is_err(), "no token in it");
+    }
 
     #[test]
     fn names_and_paths() {

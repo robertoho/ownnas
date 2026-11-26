@@ -158,6 +158,11 @@ pub struct Tokens {
     pub scope: String,
 }
 
+#[cfg(test)]
+pub(crate) fn base64url_for_tests(bytes: &[u8]) -> String {
+    base64url(bytes)
+}
+
 /// base64url without padding (RFC 4648 §5), as PKCE uses.
 fn base64url(bytes: &[u8]) -> String {
     const LETTERS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";

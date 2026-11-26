@@ -488,6 +488,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/remotes/file", get(remote_file))
         .route("/api/remotes/access", post(remote_access))
         .route("/api/remotes/settings", post(remote_settings))
+        .route("/api/remotes/google-drive", post(connect_google_drive))
         .route("/api/remotes/transfer", post(remote_transfer))
         .route("/api/remotes/transfers", get(remote_transfers))
         .route("/api/remotes/transfers/stop", post(remote_transfer_stop))
@@ -531,6 +532,7 @@ pub fn router(state: std::sync::Arc<AppState>) -> Router {
         .route("/api/images/resize", post(resize_images))
         .route("/api/nas-backup", get(nas_backup_status))
         .route("/api/nas-backup/config", post(set_nas_backup_config))
+        .route("/api/nas-backup/remove", post(remove_nas_backup_destination))
         .route("/api/nas-backup/password", post(reveal_nas_backup_password))
         .route("/api/nas-backup/run", post(run_nas_backup))
         .route("/api/nas-backup/verify", post(verify_nas_backup))
@@ -6408,6 +6410,54 @@ async fn remote_settings(State(state): State<std::sync::Arc<AppState>>, headers:
     Ok(Json(json!({ "ok": true })))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleDriveBody {
+    name: String,
+    /// What `rclone authorize "drive" …` printed on a computer with a browser.
+    token: String,
+    #[serde(default)]
+    client_id: String,
+    #[serde(default)]
+    client_secret: String,
+}
+
+/// Connects a Google Drive account to rclone (or signs one in again), with the token `rclone
+/// authorize` gave on a computer with a browser: a server has none to sign in with.
+async fn connect_google_drive(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, Json(body): Json<GoogleDriveBody>) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let bad = |err: String| ApiError::new(StatusCode::BAD_REQUEST, err);
+    let name = body.name.trim().to_string();
+    let token = crate::remotes::drive_token(&body.token).map_err(bad)?;
+    let (client_id, client_secret) = (body.client_id.trim().to_string(), body.client_secret.trim().to_string());
+    if client_id.is_empty() != client_secret.is_empty() {
+        return Err(bad("Give both the client ID and its secret, or neither".into()));
+    }
+    let settings = remote_settings_of(&state);
+    let remote = name.clone();
+    let created = tokio::task::spawn_blocking(move || {
+        crate::remotes::program(&settings).ok_or_else(|| "rclone is not installed on the server".to_string())?;
+        let endpoint = crate::remotes::rclone().endpoint(&settings)?;
+        let client = (!client_id.is_empty()).then_some((client_id.as_str(), client_secret.as_str()));
+        let created = crate::remotes::connect_drive(&endpoint, &remote, &token, client)?;
+        // Signed in: Google answers for the account (an expired or wrong token fails here). A
+        // remote made just now that does not work is not left behind.
+        crate::remotes::list(&endpoint, &remote, "").map(|_| created).map_err(|err| {
+            if created {
+                let _ = endpoint.call("config/delete", json!({ "name": remote }));
+            }
+            format!("Google did not accept the sign-in: {err}")
+        })
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not ask rclone"))?
+    .map_err(bad)?;
+    record(&state, &user, if created { "remote-added" } else { "remote-reconnected" }, &format!("{name} (Google Drive)"));
+    Ok(Json(json!({ "name": name, "created": created })))
+}
+
 // ---- Copying and moving between remotes and the library, renaming, deleting ----
 
 /// Runs `work` with the running rclone, in a thread of its own (rclone is asked over blocking
@@ -9217,14 +9267,27 @@ async fn cancel_video_job(State(state): State<std::sync::Arc<AppState>>, headers
 
 // ---- Backups of the NAS (restic) ----
 
-fn nas_backup_context(state: &AppState) -> Result<crate::nas_backup::Context, ApiError> {
+/// The destination a backup request is for (the first one when it names none).
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct DestinationBody {
+    id: Option<String>,
+}
+
+fn nas_backup_context(state: &AppState, id: Option<&str>) -> Result<crate::nas_backup::Context, ApiError> {
     let restic = crate::nas_backup::find_restic()
         .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "restic is not installed on this computer"))?;
     let config = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-        crate::nas_backup::load_config(&conn)
+        crate::nas_backup::load_one(&conn, id)
     };
-    let secrets = crate::nas_backup::load_secrets(&state.data_dir());
+    let Some(config) = config else {
+        return Err(match id {
+            Some(_) => ApiError::new(StatusCode::NOT_FOUND, "That backup destination is not there any more"),
+            None => ApiError::new(StatusCode::CONFLICT, "Choose where backups go first"),
+        });
+    };
+    let secrets = crate::nas_backup::load_secrets(&state.data_dir()).keys(&config.id);
     if config.destination.kind.is_empty() || secrets.password.is_empty() {
         return Err(ApiError::new(StatusCode::CONFLICT, "Choose where backups go first"));
     }
@@ -9234,9 +9297,12 @@ fn nas_backup_context(state: &AppState) -> Result<crate::nas_backup::Context, Ap
 async fn nas_backup_status(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
     let (user, _) = require_user(&state, &headers)?;
     require_admin(&user)?;
-    let (config, backup) = {
+    let all: Vec<(crate::nas_backup::Config, crate::nas_backup::State)> = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-        (crate::nas_backup::load_config(&conn), crate::nas_backup::load_state(&conn))
+        crate::nas_backup::load_all(&conn).into_iter().map(|config| {
+            let backup = crate::nas_backup::load_state(&conn, &config.id);
+            (config, backup)
+        }).collect()
     };
     let data = state.data_dir();
     let secrets = crate::nas_backup::load_secrets(&data);
@@ -9249,6 +9315,29 @@ async fn nas_backup_status(State(state): State<std::sync::Arc<AppState>>, header
     .unwrap_or((None, None));
     let now = db::now_secs();
     let install = if cfg!(target_os = "macos") { "brew install restic" } else if cfg!(windows) { "winget install restic.restic" } else { "sudo apt install restic" };
+    let destinations: Vec<serde_json::Value> = all
+        .into_iter()
+        .map(|(config, backup)| {
+            let keys = secrets.keys(&config.id);
+            json!({
+                "id": config.id,
+                "name": config.name,
+                "where": crate::nas_backup::describe(&config.destination),
+                "configured": !config.destination.kind.is_empty() && !keys.password.is_empty(),
+                "passwordSet": !keys.password.is_empty(),
+                "s3SecretSet": !keys.s3_secret.is_empty(),
+                // What is free where a drive backup goes.
+                "space": (config.destination.kind == "local" && !config.destination.path.is_empty())
+                    .then(|| crate::nas_backup::free_space(std::path::Path::new(&config.destination.path)))
+                    .flatten()
+                    .map(|(total, available)| json!({ "total": total, "available": available })),
+                "next": if config.enabled { crate::nas_backup::next_slot(&config, now) } else { None },
+                "alert": crate::nas_backup::alert(&config, &backup, now),
+                "state": backup,
+                "config": config,
+            })
+        })
+        .collect();
     Ok(Json(json!({
         "restic": {
             "found": restic.0.is_some(),
@@ -9257,20 +9346,9 @@ async fn nas_backup_status(State(state): State<std::sync::Arc<AppState>>, header
             "newEnough": restic.1.is_some_and(crate::nas_backup::new_enough),
             "install": install,
         },
-        "config": config,
-        "where": crate::nas_backup::describe(&config.destination),
-        "configured": !config.destination.kind.is_empty() && !secrets.password.is_empty(),
-        "passwordSet": !secrets.password.is_empty(),
-        "s3SecretSet": !secrets.s3_secret.is_empty(),
-        "state": backup,
-        // What is free where a drive backup goes.
-        "space": (config.destination.kind == "local" && !config.destination.path.is_empty())
-            .then(|| crate::nas_backup::free_space(std::path::Path::new(&config.destination.path)))
-            .flatten()
-            .map(|(total, available)| json!({ "total": total, "available": available })),
+        "destinations": destinations,
+        "maxDestinations": crate::nas_backup::MAX_DESTINATIONS,
         "progress": state.nas_backup.progress(),
-        "next": if config.enabled { crate::nas_backup::next_slot(&config, now) } else { None },
-        "alert": crate::nas_backup::alert(&config, &backup, now),
         "sshKey": crate::nas_backup::ssh_public_key(),
         "library": state.root.display().to_string(),
         "dataDir": data.display().to_string(),
@@ -9302,12 +9380,29 @@ fn confirm_account_password(state: &AppState, user: &User, password: &str, scope
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NasBackupConfigBody {
+    /// The destination to change; none: a new one.
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     account_password: String,
     config: crate::nas_backup::Config,
     /// The password of a backup made before (otherwise one is made up).
     password: Option<String>,
     s3_secret: Option<String>,
+}
+
+/// What rclone calls `remote`'s backend ("drive", "onedrive"…).
+async fn rclone_remote_type(state: &AppState, remote: &str) -> Result<String, ApiError> {
+    let settings = remote_settings_of(state);
+    let wanted = remote.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::remotes::program(&settings).ok_or_else(|| "rclone is not installed on the server".to_string())?;
+        let remotes = crate::remotes::rclone().endpoint(&settings).and_then(|endpoint| crate::remotes::remotes(&endpoint))?;
+        remotes.into_iter().find(|r| r.name == wanted).map(|r| r.kind).ok_or_else(|| format!("rclone has no remote called “{wanted}”"))
+    })
+    .await
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Could not ask rclone"))?
+    .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))
 }
 
 async fn set_nas_backup_config(
@@ -9319,12 +9414,33 @@ async fn set_nas_backup_config(
     let (user, _) = require_user(&state, &headers)?;
     require_admin(&user)?;
     let data = state.data_dir();
-    let old = {
+    let all = {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-        crate::nas_backup::load_config(&conn)
+        crate::nas_backup::load_all(&conn)
     };
+    let id = body.id.clone().filter(|id| !id.is_empty());
+    let old = match &id {
+        Some(id) => Some(all.iter().find(|config| &config.id == id).cloned().ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That backup destination is not there any more"))?),
+        None if all.len() >= crate::nas_backup::MAX_DESTINATIONS => {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, format!("Up to {} destinations", crate::nas_backup::MAX_DESTINATIONS)));
+        }
+        None => None,
+    };
+    let id = id.unwrap_or_else(|| if all.is_empty() { crate::nas_backup::MAIN.to_string() } else { crate::nas_backup::new_id(&all) });
     let mut config = body.config;
+    config.id = id.clone();
     config.destination = crate::nas_backup::validate(&config.destination, &state.root, &data).map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?;
+    if config.destination.kind == "rclone" {
+        config.destination.remote_type = rclone_remote_type(&state, &config.destination.remote).await?;
+    }
+    let repository = crate::nas_backup::repository(&config.destination);
+    if all.iter().any(|other| other.id != id && crate::nas_backup::repository(&other.destination) == repository) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Another backup goes there already. Choose a different folder."));
+    }
+    config.name = config.name.trim().chars().take(60).collect();
+    if config.name.is_empty() {
+        config.name = crate::nas_backup::default_name(&config.destination);
+    }
     if !matches!(config.frequency.as_str(), "daily" | "weekly" | "manual") {
         config.frequency = "daily".into();
     }
@@ -9337,37 +9453,48 @@ async fn set_nas_backup_config(
     let password = body.password.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
     let s3_secret = body.s3_secret.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     // Where backups go, and their keys, decide who can read the whole library.
-    let sensitive = config.destination != old.destination || password.is_some() || s3_secret.is_some() || (config.enabled && !old.enabled);
+    let sensitive = old.as_ref().is_none_or(|old| config.destination != old.destination || (config.enabled && !old.enabled)) || password.is_some() || s3_secret.is_some();
     if sensitive {
         confirm_account_password(&state, &user, &body.account_password, "backup-settings")?;
     }
     let mut secrets = crate::nas_backup::load_secrets(&data);
+    let mut keys = secrets.keys(&id);
     let s3_changed = s3_secret.is_some();
     if let Some(secret) = s3_secret {
-        secrets.s3_secret = secret;
+        keys.s3_secret = secret;
     }
-    if config.destination.kind == "s3" && secrets.s3_secret.is_empty() {
+    if config.destination.kind == "s3" && keys.s3_secret.is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "Enter the secret access key"));
     }
     let mut new_password = None;
     if let Some(password) = &password {
-        secrets.password = password.clone();
-    } else if secrets.password.is_empty() {
-        secrets.password = crate::nas_backup::new_password();
-        new_password = Some(secrets.password.clone());
+        keys.password = password.clone();
+    } else if keys.password.is_empty() {
+        keys.password = crate::nas_backup::new_password();
+        new_password = Some(keys.password.clone());
     }
-    let schedule_changed = config.enabled != old.enabled || config.frequency != old.frequency || config.minute != old.minute || config.weekday != old.weekday;
-    config.saved_at = if schedule_changed || old.saved_at == 0 { db::now_secs() } else { old.saved_at };
+    let schedule_changed = old.as_ref().is_none_or(|old| config.enabled != old.enabled || config.frequency != old.frequency || config.minute != old.minute || config.weekday != old.weekday);
+    config.saved_at = match &old {
+        Some(old) if !schedule_changed && old.saved_at != 0 => old.saved_at,
+        _ => db::now_secs(),
+    };
+    secrets.set_keys(&id, keys);
     crate::nas_backup::save_secrets(&data, &secrets).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     {
         let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
-        crate::nas_backup::save_config(&conn, &config).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+        // Read again under the lock, so a destination added meanwhile is kept.
+        let mut all = crate::nas_backup::load_all(&conn);
+        match all.iter_mut().find(|other| other.id == id) {
+            Some(slot) => *slot = config.clone(),
+            None => all.push(config.clone()),
+        }
+        crate::nas_backup::save_all(&conn, &all).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
     }
-    record(&state, &user, "backup-settings", &crate::nas_backup::describe(&config.destination));
+    record(&state, &user, "backup-settings", &format!("{}: {}", config.name, crate::nas_backup::describe(&config.destination)));
     // A new destination or password is tried at once, so a mistake shows now and not tonight.
     let mut connected = json!(null);
-    if config.destination != old.destination || password.is_some() || new_password.is_some() || s3_changed {
-        let ctx = nas_backup_context(&state)?;
+    if old.as_ref().is_none_or(|old| config.destination != old.destination) || password.is_some() || new_password.is_some() || s3_changed {
+        let ctx = nas_backup_context(&state, Some(&id))?;
         let worker = state.nas_backup.clone();
         connected = match tokio::task::spawn_blocking(move || worker.test(&ctx)).await {
             Ok(Ok(created)) => json!({ "ok": true, "created": created }),
@@ -9375,14 +9502,50 @@ async fn set_nas_backup_config(
             Err(_) => json!({ "ok": false, "error": "Could not try the destination" }),
         };
     }
-    Ok(Json(json!({ "saved": true, "connected": connected, "newPassword": new_password })))
+    Ok(Json(json!({ "saved": true, "id": id, "connected": connected, "newPassword": new_password })))
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AccountPasswordBody {
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
     account_password: String,
+}
+
+/// Takes a destination off the list. The backup there stays, and its password is shown once more
+/// on the page before (it is needed to restore from it later).
+async fn remove_nas_backup_destination(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AccountPasswordBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_csrf(&headers)?;
+    let (user, _) = require_user(&state, &headers)?;
+    require_admin(&user)?;
+    let id = body.id.clone().filter(|id| !id.is_empty()).ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Choose the destination"))?;
+    confirm_account_password(&state, &user, &body.account_password, "backup-settings")?;
+    if state.nas_backup.progress().is_some_and(|running| running.destination == id) {
+        return Err(ApiError::new(StatusCode::CONFLICT, "Stop what is running there first"));
+    }
+    let removed = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        let mut all = crate::nas_backup::load_all(&conn);
+        let Some(at) = all.iter().position(|config| config.id == id) else {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "That backup destination is not there any more"));
+        };
+        let removed = all.remove(at);
+        crate::nas_backup::save_all(&conn, &all).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+        crate::nas_backup::forget_state(&conn, &id);
+        removed
+    };
+    let data = state.data_dir();
+    let mut secrets = crate::nas_backup::load_secrets(&data);
+    secrets.forget(&id);
+    crate::nas_backup::save_secrets(&data, &secrets).map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    record(&state, &user, "backup-destination-removed", &format!("{}: {}", removed.name, crate::nas_backup::describe(&removed.destination)));
+    Ok(Json(json!({ "removed": true })))
 }
 
 async fn reveal_nas_backup_password(
@@ -9394,19 +9557,25 @@ async fn reveal_nas_backup_password(
     let (user, _) = require_user(&state, &headers)?;
     require_admin(&user)?;
     confirm_account_password(&state, &user, &body.account_password, "backup-settings")?;
-    record(&state, &user, "backup-password-shown", "");
-    Ok(Json(json!({ "password": crate::nas_backup::load_secrets(&state.data_dir()).password })))
+    let config = {
+        let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
+        crate::nas_backup::load_one(&conn, body.id.as_deref())
+    }
+    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "That backup destination is not there any more"))?;
+    record(&state, &user, "backup-password-shown", &config.name);
+    Ok(Json(json!({ "password": crate::nas_backup::load_secrets(&state.data_dir()).keys(&config.id).password })))
 }
 
 /// Starts a backup (or a check of the backup) in the background.
-async fn start_nas_backup(state: std::sync::Arc<AppState>, headers: HeaderMap, what: &'static str) -> Result<Json<serde_json::Value>, ApiError> {
+async fn start_nas_backup(state: std::sync::Arc<AppState>, headers: HeaderMap, body: DestinationBody, what: &'static str) -> Result<Json<serde_json::Value>, ApiError> {
     check_csrf(&headers)?;
     let (user, _) = require_user(&state, &headers)?;
     require_admin(&user)?;
-    let ctx = nas_backup_context(&state)?;
+    let ctx = nas_backup_context(&state, body.id.as_deref())?;
     if let Some(running) = state.nas_backup.progress() {
         return Err(ApiError::new(StatusCode::CONFLICT, format!("A {} is already running", running.action)));
     }
+    let name = ctx.config.name.clone();
     let worker = state.nas_backup.clone();
     let db_path = state.db_path.clone();
     std::thread::spawn(move || {
@@ -9424,21 +9593,21 @@ async fn start_nas_backup(state: std::sync::Arc<AppState>, headers: HeaderMap, w
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    record(&state, &user, &format!("backup-{what}"), "");
+    record(&state, &user, &format!("backup-{what}"), &name);
     Ok(Json(json!({ "started": true, "progress": state.nas_backup.progress() })))
 }
 
-async fn run_nas_backup(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
-    start_nas_backup(state, headers, "run").await
+async fn run_nas_backup(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, body: Option<Json<DestinationBody>>) -> Result<impl IntoResponse, ApiError> {
+    start_nas_backup(state, headers, body.map(|b| b.0).unwrap_or_default(), "run").await
 }
 
-async fn verify_nas_backup(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
-    start_nas_backup(state, headers, "verify").await
+async fn verify_nas_backup(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, body: Option<Json<DestinationBody>>) -> Result<impl IntoResponse, ApiError> {
+    start_nas_backup(state, headers, body.map(|b| b.0).unwrap_or_default(), "verify").await
 }
 
 /// Frees room at a full destination (see `NasBackup::tidy`).
-async fn tidy_nas_backup(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
-    start_nas_backup(state, headers, "tidy").await
+async fn tidy_nas_backup(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap, body: Option<Json<DestinationBody>>) -> Result<impl IntoResponse, ApiError> {
+    start_nas_backup(state, headers, body.map(|b| b.0).unwrap_or_default(), "tidy").await
 }
 
 async fn stop_nas_backup(State(state): State<std::sync::Arc<AppState>>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
@@ -9452,6 +9621,7 @@ async fn stop_nas_backup(State(state): State<std::sync::Arc<AppState>>, headers:
 #[derive(Deserialize)]
 struct SnapshotsQuery {
     fresh: Option<String>,
+    id: Option<String>,
 }
 
 async fn nas_backup_snapshots(
@@ -9461,7 +9631,7 @@ async fn nas_backup_snapshots(
 ) -> Result<impl IntoResponse, ApiError> {
     let (user, _) = require_user(&state, &headers)?;
     require_admin(&user)?;
-    let ctx = nas_backup_context(&state)?;
+    let ctx = nas_backup_context(&state, query.id.as_deref())?;
     let worker = state.nas_backup.clone();
     let fresh = query.fresh.is_some();
     let snapshots = tokio::task::spawn_blocking(move || worker.snapshots(&ctx, fresh))
@@ -9482,6 +9652,7 @@ fn snapshot_library(state: &AppState, ctx: &crate::nas_backup::Context, id: &str
 
 #[derive(Deserialize)]
 struct BrowseBackupQuery {
+    id: Option<String>,
     snapshot: String,
     #[serde(default)]
     path: String,
@@ -9494,7 +9665,7 @@ async fn browse_nas_backup(
 ) -> Result<impl IntoResponse, ApiError> {
     let (user, _) = require_user(&state, &headers)?;
     require_admin(&user)?;
-    let ctx = nas_backup_context(&state)?;
+    let ctx = nas_backup_context(&state, query.id.as_deref())?;
     let worker = state.clone();
     let entries = tokio::task::spawn_blocking(move || {
         let library = snapshot_library(&worker, &ctx, &query.snapshot)?;
@@ -9507,6 +9678,8 @@ async fn browse_nas_backup(
 
 #[derive(Deserialize)]
 struct RestoreBackupBody {
+    #[serde(default)]
+    id: Option<String>,
     snapshot: String,
     #[serde(default)]
     path: String,
@@ -9522,7 +9695,7 @@ async fn restore_nas_backup(
     let (user, _) = require_user(&state, &headers)?;
     require_admin(&user)?;
     require_write(&state)?;
-    let ctx = nas_backup_context(&state)?;
+    let ctx = nas_backup_context(&state, body.id.as_deref())?;
     if let Some(running) = state.nas_backup.progress() {
         return Err(ApiError::new(StatusCode::CONFLICT, format!("A {} is already running", running.action)));
     }
@@ -9686,13 +9859,16 @@ async fn health_alerts(State(state): State<std::sync::Arc<AppState>>, headers: H
         for drive in drives.into_iter().filter(|drive| drive.healthy == Some(false) || !drive.warnings.is_empty()) {
             alerts.push(json!({ "level": if drive.healthy == Some(false) { "full" } else { "low" }, "kind": "drive", "name": drive.name, "model": drive.model, "status": drive.status, "warnings": drive.warnings }));
         }
-        let (config, backup) = {
+        let backups: Vec<_> = {
             let conn = worker.db.lock().unwrap_or_else(|err| err.into_inner());
-            (crate::nas_backup::load_config(&conn), crate::nas_backup::load_state(&conn))
+            crate::nas_backup::load_all(&conn).into_iter().map(|config| {
+                let backup = crate::nas_backup::load_state(&conn, &config.id);
+                (config, backup)
+            }).collect()
         };
         // Only administrators can do something about backups, or the system's limits.
         if is_admin {
-            alerts.extend(crate::nas_backup::alert(&config, &backup, db::now_secs()));
+            alerts.extend(backups.iter().filter_map(|(config, backup)| crate::nas_backup::alert(config, backup, db::now_secs())));
             if let Some(crate::changes::Unwatched::Failed(reason)) = worker.changes.unwatched() {
                 alerts.push(json!({ "level": "low", "kind": "watch", "error": reason, "linux": cfg!(target_os = "linux") }));
             }

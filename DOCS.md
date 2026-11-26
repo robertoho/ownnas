@@ -333,7 +333,7 @@ Existing databases are upgraded automatically: if no admin exists, the oldest ac
 
 ### Backup (administrators only)
 
-Backs up the library and OwnNAS's data with restic to a drive, an S3-compatible bucket, or another computer over SFTP. Choose where, when (daily, weekly, or by hand), and how many daily, weekly, and monthly snapshots to keep. The page shows the last backup, the next one, and how much the backup takes at the destination, and lets you restore a folder from any snapshot into `Restored from backup/` in the library. Saving a new destination or password asks for your account password and tries the destination at once. See [Backups in the README](README.md#backups).
+Backs up the library and OwnNAS's data with restic to one or more destinations: a drive, Google Drive, an S3-compatible bucket, another computer over SFTP, or any rclone remote. Each destination has its own name, schedule (daily, weekly, or by hand), keep rules (how many daily, weekly, and monthly snapshots), and password; one backup runs at a time. Each card shows the last backup, the next one, and how much the backup takes there, and lets you restore a folder from any of its snapshots into `Restored from backup/` in the library. Google Drive is connected from the page: run the `rclone authorize` command it shows on a computer with a browser, and paste what it prints. Saving a new destination or password, and removing a destination, ask for your account password; a new destination is tried at once. See [Backups in the README](README.md#backups).
 
 ### Updates (self-hosted)
 

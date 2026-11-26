@@ -4377,7 +4377,24 @@ body.is-notes .app > .explorer-status-bar { display: none; }
 .backup-keeps { line-height: 2.2; margin: 0; }
 .backup-keep { width: 4.5rem; display: inline-block; padding-block: 0.2rem; }
 .backup-form textarea { font-family: var(--mono, ui-monospace, monospace); font-size: 0.85rem; }
-.backup-snapshots { margin-top: 1.4rem; padding-top: 1rem; border-top: 1px solid var(--line); }
+.backup-snapshots { margin-top: 0.8rem; padding-top: 0.8rem; border-top: 1px solid var(--line); }
+/* Several destinations: a card each, with its name. */
+.backup-card-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.2rem 0.7rem; margin-bottom: 0.2rem; min-width: 0; }
+.backup-card-head h3 { margin: 0; font-size: 1.05rem; }
+.backup-card-head .muted { font-size: 0.85rem; overflow-wrap: anywhere; min-width: 0; }
+.backup-badge { font-size: 0.75rem; padding: 0.05rem 0.5rem; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+.backup-form.backup-card { padding: 0.8rem 1rem 1rem; }
+.backup-form .backup-remove { margin-right: auto; }
+.backup-add { justify-content: flex-start; margin: 0.2rem 0 0.4rem; }
+/* Connecting Google Drive: the steps, with the command to run on a computer with a browser. */
+.backup-connect:empty { display: none; }
+.backup-drive-connect { margin: 0.3rem 0 0; }
+.backup-steps { margin: 0.2rem 0 0; padding-left: 1.3rem; display: grid; gap: 0.6rem; }
+.backup-steps li { display: grid; gap: 0.35rem; justify-items: start; }
+.backup-steps li > * { max-width: 100%; }
+.backup-steps .backup-command, .backup-steps textarea { width: 100%; box-sizing: border-box; }
+.backup-own-client summary { cursor: pointer; font-size: 0.88rem; }
+.backup-own-client p { margin: 0.4rem 0; font-size: 0.85rem; }
 .backup-snapshots-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
 .backup-snapshots h3 { margin: 0 0 0.4rem; }
 .backup-snapshot-list, .backup-browse { list-style: none; margin: 0.4rem 0 0; padding: 0; display: grid; gap: 0.15rem; }

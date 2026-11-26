@@ -1,10 +1,15 @@
 //! Backing up the NAS with restic: the library and OwnNAS's own data (its database, file
-//! history, and settings) go to a drive, an S3-compatible bucket, or another machine over SFTP,
-//! as encrypted snapshots. OwnNAS runs `restic` for each step, on a schedule or when asked, keeps
-//! the snapshots the admin chose (so many days, weeks, and months), checks a sample of the
-//! backup once a month, and restores a folder from any snapshot into the library.
+//! history, and settings) go to a drive, an S3-compatible bucket, another machine over SFTP, or
+//! one of rclone's remotes (Google Drive among them), as encrypted snapshots. OwnNAS runs
+//! `restic` for each step, on a schedule or when asked, keeps the snapshots the admin chose (so
+//! many days, weeks, and months), checks a sample of the backup once a month, and restores a
+//! folder from any snapshot into the library.
 //!
-//! The settings are in the database. The backup's password and the S3 secret key are in a file
+//! There can be several destinations (a drive at home and a cloud far away, say), each a backup
+//! of its own: its schedule, keep rules, password, and state. One restic command runs at a time,
+//! so two backups due together run one after the other.
+//!
+//! The settings are in the database. The backups' passwords and the S3 secret keys are in a file
 //! next to it, which is never backed up itself: without the password a backup cannot be read.
 
 use std::io::{BufRead, BufReader};
@@ -18,8 +23,14 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const SETTING_CONFIG: &str = "nas_backup_config";
+/// The one destination there was before there could be several: it is the first of them now,
+/// with this id, and keeps its state under the old name.
+const SETTING_CONFIG: &str = "nas_backup_config";
+const SETTING_DESTINATIONS: &str = "nas_backup_destinations";
 const SETTING_STATE: &str = "nas_backup_state";
+pub const MAIN: &str = "main";
+/// Enough for a drive, a second drive, and a cloud or two.
+pub const MAX_DESTINATIONS: usize = 8;
 const SECRETS_FILE: &str = "backup-secrets.json";
 /// A copy of the database made for each backup, since the live one changes while it is read.
 const STAGING_DIR: &str = "backup-staging";
@@ -62,6 +73,8 @@ pub struct Destination {
     pub kind: String,
     /// rclone: the remote's name in rclone's config (the folder in it is `path`).
     pub remote: String,
+    /// rclone: the remote's backend ("drive", "onedrive"…), as rclone said when it was saved.
+    pub remote_type: String,
     /// local: a folder on this computer, such as a USB drive. sftp: the folder on the other machine.
     pub path: String,
     /// s3: "s3.amazonaws.com", "https://s3.eu-central-003.backblazeb2.com", "http://minio:9000"…
@@ -80,6 +93,10 @@ pub struct Destination {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Config {
+    /// Which destination this is (`MAIN` for the first one there ever was).
+    pub id: String,
+    /// What the page calls it: "USB drive", "Google Drive"…
+    pub name: String,
     pub enabled: bool,
     pub destination: Destination,
     /// "daily", "weekly", or "manual".
@@ -106,6 +123,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            id: String::new(),
+            name: String::new(),
             enabled: false,
             destination: Destination::default(),
             frequency: "daily".into(),
@@ -122,11 +141,50 @@ impl Default for Config {
     }
 }
 
+/// The passwords and keys of every destination: the first one's (`MAIN`) where they always were,
+/// the others' by id.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Secrets {
     pub password: String,
     pub s3_secret: String,
+    pub others: std::collections::BTreeMap<String, Keys>,
+}
+
+/// One destination's backup password, and its S3 secret key.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Keys {
+    pub password: String,
+    pub s3_secret: String,
+}
+
+impl Secrets {
+    pub fn keys(&self, id: &str) -> Keys {
+        if id == MAIN {
+            Keys { password: self.password.clone(), s3_secret: self.s3_secret.clone() }
+        } else {
+            self.others.get(id).cloned().unwrap_or_default()
+        }
+    }
+
+    pub fn set_keys(&mut self, id: &str, keys: Keys) {
+        if id == MAIN {
+            self.password = keys.password;
+            self.s3_secret = keys.s3_secret;
+        } else {
+            self.others.insert(id.to_string(), keys);
+        }
+    }
+
+    pub fn forget(&mut self, id: &str) {
+        if id == MAIN {
+            self.password.clear();
+            self.s3_secret.clear();
+        } else {
+            self.others.remove(id);
+        }
+    }
 }
 
 /// What a backup did.
@@ -186,6 +244,8 @@ pub struct Restored {
 pub struct Progress {
     /// "backup", "restore", or "verify".
     pub action: String,
+    /// The destination it is for.
+    pub destination: String,
     /// What that step is doing, in words.
     pub phase: String,
     pub percent: f64,
@@ -227,7 +287,8 @@ pub struct NasBackup {
     progress: Mutex<Option<Progress>>,
     child: Mutex<Option<Arc<Mutex<Child>>>>,
     stop: AtomicBool,
-    snapshots: Mutex<Option<Vec<Snapshot>>>,
+    /// Each destination's snapshots, as last listed.
+    snapshots: Mutex<std::collections::HashMap<String, Vec<Snapshot>>>,
     started: AtomicBool,
 }
 
@@ -238,26 +299,85 @@ pub struct Context {
     pub root: PathBuf,
     pub data: PathBuf,
     pub db_path: PathBuf,
+    /// The destination's settings (its id among them).
     pub config: Config,
-    pub secrets: Secrets,
+    pub secrets: Keys,
 }
 
 // ---- Settings and secrets ----
 
-pub fn load_config(conn: &rusqlite::Connection) -> Config {
-    crate::db::get_setting(conn, SETTING_CONFIG).ok().flatten().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+/// Every destination, in the order the page shows them. Before there could be several, the one
+/// there was is the first, as `MAIN`.
+pub fn load_all(conn: &rusqlite::Connection) -> Vec<Config> {
+    let mut all: Vec<Config> = match crate::db::get_setting(conn, SETTING_DESTINATIONS).ok().flatten() {
+        Some(text) => serde_json::from_str(&text).unwrap_or_default(),
+        None => {
+            let old: Option<Config> = crate::db::get_setting(conn, SETTING_CONFIG).ok().flatten().and_then(|text| serde_json::from_str(&text).ok());
+            old.filter(|config| !config.destination.kind.is_empty())
+                .map(|mut config| {
+                    config.id = MAIN.into();
+                    config
+                })
+                .into_iter()
+                .collect()
+        }
+    };
+    for config in all.iter_mut().filter(|config| config.name.is_empty()) {
+        config.name = default_name(&config.destination);
+    }
+    all
 }
 
-pub fn save_config(conn: &rusqlite::Connection, config: &Config) -> Result<(), String> {
-    crate::db::set_setting(conn, SETTING_CONFIG, Some(&serde_json::to_string(config).unwrap_or_default()))
+pub fn save_all(conn: &rusqlite::Connection, all: &[Config]) -> Result<(), String> {
+    crate::db::set_setting(conn, SETTING_DESTINATIONS, Some(&serde_json::to_string(all).unwrap_or_default()))
 }
 
-pub fn load_state(conn: &rusqlite::Connection) -> State {
-    crate::db::get_setting(conn, SETTING_STATE).ok().flatten().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+/// A destination by id; with none, the first.
+pub fn load_one(conn: &rusqlite::Connection, id: Option<&str>) -> Option<Config> {
+    let all = load_all(conn);
+    match id.filter(|id| !id.is_empty()) {
+        Some(id) => all.into_iter().find(|config| config.id == id),
+        None => all.into_iter().next(),
+    }
 }
 
-fn save_state(conn: &rusqlite::Connection, state: &State) {
-    let _ = crate::db::set_setting(conn, SETTING_STATE, Some(&serde_json::to_string(state).unwrap_or_default()));
+/// An id for a new destination: a few letters and digits.
+pub fn new_id(taken: &[Config]) -> String {
+    loop {
+        let id: String = (0..8).map(|_| char::from(b"abcdefghijklmnopqrstuvwxyz0123456789"[rand::thread_rng().gen_range(0..36)])).collect();
+        if id != MAIN && !taken.iter().any(|config| config.id == id) {
+            return id;
+        }
+    }
+}
+
+/// What the page calls a destination that was given no name.
+pub fn default_name(d: &Destination) -> String {
+    match d.kind.as_str() {
+        "local" => "Drive".into(),
+        "s3" => "Bucket".into(),
+        "sftp" => d.host.clone(),
+        "rclone" if d.remote_type == "drive" => "Google Drive".into(),
+        "rclone" => d.remote.clone(),
+        _ => "Backup".into(),
+    }
+}
+
+fn state_key(id: &str) -> String {
+    if id == MAIN || id.is_empty() { SETTING_STATE.into() } else { format!("{SETTING_STATE}:{id}") }
+}
+
+pub fn load_state(conn: &rusqlite::Connection, id: &str) -> State {
+    crate::db::get_setting(conn, &state_key(id)).ok().flatten().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+}
+
+fn save_state(conn: &rusqlite::Connection, id: &str, state: &State) {
+    let _ = crate::db::set_setting(conn, &state_key(id), Some(&serde_json::to_string(state).unwrap_or_default()));
+}
+
+/// A destination taken off the list: its state goes too (the backup at the destination stays).
+pub fn forget_state(conn: &rusqlite::Connection, id: &str) {
+    let _ = crate::db::set_setting(conn, &state_key(id), None);
 }
 
 pub fn load_secrets(data: &Path) -> Secrets {
@@ -295,7 +415,7 @@ pub fn new_password() -> String {
 /// Checks a destination before it is saved. Returns it tidied up.
 pub fn validate(destination: &Destination, root: &Path, data: &Path) -> Result<Destination, String> {
     let mut d = destination.clone();
-    for field in [&mut d.remote, &mut d.path, &mut d.endpoint, &mut d.bucket, &mut d.prefix, &mut d.region, &mut d.access_key_id, &mut d.host, &mut d.user] {
+    for field in [&mut d.remote, &mut d.remote_type, &mut d.path, &mut d.endpoint, &mut d.bucket, &mut d.prefix, &mut d.region, &mut d.access_key_id, &mut d.host, &mut d.user] {
         *field = field.trim().to_string();
     }
     match d.kind.as_str() {
@@ -350,6 +470,10 @@ pub fn validate(destination: &Destination, root: &Path, data: &Path) -> Result<D
             d.path = crate::remotes::clean_path(&d.path).filter(|path| !path.is_empty()).ok_or("Enter the folder on the remote, such as backups/ownnas")?;
         }
         _ => return Err("Choose where backups go".into()),
+    }
+    if d.kind != "rclone" {
+        d.remote.clear();
+        d.remote_type.clear();
     }
     Ok(d)
 }
@@ -466,7 +590,7 @@ pub fn alert(config: &Config, state: &State, now: i64) -> Option<Value> {
         return None;
     }
     if state.last_result == "failed" {
-        return Some(serde_json::json!({ "kind": "backup", "level": "low", "problem": "failed", "error": state.last_error, "lastSuccess": state.last_success }));
+        return Some(serde_json::json!({ "kind": "backup", "level": "low", "problem": "failed", "error": state.last_error, "lastSuccess": state.last_success, "destination": config.id, "name": config.name }));
     }
     let interval = match config.frequency.as_str() {
         "daily" => 86400,
@@ -475,7 +599,7 @@ pub fn alert(config: &Config, state: &State, now: i64) -> Option<Value> {
     };
     let since = if state.last_success > 0 { state.last_success } else { config.saved_at };
     (since > 0 && now - since > 2 * interval + 6 * 3600)
-        .then(|| serde_json::json!({ "kind": "backup", "level": "low", "problem": "late", "lastSuccess": state.last_success }))
+        .then(|| serde_json::json!({ "kind": "backup", "level": "low", "problem": "late", "lastSuccess": state.last_success, "destination": config.id, "name": config.name }))
 }
 
 // ---- Running restic ----
@@ -497,6 +621,14 @@ impl Context {
             }
             if !settings.config.is_empty() {
                 cmd.env("RCLONE_CONFIG", &settings.config);
+            }
+            if d.remote_type == "drive" {
+                // What restic deletes (old snapshots' data, when pruning) is deleted, not moved
+                // to Google Drive's own trash, where it would keep taking the account's room.
+                cmd.arg("-o").arg("rclone.args=serve restic --stdio --b2-hard-delete --drive-use-trash=false");
+                // Fewer, larger files: Google Drive is slow with many small ones and limits how
+                // many requests are made a second.
+                cmd.arg("--pack-size").arg("64");
             }
         }
         cmd.args(args)
@@ -752,13 +884,13 @@ impl NasBackup {
     }
 
     /// Claims the worker for one action, or says what it is busy with.
-    fn begin(&self, action: &str, phase: &str) -> Result<(), String> {
+    fn begin(&self, ctx: &Context, action: &str, phase: &str) -> Result<(), String> {
         let mut slot = self.progress.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(running) = slot.as_ref() {
             return Err(format!("A {} is already running", running.action));
         }
         self.stop.store(false, Ordering::SeqCst);
-        *slot = Some(Progress { action: action.into(), phase: phase.into(), started: crate::db::now_secs(), ..Progress::default() });
+        *slot = Some(Progress { action: action.into(), destination: ctx.config.id.clone(), phase: phase.into(), started: crate::db::now_secs(), ..Progress::default() });
         Ok(())
     }
 
@@ -897,7 +1029,7 @@ impl NasBackup {
 
     /// Tries the destination now, for the Save button. Not while something else runs.
     pub fn test(&self, ctx: &Context) -> Result<bool, String> {
-        self.begin("connect", "Connecting to the destination")?;
+        self.begin(ctx, "connect", "Connecting to the destination")?;
         let result = self.connect(ctx);
         self.end();
         result
@@ -906,13 +1038,13 @@ impl NasBackup {
     /// One backup: a copy of the database, the snapshot, the keep rules, and now and then a
     /// check that the backup reads back.
     pub fn backup(&self, ctx: &Context, conn: &rusqlite::Connection) -> Result<Summary, String> {
-        self.begin("backup", "Getting ready")?;
+        self.begin(ctx, "backup", "Getting ready")?;
         let _held = HoldIndexing::new(ctx.config.gentle);
-        let mut state = load_state(conn);
+        let mut state = load_state(conn, &ctx.config.id);
         state.last_started = crate::db::now_secs();
-        save_state(conn, &state);
+        save_state(conn, &ctx.config.id, &state);
         let result = self.backup_steps(ctx, conn);
-        let mut state = load_state(conn);
+        let mut state = load_state(conn, &ctx.config.id);
         state.last_finished = crate::db::now_secs();
         match &result {
             Ok(summary) => {
@@ -934,18 +1066,18 @@ impl NasBackup {
                 state.full = err.starts_with(FULL) || err.starts_with(DATA_FULL);
             }
         }
-        save_state(conn, &state);
+        save_state(conn, &ctx.config.id, &state);
         // What the run copied before the destination filled up is of no use (restic had not
         // written down what is in it yet): it goes, so the destination has its room back.
         if matches!(&result, Err(err) if err.starts_with(FULL)) && !self.stopped() {
             let tidied = self.tidy_steps(ctx, conn);
-            let mut state = load_state(conn);
+            let mut state = load_state(conn, &ctx.config.id);
             state.last_tidied = crate::db::now_secs();
             state.tidy_error = tidied.err();
             if state.tidy_error.is_none() {
                 state.last_error = state.last_error.map(|e| format!("{e} What this run copied was removed again."));
             }
-            save_state(conn, &state);
+            save_state(conn, &ctx.config.id, &state);
         }
         if result.is_ok() && !self.stopped() && state.last_finished - state.last_verified > VERIFY_EVERY {
             let _ = self.verify_steps(ctx, conn, "2%");
@@ -960,7 +1092,7 @@ impl NasBackup {
             let folder = Path::new(&d.path);
             // A drive that is not plugged in leaves an empty folder where it mounts, on the
             // system's own disk: a new backup there would fill that disk.
-            if !folder.exists() && load_state(conn).last_success > 0 {
+            if !folder.exists() && load_state(conn, &ctx.config.id).last_success > 0 {
                 return Err(format!("The backup folder {} is not there. Is the backup drive connected?", folder.display()));
             }
             if let Some((_, available)) = free_space(folder) {
@@ -1029,7 +1161,7 @@ impl NasBackup {
         }
 
         self.measure(ctx, conn)?;
-        *self.snapshots.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.snapshots.lock().unwrap_or_else(|e| e.into_inner()).remove(&ctx.config.id);
         Ok(summary)
     }
 
@@ -1066,9 +1198,9 @@ impl NasBackup {
             }
         })?;
         if stats.code == 0 && stored.is_some() {
-            let mut state = load_state(conn);
+            let mut state = load_state(conn, &ctx.config.id);
             state.stored_bytes = stored;
-            save_state(conn, &state);
+            save_state(conn, &ctx.config.id, &state);
         }
         Ok(())
     }
@@ -1076,21 +1208,21 @@ impl NasBackup {
     /// Frees room at a full destination: snapshots past the keep rules go, and so does what
     /// backups that did not finish copied. Nothing is rewritten, which would need room itself.
     pub fn tidy(&self, ctx: &Context, conn: &rusqlite::Connection) -> Result<(), String> {
-        self.begin("tidy", "Freeing space")?;
+        self.begin(ctx, "tidy", "Freeing space")?;
         let _held = HoldIndexing::new(ctx.config.gentle);
         let result = self.tidy_steps(ctx, conn);
-        let mut state = load_state(conn);
+        let mut state = load_state(conn, &ctx.config.id);
         state.last_tidied = crate::db::now_secs();
         state.tidy_error = result.as_ref().err().cloned();
-        save_state(conn, &state);
-        *self.snapshots.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        save_state(conn, &ctx.config.id, &state);
+        self.snapshots.lock().unwrap_or_else(|e| e.into_inner()).remove(&ctx.config.id);
         self.end();
         result
     }
 
     /// Reads back a share of the backup (such as "5%") to check it is all there and intact.
     pub fn verify(&self, ctx: &Context, conn: &rusqlite::Connection, subset: &str) -> Result<(), String> {
-        self.begin("verify", "Checking the backup")?;
+        self.begin(ctx, "verify", "Checking the backup")?;
         let _held = HoldIndexing::new(ctx.config.gentle);
         let result = self.verify_steps(ctx, conn, subset);
         self.end();
@@ -1105,7 +1237,7 @@ impl NasBackup {
             p.current = None;
         });
         let finished = self.run(ctx.command(&["check", "--read-data-subset", subset]), |_| {});
-        let mut state = load_state(conn);
+        let mut state = load_state(conn, &ctx.config.id);
         match &finished {
             Err(_) => return Err("Stopped".into()),
             Ok(done) if done.code == 0 => {
@@ -1127,14 +1259,14 @@ impl NasBackup {
         }
         let ok = state.verify_result == "ok";
         let error = state.verify_error.clone();
-        save_state(conn, &state);
+        save_state(conn, &ctx.config.id, &state);
         if ok { Ok(()) } else { Err(error.unwrap_or_default()) }
     }
 
     /// The snapshots at the destination, newest first.
     pub fn snapshots(&self, ctx: &Context, fresh: bool) -> Result<Vec<Snapshot>, String> {
         if !fresh {
-            if let Some(list) = self.snapshots.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            if let Some(list) = self.snapshots.lock().unwrap_or_else(|e| e.into_inner()).get(&ctx.config.id).cloned() {
                 return Ok(list);
             }
         }
@@ -1148,7 +1280,7 @@ impl NasBackup {
             return Err(error_text(&finished));
         }
         list.sort_by(|a, b| b.time.cmp(&a.time));
-        *self.snapshots.lock().unwrap_or_else(|e| e.into_inner()) = Some(list.clone());
+        self.snapshots.lock().unwrap_or_else(|e| e.into_inner()).insert(ctx.config.id.clone(), list.clone());
         Ok(list)
     }
 
@@ -1180,7 +1312,7 @@ impl NasBackup {
     pub fn restore(&self, ctx: &Context, conn: &rusqlite::Connection, snapshot: &str, library: &str, rel: &str, target: &Path, shown_as: &str) -> Result<(), String> {
         check_id(snapshot)?;
         let from = snapshot_path(library, rel)?;
-        self.begin("restore", "Restoring")?;
+        self.begin(ctx, "restore", "Restoring")?;
         let spec = format!("{snapshot}:{from}");
         let target_text = target.display().to_string();
         let result = self
@@ -1190,9 +1322,9 @@ impl NasBackup {
                 }
             })
             .and_then(|finished| if finished.code == 0 { Ok(()) } else { Err(error_text(&finished)) });
-        let mut state = load_state(conn);
+        let mut state = load_state(conn, &ctx.config.id);
         state.last_restore = Some(Restored { snapshot: snapshot.chars().take(8).collect(), to: shown_as.into(), finished: crate::db::now_secs(), error: result.as_ref().err().cloned() });
-        save_state(conn, &state);
+        save_state(conn, &ctx.config.id, &state);
         self.end();
         result
     }
@@ -1208,31 +1340,36 @@ impl NasBackup {
             .spawn(move || {
                 let Ok(conn) = crate::db::open(&db_path) else { return };
                 // A backup that was running when OwnNAS stopped did not finish.
-                let mut state = load_state(&conn);
-                if state.last_started > state.last_finished {
-                    state.last_finished = state.last_started;
-                    state.last_result = "failed".into();
-                    state.last_error = Some("OwnNAS stopped during the backup".into());
-                    state.failures_in_row += 1;
-                    save_state(&conn, &state);
+                for config in load_all(&conn) {
+                    let mut state = load_state(&conn, &config.id);
+                    if state.last_started > state.last_finished {
+                        state.last_finished = state.last_started;
+                        state.last_result = "failed".into();
+                        state.last_error = Some("OwnNAS stopped during the backup".into());
+                        state.failures_in_row += 1;
+                        save_state(&conn, &config.id, &state);
+                    }
                 }
                 loop {
                     std::thread::sleep(Duration::from_secs(60));
-                    let config = load_config(&conn);
-                    if worker.busy() || !due(&config, &load_state(&conn), crate::db::now_secs()) {
+                    if worker.busy() {
                         continue;
                     }
+                    // One backup at a time: the first due now, the next one a minute after it ends.
+                    let now = crate::db::now_secs();
+                    let Some(config) = load_all(&conn).into_iter().find(|config| due(config, &load_state(&conn, &config.id), now)) else { continue };
                     let Some(restic) = find_restic() else {
-                        let mut state = load_state(&conn);
+                        let mut state = load_state(&conn, &config.id);
                         state.last_started = crate::db::now_secs();
                         state.last_finished = state.last_started;
                         state.last_result = "failed".into();
                         state.last_error = Some("restic is not installed".into());
                         state.failures_in_row += 1;
-                        save_state(&conn, &state);
+                        save_state(&conn, &config.id, &state);
                         continue;
                     };
-                    let ctx = Context { restic, root: root.clone(), data: data.clone(), db_path: db_path.clone(), config, secrets: load_secrets(&data) };
+                    let secrets = load_secrets(&data).keys(&config.id);
+                    let ctx = Context { restic, root: root.clone(), data: data.clone(), db_path: db_path.clone(), config, secrets };
                     let _ = worker.backup(&ctx, &conn);
                 }
             })
@@ -1438,7 +1575,7 @@ mod tests {
             data: "/var/ownnas".into(),
             db_path: "/var/ownnas/ownnas.db".into(),
             config: Config { destination: Destination { kind: "sftp".into(), ..Destination::default() }, ..Config::default() },
-            secrets: Secrets::default(),
+            secrets: Keys::default(),
         };
         let full = finished("Save(<data/1f2e>) returned error, retrying after 552ms: write /mnt/backup/data/1f/1f2e: no space left on device");
         assert!(ctx.full_error(&full).unwrap().starts_with(FULL));
@@ -1476,6 +1613,50 @@ mod tests {
         assert!(validate(&local(dir.join("backup")), &root, &data).is_ok());
         assert!(validate(&local(PathBuf::from("relative")), &root, &data).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_one_destination_there_was_becomes_the_first() {
+        let dir = std::env::temp_dir().join(format!("ownnas-backup-dests-{}-{}", std::process::id(), rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = crate::db::open(&dir.join("ownnas.db")).unwrap();
+        assert!(load_all(&conn).is_empty(), "none at first");
+        // As it was saved before there could be several.
+        let old = r#"{"enabled":true,"destination":{"kind":"local","path":"/Volumes/USB/backup"},"frequency":"daily","minute":180}"#;
+        crate::db::set_setting(&conn, SETTING_CONFIG, Some(old)).unwrap();
+        crate::db::set_setting(&conn, SETTING_STATE, Some(r#"{"lastSuccess":42}"#)).unwrap();
+        let all = load_all(&conn);
+        assert_eq!(all.len(), 1);
+        assert_eq!((all[0].id.as_str(), all[0].name.as_str()), (MAIN, "Drive"));
+        assert_eq!(load_state(&conn, MAIN).last_success, 42, "its state is kept");
+        // A second one, with a state of its own.
+        let mut cloud = Config { id: new_id(&all), name: "Google Drive".into(), ..Config::default() };
+        cloud.destination = Destination { kind: "rclone".into(), remote: "gdrive".into(), remote_type: "drive".into(), path: "OwnNAS backup".into(), ..Destination::default() };
+        save_all(&conn, &[all[0].clone(), cloud.clone()]).unwrap();
+        save_state(&conn, &cloud.id, &State { last_success: 7, ..State::default() });
+        assert_eq!(load_all(&conn).len(), 2);
+        assert_eq!(load_one(&conn, None).unwrap().id, MAIN, "the first when none is named");
+        assert_eq!(load_one(&conn, Some(&cloud.id)).unwrap().name, "Google Drive");
+        assert!(load_one(&conn, Some("nope")).is_none());
+        assert_eq!((load_state(&conn, MAIN).last_success, load_state(&conn, &cloud.id).last_success), (42, 7));
+        forget_state(&conn, &cloud.id);
+        assert_eq!(load_state(&conn, &cloud.id).last_success, 0);
+        assert_eq!(repository(&cloud.destination), "rclone:gdrive:OwnNAS backup");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn each_destination_has_its_own_password() {
+        // The first one's keys stay where they always were, so an older OwnNAS still reads them.
+        let mut secrets: Secrets = serde_json::from_str(r#"{"password":"first","s3Secret":"s3"}"#).unwrap();
+        assert_eq!(secrets.keys(MAIN).password, "first");
+        assert!(secrets.keys("other").password.is_empty());
+        secrets.set_keys("other", Keys { password: "second".into(), s3_secret: String::new() });
+        let saved: Secrets = serde_json::from_str(&serde_json::to_string(&secrets).unwrap()).unwrap();
+        assert_eq!((saved.password.as_str(), saved.keys("other").password.as_str()), ("first", "second"));
+        secrets.forget("other");
+        assert!(secrets.others.is_empty());
+        assert_eq!(secrets.keys(MAIN).s3_secret, "s3");
     }
 
     #[test]

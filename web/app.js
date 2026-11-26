@@ -6619,11 +6619,12 @@ async function pollHealthAlerts() {
     if (alert.kind === "disk") return `The disk with ${alert.what} is ${alert.level === "full" ? "nearly full" : "getting full"}: ${formatSize(alert.free, false)} free (${Math.round((alert.free / (alert.total || 1)) * 100)}%).`;
     if (alert.kind === "backup") {
       const since = alert.lastSuccess ? ` The last one that worked was on ${new Date(alert.lastSuccess * 1000).toLocaleDateString()}.` : "";
-      return alert.problem === "failed" ? `The last backup failed: ${(alert.error || "unknown error").replace(/\.$/, "")}.${since}` : `Backups have not worked for a while.${since}`;
+      const to = alert.name ? ` to ${alert.name}` : "";
+      return alert.problem === "failed" ? `The last backup${to} failed: ${(alert.error || "unknown error").replace(/\.$/, "")}.${since}` : `Backups${to} have not worked for a while.${since}`;
     }
     return `The drive ${alert.model || alert.name} ${alert.status === "Failing" ? "says it is failing" : `reports ${alert.warnings.join(", ")}`}.`;
   });
-  healthAlertKey = alerts.map((alert) => `${alert.kind}:${alert.level}:${alert.mount || alert.name || alert.problem}:${alert.lastSuccess || ""}`).join("|");
+  healthAlertKey = alerts.map((alert) => `${alert.kind}:${alert.level}:${alert.mount || alert.destination || alert.name || alert.problem}:${alert.problem || ""}:${alert.lastSuccess || ""}`).join("|");
   // Only backup problems: the button goes to Backup instead of Health.
   healthAlertTab = alerts.every((alert) => alert.kind === "backup") ? "backup" : "health";
   $("health-alert-open").textContent = healthAlertTab === "backup" ? "See Backup" : "See Health";
