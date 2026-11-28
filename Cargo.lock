@@ -3321,7 +3321,7 @@ dependencies = [
 
 [[package]]
 name = "ownnas"
-version = "0.9.17"
+version = "0.9.18"
 dependencies = [
  "apache-avro",
  "argon2",
@@ -3391,7 +3391,7 @@ dependencies = [
 
 [[package]]
 name = "ownnas-cloud"
-version = "0.9.17"
+version = "0.9.18"
 dependencies = [
  "clap",
  "cloud-filter",
@@ -3434,7 +3434,7 @@ dependencies = [
 
 [[package]]
 name = "ownnas-mount"
-version = "0.9.17"
+version = "0.9.18"
 dependencies = [
  "clap",
  "fuser",
@@ -3447,7 +3447,7 @@ dependencies = [
 
 [[package]]
 name = "ownnas-sync"
-version = "0.9.17"
+version = "0.9.18"
 dependencies = [
  "clap",
  "ownnas-core",
@@ -3458,7 +3458,7 @@ dependencies = [
 
 [[package]]
 name = "ownnascli"
-version = "0.9.17"
+version = "0.9.18"
 dependencies = [
  "clap",
  "libc",
