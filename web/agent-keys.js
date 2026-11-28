@@ -39,7 +39,7 @@ const endpoint = () => `${location.origin}/mcp`;
 // What the form holds survives a refresh of the list.
 const draft = { name: "", scope: "folders", folders: [], expires: "", level: "read", approve: true };
 const STATUSES = { pending: "Waiting for you", done: "Made", declined: "Declined", failed: "Failed", undone: "Undone" };
-const LEVELS = { read: "Read only", organise: "Read and organise", write: "Read, organise and write" };
+const LEVELS = { read: "Read only", journal: "Read and keep the journal", organise: "Read and organise", write: "Read, organise and write" };
 
 async function copy(text, done) {
   try {
@@ -113,7 +113,15 @@ function createForm() {
   approveRow.hidden = draft.level === "read";
   const levelChoice = (value, label, about) => {
     const input = el("input", { type: "radio", name: "agent-level", value, checked: draft.level === value });
-    input.addEventListener("change", () => { draft.level = value; approveRow.hidden = value === "read"; });
+    input.addEventListener("change", () => {
+      draft.level = value;
+      approveRow.hidden = value === "read";
+      // The journal is kept without asking each time (every entry can be undone); tick to ask.
+      if (value === "journal") {
+        draft.approve = false;
+        approveBox.checked = false;
+      }
+    });
     return el("label", { class: "agent-scope-choice" }, input, el("span", {}, label, el("span", { class: "muted" }, ` — ${about}`)));
   };
 
@@ -129,6 +137,7 @@ function createForm() {
     el("fieldset", { class: "agent-scope" },
       el("legend", {}, "What it can do"),
       levelChoice("read", "Read", "list, search, read and look at files"),
+      levelChoice("journal", "Read and keep the journal", "also add to the user's journal (the Journal folder): a daily log of what was done, and topic pages about projects, learning and analyses. Nothing else is changed. The key is given the Journal folder, which is made if it is not there, and every entry can be undone here."),
       levelChoice("organise", "Read and organise", "also tag, make folders, rename, move, move to the Trash, and arrange albums. Nothing is deleted for good, and protected files are left alone. Every change can be undone here."),
       levelChoice("write", "Read, organise and write", "also make text files, change passages, add rows to tables, and copy. What a file held is kept in its history first, so this can be undone too."),
       approveRow),
@@ -139,8 +148,8 @@ function createForm() {
     event.preventDefault();
     const folders = draft.scope === "whole" ? [WHOLE_LIBRARY] : draft.folders;
     if (!draft.name.trim()) return ctx.toast("Give the key a name", true);
-    if (!folders.length) return ctx.toast("Add at least one folder, or choose the whole library", true);
-    const verb = { read: "read", organise: "read and organise", write: "read, organise and change" }[draft.level];
+    if (!folders.length && draft.level !== "journal") return ctx.toast("Add at least one folder, or choose the whole library", true);
+    const verb = { read: "read", journal: "read", organise: "read and organise", write: "read, organise and change" }[draft.level];
     if (draft.scope === "whole" && !(await ctx.askConfirm(`This key will be able to ${verb} every file in the library, apart from hidden files and the Trash. Create it?`, "Create key"))) return;
     submit.disabled = true;
     try {
@@ -227,8 +236,8 @@ async function settingsDialog(key) {
     ctx.toast(err.message, true);
     return;
   }
-  const levels = key.level === "write" ? ["read", "organise", "write"] : key.level === "organise" ? ["read", "organise"] : ["read"];
-  const titles = { read: "Reading", organise: "Organising", write: "Writing" };
+  const levels = key.level === "write" ? ["read", "journal", "organise", "write"] : key.level === "organise" ? ["read", "journal", "organise"] : key.level === "journal" ? ["read", "journal"] : ["read"];
+  const titles = { read: "Reading", journal: "Journal", organise: "Organising", write: "Writing" };
   const boxes = [];
   const groups = levels.map((level) => el("fieldset", { class: "agent-scope agent-tools" },
     el("legend", {}, titles[level]),
@@ -407,7 +416,7 @@ function keyCard(key, now, waiting, open, probing) {
       ctx.toast(err.message, true);
     }
   });
-  const organises = key.level === "organise" || key.level === "write";
+  const organises = key.level === "organise" || key.level === "write" || key.level === "journal";
   const usageHost = el("div", { class: "agent-log", hidden: true });
   const showUsage = el("button", { type: "button", onclick: async () => {
     if (!usageHost.hidden) {

@@ -149,7 +149,7 @@ pub fn tools() -> Vec<Value> {
 }
 
 pub fn has(name: &str) -> bool {
-    tools().iter().any(|tool| tool["name"] == name) || mcp_write::has(name)
+    tools().iter().any(|tool| tool["name"] == name) || mcp_write::has(name) || crate::mcp_journal::is_write(name)
 }
 
 /// A change that was made: what to tell the agent, and how to undo it.
@@ -170,7 +170,11 @@ pub(crate) async fn call(state: &Arc<AppState>, key: &AgentKey, name: &str, args
     if !has(name) {
         return None;
     }
-    if !key.can_organise() {
+    let journal = crate::mcp_journal::is_write(name);
+    if journal && !key.can_journal() {
+        return Some(failed("This key can only read the journal. Ask the user for a key at the journal level in OwnNAS, Settings → Agents."));
+    }
+    if !journal && !key.can_organise() {
         return Some(failed("This key can only read. Ask the user for a key with organise access in OwnNAS, Settings → Agents."));
     }
     if mcp_write::has(name) && !key.can_write() {
@@ -223,6 +227,7 @@ async fn run(state: &Arc<AppState>, key: &AgentKey, name: &str, args: &Args<'_>)
         "sort_into_folders" => sort_into_folders(state, key, args).await,
         "rename_many" => rename_many(state, key, args).await,
         other if mcp_write::has(other) && key.can_write() => mcp_write::run(state, key, other, args).await,
+        other if crate::mcp_journal::is_write(other) && key.can_journal() => crate::mcp_journal::run(state, key, other, args).await,
         _ => failed("Unknown tool"),
     }
 }
@@ -255,6 +260,9 @@ async fn writable(state: &Arc<AppState>, key: &AgentKey, name: &str, args: &Args
     let mut places = targets(name, args);
     if name == "create_note" {
         places.push((crate::http::notes_folder(state), None));
+    }
+    if crate::mcp_journal::is_write(name) {
+        places.push((crate::mcp_journal::folder(state), None));
     }
     let (root, key) = (state.root.clone(), key.clone());
     blocking(move || {
@@ -298,6 +306,7 @@ fn summarize(name: &str, args: &Args<'_>) -> String {
         "copy" => format!("Copy {} into {}", args.path(), args.text("to")),
         "add_paragraphs" => format!("Add {} paragraph(s) to {}", args.texts("paragraphs").len(), args.path()),
         "upload_file" => format!("Upload {} into {}", args.text("name"), args.path()),
+        "journal_log" | "journal_remember" => crate::mcp_journal::summarize(name, args),
         "create_note" => format!("Make the note “{}”", if args.text("title").trim().is_empty() { args.text("text").lines().next().unwrap_or_default().chars().take(60).collect::<String>() } else { args.text("title") }),
         "append_to_note" => format!("Add to the note {}", args.path()),
         "tick_item" => format!("{} “{}” in {}", if args.raw().get("done").and_then(Value::as_bool).unwrap_or(true) { "Tick" } else { "Untick" }, args.text("item"), args.path()),

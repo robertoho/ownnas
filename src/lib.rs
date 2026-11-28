@@ -49,6 +49,7 @@ pub mod mcp_files;
 pub mod mcp_organise;
 pub mod mcp_photos;
 pub mod mcp_write;
+pub mod mcp_journal;
 pub mod mcp_notes;
 pub mod mcp_ask;
 pub mod notes;

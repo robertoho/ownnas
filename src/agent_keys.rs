@@ -168,12 +168,19 @@ impl AgentKey {
     pub fn can_organise(&self) -> bool {
         self.level == ORGANISE || self.level == WRITE
     }
+    /// Whether it may add to the journal (`mcp_journal.rs`): a "journal" key, or one that may
+    /// organise or write anyway.
+    pub fn can_journal(&self) -> bool {
+        self.level == JOURNAL || self.can_organise()
+    }
     pub fn can_write(&self) -> bool {
         self.level == WRITE
     }
 }
 
 pub const READ: &str = "read";
+/// Reads like "read", and adds to the journal (its log and topic pages), nothing else.
+pub const JOURNAL: &str = "journal";
 pub const ORGANISE: &str = "organise";
 pub const WRITE: &str = "write";
 
@@ -313,11 +320,26 @@ pub fn create(conn: &mut Connection, root: &Path, user_id: i64, name: &str, leve
     if name.is_empty() || name.chars().count() > 80 {
         return Err("Give the key a name of up to 80 characters".into());
     }
-    if ![READ, ORGANISE, WRITE].contains(&level) {
-        return Err("Choose read, organise or write access".into());
+    if ![READ, JOURNAL, ORGANISE, WRITE].contains(&level) {
+        return Err("Choose read, journal, organise or write access".into());
     }
     if expires_at.is_some_and(|at| at <= now) {
         return Err("The expiry date has already passed".into());
+    }
+    let mut folders = folders.to_vec();
+    // A journal key always has the journal, made when it is not there yet.
+    if level == JOURNAL {
+        let journal = crate::mcp_journal::folder_of(conn);
+        let bad = || "The journal folder's name cannot be used".to_string();
+        if journal.split('/').any(|part| part.is_empty() || part == "." || part == ".." || part.starts_with('.')) || journal.contains('\\') {
+            return Err(bad());
+        }
+        std::fs::create_dir_all(root.join(&journal)).map_err(|_| "Could not make the journal folder".to_string())?;
+        // Made: now it must be inside the library once links are followed.
+        files::resolve(root, &journal).map_err(|_| bad())?;
+        if !folders.iter().any(|folder| folder.trim().trim_matches('/') == journal) {
+            folders.push(journal);
+        }
     }
     if folders.is_empty() {
         return Err("Choose at least one folder".into());

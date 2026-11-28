@@ -146,13 +146,13 @@ pub(crate) async fn run(state: &Arc<AppState>, key: &AgentKey, name: &str, args:
 }
 
 /// Keeps what a file holds before it changes; the version's id (`None` for an empty file).
-fn keep(state: &AppState, key: &AgentKey, full: &Path, rel: &str) -> Result<Option<i64>, Stop> {
+pub(crate) fn keep(state: &AppState, key: &AgentKey, full: &Path, rel: &str) -> Result<Option<i64>, Stop> {
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     crate::versions::keep_for_agent(&conn, &state.versions, full, rel, &format!("agent: {}", key.name))
         .map_err(|_| Stop::Failed("Could not keep a copy of the file before changing it, so it was left as it is.".to_string()))
 }
 
-fn after_write(state: &AppState, key: &AgentKey, action: &str, rel: &str) {
+pub(crate) fn after_write(state: &AppState, key: &AgentKey, action: &str, rel: &str) {
     crate::http::invalidate_sizes(state, rel.rsplit_once('/').map_or("", |(parent, _)| parent));
     let conn = state.db.lock().unwrap_or_else(|err| err.into_inner());
     let _ = crate::db::log_event(&conn, None, &format!("agent: {}", key.name), action, rel);

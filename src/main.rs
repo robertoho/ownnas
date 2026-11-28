@@ -43,6 +43,7 @@ mod mcp_files;
 mod mcp_organise;
 mod mcp_photos;
 mod mcp_write;
+mod mcp_journal;
 mod mcp_notes;
 mod mcp_ask;
 mod notes;
